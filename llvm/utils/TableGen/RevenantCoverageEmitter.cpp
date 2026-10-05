@@ -18,6 +18,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace llvm;
@@ -86,6 +87,30 @@ static void collectDstInsts(const TreePatternNode &N,
   for (const TreePatternNode &Child : N.children())
     collectDstInsts(Child, Out);
 }
+static bool operandsCompatible(const CGIOperandList::OperandInfo &A,
+                               const CGIOperandList::OperandInfo &B) {
+  if (A.Rec == B.Rec)
+    return true;
+  // OperandType is namespace-prefixed, e.g. "MCOI::OPERAND_IMMEDIATE".
+  auto Is = [](StringRef T, StringRef Kind) { return T.ends_with(Kind); };
+  return (Is(A.OperandType, "OPERAND_IMMEDIATE") &&
+          Is(B.OperandType, "OPERAND_IMMEDIATE")) ||
+         (Is(A.OperandType, "OPERAND_PCREL") &&
+          Is(B.OperandType, "OPERAND_PCREL"));
+}
+
+/// True if any node strictly below N has an Instruction-record operator.
+static bool hasNestedInstOp(const TreePatternNode &N) {
+  for (const TreePatternNode &Child : N.children()) {
+    if (Child.isLeaf())
+      continue;
+    if (Child.getOperator()->isSubClassOf("Instruction"))
+      return true;
+    if (hasNestedInstOp(Child))
+      return true;
+  }
+  return false;
+}
 
 class RevenantCoverageEmitter {
   CodeGenDAGPatterns CGP;
@@ -104,13 +129,14 @@ void RevenantCoverageEmitter::run(raw_ostream &OS) {
            LessRecordByID>
       Direct;
   std::set<const Record *> AppearsInDst;
-  std::set<const Record *, LessRecordByID> InstDefs;
+  std::map<const Record *, const CodeGenInstruction *, LessRecordByID> InstMap;
   for (const CodeGenInstruction *I : AllInsts)
-    InstDefs.insert(I->TheDef);
+    InstMap[I->TheDef] = I;
 
   // One pass over all patterns: a pattern is direct for instruction I when
-  // the Dst root is I and every root child is a leaf. Any instruction record
-  // used as an operator anywhere in a Dst tree counts as appearing there.
+  // the Dst root operator is I and no node strictly below the root has an
+  // Instruction-record operator. Any instruction record used as an operator
+  // anywhere in a Dst tree counts as appearing there.
   for (const PatternToMatch &P : CGP.ptms()) {
     TreePatternNode &Dst = P.getDstPattern();
     if (Dst.isLeaf())
@@ -119,17 +145,13 @@ void RevenantCoverageEmitter::run(raw_ostream &OS) {
     std::set<const Record *> InDst;
     collectDstInsts(Dst, InDst);
     for (const Record *R : InDst)
-      if (InstDefs.count(R))
+      if (InstMap.count(R))
         AppearsInDst.insert(R);
 
     const Record *Root = Dst.getOperator();
-    if (!InstDefs.count(Root))
+    if (!InstMap.count(Root) || hasNestedInstOp(Dst))
       continue;
-    bool AllLeaves = true;
-    for (const TreePatternNode &Child : Dst.children())
-      AllLeaves &= Child.isLeaf();
-    if (AllLeaves)
-      Direct[Root].push_back(&P);
+    Direct[Root].push_back(&P);
   }
 
   // Collect Src-tree nodes used by each instruction's direct patterns.
@@ -144,6 +166,91 @@ void RevenantCoverageEmitter::run(raw_ostream &OS) {
                         const CodeGenInstruction *B) {
     return A->TheDef->getName() < B->TheDef->getName();
   });
+
+  // Pass 1: categories without twins (full/partial/control/move/composite/none).
+  std::map<const Record *, std::string, LessRecordByID> Cat;
+  std::map<const Record *, std::vector<std::string>, LessRecordByID> Uncovered;
+  std::map<const Record *, std::set<const Record *>, LessRecordByID>
+      CoveredRegs;
+  for (const CodeGenInstruction *I : Sorted) {
+    const Record *TheDef = I->TheDef;
+    std::set<const Record *> &Covered = CoveredRegs[TheDef];
+    auto It = Direct.find(TheDef);
+    if (It != Direct.end()) {
+      for (const PatternToMatch *P : It->second) {
+        for (const Record *R : P->getDstRegs())
+          Covered.insert(R);
+        // Extra Src root results map to implicit defs in order.
+        int64_t K = static_cast<int64_t>(P->getSrcPattern().getNumTypes()) -
+                    I->Operands.NumDefs;
+        for (int64_t Idx = 0; Idx < K &&
+             Idx < static_cast<int64_t>(I->ImplicitDefs.size());
+             ++Idx)
+          Covered.insert(I->ImplicitDefs[Idx]);
+      }
+      std::vector<std::string> Miss;
+      for (const Record *R : I->ImplicitDefs)
+        if (!Covered.count(R))
+          Miss.push_back(R->getName().str());
+      Uncovered[TheDef] = Miss;
+      Cat[TheDef] = Miss.empty() ? "full" : "partial";
+      continue;
+    }
+    if (I->TheDef->getValueAsBit("isBranch") ||
+        I->TheDef->getValueAsBit("isCall") ||
+        I->TheDef->getValueAsBit("isReturn") ||
+        I->TheDef->getValueAsBit("isIndirectBranch")) {
+      Cat[TheDef] = "control";
+      continue;
+    }
+    if (I->TheDef->getValueAsBit("isMoveReg")) {
+      Cat[TheDef] = "move";
+      continue;
+    }
+    Cat[TheDef] = AppearsInDst.count(TheDef) ? "composite" : "none";
+  }
+
+  // Pass 2: twins. Per precedence twin > control > move > composite > none,
+  // every instruction without a direct pattern is a twin candidate. Bucket
+  // potential twins by (AsmString, NumDefs, operand count) so we don't do an
+  // O(N^2) scan over all instructions.
+  std::map<std::tuple<std::string, unsigned, unsigned>,
+           std::vector<const CodeGenInstruction *>>
+      TwinSources;
+  for (const CodeGenInstruction *J : Sorted) {
+    const std::string &JCat = Cat[J->TheDef];
+    if (JCat != "full" && JCat != "partial" && JCat != "control" &&
+        JCat != "move")
+      continue;
+    TwinSources[{J->AsmString.str(), J->Operands.NumDefs,
+                 J->Operands.size()}]
+        .push_back(J);
+  }
+  std::map<const Record *, std::vector<const CodeGenInstruction *>,
+           LessRecordByID>
+      Twins;
+  for (const CodeGenInstruction *I : Sorted) {
+    const std::string &ICat = Cat[I->TheDef];
+    if (ICat == "full" || ICat == "partial")
+      continue;
+    auto Bit = TwinSources.find(
+        {I->AsmString.str(), I->Operands.NumDefs, I->Operands.size()});
+    if (Bit == TwinSources.end())
+      continue;
+    for (const CodeGenInstruction *J : Bit->second) {
+      if (J == I)
+        continue;
+      const CGIOperandList &IOps = I->Operands, &JOps = J->Operands;
+      bool AllOk = true;
+      for (unsigned O = 0; O < IOps.size(); ++O)
+        if (!operandsCompatible(IOps[O], JOps[O])) {
+          AllOk = false;
+          break;
+        }
+      if (AllOk)
+        Twins[I->TheDef].push_back(J);
+    }
+  }
 
   json::Array InstArray;
   for (const CodeGenInstruction *I : Sorted) {
@@ -162,12 +269,9 @@ void RevenantCoverageEmitter::run(raw_ostream &OS) {
                      !TheDef->getValueAsBit("isAsmParserOnly") &&
                      (!I->isCodeGenOnly || ForceDisassemble);
 
-    std::set<const Record *> CoveredRegs;
     std::vector<std::string> SrcStrs;
     if (Pats) {
       for (const PatternToMatch *P : *Pats) {
-        for (const Record *R : P->getDstRegs())
-          CoveredRegs.insert(R);
         std::string S;
         raw_string_ostream SS(S);
         P->getSrcPattern().print(SS);
@@ -189,32 +293,83 @@ void RevenantCoverageEmitter::run(raw_ostream &OS) {
     }
 
     std::vector<std::string> ImplicitDefNames;
-    std::vector<std::string> Uncovered;
-    for (const Record *R : I->ImplicitDefs) {
+    for (const Record *R : I->ImplicitDefs)
       ImplicitDefNames.push_back(R->getName().str());
-      if (Pats && !CoveredRegs.count(R))
-        Uncovered.push_back(R->getName().str());
-    }
 
-    StringRef Category;
-    if (Pats)
-      Category = Uncovered.empty() ? "full" : "partial";
-    else if (AppearsInDst.count(TheDef))
-      Category = "composite";
-    else
-      Category = "none";
+    std::vector<std::string> Flags;
+    for (const char *F : {"isBranch", "isCall", "isReturn",
+                          "isIndirectBranch", "isMoveReg"})
+      if (TheDef->getValueAsBit(F))
+        Flags.push_back(F);
 
     json::Object Entry;
     Entry["name"] = TheDef->getName();
     Entry["decodable"] = Decodable;
-    Entry["category"] = Category;
-    Entry["uncovered_implicit_defs"] = json::Array(Uncovered);
+    Entry["uncovered_implicit_defs"] = json::Array(Uncovered[TheDef]);
     Entry["implicit_defs"] = json::Array(ImplicitDefNames);
     Entry["direct_patterns"] = json::Array(SrcStrs);
-    Entry["nodes"] = json::Array(
-        std::vector<std::string>(NodeNames.begin(), NodeNames.end()));
-    Entry["intrinsic_only"] =
-        HasIntrinsic && !HasNonGenericNonIntrinsicNonComplex;
+    Entry["flags"] = json::Array(Flags);
+
+    auto TwinIt = Twins.find(TheDef);
+    if (TwinIt != Twins.end()) {
+      // Prefer a twin with all-identical operand records, then the
+      // lexicographically smallest name.
+      const CodeGenInstruction *Best = nullptr;
+      bool BestAllIdentical = false;
+      for (const CodeGenInstruction *J : TwinIt->second) {
+        bool AllIdentical = true;
+        for (unsigned O = 0; O < I->Operands.size(); ++O)
+          if (I->Operands[O].Rec != J->Operands[O].Rec) {
+            AllIdentical = false;
+            break;
+          }
+        if (!Best || (AllIdentical && !BestAllIdentical) ||
+            (AllIdentical == BestAllIdentical &&
+             J->TheDef->getName() < Best->TheDef->getName())) {
+          Best = J;
+          BestAllIdentical = AllIdentical;
+        }
+      }
+      Entry["category"] = "twin";
+      Entry["twin_of"] = Best->TheDef->getName();
+      Entry["twin_category"] = Cat[Best->TheDef];
+      Entry["twin_candidates"] =
+          static_cast<int64_t>(TwinIt->second.size());
+      // Copy the twin's semantics onto I.
+      std::set<std::string> TwinNodes;
+      for (const auto &[Name, NE] : Nodes)
+        if (NE.Instructions.count(Best->TheDef))
+          TwinNodes.insert(Name);
+      std::vector<std::string> TwinPats;
+      if (auto Jt = Direct.find(Best->TheDef); Jt != Direct.end())
+        for (const PatternToMatch *P : Jt->second) {
+          std::string S;
+          raw_string_ostream SS(S);
+          P->getSrcPattern().print(SS);
+          TwinPats.push_back(SS.str());
+        }
+      bool TwinIntrinsic = false, TwinBadNode = false;
+      for (const auto &[Name, NE] : Nodes) {
+        if (!NE.Instructions.count(Best->TheDef))
+          continue;
+        if (NE.Kind == "intrinsic")
+          TwinIntrinsic = true;
+        else if (NE.Kind != "generic" && NE.Kind != "complex")
+          TwinBadNode = true;
+      }
+      Entry["nodes"] = json::Array(
+          std::vector<std::string>(TwinNodes.begin(), TwinNodes.end()));
+      Entry["direct_patterns"] = json::Array(TwinPats);
+      Entry["intrinsic_only"] = TwinIntrinsic && !TwinBadNode;
+      Entry["uncovered_implicit_defs"] =
+          json::Array(Uncovered[Best->TheDef]);
+    } else {
+      Entry["category"] = Cat[TheDef];
+      Entry["nodes"] = json::Array(
+          std::vector<std::string>(NodeNames.begin(), NodeNames.end()));
+      Entry["intrinsic_only"] =
+          HasIntrinsic && !HasNonGenericNonIntrinsicNonComplex;
+    }
     InstArray.push_back(std::move(Entry));
   }
 
