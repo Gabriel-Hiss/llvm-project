@@ -61,6 +61,7 @@ add_tablegen(llvm-tblgen LLVM
   OptionParserEmitter.cpp
   OptionRSTEmitter.cpp
   PseudoLoweringEmitter.cpp
+  RevenantCoverageEmitter.cpp
   RegisterBankEmitter.cpp
   RegisterInfoEmitter.cpp
   SDNodeInfoEmitter.cpp
