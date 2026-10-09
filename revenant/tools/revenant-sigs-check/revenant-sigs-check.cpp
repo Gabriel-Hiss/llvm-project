@@ -1,7 +1,9 @@
+#include "revenant/Analysis/Analysis.h"
 #include "revenant/Analysis/Signatures.h"
 #include "revenant/Core/Program.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/Object/PeFile.h"
+#include "revenant/Target/TargetHooks.h"
 #include "llvm/DebugInfo/CodeView/SymbolDeserializer.h"
 #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
 #include "llvm/DebugInfo/CodeView/TypeDeserializer.h"
@@ -39,121 +41,6 @@ static cl::opt<std::string> PdbPath(cl::Positional, cl::Required,
 static cl::opt<std::string> CsvPath(cl::Positional, cl::Required,
                                     cl::desc("recovered signatures CSV"));
 
-static void buildPdataProgram(const PeFile &PE, const Disasm &Dis,
-                              Program &P) {
-  P.Img = PE.Img;
-  P.Externs = std::make_shared<std::map<Va, Extern>>();
-  P.Names = std::make_shared<std::map<Va, std::string>>();
-  for (const RuntimeFunction &RF : PE.Pdata) {
-    if (RF.ChainedTo || RF.End <= RF.Begin)
-      continue;
-    auto StartRva = RF.Begin.offsetFrom(PE.Img->Base);
-    auto EndRva = RF.End.offsetFrom(PE.Img->Base);
-    if (!StartRva || !EndRva || *StartRva > UINT32_MAX ||
-        *EndRva > UINT32_MAX)
-      continue;
-
-    FuncRecord F;
-    F.Start = RF.Begin;
-    F.End = RF.End;
-    F.HasPdata = true;
-    F.Chunks.push_back({RF.Begin, RF.End});
-    std::vector<Instr> Instructions;
-    std::map<uint64_t, size_t> Indices;
-    for (Va IP = RF.Begin; IP < RF.End;) {
-      auto Ins = Dis.decodeOne(IP);
-      if (!Ins || Ins->Size == 0)
-        break;
-      Indices.emplace(IP.Value, Instructions.size());
-      Instructions.push_back(*Ins);
-      auto Rva = IP.offsetFrom(PE.Img->Base);
-      if (!Rva || *Rva > UINT32_MAX)
-        break;
-      F.InstrRvas.push_back(static_cast<uint32_t>(*Rva));
-      IP = Ins->nextVa();
-    }
-    if (Instructions.empty())
-      continue;
-
-    std::set<size_t> Boundaries{0};
-    for (size_t I = 0; I < Instructions.size(); ++I) {
-      const Instr &Ins = Instructions[I];
-      if (Ins.Flow != FlowKind::Branch && Ins.Flow != FlowKind::CondBranch &&
-          Ins.Flow != FlowKind::IndirectBranch && Ins.Flow != FlowKind::Return &&
-          Ins.Flow != FlowKind::Trap)
-        continue;
-      if (I + 1 < Instructions.size())
-        Boundaries.insert(I + 1);
-      if (Ins.HasTarget && Ins.Target >= RF.Begin && Ins.Target < RF.End) {
-        auto Target = Indices.find(Ins.Target.Value);
-        if (Target != Indices.end())
-          Boundaries.insert(Target->second);
-      }
-    }
-    SmallVector<size_t, 16> Starts(Boundaries.begin(), Boundaries.end());
-    for (size_t BI = 0; BI < Starts.size(); ++BI) {
-      size_t Begin = Starts[BI];
-      size_t End = BI + 1 < Starts.size() ? Starts[BI + 1]
-                                           : Instructions.size();
-      if (Begin >= End)
-        continue;
-      const Instr &Last = Instructions[End - 1];
-      BlockRec B;
-      B.Start = static_cast<uint32_t>(
-          Instructions[Begin].Addr - PE.Img->Base);
-      Va BlockEndVa = Last.nextVa();
-      if (BlockEndVa > RF.End)
-        BlockEndVa = RF.End;
-      B.End = static_cast<uint32_t>(BlockEndVa - PE.Img->Base);
-      B.InstrsBegin = Begin;
-      B.InstrsEnd = End;
-      B.EdgesBegin = F.Edges.size();
-
-      auto AddEdge = [&](Va Target, EdgeTag Kind) {
-        auto TargetRva = Target.offsetFrom(PE.Img->Base);
-        if (!TargetRva || *TargetRva > UINT32_MAX)
-          return;
-        F.Edges.push_back({static_cast<uint32_t>(*TargetRva), Kind});
-      };
-      auto AddFallthrough = [&]() {
-        if (End < Instructions.size())
-          AddEdge(Instructions[End].Addr, EdgeTag::Fallthrough);
-      };
-      if (Last.Flow == FlowKind::Return) {
-        B.EndKind = BlockEnd::Return;
-      } else if (Last.Flow == FlowKind::Trap) {
-        B.EndKind = BlockEnd::Noreturn;
-      } else if (Last.Flow == FlowKind::IndirectBranch) {
-        B.EndKind = BlockEnd::UnresolvedIndirect;
-        F.UnresolvedIndirects.push_back(Last.Addr);
-      } else if (Last.Flow == FlowKind::CondBranch) {
-        B.EndKind = BlockEnd::Branch;
-        if (Last.HasTarget && Last.Target >= RF.Begin && Last.Target < RF.End)
-          AddEdge(Last.Target, EdgeTag::CondTaken);
-        else if (Last.HasTarget)
-          AddEdge(Last.Target, EdgeTag::TailCall);
-        AddFallthrough();
-      } else if (Last.Flow == FlowKind::Branch) {
-        if (Last.HasTarget && Last.Target >= RF.Begin && Last.Target < RF.End) {
-          B.EndKind = BlockEnd::Branch;
-          AddEdge(Last.Target, EdgeTag::Jump);
-        } else {
-          B.EndKind = BlockEnd::TailCall;
-          if (Last.HasTarget)
-            AddEdge(Last.Target, EdgeTag::TailCall);
-        }
-      } else if (End < Instructions.size()) {
-        B.EndKind = BlockEnd::Fallthrough;
-        AddFallthrough();
-      } else {
-        B.EndKind = BlockEnd::EndOfFunction;
-      }
-      B.EdgesEnd = F.Edges.size();
-      F.Blocks.push_back(B);
-    }
-    P.Functions.emplace(F.Start, std::move(F));
-  }
-}
 
 static std::optional<std::pair<unsigned, bool>>
 functionTypeParameters(TpiStream &TPI, TpiStream &IPI,
@@ -276,14 +163,18 @@ int main(int Argc, char **Argv) {
     return 1;
   }
   PeFile PE = std::move(*PEOrErr);
+  auto Hooks = createX86TargetHooks();
+  if (!Hooks) {
+    errs() << "target hooks setup failed\n";
+    return 1;
+  }
+  Program P = revenant::analyze(PE, *Hooks);
   auto DisOrErr = Disasm::create(*PE.Img);
   if (!DisOrErr) {
     logAllUnhandledErrors(DisOrErr.takeError(), errs(), "decoder setup failed: ");
     return 1;
   }
   Disasm Dis = std::move(*DisOrErr);
-  Program P;
-  buildPdataProgram(PE, Dis, P);
   Signatures Sigs = analyzeSignatures(P, Dis);
 
   std::unique_ptr<IPDBSession> Session;
