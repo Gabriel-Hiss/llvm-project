@@ -22,6 +22,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -40,6 +41,9 @@ using namespace llvm;
 
 namespace revenant {
 bool foldStructuralIPO(Module &M);
+// Constant equivalence modulo dedup'd constant data and trap-stub
+// declarations (Structural.cpp).
+bool constantsEquivalent(const Constant *A, const Constant *B);
 }
 
 namespace {
@@ -228,22 +232,31 @@ bool stripCloneSuffix(StringRef Name, StringRef &Base) {
 
 // Rebind only operands that permit runtime values. Switch cases, struct GEP
 // indices, intrinsic immargs and other constant-only operands stay constant.
+// Operands equivalent to C (dedup'd data globals, equivalent ConstantExprs)
+// rebind too: GCC folds the source global, the lifter re-emits it per VA.
 void rebindConstantToArg(Function &NewF, Constant *C, Argument *A) {
   if (!C || !A || C->getType() != A->getType())
     return;
   for (BasicBlock &BB : NewF)
     for (Instruction &I : BB) {
-      if (!isa<BinaryOperator>(I) && !isa<CmpInst>(I) &&
-          !isa<SelectInst>(I) && !isa<CastInst>(I) && !isa<PHINode>(I) &&
-          !isa<ReturnInst>(I) && !isa<FreezeInst>(I))
+      if (isa<BinaryOperator>(I) || isa<CmpInst>(I) || isa<SelectInst>(I) ||
+          isa<CastInst>(I) || isa<PHINode>(I) || isa<ReturnInst>(I) ||
+          isa<FreezeInst>(I) || isa<StoreInst>(I)) {
+        for (unsigned N = 0; N < I.getNumOperands(); ++N) {
+          auto *Old = dyn_cast<Constant>(I.getOperand(N));
+          if (Old && Old->getType() == C->getType() &&
+              revenant::constantsEquivalent(Old, C))
+            I.setOperand(N, A);
+        }
         continue;
-      for (unsigned N = 0; N < I.getNumOperands(); ++N) {
-        auto *Old = dyn_cast<ConstantInt>(I.getOperand(N));
-        auto *Value = dyn_cast<ConstantInt>(C);
-        if (Old && Value && Old->getType() == Value->getType() &&
-            Old->getValue() == Value->getValue())
-          I.setOperand(N, A);
       }
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        for (unsigned N = 0; N < CB->arg_size(); ++N) {
+          auto *Old = dyn_cast<Constant>(CB->getArgOperand(N));
+          if (Old && Old->getType() == C->getType() &&
+              revenant::constantsEquivalent(Old, C))
+            CB->setArgOperand(N, A);
+        }
     }
 }
 
@@ -632,6 +645,91 @@ bool restoreABIExtra(Module &M, Function &F) {
                           Common, F.arg_size(), "");
 }
 
+// Peel a constant expression down to the global it derives from. Only
+// transparent casts qualify: a ConstantExpr mixing a global with other
+// data (add/sub, GEP past the head) is not a whole-object reference.
+GlobalVariable *globalBehind(const Constant *C) {
+  if (const auto *GV = dyn_cast<GlobalVariable>(C))
+    return const_cast<GlobalVariable *>(GV);
+  if (const auto *E = dyn_cast<ConstantExpr>(C)) {
+    if (E->getNumOperands() == 1 &&
+        (E->getOpcode() == Instruction::PtrToInt ||
+         E->getOpcode() == Instruction::BitCast ||
+         E->getOpcode() == Instruction::AddrSpaceCast))
+      if (const auto *Op = dyn_cast<Constant>(E->getOperand(0)))
+        return globalBehind(Op);
+  }
+  return nullptr;
+}
+
+// True when C contains any global-bearing leaf (used to veto functions
+// that touch a second data object).
+bool containsGlobal(const Constant *C) {
+  if (isa<GlobalValue>(C))
+    return true;
+  if (const auto *E = dyn_cast<ConstantExpr>(C))
+    for (const Value *V : E->operand_values())
+      if (const auto *Op = dyn_cast<Constant>(V))
+        if (containsGlobal(Op))
+          return true;
+  return false;
+}
+
+// Folded-global argument restoration (clone-only constprop). A GCC
+// constprop clone of a single-object function keeps the folded object
+// reference inline: the body passes `ptrtoint(@g)` (or an equivalent
+// dedup'd global) to its callees, once per use, where the general
+// version read `this`. The signature evidence is narrow on purpose:
+// exactly one surviving formal, callers that disagree on it (so no
+// caller-side constant is the specialization), and exactly one
+// equivalence class of referenced data global, appearing at least twice
+// as a call argument and nowhere else. That is `this`/the singleton the
+// specialization folded; restoring it as formal 0 and passing it at
+// every call site is a plain rebind, equivalent by construction.
+// Zero-caller clones restore the same signature (the rebind is
+// semantics-preserving even with no sites to update).
+bool restoreFoldedGlobal(Module &M, Function &F) {
+  if (F.isDeclaration() || F.isVarArg() || F.arg_size() != 1 ||
+      F.hasDLLExportStorageClass() || hasBadCallSite(F) ||
+      callsOpaqueOrSpecial(F, true))
+    return false;
+  for (Argument &A : F.args())
+    if (A.hasAttribute(Attribute::StructRet) ||
+        A.hasAttribute(Attribute::ByVal))
+      return false;
+  Constant *Bound = nullptr;
+  unsigned ArgUses = 0;
+  SmallPtrSet<GlobalVariable *, 4> Class;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      for (unsigned K = 0; K < I.getNumOperands(); ++K) {
+        auto *C = dyn_cast<Constant>(I.getOperand(K));
+        if (!C || !containsGlobal(C))
+          continue;
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (K >= CB->arg_size())
+            continue; // the callee operand itself is not evidence
+          if (GlobalVariable *G = globalBehind(C)) {
+            Class.insert(G);
+            ++ArgUses;
+            if (!Bound)
+              Bound = C;
+            continue;
+          }
+        }
+        return false; // a second data object, or a non-argument global use
+      }
+    }
+  if (ArgUses < 2 || Class.size() != 1 || !Bound)
+    return false;
+  SmallVector<Type *, 4> Params;
+  Params.push_back(Bound->getType());
+  Params.push_back(F.getArg(0)->getType());
+  SmallVector<int64_t, 4> Forward = {-1, 0};
+  return rewriteSignature(M, F, F.getReturnType(), Params, Forward,
+                          Bound, /*RebindParam=*/0, "");
+}
+
 bool runOnModule(Module &M) {
   bool Changed = revenant::foldStructuralIPO(M);
   SmallVector<std::string, 16> Names;
@@ -641,6 +739,9 @@ bool runOnModule(Module &M) {
   for (const std::string &Name : Names)
     while (restoreABIExtra(M, *M.getFunction(Name)))
       Changed = true;
+  for (const std::string &Name : Names)
+    if (Function *F = M.getFunction(Name))
+      Changed |= restoreFoldedGlobal(M, *F);
   SmallVector<Function *, 16> Work;
   for (Function &F : M) {
     if (F.isDeclaration() || F.isIntrinsic())
