@@ -11,6 +11,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/Decl.h"
@@ -58,7 +59,7 @@ private:
 TEST(TranslationUnitTest, EmitsEnumSwitchCaseLiteralsAsIntegerTypes) {
   LLVMContext Context;
   Module M("enum-switch", Context);
-  M.setTargetTriple("x86_64-pc-windows-msvc");
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
   Type *I32 = Type::getInt32Ty(Context);
   Function *F = Function::Create(FunctionType::get(I32, {I32}, false),
                                  Function::ExternalLinkage, "enum_switch", M);
@@ -67,7 +68,7 @@ TEST(TranslationUnitTest, EmitsEnumSwitchCaseLiteralsAsIntegerTypes) {
   BasicBlock *Default = BasicBlock::Create(Context, "default", F);
   IRBuilder<> Builder(Entry);
   SwitchInst *Switch = Builder.CreateSwitch(F->getArg(0), Default, 1);
-  Switch->addCase(ConstantInt::get(I32, 1), Case);
+  Switch->addCase(ConstantInt::get(cast<IntegerType>(I32), 1), Case);
   Builder.SetInsertPoint(Case);
   Builder.CreateRet(ConstantInt::get(I32, 2));
   Builder.SetInsertPoint(Default);
@@ -76,14 +77,19 @@ TEST(TranslationUnitTest, EmitsEnumSwitchCaseLiteralsAsIntegerTypes) {
   ClangFrontendOptions Options;
   Options.Lang = "c";
   auto TUOrErr = createASTContext(M, Options);
-  ASSERT_TRUE(TUOrErr) << toString(TUOrErr.takeError());
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
   std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
   auto *Enum = clang::EnumDecl::Create(
       TU->ast(), TU->tu(), clang::SourceLocation(), clang::SourceLocation(),
       TU->frontend().ident("Mode"), nullptr, false, false, true);
   Enum->startDefinition();
   Enum->completeDefinition(TU->ast().IntTy, TU->ast().IntTy, 32, 32);
-  EnumSwitchTypeBuilder Types(TU->frontend(), TU->ast().getEnumType(Enum));
+  EnumSwitchTypeBuilder Types(
+      TU->frontend(), TU->ast().getTypeDeclType(
+                          static_cast<const clang::TypeDecl *>(Enum)));
   std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), Types);
   std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), Types);
   fillTranslationUnit(*TU, M, Types, *Stmts, *Exprs);
@@ -97,7 +103,7 @@ TEST(TranslationUnitTest, EmitsEnumSwitchCaseLiteralsAsIntegerTypes) {
 TEST(TranslationUnitTest, EmitsPointerReturnFallbackWithPointerType) {
   LLVMContext Context;
   Module M("pointer-return", Context);
-  M.setTargetTriple("x86_64-pc-windows-msvc");
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
   Type *PtrTy = PointerType::get(Context, 0);
   Function *F = Function::Create(FunctionType::get(PtrTy, false),
                                  Function::ExternalLinkage, "pointer_result", M);
@@ -108,7 +114,10 @@ TEST(TranslationUnitTest, EmitsPointerReturnFallbackWithPointerType) {
   ClangFrontendOptions Options;
   Options.Lang = "c";
   auto TUOrErr = createASTContext(M, Options);
-  ASSERT_TRUE(TUOrErr) << toString(TUOrErr.takeError());
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
   std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
   std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
   std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
