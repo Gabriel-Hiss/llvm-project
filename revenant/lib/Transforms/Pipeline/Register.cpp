@@ -58,6 +58,21 @@
 #if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
 #include "revenant/Transforms/Unhoist/Unhoist.h"
 #endif
+#if __has_include("revenant/Transforms/Uninline/Uninline.h")
+#include "revenant/Transforms/Uninline/Uninline.h"
+#endif
+#if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
+#include "revenant/Transforms/UnhotCold/UnhotCold.h"
+#endif
+#if __has_include("revenant/Transforms/Unselect/Unselect.h")
+#include "revenant/Transforms/Unselect/Unselect.h"
+#endif
+#if __has_include("revenant/Transforms/UntailDup/UntailDup.h")
+#include "revenant/Transforms/UntailDup/UntailDup.h"
+#endif
+#if __has_include("revenant/Transforms/Uneh/Uneh.h")
+#include "revenant/Transforms/Uneh/Uneh.h"
+#endif
 #if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
 #include "revenant/Transforms/UnloopVec/UnloopVec.h"
 #endif
@@ -140,6 +155,30 @@ void registerRevenantPasses(PassBuilder &PB) {
           return true;
         }
 #endif
+#if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
+        if (Name == "revenant-unhotcold") {
+          FPM.addPass(UnhotColdPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unselect/Unselect.h")
+        if (Name == "revenant-unselect") {
+          FPM.addPass(UnselectPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/UntailDup/UntailDup.h")
+        if (Name == "revenant-untaildup") {
+          FPM.addPass(UntailDupPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Uneh/Uneh.h")
+        if (Name == "revenant-uneh") {
+          FPM.addPass(UnehPass());
+          return true;
+        }
+#endif
         return false;
       });
   // Module passes: only passes that must erase/replace Function objects
@@ -152,6 +191,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Uninline/Uninline.h")
+        if (Name == "revenant-uninline") {
+          MPM.addPass(UninlinePass());
           return true;
         }
 #endif

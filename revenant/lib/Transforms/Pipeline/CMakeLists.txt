@@ -32,5 +32,10 @@ add_llvm_library(RevenantTransformPipeline
   $<$<TARGET_EXISTS:RevenantTransformSsaOut>:RevenantTransformSsaOut>
   $<$<TARGET_EXISTS:RevenantTransformUnabi>:RevenantTransformUnabi>
   $<$<TARGET_EXISTS:RevenantTransformUnhoist>:RevenantTransformUnhoist>
+  $<$<TARGET_EXISTS:RevenantTransformUninline>:RevenantTransformUninline>
+  $<$<TARGET_EXISTS:RevenantTransformUnhotCold>:RevenantTransformUnhotCold>
+  $<$<TARGET_EXISTS:RevenantTransformUnselect>:RevenantTransformUnselect>
+  $<$<TARGET_EXISTS:RevenantTransformUntailDup>:RevenantTransformUntailDup>
+  $<$<TARGET_EXISTS:RevenantTransformUneh>:RevenantTransformUneh>
   $<$<TARGET_EXISTS:RevenantTransformUnloopVec>:RevenantTransformUnloopVec>
   )
