@@ -750,14 +750,14 @@ Expected<EmitResult> emitRustcSource(const Module &M, StringRef LlText) {
   EC = sys::fs::createTemporaryFile("revenant", "rs", OutPath);
   if (EC)
     return createStringError(EC, "create temp .rs");
-  // The flag's exact emit spelling is settled when LunaRustcCore lands;
-  // run with just the -Z flag and read the source back from the temp.
-  std::string Flag = ("revenant-decompile=" + LlPath).str();
   std::string Stderr;
-  SmallVector<StringRef, 8> Argv = {Rustc, "-Z", Flag};
-  int Rc = sys::ExecuteAndWait(
-      Rustc, Argv, /*Env=*/std::nullopt, /*Redirects=*/{},
-      /*SecondsToWait=*/120, /*MemoryLimit=*/0, &Stderr);
+  // The fork writes its generated crate to the output path selected by `-o`.
+  std::string Flag = ("revenant-decompile=" + LlPath).str();
+  SmallVector<StringRef, 8> Argv = {Rustc, "-Z", Flag, "-", "--crate-name",
+                                   "revenant", "-o", OutPath};
+  int Rc = sys::ExecuteAndWait(Rustc, Argv, /*Env=*/std::nullopt,
+                               /*Redirects=*/{}, /*SecondsToWait=*/120,
+                               /*MemoryLimit=*/0, &Stderr);
   std::string Src;
   if (auto Buf = MemoryBuffer::getFile(OutPath); Buf && *Buf &&
       !(*Buf)->getBuffer().empty())
