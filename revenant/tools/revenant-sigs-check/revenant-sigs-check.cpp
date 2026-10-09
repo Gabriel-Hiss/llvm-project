@@ -146,8 +146,14 @@ pdbParameterCounts(NativeSession &Session) {
       uint32_t Rva = Session.getRVAFromSectOffset(Proc.Segment, Proc.CodeOffset);
       auto Params =
           functionTypeParameters(TPI, IPI, Proc.FunctionType, IsProcId);
-      if (Params)
-        Counts[Rva] = Params->first + Params->second;
+      if (Params) {
+        unsigned N = Params->first + Params->second;
+        auto Prev = Counts.find(Rva);
+        if (Prev != Counts.end() && Prev->second != N)
+          errs() << "folded twins at rva " << format_hex_no_prefix(Rva, 8)
+                 << ": pdb counts " << Prev->second << " vs " << N << '\n';
+        Counts[Rva] = N;
+      }
     }
     (void)HadError;
   }

@@ -335,10 +335,24 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
 
   while (!Fn->empty())
     Fn->begin()->eraseFromParent();
+  // LLVM forbids predecessors of the entry block. When a loop or jump targets
+  // the function's first instruction, the setup block is a separate entry
+  // that branches to the block holding that code.
+  bool EntryIsTarget = false;
+  for (const BlockRec &BR : F.Blocks)
+    for (const EdgeRec &E : F.edgesOf(BR)) {
+      size_t Idx = &E - F.Edges.data();
+      if (E.Kind != EdgeTag::TailCall && F.edgeTo(*P.Img, Idx) == F.Start)
+        EntryIsTarget = true;
+    }
   llvm::BasicBlock *Entry = llvm::BasicBlock::Create(M.getContext(), "", Fn);
-  ir::nameBlock(*Entry, F.Start.Value);
+  if (EntryIsTarget)
+    ir::nameBlock(*Entry);
+  else
+    ir::nameBlock(*Entry, F.Start.Value);
   LiftState LS(M, *Fn, P, F, D, Sigs, std::move(*StackOrErr), Instrs);
-  LS.Blocks.emplace(F.Start, Entry);
+  if (!EntryIsTarget)
+    LS.Blocks.emplace(F.Start, Entry);
   LS.B.SetInsertPoint(Entry);
 
   // Register file: 15 GPR roots as i64, xmm0-15 as i128, 5 flags as i1.
@@ -439,6 +453,13 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     llvm::BasicBlock *BB = llvm::BasicBlock::Create(M.getContext(), "", Fn);
     ir::nameBlock(*BB, Start.Value);
     LS.Blocks.emplace(Start, BB);
+  }
+  if (EntryIsTarget) {
+    auto It = LS.Blocks.find(F.Start);
+    if (It != LS.Blocks.end())
+      attachVa(LS.B.CreateBr(It->second), F.Start.Value);
+    else
+      attachVa(LS.B.CreateUnreachable(), F.Start.Value);
   }
 
   for (const BlockRec &BR : F.Blocks) {

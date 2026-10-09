@@ -197,7 +197,7 @@ QualType ExprBuilderImpl::exprTypeOf(llvm::Value *V) {
   const llvm::DIType *DI = debugTypeOf(V);
   QualType T = Types.typeOf(V->getType(), DI);
   if (CurFD && V->getType() == CurF->getReturnType() &&
-      V->getType()->isStructTy())
+      (V->getType()->isStructTy() || V->getType()->isArrayTy()))
     T = CurFD->getReturnType();
   assert(!T.isNull() && "TypeBuilder must never return null");
   return T;
@@ -314,6 +314,33 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
     T = AST->IntTy;
   }
   unsigned W = (unsigned)AST->getIntWidth(T);
+  // No C/C++ spelling exists for a >64-bit decimal literal: Clang's
+  // printer emits the raw digits and clang-cl rejects them ("integer
+  // literal is too large"). Split the value into two 64-bit halves
+  // joined by a shift+or, which folds to the same constant.
+  if (W > 64 && !V.isZero()) {
+    uint64_t Lo = V.trunc(64).getZExtValue();
+    uint64_t Hi = V.lshr(64).trunc(64).getZExtValue();
+    Expr *LoE = IntegerLiteral::Create(
+        *AST, llvm::APInt(64, Lo), AST->UnsignedLongLongTy, SourceLocation());
+    Expr *HiE = IntegerLiteral::Create(
+        *AST, llvm::APInt(64, Hi), AST->UnsignedLongLongTy, SourceLocation());
+    Expr *ShiftAmt = IntegerLiteral::Create(
+        *AST, llvm::APInt(32, 64), AST->IntTy, SourceLocation());
+    Expr *Shift = BinaryOperator::Create(*AST, HiE, ShiftAmt, BO_Shl,
+                                         AST->UnsignedLongLongTy, VK_PRValue,
+                                         OK_Ordinary, SourceLocation(),
+                                         FPOptionsOverride());
+    QualType U128 = T->isSignedIntegerType() ? AST->Int128Ty
+                                             : AST->UnsignedInt128Ty;
+    Expr *Or = BinaryOperator::Create(
+        *AST, makeCStyleCast(U128, CK_IntegralCast, Shift),
+        makeCStyleCast(U128, CK_IntegralCast, LoE), BO_Or, U128, VK_PRValue,
+        OK_Ordinary, SourceLocation(), FPOptionsOverride());
+    if (U128 != T)
+      return Or;
+    return makeCStyleCast(T, CK_IntegralCast, Or);
+  }
   llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative())
                         ? V.sextOrTrunc(W)
                         : V.zextOrTrunc(W);

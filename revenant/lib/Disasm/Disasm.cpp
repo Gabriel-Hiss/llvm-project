@@ -140,6 +140,12 @@ static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
     Out.HasMemTarget = true;
     Out.MemTarget = Va(*MemAddr);
   }
+  // A `3E` prefix on an indirect call/jmp is CET `notrack`; the decoder
+  // keeps it as a segment override that the printer then drops.
+  if (Bytes[0] == 0x3E &&
+      (Out.Flow == FlowKind::IndirectBranch ||
+       (Out.Flow == FlowKind::Call && !Out.HasTarget)))
+    Out.Inst.setFlags(Out.Inst.getFlags() | X86::IP_HAS_NOTRACK);
   return Out;
 }
 

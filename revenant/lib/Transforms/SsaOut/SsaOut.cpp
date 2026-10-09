@@ -373,8 +373,14 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     for (BasicBlock *Succ : Succs) {
       if (Succ->phis().empty())
         continue;
-      if (SplitCriticalEdge(&BB, Succ))
+      if (BasicBlock *EdgeBB = SplitCriticalEdge(&BB, Succ)) {
+        // `!revenant.region` operands are block-list indices; inserting
+        // the split block mid-list would shift every later index and
+        // mis-decode annotations written before this pass. Keep the new
+        // block at the end so existing indices stay valid.
+        EdgeBB->moveAfter(&F.back());
         Changed = true;
+      }
     }
   }
 

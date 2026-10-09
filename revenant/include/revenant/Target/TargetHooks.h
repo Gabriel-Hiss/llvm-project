@@ -100,6 +100,18 @@ public:
   virtual std::optional<int64_t> movEaxImm(const Instr &I) const = 0;
   virtual bool writesSpDynamically(const Instr &I) const = 0;
 
+  /// `lea reg,[rsp+disp]` or `mov reg,rsp`: the register now holds
+  /// `rsp + disp`. Returns (register id, disp). Targets without the shape
+  /// keep the default.
+  virtual std::optional<std::pair<unsigned, int64_t>>
+  spCopy(const Instr &) const {
+    return std::nullopt;
+  }
+  /// `mov rsp,reg`: returns the source register id.
+  virtual std::optional<unsigned> spRestoreFrom(const Instr &) const {
+    return std::nullopt;
+  }
+
   /// Instruction operand decoding for jump-table analysis (iced-level
   /// operand view). Implemented by the target's X86JumpTables; null when
   /// the target has no jump-table support.

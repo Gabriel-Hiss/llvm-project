@@ -374,7 +374,7 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
   // 64-bit ops.
   unsigned Mask = (W == 64) ? 63 : 31;
   Value *C8 = B.CreateAnd(C, constI(Mask, 64));
-  Value *CW = B.CreateTrunc(C8, V->getType());
+  Value *CW = B.CreateTruncOrBitCast(C8, V->getType());
   Value *Is0 = B.CreateICmpEQ(C8, constI(0, 64));
 
   Value *Res;
@@ -415,14 +415,14 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
   Value *Cfc;
   if (Name == "shl") {
     Value *Pos = B.CreateSub(constI(W, 64), C8);
-    Cfc = B.CreateTrunc(B.CreateLShr(B.CreateZExt(V, iN(64)), Pos), iN(1));
+    Cfc = B.CreateTrunc(B.CreateLShr(zextOrTrunc(V, iN(64)), Pos), iN(1));
   } else if (Name == "shr") {
-    Cfc = B.CreateTrunc(B.CreateLShr(B.CreateZExt(V, iN(64)),
+    Cfc = B.CreateTrunc(B.CreateLShr(zextOrTrunc(V, iN(64)),
                                      B.CreateSub(C8, constI(1, 64))),
                         iN(1));
   } else if (Name == "sar") {
     Value *Bit = B.CreateTrunc(
-        B.CreateLShr(B.CreateZExt(V, iN(64)), B.CreateSub(C8, constI(1, 64))),
+        B.CreateLShr(zextOrTrunc(V, iN(64)), B.CreateSub(C8, constI(1, 64))),
         iN(1));
     Cfc = B.CreateSelect(B.CreateICmpULE(C8, constI(W, 64)), Bit,
                          B.CreateICmpSLT(V, Zero));
@@ -466,7 +466,7 @@ Value *X86LiftContext::flagsShift2(StringRef Name, Value *V, Value *Extra,
   Value *Wide = B.CreateOr(
       B.CreateShl(B.CreateZExt(V, iN(2 * W)), constI(W, 2 * W)),
       B.CreateZExt(E, iN(2 * W)));
-  Value *CW = B.CreateTrunc(C8, iN(2 * W));
+  Value *CW = B.CreateZExtOrTrunc(C8, iN(2 * W));
   Value *Res;
   if (Name == "shld")
     Res = B.CreateTrunc(
@@ -486,11 +486,11 @@ Value *X86LiftContext::flagsShift2(StringRef Name, Value *V, Value *Extra,
     Cfc = B.CreateTrunc(
         B.CreateLShr(Wide,
                      B.CreateSub(constI(2 * W, 2 * W),
-                                 B.CreateTrunc(C8, iN(2 * W)))),
+                                 B.CreateZExtOrTrunc(C8, iN(2 * W)))),
         iN(1));
   else
     Cfc = B.CreateTrunc(B.CreateLShr(
-                            B.CreateZExt(V, iN(64)),
+                            zextOrTrunc(V, iN(64)),
                             B.CreateSub(C8, constI(1, 64))),
                         iN(1));
   Value *InRange =
@@ -833,7 +833,7 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
         B.CreateInsertElement(Vec, S, uint64_t(0)), iN(128));
   }
   if (Name == "xnewlane0f32") {
-    Value *Vec = UndefValue::get(Vec128(F32));
+    Value *Vec = Constant::getNullValue(Vec128(F32));
     Value *S = Bv && Bv->getType()->isFloatTy()
                    ? Bv
                    : B.CreateBitCast(toInt(Bv, 32), F32);
@@ -841,7 +841,7 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
         B.CreateInsertElement(Vec, S, uint64_t(0)), iN(128));
   }
   if (Name == "xnewlane0f64") {
-    Value *Vec = UndefValue::get(Vec128(F64));
+    Value *Vec = Constant::getNullValue(Vec128(F64));
     Value *S = Bv && Bv->getType()->isDoubleTy()
                    ? Bv
                    : B.CreateBitCast(toInt(Bv, 64), F64);

@@ -89,13 +89,13 @@ llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
                                        const TargetHooks &Hooks) {
   StackInfo Out;
   std::map<Va, int64_t> BlockIn;
-  std::vector<std::pair<Va, int64_t>> Work;
-  Work.emplace_back(F.Start, 0);
+  std::vector<std::tuple<Va, int64_t, Va>> Work;
+  Work.emplace_back(F.Start, 0, F.Start);
 
   while (!Work.empty()) {
-    Va Start;
+    Va Start, From;
     int64_t InDelta;
-    std::tie(Start, InDelta) = Work.back();
+    std::tie(Start, InDelta, From) = Work.back();
     Work.pop_back();
 
     size_t BI = F.Blocks.size();
@@ -112,9 +112,10 @@ llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
       if (Known->second != InDelta)
         return llvm::createStringError(
             std::make_error_code(std::errc::invalid_argument),
-            "inconsistent rsp delta %lld vs %lld at block %llx",
+            "inconsistent rsp delta %lld vs %lld at block %llx (from block "
+            "%llx)",
             (long long)Known->second, (long long)InDelta,
-            (unsigned long long)Start.Value);
+            (unsigned long long)Start.Value, (unsigned long long)From.Value);
       continue;
     }
     BlockIn.emplace(Start, InDelta);
@@ -123,6 +124,8 @@ llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
     int64_t Delta = InDelta;
     // Last `mov eax, imm` feeding a possible `call __chkstk`.
     std::optional<int64_t> ChkstkSize;
+    // Registers holding `rsp + K`: reg id -> rsp delta they restore.
+    std::map<unsigned, int64_t> SpCopies;
 
     for (size_t I = B.InstrsBegin; I < B.InstrsEnd; ++I) {
       const Instr &Ins = F.Instrs[I];
@@ -166,6 +169,24 @@ llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
         continue;
       }
 
+      // `lea r,[rsp+K]` ... `mov rsp,r` (MSVC epilogue through a scratch
+      // register): rsp comes back to the delta the copy captured.
+      if (auto Src = Hooks.spRestoreFrom(Ins)) {
+        auto Copy = SpCopies.find(*Src);
+        if (Copy != SpCopies.end()) {
+          Delta = Copy->second;
+          continue;
+        }
+      }
+      // Any other write to a tracked copy register, or a call, ends its
+      // life (scratch registers do not survive calls).
+      if (Ins.Flow == FlowKind::Call)
+        SpCopies.clear();
+      else if (Ins.Inst.getNumOperands() && Ins.Inst.getOperand(0).isReg())
+        SpCopies.erase(Ins.Inst.getOperand(0).getReg());
+      if (auto Copy = Hooks.spCopy(Ins))
+        SpCopies[Copy->first] = Delta - Copy->second;
+
       // `leave` / `mov rsp, rbp` restore the frame pointer's delta.
       if (Hooks.restoresSpFromFp(Ins) && Out.RbpDelta) {
         Delta = *Out.RbpDelta;
@@ -187,7 +208,7 @@ llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
       continue;
     for (const Edge &E : B.Edges)
       if (propagates(E.Kind))
-        Work.emplace_back(E.To, Delta);
+        Work.emplace_back(E.To, Delta, B.Start);
   }
 
   return Out;

@@ -153,3 +153,85 @@ rust-o3 dot4/vec_ops), and `.constprop.N`/`.isra.N`/`.specialized.N`/
 `-passes=revenant-unipo`, not in the default pipeline. Guarantees
 `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM 22
 parseable output.
+
+## Robustness
+
+Reroll's affine model accepts signed 64-bit constants only. Lifted i128
+SIMD masks outside that range veto the candidate rather than narrowing
+through `APInt::getSExtValue`. Constant differences use 65-bit arithmetic
+and must fit signed 64 bits before the model consumes them. The minimum
+signed stride also vetoes the candidate because its magnitude cannot fit.
+
+Untailrec moves required header definitions into the recursive call block
+in their original instruction order. Shared dependencies stay before
+every user. It does not match split-latch clones by instruction name:
+unnamed numeric SSA values have empty names, so names cannot identify them.
+
+The engine verifies every function after each function pass. If a pass
+produces invalid IR, it restores the previous body, reports the function,
+stage and pass, and continues with the next pass. A returned lift error
+also reports the failed function and continues with the remaining functions.
+Assertions still require fixing their offending pass or lifter operation.
+**revenant-unoutline (owner: Swe2DeoptOutliner).** Module pass that restores
+small shared binary-derived fragments and direct-call thunks at their call
+sites. It requires multiple direct callers and a single straight-line block;
+uncertain functions remain calls. Runs explicitly with
+`-passes=revenant-unoutline`.
+**revenant-unipo, structural recovery.** Structural clone recovery does not
+inspect function names or oracle symbols.
+It specializes a candidate general definition at one constant parameter, runs
+InstCombine, SimplifyCFG and SCCP on temporary copies, then hashes normalized
+bodies with constants abstracted. Hash matches require exact instruction,
+operand, CFG and semantic-metadata equality modulo local names before merging.
+The specialized function may retain its parameter or omit one parameter,
+including a middle parameter. Direct callers then call the general definition
+with the proven constant, and the specialized definition is deleted.
+
+When no general definition survived, lifted Win64 register-slot stores provide
+another recovery path. Every direct caller must have the same locally reaching
+constant in the next RCX/RDX/R8/R9 slot. Calls and unknown writes stop the search.
+The pass adds that formal and passes the observed constant at every caller.
+Scalar body uses of that constant become uses of the formal. Constant-only
+operands, including switch cases and struct GEP indices, stay constant.
+This proves equivalence at the recovered callers; it does not prove that a
+source-level formal existed. Conflicting constants, missing register evidence,
+address-taken functions, exports and operand bundles prevent this recovery.
+LunaSigs3 currently exposes no extra-argument IR metadata, so Unipo reads lifted
+call sites directly. Run this recovery before dead register stores disappear.
+
+Existing return restoration and DI-driven dead-argument restoration remain.
+Named clone suffixes are only a source-name recovery path when a symbol exists,
+not evidence used by structural matching. New calls preserve instruction
+metadata and VA provenance. Structural matching rejects opaque instructions
+and region annotations rather than discarding them during normalization.
+
+Measured with the standalone plugin and `revenant-unipo,verify` on stripped
+raw lifted modules:
+
+| Target | Definitions | Oracle `.constprop`/`.isra` entries | Clone merges | Clone signature restorations | All extended signatures |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| c-gcc-o2 | 151 | 0 | 0 | 0 | 8 |
+| c-gcc-o3 | 151 | 0 | 0 | 0 | 6 |
+| cpp-gcc-o2 | 916 | 9 | 0 | 0 | 5 |
+| cpp-gcc-o3 | 916 | 9 | 0 | 0 | 5 |
+| c-clang-o2lto | 3401 | 0 | 0 | 0 | 0 |
+
+Oracle instruction owners were grouped by symbol and their first RVA mapped
+to lifted `sub_<image-base+RVA>` definitions for scoring only. All nine GCC C++
+entries were present, including two `.cold` partitions. None met the structural
+or unanimous extra-register evidence requirements. These are missed cases,
+not successful IPO inversions. Extended non-oracle signatures demonstrate the
+ABI evidence rule, not recovery of an oracle-proven specialization.
+
+The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
+`cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
+`sub_140001017` call sequence that stores 2 in RCX before calling
+`sub_140003A10`. Controlled variants cover omitted/middle/retained parameters,
+clone-only restoration, exact constant mismatches, address-taking, barriers,
+conflicting callers and constant-only switch operands. They do not claim those
+controlled specializations existed in the measured binaries.
+
+Raw clang LTO emission succeeds with the current driver. Its `ir-final` path
+currently aborts in RerollPass on `sub_140001930` because an APInt exceeds the
+signed 64-bit extraction limit. Normalized `ir-final` scoring remains blocked
+on the separate driver/normalization owners; raw measurement above is complete.

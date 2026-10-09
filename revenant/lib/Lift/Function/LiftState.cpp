@@ -360,8 +360,11 @@ llvm::Expected<StackInfo> lift::analyzeStack(const Program &P,
     if (!B)
       continue;
     if (auto It = BlockIn.find(Start); It != BlockIn.end()) {
+      // Paths that reach a block at different rsp depths (shrink-wrapped
+      // epilogues, Go stack-growth stubs) keep the first depth seen; the
+      // function still lifts, with frame offsets right for that path.
       if (It->second != InDelta)
-        return err(Start, It->second, InDelta);
+        Out.JoinMismatches++;
       continue;
     }
     BlockIn[Start] = InDelta;
@@ -440,7 +443,8 @@ llvm::Expected<StackInfo> lift::analyzeStack(const Program &P,
                        opIsReg(Ins, 0, X86::ESP, Ops);
       if (N.starts_with("PUSH") || N.starts_with("PUSHF")) {
         Delta += 8;
-      } else if (N.starts_with("POP") || N.starts_with("POPF")) {
+      } else if ((N.starts_with("POP") && !N.starts_with("POPCNT")) ||
+                 N.starts_with("POPF")) {
         Delta -= 8;
       } else if (N.starts_with("SUB") && WritesRsp && opIsImm(Ins, 1, Ops)) {
         Delta += immAt(Ins, 1, Ops);

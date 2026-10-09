@@ -3,6 +3,7 @@
 #include "revenant/Compiler/Profile.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
 
@@ -49,6 +50,165 @@ bool hasImageText(const Image &Img, llvm::StringRef Needle) {
       return true;
   return false;
 }
+
+/// User C++ exception tables surviving the link: for each .pdata unwind
+/// record with UNW_FLAG_EHANDLER, the language-handler data is either a
+/// FuncInfo3 record (magic 0x19930520-0x19930524) or an RVA to a
+/// `$cppxdata` table (FuncInfo4 flag-byte form). CRT tables of both
+/// shapes exist in every MSVC binary, but only user C++ (throw/catch,
+/// ctor/dtor cleanups with try regions) carries a TRY map: FuncInfo3
+/// with tryCount != 0, or FuncInfo4 with a TryDisp. SEH scope tables
+/// (a small count dword) never qualify.
+static std::optional<uint32_t> fh4Length(uint8_t First) {
+  static constexpr uint8_t Lengths[16] = {1, 2, 1, 3, 1, 2, 1, 4,
+                                          1, 2, 1, 3, 1, 2, 1, 5};
+  return Lengths[First & 0x0f];
+}
+
+static bool hasCppExceptionTables(const PeFile &PE) {
+  if (!PE.Img || PE.Pdata.empty())
+    return false;
+  const Image &Img = *PE.Img;
+  for (const RuntimeFunction &R : PE.Pdata) {
+    if (R.ChainedTo)
+      continue;
+    auto Head = Img.readAtMost(R.Unwind, 4);
+    if (!Head || Head->size() != 4)
+      continue;
+    uint8_t Flags = (*Head)[0] >> 3;
+    if (Flags & 4) // CHAININFO: no language handler of its own.
+      continue;
+    if (!(Flags & 1)) // UNW_FLAG_EHANDLER only.
+      continue;
+    uint64_t Count = (*Head)[2];
+    uint64_t DataOff = 4 + ((Count + 1u) & ~1u) * 2u;
+    Va Data = R.Unwind.wrappingAdd(DataOff + 4);
+    auto First = Img.readU32(Data);
+    if (!First)
+      continue;
+    // Inline FuncInfo3: magic LED, try count at +12.
+    if (*First >= 0x19930520 && *First <= 0x19930524) {
+      auto TryCount = Img.readU32(Data.wrappingAdd(12));
+      auto TryRva = Img.readU32(Data.wrappingAdd(16));
+      if (TryCount && *TryCount < 4096 && TryRva && *TryRva)
+        return true;
+      continue;
+    }
+    // Otherwise Data holds an RVA to the `$cppxdata` table: FuncInfo4
+    // when the target starts with a flag byte (high bit clear, one of
+    // the low disp bits set). SEH scope counts are small dwords that
+    // never resolve into a mapped table with that shape.
+    if (*First < 0x10000)
+      continue;
+    Va Target = Img.vaOfRva(*First);
+    // The target is either magic-led FuncInfo3 (clang output) or
+    // flag-byte FuncInfo4 (cl output).
+    if (auto Magic = Img.readU32(Target);
+        Magic && *Magic >= 0x19930520 && *Magic <= 0x19930524) {
+      auto TryCount = Img.readU32(Target.wrappingAdd(12));
+      auto TryRva = Img.readU32(Target.wrappingAdd(16));
+      if (TryCount && *TryCount < 4096 && TryRva && *TryRva)
+        return true;
+      continue;
+    }
+    auto FlagBytes = Img.dataAt(Target, 1);
+    if (FlagBytes.empty())
+      continue;
+    uint8_t H = FlagBytes[0];
+    if ((H & 0x80) || !(H & 0x78))
+      continue;
+    // FuncInfo4 header: optional compressed int, then unwind/try/IP
+    // relative dwords. Any TryDisp proves a try/catch region.
+    Va P = Target.wrappingAdd(1);
+    if (H & 0x04) {
+      auto N = fh4Length(Img.dataAt(P, 1).empty() ? 0 : Img.dataAt(P, 1)[0]);
+      if (!N)
+        continue;
+      P = P.wrappingAdd(*N);
+    }
+    if (H & 0x08)
+      P = P.wrappingAdd(4);
+    if (H & 0x10) {
+      auto TryDisp = Img.readU32(P);
+      if (TryDisp && *TryDisp)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool isMsvcRuntimeType(llvm::StringRef Name) {
+  return Name == ".?AVtype_info@@" || Name.starts_with(".?AVbad_") ||
+         Name.starts_with(".?AVexception@std@@") ||
+         Name.starts_with(".?AVlogic_error@std@@") ||
+         Name.starts_with(".?AVruntime_error@std@@") ||
+         Name.starts_with(".?AVlength_error@std@@") ||
+         Name.starts_with(".?AVout_of_range@std@@") ||
+         Name.starts_with(".?AVinvalid_argument@std@@") ||
+         Name.starts_with(".?AVoverflow_error@std@@") ||
+         Name.starts_with(".?AVregex_error@std@@") ||
+         Name.starts_with(".?AVDNameNode@@") ||
+         Name.starts_with(".?AVDNameStatusNode@@") ||
+         Name.starts_with(".?AVcharNode@@") ||
+         Name.starts_with(".?AVpDNameNode@@") ||
+         Name.starts_with(".?AVpairNode@@") ||
+         Name.starts_with(".?AVpcharNode@@");
+}
+
+static bool hasMsvcRtti(const PeFile &PE) {
+  if (!PE.Img)
+    return false;
+  const Image &Img = *PE.Img;
+  for (const Section &Names : Img.Sections) {
+    if (Names.Data.size() < 17)
+      continue;
+    llvm::StringRef Bytes(reinterpret_cast<const char *>(Names.Data.data()),
+                          Names.Data.size());
+    size_t Pos = 0;
+    while ((Pos = Bytes.find(".?A", Pos)) != llvm::StringRef::npos) {
+      Va NameVa = Names.SecVa.wrappingAdd(Pos);
+      auto Name = Img.readCstr(NameVa, 256);
+      if (!Name || !(llvm::StringRef(*Name).starts_with(".?AV") ||
+                     llvm::StringRef(*Name).starts_with(".?AU")) ||
+          isMsvcRuntimeType(*Name)) {
+        ++Pos;
+        continue;
+      }
+      if (NameVa.Value < Img.Base.Value + 16) {
+        ++Pos;
+        continue;
+      }
+      auto TypeRva = (NameVa - 16).offsetFrom(Img.Base);
+      if (!TypeRva || *TypeRva > UINT32_MAX) {
+        ++Pos;
+        continue;
+      }
+      for (const Section &Data : Img.Sections) {
+        for (size_t I = 0; I + 24 <= Data.Data.size(); ++I) {
+          const uint8_t *P = Data.Data.data() + I;
+          if (llvm::support::endian::read32le(P) != 1 ||
+              llvm::support::endian::read32le(P + 12) != *TypeRva)
+            continue;
+          Va ColVa = Data.SecVa.wrappingAdd(I);
+          auto ColRva = ColVa.offsetFrom(Img.Base);
+          uint32_t ClassRva = llvm::support::endian::read32le(P + 16);
+          if (!ColRva || *ColRva > UINT32_MAX ||
+              llvm::support::endian::read32le(P + 20) != *ColRva ||
+              !Img.sectionOf(Img.Base.wrappingAdd(ClassRva)))
+            continue;
+          for (const Section &Vtables : Img.Sections)
+            for (size_t V = 0; V + 8 <= Vtables.Data.size(); ++V)
+              if (llvm::support::endian::read64le(Vtables.Data.data() + V) ==
+                  ColVa.Value)
+                return true;
+        }
+      }
+      ++Pos;
+    }
+  }
+  return false;
+}
+
 
 bool hasSymbolPrefix(const std::vector<std::string> &Names,
                      llvm::StringRef Prefix) {
@@ -107,9 +267,21 @@ CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
                         hasSectionPrefix(PE, "memset_")) ||
                        (hasSectionPrefix(PE, "_RDATA") &&
                         hasSectionPrefix(PE, "_guard_"));
-  const bool IsCpp = hasText(Symbols, "?AV") || hasText(Symbols, "?AU") ||
-                     hasSymbolPrefix(Symbols, "_Z") ||
-                     hasImport(PE, "__CxxFrameHandler");
+  // C++ exception tables live in .xdata whether or not any import, export
+  // or string names them: FuncInfo magic reachable from an EHANDLER
+  // unwind record proves user C++ (throw/ctor/dtor) code.
+  const bool HasCppEH = hasCppExceptionTables(PE);
+  const bool HasBinaryRtti = hasMsvcRtti(PE) ||
+                             hasImageText(*PE.Img, "typeinfo for ") ||
+                             hasImageText(*PE.Img, "typeinfo name for ");
+  const bool HasCppSymbol = hasText(Symbols, "?AV") ||
+                            hasText(Symbols, "?AU") ||
+                            hasSymbolPrefix(Symbols, "_Z");
+  const bool HasCppImport =
+      hasImport(PE, "__CxxFrameHandler") || hasImport(PE, "__gxx_personality") ||
+      hasImport(PE, "??2") || hasImport(PE, "??3") ||
+      hasImport(PE, "msvcp") || hasImport(PE, "libstdc++");
+  const bool IsCpp = HasCppEH || HasBinaryRtti || HasCppSymbol || HasCppImport;
 
   if (IsGo) {
     I.Producer = CompilerProducer::Go; I.Language = SourceLanguage::Go;
@@ -132,6 +304,11 @@ CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
     I.Language = IsCpp ? SourceLanguage::Cpp : SourceLanguage::C;
     I.Evidence.emplace_back("MSVC Rich-header or runtime evidence");
   }
+  if (IsCpp)
+    I.Evidence.emplace_back(
+        llvm::formatv("C++ evidence: EH={0}, RTTI={1}, symbol={2}, import={3}",
+                      HasCppEH, HasBinaryRtti, HasCppSymbol, HasCppImport)
+            .str());
 
   CompilerBuildTraits &T = I.Traits;
   if (HasLto) { T.Lto = true; I.Evidence.emplace_back("Rich-header LTCG product id"); }

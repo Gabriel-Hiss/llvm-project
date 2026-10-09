@@ -50,6 +50,9 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/IRBuilder.h"
+#include <algorithm>
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -473,6 +476,9 @@ struct Candidate {
   // mode records, the post check after the top-body match keeps only
   // resume phis) and the accepted resume set.
   SmallVector<const PHINode *, 4> CondPhis;
+  DenseSet<BasicBlock *> Starts; // zero-start paths into the scalar tail
+  bool Versioned = false;        // full scalar loop is a separate guard arm
+  BasicBlock *VersionedBody = nullptr;
   DenseSet<const PHINode *> Resume;
 };
 
@@ -484,7 +490,8 @@ struct Candidate {
 // is a pure function of N). Accumulators (fed by reductions) never
 // qualify: routing or bounds depending on them would differ after the
 // restart, so they keep failing the S-condition and bound checks.
-void collectResumePhis(BasicBlock *S, BasicBlock *D,
+void collectResumePhis(BasicBlock *S,
+                       const DenseSet<BasicBlock *> &Starts,
                        const DenseSet<BasicBlock *> &R, Value *Bound,
                        Value *IVNext, const Function &F,
                        DenseSet<const PHINode *> &Out) {
@@ -494,7 +501,7 @@ void collectResumePhis(BasicBlock *S, BasicBlock *D,
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
       BasicBlock *IB = Phi.getIncomingBlock(I);
       Value *Inc = Phi.getIncomingValue(I);
-      if (IB == D) {
+      if (Starts.count(IB)) {
         auto *CZ = dyn_cast<ConstantInt>(Inc);
         if (!CZ || !CZ->isZero())
           OK = false;
@@ -517,30 +524,57 @@ void collectResumePhis(BasicBlock *S, BasicBlock *D,
 // and the single-block scalar self-loop L sits directly under S with
 // preds exactly {S, L}.
 bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
-                    const DenseSet<BasicBlock *> &R, bool StrictPreds) {
-  // S preds: D plus (in strict mode) at least one R block and no
-  // other outsiders. Loose mode only needs the D edge; the strict
-  // check runs after R is collected.
+                    const DenseSet<BasicBlock *> &R, bool StrictPreds,
+                    bool AllowNoR = false) {
+  // S preds are the primary dispatch, R resume blocks, and optionally
+  // a small-trip guard that also enters S with a zero resume value.
   bool HasD = false, HasR = false;
+  C.Starts.clear();
+  C.Starts.insert(D);
   for (BasicBlock *P : predecessors(S)) {
     if (P == D)
       HasD = true;
-    else if (R.count(P))
+    else if (R.count(P)) {
+      auto *PB = dyn_cast<BranchInst>(P->getTerminator());
+      BasicBlock *Other = nullptr;
+      if (PB && PB->isConditional()) {
+        if (PB->getSuccessor(0) == S)
+          Other = PB->getSuccessor(1);
+        else if (PB->getSuccessor(1) == S)
+          Other = PB->getSuccessor(0);
+      }
+      if (!Other || (!R.count(Other) && Other != D))
+        return false;
       HasR = true;
-    else if (StrictPreds)
-      return false;
+      C.Starts.insert(P);
+    } else if (StrictPreds) {
+      auto *PB = dyn_cast<BranchInst>(P->getTerminator());
+      bool StartsAtZero = PB && PB->isConditional() &&
+                          ((PB->getSuccessor(0) == D &&
+                            PB->getSuccessor(1) == S) ||
+                           (PB->getSuccessor(1) == D &&
+                            PB->getSuccessor(0) == S));
+      if (!StartsAtZero)
+        return false;
+      C.Starts.insert(P);
+    }
   }
-  if (!HasD || (StrictPreds && !HasR))
+  if (!HasD || (StrictPreds && !HasR && !AllowNoR))
     return false;
-  // S phis: every non-D incoming must be fed from an R block (strict
-  // only; loose mode skips phi checks entirely).
+  // Every predecessor that starts at S must feed zero into each phi.
   if (StrictPreds) {
     for (PHINode &Phi : S->phis()) {
       for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
         BasicBlock *IB = Phi.getIncomingBlock(I);
-        if (IB == D)
+        if (C.Starts.count(IB)) {
+          auto *CZ = dyn_cast<ConstantInt>(Phi.getIncomingValue(I));
+          if (!CZ || !CZ->isZero())
+            return false;
           continue;
-        if (!R.count(IB))
+        }
+        if (R.count(IB))
+          continue;
+        if (!C.Starts.count(IB))
           return false;
       }
     }
@@ -608,8 +642,9 @@ bool matchScalarTailLoose(BasicBlock *S, BasicBlock *D, Candidate &C) {
 
 // Strict: S entered from D and R only, phis agree.
 bool matchScalarTail(BasicBlock *S, BasicBlock *D,
-                     const DenseSet<BasicBlock *> &R, Candidate &C) {
-  return matchTailShape(S, D, C, R, true);
+                     const DenseSet<BasicBlock *> &R, Candidate &C,
+                     bool AllowNoR = false) {
+  return matchTailShape(S, D, C, R, true, AllowNoR);
 }
 // Top vector body: single-block self-loop, IV from constant 0,
 // constant step K >= 2, exit == (IV.next == n.vec). n.vec must match
@@ -708,11 +743,11 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   DenseSet<const PHINode *> Local;
   const DenseSet<const PHINode *> *Resume = &C.Resume;
   if (!Secondary) {
-    collectResumePhis(C.S, C.D, C.R, Bound, IVNext, F, C.Resume);
+    collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, C.Resume);
     if (C.Resume.empty())
       return false;
   } else if (C.Resume.empty()) {
-    collectResumePhis(C.S, C.D, C.R, Bound, IVNext, F, Local);
+    collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, Local);
     Resume = &Local;
   }
   if (!matchTierBound(B, V, C, F, Bound, Step, *Resume))
@@ -724,6 +759,7 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 // with a scalar self-loop latch directly under it (preds {S, L});
 // R is everything reachable from the other successor without passing
 // through S, L, or L's exit.
+
 #ifndef NDEBUG
 #define ULV_BAIL()                                                           \
   do {                                                                       \
@@ -733,6 +769,9 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 #else
 #define ULV_BAIL() ((void)0)
 #endif
+Value *broadcastScalar(Value *V);
+bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F);
+
 bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
   auto *Br = dyn_cast<BranchInst>(D->getTerminator());
   if (!Br || !Br->isConditional())
@@ -745,24 +784,33 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     Candidate Cand;
     Cand.D = D;
     Cand.S = S;
-    // Find the scalar tail loop L directly under S first, with no
-    // region yet (empty R: the pred check below is loose, the real
-    // check happens after R is collected).
-    DenseSet<BasicBlock *> Empty;
-    if (!matchScalarTailLoose(S, D, Cand))
+    if (!matchScalarTailLoose(S, D, Cand)) {
       continue;
+    }
     BasicBlock *L = Cand.L;
     DenseSet<BasicBlock *> Stop{S, L};
     for (BasicBlock *ES : successors(L))
       if (ES != L)
         Stop.insert(ES);
     DenseSet<BasicBlock *> R;
-    if (!collectRegion(V, Stop, R, F))
+    if (!collectRegion(V, Stop, R, F)) {
       continue;
-    if (R.size() < 2)
+    }
+    if (R.size() < 2) {
       continue;
+    }
     Cand.R = R;
     Cand.L = nullptr;
+    bool HasRegionPredecessor = false;
+    for (BasicBlock *P : predecessors(S)) {
+      if (!Cand.R.count(P))
+        continue;
+      auto *PB = dyn_cast<BranchInst>(P->getTerminator());
+      bool Guard = PB && PB->isConditional() &&
+                   (PB->getSuccessor(0) == S || PB->getSuccessor(1) == S);
+      HasRegionPredecessor |= !Guard;
+    }
+    Cand.Versioned = !HasRegionPredecessor;
     // Compute the dispatch chain BEFORE the strict tail check so
     // the escape rule can see chain membership: chain blocks are
     // reachable from D without passing S/L/exits.
@@ -795,7 +843,7 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       }
     }
     Cand.Chain = Chain;
-    if (!matchScalarTail(S, D, Cand.R, Cand))
+    if (!matchScalarTail(S, D, Cand.R, Cand, Cand.Versioned))
       continue;
     // Refresh the chain now that L is known (exclude L and its
     // exit from the walk).
@@ -1005,14 +1053,17 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           ULV_BAIL();
           goto next_pick;
         }
-        if (auto *P = dyn_cast<PHINode>(Inc)) {
+        if (auto *CZ = dyn_cast<ConstantInt>(Inc)) {
+          if (CZ->isZero())
+            IVOK = true;
+        } else if (auto *P = dyn_cast<PHINode>(Inc)) {
           if (P->getParent() != S) {
             ULV_BAIL();
             goto next_pick;
           }
           bool Zero = false;
           for (unsigned J = 0; J < P->getNumIncomingValues(); ++J)
-            if (P->getIncomingBlock(J) == D) {
+            if (Cand.Starts.count(P->getIncomingBlock(J))) {
               if (auto *CZ = dyn_cast<ConstantInt>(P->getIncomingValue(J)))
                 if (CZ->isZero())
                   Zero = true;
@@ -1062,7 +1113,10 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       // from D or the chain.
       for (BasicBlock *BB : Cand.R) {
         Candidate Probe = Cand;
-        if (matchVectorBody(BB, Probe, F, false)) {
+        bool VM = Cand.Versioned && matchVersionedBody(BB, Probe, F);
+        if (matchVectorBody(BB, Probe, F, false) || VM) {
+          if (Cand.Versioned)
+            Probe.VersionedBody = BB;
           Cand = Probe;
           Found = true;
           break;
@@ -1080,13 +1134,15 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
         if (!Self)
           continue;
         Candidate Probe = Cand;
-        if (matchVectorBody(BB, Probe, F, false) ||
+        if ((Cand.Versioned && BB == Cand.VersionedBody) ||
+            matchVectorBody(BB, Probe, F, false) ||
             matchVectorBody(BB, Probe, F, true))
           continue;
         ULV_BAIL();
         goto next_pick;
       }
     }
+
     // S-routing post check: every S phi the tail dispatch routes on
     // must be a resume phi (D-incoming 0, R-incomings Bound-derived,
     // so the routing is a pure function of N on the folded path).
@@ -1103,9 +1159,413 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
   }
   return false;
 }
+// Prove the GCC-style guarded loop versioning shape before discarding its
+// vector arm. The scalar fallback and vector loop must share memory bases,
+// the vector lanes must implement scalar IVs 4*i through 4*i+3, the mask
+// must cover exactly floor(N/4)*4 elements, and all three guarded scalar
+// epilogue lanes must continue that range to N.
+
+Value *broadcastScalar(Value *V);
+
+bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
+  ScalarLoopInfo Scalar;
+  if (!matchScalarLoop(C.L, Scalar)) {
+    return false;
+  }
+  auto *ScalarCmp = dyn_cast<ICmpInst>(
+      cast<BranchInst>(C.L->getTerminator())->getCondition());
+  Value *ScalarBound = loopBound(Scalar);
+  if (!ScalarCmp || !ScalarBound)
+    return false;
+  Value *Start = nullptr;
+  for (unsigned I = 0; I < Scalar.IV->getNumIncomingValues(); ++I)
+    if (Scalar.IV->getIncomingBlock(I) != C.L)
+      Start = Scalar.IV->getIncomingValue(I);
+  auto *StartZero = dyn_cast_or_null<ConstantInt>(Start);
+  if (!StartZero || !StartZero->isZero())
+    return false;
+
+  ScalarLoopInfo Vector;
+  if (!matchScalarLoop(B, Vector)) {
+    return false;
+  }
+  auto *VectorStep = dyn_cast<ConstantInt>(Vector.Step);
+  Value *VectorBound = loopBound(Vector);
+  Value *VectorStart = nullptr;
+  for (unsigned I = 0; I < Vector.IV->getNumIncomingValues(); ++I)
+    if (Vector.IV->getIncomingBlock(I) != B)
+      VectorStart = Vector.IV->getIncomingValue(I);
+  auto *VectorStartZero = dyn_cast_or_null<ConstantInt>(VectorStart);
+  auto *ScalarStep = dyn_cast<ConstantInt>(Scalar.Step);
+  if (!VectorStartZero || !VectorStartZero->isZero() || !ScalarStep ||
+      !ScalarStep->isOne() || !VectorStep ||
+      VectorStep->getZExtValue() != 4 || !VectorBound)
+    return false;
+
+  SmallVector<LoadInst *, 2> ScalarLoads, VectorLoads;
+  SmallVector<StoreInst *, 2> ScalarStores, VectorStores;
+  SmallVector<BinaryOperator *, 2> ScalarAdds, VectorAdds;
+  for (Instruction &I : *C.L) {
+    if (auto *L = dyn_cast<LoadInst>(&I))
+      ScalarLoads.push_back(L);
+    else if (auto *St = dyn_cast<StoreInst>(&I))
+      ScalarStores.push_back(St);
+    else if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (BO->getOpcode() == Instruction::Add)
+        ScalarAdds.push_back(BO);
+  }
+  for (Instruction &I : *B) {
+    if (auto *L = dyn_cast<LoadInst>(&I))
+      VectorLoads.push_back(L);
+    else if (auto *St = dyn_cast<StoreInst>(&I))
+      VectorStores.push_back(St);
+    else if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (BO->getOpcode() == Instruction::Add)
+        VectorAdds.push_back(BO);
+  }
+  ScalarAdds.clear();
+  VectorAdds.clear();
+  if (!ScalarStores.empty())
+    if (auto *BO = dyn_cast<BinaryOperator>(
+            ScalarStores.front()->getValueOperand()))
+      if (BO->getOpcode() == Instruction::Add)
+        ScalarAdds.push_back(BO);
+  if (!VectorStores.empty())
+    if (auto *BO = dyn_cast<BinaryOperator>(
+            VectorStores.front()->getValueOperand()))
+      if (BO->getOpcode() == Instruction::Add)
+        VectorAdds.push_back(BO);
+  if (ScalarLoads.size() != 1 || ScalarStores.size() != 1 ||
+      ScalarAdds.size() != 1 || VectorLoads.size() != 1 ||
+      VectorStores.size() != 1 || VectorAdds.size() != 1) {
+    return false;
+  }
+  auto *VT = dyn_cast<FixedVectorType>(VectorLoads[0]->getType());
+  if (!VT || VT->getNumElements() != 4 ||
+      VT->getElementType() != ScalarLoads[0]->getType() ||
+      VectorStores[0]->getValueOperand() != VectorAdds[0]) {
+    return false;
+  }
+  if (VectorAdds[0]->getOperand(0) != VectorLoads[0] &&
+      VectorAdds[0]->getOperand(1) != VectorLoads[0])
+    return false;
+  Value *VectorOther = VectorAdds[0]->getOperand(
+      VectorAdds[0]->getOperand(0) == VectorLoads[0] ? 1 : 0);
+  Value *ScalarOther = ScalarAdds[0]->getOperand(
+      ScalarAdds[0]->getOperand(0) == ScalarLoads[0] ? 1 : 0);
+  if (broadcastScalar(VectorOther) != ScalarOther ||
+      (ScalarAdds[0]->getOperand(0) != ScalarLoads[0] &&
+       ScalarAdds[0]->getOperand(1) != ScalarLoads[0]))
+    return false;
+  auto *SOverflow = dyn_cast<OverflowingBinaryOperator>(ScalarAdds[0]);
+  auto *VOverflow = dyn_cast<OverflowingBinaryOperator>(VectorAdds[0]);
+  if (ScalarLoads[0]->isVolatile() || ScalarLoads[0]->isAtomic() ||
+      VectorLoads[0]->isVolatile() || VectorLoads[0]->isAtomic() ||
+      ScalarStores[0]->isVolatile() || ScalarStores[0]->isAtomic() ||
+      VectorStores[0]->isVolatile() || VectorStores[0]->isAtomic() ||
+      !SOverflow || !VOverflow ||
+      SOverflow->hasNoSignedWrap() != VOverflow->hasNoSignedWrap() ||
+      SOverflow->hasNoUnsignedWrap() != VOverflow->hasNoUnsignedWrap())
+    return false;
+  auto *VStorePtr = dyn_cast<GetElementPtrInst>(
+      VectorStores[0]->getPointerOperand());
+  auto *VLoadPtr = dyn_cast<GetElementPtrInst>(
+      VectorLoads[0]->getPointerOperand());
+  auto *SStorePtr = dyn_cast<GetElementPtrInst>(
+      ScalarStores[0]->getPointerOperand());
+  auto *SLoadPtr = dyn_cast<GetElementPtrInst>(
+      ScalarLoads[0]->getPointerOperand());
+  if (!VStorePtr || !VLoadPtr || !SStorePtr || !SLoadPtr)
+    return false;
+  if (VLoadPtr->getSourceElementType() != VT->getElementType() ||
+      VStorePtr->getSourceElementType() != VT->getElementType() ||
+      SLoadPtr->getSourceElementType() != ScalarLoads[0]->getType() ||
+      SStorePtr->getSourceElementType() != ScalarLoads[0]->getType())
+    return false;
+  auto *VectorIndex = dyn_cast<PHINode>(VLoadPtr->getOperand(1));
+  auto *ScalarIndex = dyn_cast<PHINode>(SLoadPtr->getOperand(1));
+  auto *VectorStoreIndex = dyn_cast<PHINode>(VStorePtr->getOperand(1));
+  auto *ScalarStoreIndex = dyn_cast<PHINode>(SStorePtr->getOperand(1));
+  auto *Mask = dyn_cast<BinaryOperator>(VectorBound);
+  auto *MaskValue = Mask && Mask->getOpcode() == Instruction::And
+                        ? dyn_cast<ConstantInt>(Mask->getOperand(1))
+                        : nullptr;
+  if (!MaskValue || MaskValue->getSExtValue() != -4 ||
+      Mask->getOperand(0) != ScalarBound ||
+      VectorIndex != Vector.IV || VectorStoreIndex != Vector.IV ||
+      ScalarIndex != Scalar.IV || ScalarStoreIndex != Scalar.IV)
+    return false;
+  BasicBlock *AliasGuard = nullptr;
+  for (BasicBlock *BB : C.R) {
+    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Br || !Br->isConditional() ||
+        (Br->getSuccessor(0) != C.S && Br->getSuccessor(1) != C.S))
+      continue;
+    BasicBlock *Other = Br->getSuccessor(0) == C.S
+                            ? Br->getSuccessor(1)
+                            : Br->getSuccessor(0);
+    if (C.R.count(Other)) {
+      AliasGuard = BB;
+      break;
+    }
+  }
+  if (!AliasGuard && C.D != C.S)
+    AliasGuard = C.D;
+  auto *DispatchBr = AliasGuard
+                         ? dyn_cast<BranchInst>(AliasGuard->getTerminator())
+                         : nullptr;
+  auto *AliasCmp = DispatchBr
+                       ? dyn_cast<ICmpInst>(DispatchBr->getCondition())
+                       : nullptr;
+  auto *Difference =
+      AliasCmp ? dyn_cast<BinaryOperator>(AliasCmp->getOperand(0)) : nullptr;
+  auto *DestAddr = Difference
+                       ? dyn_cast<PtrToIntInst>(Difference->getOperand(0))
+                       : nullptr;
+  auto *SourceOffset =
+      Difference ? dyn_cast<BinaryOperator>(Difference->getOperand(1))
+                 : nullptr;
+  auto *SourceAddr = SourceOffset
+                         ? dyn_cast<PtrToIntInst>(SourceOffset->getOperand(0))
+                         : nullptr;
+  auto *Offset = SourceOffset
+                     ? dyn_cast<ConstantInt>(SourceOffset->getOperand(1))
+                     : nullptr;
+  auto *Limit = AliasCmp ? dyn_cast<ConstantInt>(AliasCmp->getOperand(1))
+                         : nullptr;
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  uint64_t ElemBytes = DL.getTypeStoreSize(VT->getElementType()).getFixedValue();
+  if (!DispatchBr || !DispatchBr->isConditional() ||
+      !C.R.count(DispatchBr->getSuccessor(0)) || !AliasCmp ||
+      AliasCmp->getPredicate() != ICmpInst::ICMP_UGT || !Difference ||
+      Difference->getOpcode() != Instruction::Sub || !DestAddr ||
+      DestAddr->getPointerOperand() != VStorePtr->getPointerOperand() ||
+      !SourceAddr ||
+      SourceAddr->getPointerOperand() != VLoadPtr->getPointerOperand() ||
+      !Offset || !Limit ||
+      Offset->getZExtValue() + Limit->getZExtValue() !=
+          VT->getNumElements() * ElemBytes - ElemBytes)
+    return false;
+  SmallVector<LoadInst *, 4> TailLoads;
+  SmallVector<StoreInst *, 4> TailStores;
+  for (BasicBlock *BB : C.R) {
+    if (BB == B)
+      continue;
+    for (Instruction &I : *BB) {
+      if (auto *L = dyn_cast<LoadInst>(&I)) {
+        if (L->isVolatile() || L->isAtomic())
+          return false;
+        TailLoads.push_back(L);
+      } else if (auto *St = dyn_cast<StoreInst>(&I)) {
+        if (St->isVolatile() || St->isAtomic())
+          return false;
+        TailStores.push_back(St);
+      } else if (!I.isTerminator() && !isa<PHINode>(&I) &&
+                 !isa<GetElementPtrInst>(&I) && !isa<ICmpInst>(&I) &&
+                 !isa<BinaryOperator>(&I) && !isa<InsertElementInst>(&I) &&
+                 !isa<ShuffleVectorInst>(&I))
+        return false;
+    }
+  }
+  if (TailLoads.size() != 3 || TailStores.size() != 3)
+    return false;
+  auto MatchTailBranch = [&](BasicBlock *BB, Value *Count,
+                             BasicBlock *Continue, BasicBlock *Exit) {
+    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Br || !Br->isConditional())
+      return false;
+    auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+    bool CountSide =
+        Cmp && Cmp->getPredicate() == ICmpInst::ICMP_ULT &&
+        ((Cmp->getOperand(0) == Count &&
+          Cmp->getOperand(1) == ScalarBound) ||
+         (Cmp->getOperand(1) == Count &&
+          Cmp->getOperand(0) == ScalarBound));
+    return CountSide && Br->getSuccessor(0) == Continue &&
+           Br->getSuccessor(1) == Exit;
+  };
+  SmallVector<StoreInst *, 3> TailOrder;
+  SmallVector<Value *, 2> TailNext;
+  Value *TailIndex = VectorBound;
+  for (unsigned Lane = 0; Lane != 3; ++Lane) {
+    LoadInst *TailLoad = nullptr;
+    for (LoadInst *L : TailLoads) {
+      auto *G = dyn_cast<GetElementPtrInst>(L->getPointerOperand());
+      if (G && G->getOperand(1) == TailIndex &&
+          G->getPointerOperand() == SLoadPtr->getPointerOperand())
+        TailLoad = L;
+    }
+    if (!TailLoad)
+      return false;
+    StoreInst *TailStore = nullptr;
+    for (StoreInst *St : TailStores) {
+      auto *G = dyn_cast<GetElementPtrInst>(St->getPointerOperand());
+      auto *Add = dyn_cast<BinaryOperator>(St->getValueOperand());
+      if (!G || G->getOperand(1) != TailIndex ||
+          G->getPointerOperand() != SStorePtr->getPointerOperand() ||
+          !Add || Add->getOpcode() != Instruction::Add)
+        continue;
+      if ((Add->getOperand(0) == TailLoad &&
+           Add->getOperand(1) == ScalarOther) ||
+          (Add->getOperand(1) == TailLoad &&
+           Add->getOperand(0) == ScalarOther))
+        TailStore = St;
+    }
+    if (!TailStore)
+      return false;
+    TailOrder.push_back(TailStore);
+    TailLoads.erase(std::find(TailLoads.begin(), TailLoads.end(), TailLoad));
+    TailStores.erase(std::find(TailStores.begin(), TailStores.end(), TailStore));
+    if (Lane != 2) {
+      BinaryOperator *Next = nullptr;
+      for (Instruction &I : *TailStore->getParent())
+        if (auto *BO = dyn_cast<BinaryOperator>(&I))
+          if (BO->getOpcode() == Instruction::Add &&
+              ((BO->getOperand(0) == TailIndex &&
+                isa<ConstantInt>(BO->getOperand(1)) &&
+                cast<ConstantInt>(BO->getOperand(1))->isOne()) ||
+               (BO->getOperand(1) == TailIndex &&
+                isa<ConstantInt>(BO->getOperand(0)) &&
+                cast<ConstantInt>(BO->getOperand(0))->isOne())))
+            Next = BO;
+      if (!Next)
+        return false;
+      TailNext.push_back(Next);
+      TailIndex = Next;
+    }
+  }
+  BasicBlock *VectorExit = nullptr;
+  for (BasicBlock *Succ : successors(B))
+    if (Succ != B)
+      VectorExit = Succ;
+  BasicBlock *ScalarExit = nullptr;
+  for (BasicBlock *Succ : successors(C.L))
+    if (Succ != C.L)
+      ScalarExit = Succ;
+  if (!VectorExit || !ScalarExit ||
+      !MatchTailBranch(VectorExit, VectorBound,
+                       TailOrder.front()->getParent(), ScalarExit))
+    return false;
+  for (unsigned I = 0; I < TailNext.size(); ++I)
+    if (!MatchTailBranch(TailOrder[I]->getParent(), TailNext[I],
+                         TailOrder[I + 1]->getParent(), ScalarExit))
+      return false;
+  auto *Last = dyn_cast<BranchInst>(
+      TailOrder.back()->getParent()->getTerminator());
+  return Last && !Last->isConditional() &&
+         Last->getSuccessor(0) == ScalarExit;
+}
+
+
+// Counted loops can lower wide copies to i128 load/store pairs, or repeated
+// fills to vector splats. Split only these proven memory shapes. Keep all
+// copy loads before their stores so each chunk retains read-before-write
+// behavior. Arithmetic vector loops remain unchanged until their lane
+// semantics can be established.
+Value *broadcastScalar(Value *V) {
+  auto *Shuffle = dyn_cast<ShuffleVectorInst>(V);
+  if (!Shuffle)
+    return nullptr;
+  auto *Insert = dyn_cast<InsertElementInst>(Shuffle->getOperand(0));
+  if (!Insert)
+    return nullptr;
+  auto *Index = dyn_cast<ConstantInt>(Insert->getOperand(2));
+  if (!Index || !Index->isZero())
+    return nullptr;
+  for (int I = 0; I != static_cast<int>(Shuffle->getShuffleMask().size()); ++I)
+    if (Shuffle->getMaskValue(I) != 0)
+      return nullptr;
+  return Insert->getOperand(1);
+}
+
+bool scalarizeCountedWideMemory(Function &F) {
+  SmallVector<StoreInst *, 8> Stores;
+  SmallVector<std::pair<LoadInst *, StoreInst *>, 8> Copies;
+  for (BasicBlock &BB : F) {
+    auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Br || !Br->isConditional() ||
+        (Br->getSuccessor(0) != &BB && Br->getSuccessor(1) != &BB))
+      continue;
+    ScalarLoopInfo Loop;
+    if (!matchScalarLoop(&BB, Loop))
+      continue;
+    for (Instruction &I : BB) {
+      auto *Store = dyn_cast<StoreInst>(&I);
+      if (!Store)
+        continue;
+      if (Store->isVolatile() || Store->isAtomic())
+        continue;
+      if (isa<FixedVectorType>(Store->getValueOperand()->getType()) &&
+          broadcastScalar(Store->getValueOperand())) {
+        Stores.push_back(Store);
+        continue;
+      }
+      auto *Load = dyn_cast<LoadInst>(Store->getValueOperand());
+      if (Load && Load->hasOneUse() &&
+          Load->getType()->isIntegerTy(128) &&
+          !Load->isVolatile() && !Load->isAtomic())
+        Copies.push_back({Load, Store});
+    }
+  }
+  bool Changed = false;
+  for (StoreInst *Store : Stores) {
+    auto *VT = cast<FixedVectorType>(Store->getValueOperand()->getType());
+    Value *Scalar = broadcastScalar(Store->getValueOperand());
+    Type *ElementTy = VT->getElementType();
+    IRBuilder<> B(Store);
+    for (unsigned I = 0; I < VT->getNumElements(); ++I) {
+      Value *Ptr = Store->getPointerOperand();
+      if (I) {
+        Ptr = B.CreateGEP(ElementTy, Ptr, B.getInt32(I));
+        copyVA(Store, cast<Instruction>(Ptr));
+      }
+      auto *ScalarStore = B.CreateStore(Scalar, Ptr);
+      ScalarStore->setAlignment(Align(1));
+      copyVA(Store, ScalarStore);
+    }
+    Value *Vector = Store->getValueOperand();
+    auto *Shuffle = cast<Instruction>(Vector);
+    auto *Insert = cast<Instruction>(Shuffle->getOperand(0));
+    Store->eraseFromParent();
+    if (Shuffle->use_empty())
+      Shuffle->eraseFromParent();
+    if (Insert->use_empty())
+      Insert->eraseFromParent();
+    Changed = true;
+  }
+  for (auto [Load, Store] : Copies) {
+    Type *I64 = Type::getInt64Ty(F.getContext());
+    SmallVector<Value *, 2> Values;
+    IRBuilder<> LB(Load);
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *Ptr = LB.CreateGEP(I64, Load->getPointerOperand(),
+                                LB.getInt32(I));
+      if (auto *GEP = dyn_cast<Instruction>(Ptr))
+        copyVA(Load, GEP);
+      auto *Lane = LB.CreateLoad(I64, Ptr);
+      Lane->setAlignment(Align(1));
+      copyVA(Load, Lane);
+      Values.push_back(Lane);
+    }
+    IRBuilder<> SB(Store);
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *Ptr = SB.CreateGEP(I64, Store->getPointerOperand(),
+                                SB.getInt32(I));
+      if (auto *GEP = dyn_cast<Instruction>(Ptr))
+        copyVA(Store, GEP);
+      auto *LaneStore = SB.CreateStore(Values[I], Ptr);
+      LaneStore->setAlignment(Align(1));
+      copyVA(Store, LaneStore);
+    }
+    Store->eraseFromParent();
+    Load->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
 
 bool runOnFunction(Function &F) {
-  bool Changed = false;
+  bool Changed = scalarizeCountedWideMemory(F);
   SmallVector<Candidate, 4> Cands;
   // Collect-then-rewrite: matching never mutates.
   for (BasicBlock &BB : F) {

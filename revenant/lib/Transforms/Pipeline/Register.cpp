@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/Pipeline/Pipeline.h"
+#include "revenant/Transforms/LiftNormalize/LiftNormalize.h"
 
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -83,6 +84,18 @@
 #if __has_include("revenant/Transforms/Unrust/Unrust.h")
 #include "revenant/Transforms/Unrust/Unrust.h"
 #endif
+#if __has_include("revenant/Transforms/Uncxx/Uncxx.h")
+#include "revenant/Transforms/Uncxx/Uncxx.h"
+#endif
+#if __has_include("revenant/Transforms/Univ/Univ.h")
+#include "revenant/Transforms/Univ/Univ.h"
+#endif
+#if __has_include("revenant/Transforms/Unswitch/Unswitch.h")
+#include "revenant/Transforms/Unswitch/Unswitch.h"
+#endif
+#if __has_include("revenant/Transforms/Unoutline/Unoutline.h")
+#include "revenant/Transforms/Unoutline/Unoutline.h"
+#endif
 using namespace llvm;
 
 namespace revenant {
@@ -91,6 +104,10 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, FunctionPassManager &FPM,
          ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "revenant-lift-normalize") {
+          FPM.addPass(LiftNormalizePass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
         if (Name == "revenant-devectorize") {
           FPM.addPass(DevectorizePass());
@@ -191,6 +208,24 @@ void registerRevenantPasses(PassBuilder &PB) {
           return true;
         }
 #endif
+#if __has_include("revenant/Transforms/Uncxx/Uncxx.h")
+        if (Name == "revenant-uncxx") {
+          FPM.addPass(UncxxPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Univ/Univ.h")
+        if (Name == "revenant-univ") {
+          FPM.addPass(UnivPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unswitch/Unswitch.h")
+        if (Name == "revenant-unswitch") {
+          FPM.addPass(UnswitchPass());
+          return true;
+        }
+#endif
         return false;
       });
   // Module passes: only passes that must erase/replace Function objects
@@ -200,6 +235,10 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, ModulePassManager &MPM,
          ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "revenant-lift-abi") {
+          MPM.addPass(LiftABIPass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());
@@ -215,6 +254,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Unipo/Unipo.h")
         if (Name == "revenant-unipo") {
           MPM.addPass(UnipoPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unoutline/Unoutline.h")
+        if (Name == "revenant-unoutline") {
+          MPM.addPass(UnoutlinePass());
           return true;
         }
 #endif

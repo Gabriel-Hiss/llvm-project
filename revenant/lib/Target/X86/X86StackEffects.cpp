@@ -96,12 +96,24 @@ bool isPushName(llvm::StringRef N) {
   return N.starts_with("PUSH");
 }
 
-bool isPopName(llvm::StringRef N) { return N.starts_with("POP"); }
+bool isPopName(llvm::StringRef N) {
+  return N.starts_with("POP") && !N.starts_with("POPCNT");
+}
+
+/// Register-to-register move in either encoding (`8B /r` decodes as
+/// `MOV64rr_REV`). `Width` is the register-name stem, e.g. "MOV64rr".
+bool isMovRR(llvm::StringRef N, llvm::StringRef Stem) {
+  return N == Stem || (N.starts_with(Stem) && N.drop_front(Stem.size()) == "_REV");
+}
 
 /// Def operand 0 is a register (the SUB/ADD/MOV/LEA destination form the
 /// reference models: `writes_rsp` = op0 is rsp/esp).
-bool defIsSp(const llvm::MCRegisterInfo &MRI, const llvm::MCInst &M) {
-  if (M.getNumOperands() < 1 || !M.getOperand(0).isReg())
+bool defIsSp(const llvm::MCInstrInfo &MII, const llvm::MCRegisterInfo &MRI,
+             const llvm::MCInst &M) {
+  // A memory-destination form (`add [rsp+8],rbx`) lists the address base as
+  // operand 0 without defining it; only a real register def counts.
+  if (M.getNumOperands() < 1 || !M.getOperand(0).isReg() ||
+      MII.get(M.getOpcode()).getNumDefs() < 1)
     return false;
   return isSpReg(MRI, M.getOperand(0).getReg());
 }
@@ -150,18 +162,18 @@ std::optional<int64_t> stackDelta(const llvm::MCInstrInfo &MII,
     return 8;
   if (isPopName(Name))
     return -8;
-  if (Name.starts_with("SUB") && defIsSp(MRI, M)) {
+  if (Name.starts_with("SUB") && defIsSp(MII, MRI, M)) {
     // Register-source sub (sub rsp, rax) is dynamic, not a delta.
     if (auto Imm = arithImm(M))
       return *Imm;
     return std::nullopt;
   }
-  if (Name.starts_with("ADD") && defIsSp(MRI, M)) {
+  if (Name.starts_with("ADD") && defIsSp(MII, MRI, M)) {
     if (auto Imm = arithImm(M))
       return -*Imm;
     return std::nullopt;
   }
-  if ((Name == "LEA64r" || Name == "LEA64_32r") && defIsSp(MRI, M)) {
+  if ((Name == "LEA64r" || Name == "LEA64_32r") && defIsSp(MII, MRI, M)) {
     for (const MemRef &R : memGroups(M))
       if (R.BaseIsReg && isSpReg(MRI, R.Base) && !R.IndexIsReg)
         return -R.Disp;
@@ -199,7 +211,8 @@ FpEstablish fpEstablish(const llvm::MCInstrInfo &MII,
   FpEstablish Out;
   const llvm::MCInst &M = I.Inst;
   llvm::StringRef Name = MII.getName(M.getOpcode());
-  if ((Name == "MOV64rr" || Name == "MOV32rr") && M.getNumOperands() >= 2 &&
+  if ((isMovRR(Name, "MOV64rr") || isMovRR(Name, "MOV32rr")) &&
+      M.getNumOperands() >= 2 &&
       M.getOperand(0).isReg() && M.getOperand(1).isReg() &&
       isFpReg(MRI, M.getOperand(0).getReg()) &&
       isSpReg(MRI, M.getOperand(1).getReg())) {
@@ -224,7 +237,8 @@ bool restoresSpFromFp(const llvm::MCInstrInfo &MII,
   if (Name == "LEAVE" || Name == "LEAVE64")
     return true;
   // mov rsp, rbp (any MOV*rr width, including 32-bit esp,ebp).
-  if (Name.starts_with("MOV") && Name.ends_with("rr") &&
+  if (Name.starts_with("MOV") &&
+      (Name.ends_with("rr") || Name.ends_with("rr_REV")) &&
       M.getNumOperands() >= 2 && M.getOperand(0).isReg() &&
       M.getOperand(1).isReg() && isSpReg(MRI, M.getOperand(0).getReg()) &&
       isFpReg(MRI, M.getOperand(1).getReg()))
@@ -259,9 +273,9 @@ bool writesSpDynamically(const llvm::MCInstrInfo &MII,
   if (restoresSpFromFp(MII, MRI, I))
     return false;
   if ((Name.starts_with("SUB") || Name.starts_with("ADD")) &&
-      defIsSp(MRI, M))
+      defIsSp(MII, MRI, M))
     return !arithImm(M).has_value();
-  if ((Name == "LEA64r" || Name == "LEA64_32r") && defIsSp(MRI, M)) {
+  if ((Name == "LEA64r" || Name == "LEA64_32r") && defIsSp(MII, MRI, M)) {
     // The simple [rsp+disp] form is modeled; any other LEA writing rsp
     // (indexed, absolute, rip-relative) is dynamic.
     for (const MemRef &R : memGroups(M))
@@ -271,13 +285,44 @@ bool writesSpDynamically(const llvm::MCInstrInfo &MII,
   }
   // Any other def of rsp/esp (mov rsp,rax; and rsp,-N; xchg; ...),
   // explicit or implicit.
-  if (defIsSp(MRI, M))
+  if (defIsSp(MII, MRI, M))
     return true;
   const llvm::MCInstrDesc &Desc = MII.get(M.getOpcode());
   for (llvm::MCPhysReg R : Desc.implicit_defs())
     if (R && isSpReg(MRI, R))
       return true;
   return false;
+}
+
+std::optional<std::pair<unsigned, int64_t>>
+spCopy(const llvm::MCInstrInfo &MII, const llvm::MCRegisterInfo &MRI,
+       const Instr &I) {
+  const llvm::MCInst &M = I.Inst;
+  llvm::StringRef Name = MII.getName(M.getOpcode());
+  if (M.getNumOperands() < 1 || !M.getOperand(0).isReg() ||
+      isSpReg(MRI, M.getOperand(0).getReg()))
+    return std::nullopt;
+  const unsigned Dst = M.getOperand(0).getReg();
+  if (isMovRR(Name, "MOV64rr") && M.getNumOperands() >= 2 &&
+      M.getOperand(1).isReg() && isSpReg(MRI, M.getOperand(1).getReg()))
+    return std::pair<unsigned, int64_t>(Dst, 0);
+  if (Name == "LEA64r")
+    for (const MemRef &R : memGroups(M))
+      if (R.BaseIsReg && isSpReg(MRI, R.Base) && !R.IndexIsReg)
+        return std::pair<unsigned, int64_t>(Dst, R.Disp);
+  return std::nullopt;
+}
+
+std::optional<unsigned> spRestoreFrom(const llvm::MCInstrInfo &MII,
+                                      const llvm::MCRegisterInfo &MRI,
+                                      const Instr &I) {
+  const llvm::MCInst &M = I.Inst;
+  llvm::StringRef Name = MII.getName(M.getOpcode());
+  if (isMovRR(Name, "MOV64rr") && M.getNumOperands() >= 2 && M.getOperand(0).isReg() &&
+      M.getOperand(1).isReg() && isSpReg(MRI, M.getOperand(0).getReg()) &&
+      !isFpReg(MRI, M.getOperand(1).getReg()))
+    return (unsigned)M.getOperand(1).getReg();
+  return std::nullopt;
 }
 
 } // end namespace x86_stack
