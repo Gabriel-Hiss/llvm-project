@@ -7,5 +7,9 @@ class LiftNormalizePass : public llvm::PassInfoMixin<LiftNormalizePass> {
 public:
   llvm::PreservedAnalyses run(llvm::Function &, llvm::FunctionAnalysisManager &);
 };
+class LiftABIPass : public llvm::PassInfoMixin<LiftABIPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &, llvm::ModuleAnalysisManager &);
+};
 } // namespace revenant
 #endif

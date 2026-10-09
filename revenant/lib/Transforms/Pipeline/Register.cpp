@@ -205,6 +205,10 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, ModulePassManager &MPM,
          ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "revenant-lift-abi") {
+          MPM.addPass(LiftABIPass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());
