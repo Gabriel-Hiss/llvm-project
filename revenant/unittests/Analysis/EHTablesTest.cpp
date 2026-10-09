@@ -101,6 +101,8 @@ TEST(EHTablesTest, DecodesFuncInfo3CatchHandlerAndTypeName) {
   ASSERT_EQ(EH.size(), 1u);
   EXPECT_EQ(EH[0].Model, EHModel::MSVC);
   ASSERT_EQ(EH[0].TryRegions.size(), 1u);
+  ASSERT_EQ(EH[0].TryRegions[0].Handlers.size(), 1u);
+  EXPECT_EQ(EH[0].TryRegions[0].Handlers[0], 0u);
   ASSERT_EQ(EH[0].Handlers.size(), 1u);
   EXPECT_EQ(EH[0].Handlers[0].Address, Va(0x2300));
   EXPECT_EQ(EH[0].Handlers[0].TypeName, ".H");
@@ -114,6 +116,8 @@ TEST(EHTablesTest, DecodesSehScopeRangeAndFinally) {
   EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1100));
   EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1180));
   ASSERT_EQ(EH[0].Handlers.size(), 1u);
+  ASSERT_EQ(EH[0].TryRegions[0].Handlers.size(), 1u);
+  EXPECT_EQ(EH[0].TryRegions[0].Handlers[0], 0u);
   EXPECT_EQ(EH[0].Handlers[0].Kind, HandlerKind::Finally);
   ASSERT_EQ(EH[0].Cleanups.size(), 1u);
 }
@@ -137,6 +141,17 @@ TEST(EHTablesTest, DecodesExceptionMetadataFromCorpus) {
       if (!F.TryRegions.empty() || !F.Handlers.empty() ||
           !F.Cleanups.empty() || !F.CallSites.empty())
         ++WithContent;
+      EXPECT_FALSE(F.TryRegions.empty() && F.Handlers.empty() &&
+                   F.Cleanups.empty() && F.CallSites.empty());
+      for (const EHTryRegion &T : F.TryRegions) {
+        EXPECT_LT(T.Begin, T.End) << Path;
+        EXPECT_GE(T.Begin, F.Function) << Path;
+        EXPECT_LE(T.End, F.End) << Path;
+      }
+      for (const EHHandler &H : F.Handlers)
+        EXPECT_NE(Loaded->Img->sectionOf(H.Address), nullptr) << Path;
+      for (const EHCleanup &C : F.Cleanups)
+        EXPECT_NE(Loaded->Img->sectionOf(C.Address), nullptr) << Path;
     }
     llvm::errs() << Path << " entries=" << EH.size()
                  << " withcontent=" << WithContent << "\n";

@@ -135,17 +135,20 @@ void readSEH(const Image &I, FunctionEH &F, Va Data) {
     T.Begin = Lo;
     T.End = Hi;
     T.State = static_cast<int32_t>(N);
-    F.TryRegions.push_back(T);
     F.CallSites.push_back({Lo, static_cast<int32_t>(N)});
     if (!Filter) {
+      T.Handlers.push_back(F.Handlers.size());
       F.Cleanups.push_back({Target, static_cast<int32_t>(N)});
-      F.Handlers.push_back({Target, HandlerKind::Finally, {}, static_cast<int32_t>(N)});
+      F.Handlers.push_back({Target, HandlerKind::Finally, {},
+                            static_cast<int32_t>(N)});
     } else {
       F.Handlers.push_back({I.vaOfRva(Filter), HandlerKind::Filter, {},
                             static_cast<int32_t>(N)});
+      T.Handlers.push_back(F.Handlers.size());
       F.Handlers.push_back({Target, HandlerKind::Catch, {},
                             static_cast<int32_t>(N)});
     }
+    F.TryRegions.push_back(std::move(T));
   }
 }
 

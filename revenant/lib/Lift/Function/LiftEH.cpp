@@ -75,7 +75,7 @@ StringRef personalityFor(EHModel Model) {
   case EHModel::Itanium:
     return "__gxx_personality_seh0";
   case EHModel::Rust:
-    return "__C_specific_handler";
+    return "__CxxFrameHandler3";
   case EHModel::None:
     return "";
   }
@@ -111,11 +111,12 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
       auto *CI = dyn_cast<CallInst>(&I);
       if (!CI)
         continue;
-      // Intrinsics, inline asm and declarations without bodies never throw
-      // across a recovered table range.
-      Function *Callee = CI->getCalledFunction();
-      if (!Callee || Callee->isIntrinsic() || Callee->isDeclaration())
-        continue;
+      // A direct call to an intrinsic cannot unwind. Ordinary declarations
+      // may throw, and indirect calls may target a throwing function, so both
+      // remain candidates when their instruction VA is inside the range.
+      if (Function *Callee = CI->getCalledFunction())
+        if (Callee->isIntrinsic())
+          continue;
       auto VA = vaOf(*CI);
       if (!VA)
         continue;
@@ -143,16 +144,25 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
       continue;
     const EHTryRegion &T = EH.TryRegions[(size_t)RI];
 
-    // Resolve the handler/cleanup addresses for this range: prefer the
-    // range's own handler list, else any handler/cleanup in the entry.
-    const EHHandler *Handler = nullptr;
+    // Resolve only handlers associated with this try region. Filter helper
+    // entries are not catch funclets; the scope table's second entry is the
+    // actual __except body.
+    SmallVector<const EHHandler *, 4> Handlers;
     for (uint32_t H : T.Handlers)
-      if (H < EH.Handlers.size()) {
-        Handler = &EH.Handlers[H];
+      if (H < EH.Handlers.size() &&
+          EH.Handlers[H].Kind != HandlerKind::Filter)
+        Handlers.push_back(&EH.Handlers[H]);
+    if (Handlers.empty())
+      for (const EHHandler &H : EH.Handlers)
+        if (H.State == T.State && H.Kind != HandlerKind::Filter)
+          Handlers.push_back(&H);
+    const EHCleanup *Cleanup = nullptr;
+    for (const EHCleanup &C : EH.Cleanups)
+      if (C.State == T.State) {
+        Cleanup = &C;
         break;
       }
-    const EHCleanup *Cleanup =
-        EH.Cleanups.empty() ? nullptr : &EH.Cleanups[0];
+    const EHHandler *Handler = Handlers.empty() ? nullptr : Handlers.front();
     if (!Handler && !Cleanup)
       continue;
 
@@ -161,13 +171,11 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     BasicBlock::iterator SplitAt = CI->getIterator();
     ++SplitAt;
     BasicBlock *Normal = BB->splitBasicBlock(SplitAt, "eh.normal");
-    // The split moved the call's successors; the call still ends BB.
     BasicBlock *Dispatch =
         BasicBlock::Create(C, "eh.dispatch", &Fn, Normal);
 
     // Build the pad in the dispatch block per model.
     Value *Pad = nullptr;
-    BasicBlock *HandlerBB = nullptr;
     if (EH.Model == EHModel::Itanium) {
       // MinGW LSDA: landingpad + resume. Catch clauses come from the
       // type table when the action is nonzero; cleanup always present
@@ -181,42 +189,45 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
       ir::copyInstructionVA(*CI, *Resume);
       (void)Handler;
       (void)Cleanup;
-    } else if (Handler && (EH.Model == EHModel::MSVC ||
-                           EH.Model == EHModel::SEH)) {
-      // catchswitch/catchpad skeleton copied from clang -cc1 lowering.
-      // Top-level dispatch: parent pad is the none token (never null:
-      // the instruction derives its type from the parent pad).
-      auto *SW = CatchSwitchInst::Create(ConstantTokenNone::get(C), nullptr, 1,
-                                         "eh.catchswitch", Dispatch);
-      HandlerBB = BasicBlock::Create(C, "eh.catch", &Fn, Normal);
-      SW->addHandler(HandlerBB);
-      CatchPadInst *PadI = nullptr;
-      if (EH.Model == EHModel::MSVC) {
-        // [ptr @typeinfo-or-null, i32 0, ptr null]; the lifter has no
-        // RTTI globals, so a null selector keeps the shape verifiable.
+    } else if (Handler && Handler->Kind != HandlerKind::Finally &&
+               Handler->Kind != HandlerKind::Cleanup &&
+               (EH.Model == EHModel::MSVC || EH.Model == EHModel::SEH)) {
+      // One catchpad per decoded catch funclet, matching catchswitch's list.
+      auto *SW = CatchSwitchInst::Create(
+          ConstantTokenNone::get(C), nullptr, Handlers.size(),
+          "eh.catchswitch", Dispatch);
+      for (const EHHandler *H : Handlers) {
+        BasicBlock *HandlerBB = BasicBlock::Create(C, "eh.catch", &Fn, Normal);
+        SW->addHandler(HandlerBB);
+        CatchPadInst *PadI = nullptr;
         Value *NullPtr =
             ConstantPointerNull::get(PointerType::getUnqual(C));
-        Value *Args[] = {NullPtr, ConstantInt::get(Type::getInt32Ty(C), 0),
-                         NullPtr};
-        PadI = CatchPadInst::Create(SW, Args, "eh.catchpad", HandlerBB);
-      } else {
-        Value *NullPtr =
-            ConstantPointerNull::get(PointerType::getUnqual(C));
-        PadI = CatchPadInst::Create(SW, {NullPtr}, "eh.catchpad", HandlerBB);
+        if (EH.Model == EHModel::MSVC) {
+          // The lifted module has no RTTI globals. Retain the source type
+          // spelling in metadata while keeping the selector verifiable.
+          Value *Args[] = {NullPtr, ConstantInt::get(Type::getInt32Ty(C), 0),
+                           NullPtr};
+          PadI = CatchPadInst::Create(SW, Args, "eh.catchpad", HandlerBB);
+        } else {
+          PadI = CatchPadInst::Create(SW, {NullPtr}, "eh.catchpad", HandlerBB);
+        }
+        auto *Ret = CatchReturnInst::Create(PadI, Normal, HandlerBB);
+        ir::copyInstructionVA(*CI, *PadI);
+        ir::copyInstructionVA(*CI, *Ret);
+        PadI->setMetadata(
+            "revenant.handler",
+            MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
+                            Type::getInt64Ty(C), H->Address.Value))}));
+        if (!H->TypeName.empty())
+          PadI->setMetadata("revenant.catchtype",
+                            MDNode::get(C, MDString::get(C, H->TypeName)));
+        Pad = PadI;
       }
-      auto *Ret = CatchReturnInst::Create(PadI, Normal, HandlerBB);
       ir::copyInstructionVA(*CI, *SW);
-      ir::copyInstructionVA(*CI, *PadI);
-      ir::copyInstructionVA(*CI, *Ret);
-      // Record the source handler VA on the pad for the uneh pass.
-      PadI->setMetadata(
-          "revenant.handler",
-          MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
-                          Type::getInt64Ty(C), Handler->Address.Value))}));
-      Pad = PadI;
-    } else if (Cleanup) {
-      // Unwind-only: cleanuppad/cleanupret to the normal edge.
-      // cleanupret unwinds to caller: the pad runs dtors then resumes.
+    } else if (Cleanup || Handler) {
+      // Finally/cleanup handlers run only while unwinding.
+      const uint64_t HandlerVA = Handler ? Handler->Address.Value
+                                         : Cleanup->Address.Value;
       auto *PadI = CleanupPadInst::Create(ConstantTokenNone::get(C), {},
                                           "eh.cleanup", Dispatch);
       auto *Ret = CleanupReturnInst::Create(PadI, nullptr, Dispatch);
@@ -225,13 +236,14 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
       PadI->setMetadata(
           "revenant.handler",
           MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
-                          Type::getInt64Ty(C), Cleanup->Address.Value))}));
+                          Type::getInt64Ty(C), HandlerVA))}));
       Pad = PadI;
     } else {
       Normal->eraseFromParent();
       Dispatch->eraseFromParent();
       continue;
     }
+
 
     // Convert the call to an invoke along the same edges. splitBasicBlock
     // left a `br Normal` terminator in BB: drop it, insert the invoke at
