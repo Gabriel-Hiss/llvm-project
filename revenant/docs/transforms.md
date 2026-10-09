@@ -289,3 +289,19 @@ Raw clang LTO emission succeeds with the current driver. Its `ir-final` path
 currently aborts in RerollPass on `sub_140001930` because an APInt exceeds the
 signed 64-bit extraction limit. Normalized `ir-final` scoring remains blocked
 on the separate driver/normalization owners; raw measurement above is complete.
+**revenant-unrust (owner: MuseDeoptRust2).** Expects a module with
+`revenant.lang == "rust"` (any other module is a no-op). Inverts six rustc
+codegen shapings toward the compiler's ir-pre spelling: bounds compares back
+to `icmp ult idx, len` with the panic path recognized by name
+(`panic_bounds_check`, `slice_index_fail`, `slice_error_fail`) or by the
+lifted `call + unreachable` panic-block shape (`ule` spellings also swap the
+branch successors); folded overflow checks back to
+`llvm.*.with.overflow` when the function still panics; Range/slice-iter
+frames rebuilt only when the function holds no alloca at all and the `ult`
+compare tests an induction phi with a constant step; Option/Result niche
+discriminant tests restored from the sentinel-plus-payload ladder; Vec/String
+triple frames rebuilt only when the raw buffer pointer walks through a phi;
+inlined drop glue re-outlined into `drop_glue.unrust` when every operand the
+free arm reads is remappable. Guarantees semantics-preserving rewrites only,
+`!revenant.va` preserved, `!revenant.opaque` untouched. Runs explicitly via
+`-passes=revenant-unrust`, not in the default pipeline.
