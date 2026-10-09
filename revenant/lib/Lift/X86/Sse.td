@@ -81,7 +81,7 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VMOVDI2PDIrr";
-  dag Body = (rv_setz $dst, (rv_zext 128, (rv_op 1)));
+  dag Body = (rv_setz $dst, (rv_zext 128, (rv_op 0)));
 }
 def : RVMatch {
   string Glob = "MOVDI2PDIrm";
@@ -97,7 +97,7 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VMOV64toPQIrr";
-  dag Body = (rv_setz $dst, (rv_zext 128, (rv_op 1)));
+  dag Body = (rv_setz $dst, (rv_zext 128, (rv_op 0)));
 }
 def : RVMatch {
   string Glob = "MOVQI2PQIrm";
@@ -113,7 +113,7 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VMOVPQIto64rr";
-  dag Body = (rv_set $dst, (rv_trunc 64, (rv_op 1)));
+  dag Body = (rv_set $dst, (rv_trunc 64, (rv_op 0)));
 }
 // movd/movq xmm -> mem truncates the low lane.
 def : RVMatch {
@@ -162,11 +162,11 @@ def : RVMatch {
 }
 // VEX blends: dst = src1 with lane 0 from src2 (reg or memory).
 def : RVMatch {
-  string Glob = "VMOVSSr*";
+  string Glob = "VMOVSSrr*";
   dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0), (rv_xlane0f32 (rv_op 1))));
 }
 def : RVMatch {
-  string Glob = "VMOVSDr*";
+  string Glob = "VMOVSDrr*";
   dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0), (rv_xlane0f64 (rv_op 1))));
 }
 def : RVMatch {
@@ -403,19 +403,19 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "CVTTSS2SIrr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTTSS2SI64rr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTTSD2SIrr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTTSD2SI64rr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTSS2SDrr_Int";
@@ -439,19 +439,19 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "CVTSD2SIrr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTSD2SI64rr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTSS2SIrr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "CVTSS2SI64rr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
 }
 
 // ---- scalar float compares (flags only) --------------------------------------
@@ -523,98 +523,10 @@ def : RVMatch {
   dag Body = (rv_set $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
 }
 
-// ---- packed integer arithmetic (lane-wise, from the mnemonic suffix) ---------
-def : RVMatch {
-  string Glob = "PADDBr*";
-  dag Body = (rv_set $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PADDWr*";
-  dag Body = (rv_set $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PADDD*r";
-  dag Body = (rv_set $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PADDQr*";
-  dag Body = (rv_set $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PSUBBr*";
-  dag Body = (rv_set $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PSUBWr*";
-  dag Body = (rv_set $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PSUBDr*";
-  dag Body = (rv_set $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PSUBQr*";
-  dag Body = (rv_set $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PMULLDr*";
-  dag Body = (rv_set $dst, (rv_mul (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PMULUDQr*";
-  dag Body = (rv_set $dst, (rv_mul (rv_op 0), (rv_op 1)));
-}
-// Whole-vector bitwise ops stay on i128.
-def : RVMatch {
-  string Glob = "PANDr*";
-  dag Body = (rv_set $dst, (rv_and (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PANDNr*";
-  dag Body = (rv_set $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PORr*";
-  dag Body = (rv_set $dst, (rv_or (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "PXORr*";
-  dag Body = (rv_set $dst, (rv_xor (rv_op 0), (rv_op 1)));
-}
-// Per-lane compares produce all-ones/all-zero lanes; the generic integer
-// icmp is type-agnostic so lane width rides on the operand types.
-def : RVMatch {
-  string Glob = "PCMPEQBr*";
-  dag Body = (rv_set $dst, (rv_sext 8, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPEQWr*";
-  dag Body = (rv_set $dst, (rv_sext 16, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPEQDr*";
-  dag Body = (rv_set $dst, (rv_sext 32, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPEQQr*";
-  dag Body = (rv_set $dst, (rv_sext 64, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPGTBr*";
-  dag Body = (rv_set $dst, (rv_sext 8, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPGTWr*";
-  dag Body = (rv_set $dst, (rv_sext 16, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPGTDr*";
-  dag Body = (rv_set $dst, (rv_sext 32, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "PCMPGTQr*";
-  dag Body = (rv_set $dst, (rv_sext 64, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
+// Lane-wise integer arithmetic, bitwise ops and compares come from the
+// typed pattern inversion (X86LiftVector.cpp); the width-blind DSL entries
+// that used to sit here treated xmm values as 64-bit integers.
+
 def : RVMatch {
   string Glob = "PUNPCKLBWr*";
   dag Body = (rv_set $dst, (rv_punpckl 8, (rv_op 0), (rv_op 1)));
@@ -808,22 +720,6 @@ def : RVMatch {
 }
 
 // ---- masks, test, blend ---------------------------------------------------------------
-def : RVMatch {
-  string Glob = "PMOVMSKBrr";
-  dag Body = (rv_set $dst, (rv_zext 32, (rv_pmovmskb (rv_op 0))));
-}
-def : RVMatch {
-  string Glob = "VPMOVMSKBrr";
-  dag Body = (rv_set $dst, (rv_zext 32, (rv_pmovmskb (rv_op 0))));
-}
-def : RVMatch {
-  string Glob = "MOVMSKPSrr";
-  dag Body = (rv_set $dst, (rv_zext 32, (rv_movmskps (rv_op 0))));
-}
-def : RVMatch {
-  string Glob = "MOVMSKPDrr";
-  dag Body = (rv_set $dst, (rv_zext 32, (rv_movmskpd (rv_op 0))));
-}
 def : RVMatch {
   string Glob = "PTESTrr";
   dag Body = (rv_ptest (rv_op 0), (rv_op 1));
