@@ -160,6 +160,7 @@ private:
   /// Null when BB does not end in an invoke into a catchswitch or
   /// landingpad/cleanuppad dispatch.
   Stmt *tryTry(BasicBlock *BB);
+  VarDecl *catchVariable(CatchPadInst *Pad);
   void emitCatchBlockStmts(BasicBlock *BB, SmallVectorImpl<Stmt *> &Out);
   Expr *condOf(BranchInst *BI, BasicBlock *ContinueSucc);
   Expr *inverted(Value *V);
@@ -1082,6 +1083,64 @@ void StructuredStmtBuilder::emitCatchBlockStmts(
       Out.push_back(S);
   }
 }
+VarDecl *StructuredStmtBuilder::catchVariable(CatchPadInst *Pad) {
+  MDNode *TypeMD = Pad->getMetadata("revenant.catchtype");
+  auto *TypeName = TypeMD && TypeMD->getNumOperands() == 1
+                       ? dyn_cast<MDString>(TypeMD->getOperand(0))
+                       : nullptr;
+  if (!TypeName || !FD)
+    return nullptr;
+  StringRef Decorated = TypeName->getString();
+  if (!Decorated.starts_with(".?AV") && !Decorated.starts_with(".?AU"))
+    return nullptr;
+  StringRef Body = Decorated.drop_front(4);
+  if (!Body.ends_with("@@"))
+    return nullptr;
+  Body = Body.drop_back(2);
+  SmallVector<StringRef, 4> Parts;
+  Body.split(Parts, '@');
+  if (Parts.size() < 2 || Parts.front().empty())
+    return nullptr;
+
+  DeclContext *DC = AST->getTranslationUnitDecl();
+  NestedNameSpecifier Qualifier = NestedNameSpecifier::getGlobal();
+  for (auto It = Parts.rbegin(); It != Parts.rend() - 1; ++It) {
+    IdentifierInfo *II = Ctx.ident(*It);
+    NamespaceDecl *NS = nullptr;
+    for (NamedDecl *D : DC->lookup(II))
+      if ((NS = dyn_cast<NamespaceDecl>(D)))
+        break;
+    if (!NS) {
+      NS = NamespaceDecl::Create(*AST, DC, false, SourceLocation(),
+                                 SourceLocation(), II, nullptr, false);
+      DC->addDecl(NS);
+    }
+    Qualifier = NestedNameSpecifier(*AST, NS, Qualifier);
+    DC = NS;
+  }
+
+  IdentifierInfo *TypeId = Ctx.ident(Parts.front());
+  CXXRecordDecl *Record = nullptr;
+  for (NamedDecl *D : DC->lookup(TypeId))
+    if ((Record = dyn_cast<CXXRecordDecl>(D)))
+      break;
+  if (!Record) {
+    Record = CXXRecordDecl::Create(*AST, TagTypeKind::Class, DC, SourceLocation(),
+                                   SourceLocation(), TypeId, nullptr);
+    DC->addDecl(Record);
+    Record->startDefinition();
+    Record->completeDefinition();
+  }
+
+  QualType RecordType = AST->getTypeDeclType(
+      ElaboratedTypeKeyword::None,
+      Qualifier, Record);
+  QualType CatchType =
+      AST->getLValueReferenceType(AST->getConstType(RecordType));
+  return VarDecl::Create(*AST, FD, SourceLocation(), SourceLocation(),
+                         Ctx.ident("e"), CatchType,
+                         AST->getTrivialTypeSourceInfo(CatchType), SC_None);
+}
 
 /// Try statement from an invoke whose unwind edge reaches EH pads.
 /// Shapes (mirroring clang -cc1 lowering, x86_64-pc-windows-msvc):
@@ -1157,6 +1216,19 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
     EHClaimed.insert(H);
   EHClaimed.insert(Dispatch);
 
+  if (IsSEH && CP && CP->getMetadata("revenant.finally")) {
+    SmallVector<Stmt *, 4> FinallyBody;
+    emitCatchBlockStmts(Dispatch, FinallyBody);
+    if (FinallyBody.empty())
+      FinallyBody.push_back(new (*AST) NullStmt(SourceLocation(), false));
+    CompoundStmt *TryC = CompoundStmt::Create(
+        *AST, TryBody, FPOptionsOverride(), SourceLocation(), SourceLocation());
+    CompoundStmt *HC = CompoundStmt::Create(
+        *AST, FinallyBody, FPOptionsOverride(), SourceLocation(),
+        SourceLocation());
+    Stmt *Handler = SEHFinallyStmt::Create(*AST, SourceLocation(), HC);
+    return SEHTryStmt::Create(*AST, false, SourceLocation(), TryC, Handler);
+  }
   if (IsSEH) {
     SmallVector<Stmt *, 4> HandlerBody;
     for (BasicBlock *H : Handlers)
@@ -1175,10 +1247,16 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
     return SEHTryStmt::Create(*AST, false, SourceLocation(), TryC, Handler);
   }
 
-  // C++ try/catch (MSVC catchpad, MinGW landingpad, cleanuppad): one
-  // catch-all handler per handler block.
+  // C++ try/catch (MSVC catchpad, MinGW landingpad, cleanuppad): one handler
+  // Preserve catch types recovered from MSVC RTTI metadata.
   SmallVector<Stmt *, 2> CatchStmts;
   for (BasicBlock *H : Handlers) {
+    VarDecl *ExceptionDecl = nullptr;
+    for (Instruction &I : *H)
+      if (auto *Pad = dyn_cast<CatchPadInst>(&I)) {
+        ExceptionDecl = catchVariable(Pad);
+        break;
+      }
     SmallVector<Stmt *, 4> HandlerBody;
     emitCatchBlockStmts(H, HandlerBody);
     if (HandlerBody.empty())
@@ -1186,7 +1264,8 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
     CompoundStmt *HC = CompoundStmt::Create(
         *AST, HandlerBody, FPOptionsOverride(), SourceLocation(),
         SourceLocation());
-    CatchStmts.push_back(new (*AST) CXXCatchStmt(SourceLocation(), nullptr, HC));
+    CatchStmts.push_back(
+        new (*AST) CXXCatchStmt(SourceLocation(), ExceptionDecl, HC));
   }
   CompoundStmt *TryC = CompoundStmt::Create(
       *AST, TryBody, FPOptionsOverride(), SourceLocation(), SourceLocation());

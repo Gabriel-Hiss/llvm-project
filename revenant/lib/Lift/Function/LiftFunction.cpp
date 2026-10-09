@@ -392,6 +392,12 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
   }
   if (Sig && Sig->NoReturn)
     Fn->addFnAttr(llvm::Attribute::NoReturn);
+  if (Sig)
+    for (const Param &P : Sig->Params)
+      if (P.Name && *P.Name == "frame") {
+        Fn->addFnAttr("revenant.msvc.funclet");
+        break;
+      }
 
   while (!Fn->empty())
     Fn->begin()->eraseFromParent();

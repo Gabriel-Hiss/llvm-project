@@ -18,6 +18,7 @@
 #include "revenant/Engine/Session.h"
 
 #include "revenant/Analysis/LibMatch.h"
+#include "revenant/Analysis/EHTables.h"
 #include "revenant/Analysis/Signatures.h"
 #include "revenant/Clang/ClangFrontend.h"
 #include "revenant/Clang/ExprBuilder.h"
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <numeric>
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/LLVMContext.h"
@@ -39,6 +41,11 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "X86BaseInfo.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -47,7 +54,6 @@
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
-#include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 
@@ -516,13 +522,82 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // ---- lift -> ir-raw ----------------------------------------------------
     LLVMContext Ctx;
     auto M = moduleFor(Ctx, Out);
+    // Decode the image's EH metadata once, then associate each lifted function
+    // with its table entry. The EH vector owns these entries through the loop.
+    std::vector<FunctionEH> EHFunctions = decodeEHTables(pe());
+    DenseSet<uint64_t> FuncletAddresses;
+    DenseMap<uint64_t, uint64_t> FuncletAliases;
+    // EH map targets can point at the entry instruction inside a discovered
+    // funclet, rather than at its containing Program function's start.
+    auto collectFunclet = [&](Va Handler, Va Owner) {
+      auto Exact = Prog.Functions.find(Handler);
+      if (Exact != Prog.Functions.end() && Handler != Owner) {
+        FuncletAddresses.insert(Handler.Value);
+        FuncletAliases[Handler.Value] = Handler.Value;
+        return;
+      }
+      for (const auto &[Start, F] : Prog.Functions) {
+        if (Start == Owner)
+          continue;
+        bool Contains = false;
+        for (const auto &[Lo, Hi] : F.Chunks)
+          Contains |= Lo <= Handler && Handler < Hi;
+        if (F.Chunks.empty())
+          Contains = Start <= Handler && Handler < F.End;
+        if (!Contains)
+          continue;
+        FuncletAddresses.insert(Start.Value);
+        FuncletAliases[Handler.Value] = Start.Value;
+        return;
+      }
+    };
+    for (const FunctionEH &EH : EHFunctions) {
+      if (!llvm::is_contained(Todo, EH.Function))
+        continue;
+      for (const EHHandler &H : EH.Handlers)
+        collectFunclet(H.Address, EH.Function);
+      for (const EHCleanup &C : EH.Cleanups)
+        collectFunclet(C.Address, EH.Function);
+    }
+    DenseMap<uint64_t, llvm::Function *> Funclets;
+    for (uint64_t Address : FuncletAddresses) {
+      Va At(Address);
+      auto SignatureMap = *Sigs;
+      lift::Signature FuncletSig;
+      FuncletSig.Params.push_back(
+          {lift::ParamLoc::reg(llvm::X86::RDX), 64, false, std::string("frame")});
+      FuncletSig.Ret = lift::RetLoc{false, 64};
+      SignatureMap.Funcs[At] = std::move(FuncletSig);
+      auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(At), *Dis,
+                                  &SignatureMap, /*TM=*/nullptr,
+                                  /*RunPasses=*/false, /*EH=*/nullptr);
+      if (!L) {
+        std::string Message = toString(L.takeError());
+        return createStringError(inconvertibleErrorCode(),
+                                 "failed to lift EH funclet 0x%llx: %s",
+                                 static_cast<unsigned long long>(Address),
+                                 Message.c_str());
+      }
+      Funclets[Address] = L->Fn;
+    }
     size_t OpaqueSites = 0;
     for (Va T : Todo) {
+      if (FuncletAddresses.contains(T.Value))
+        continue;
       FunctionStageTrace Trace("lift", "liftFunction", Prog.Functions.at(T).Name,
                                T.Value);
+      const FunctionEH *EH = nullptr;
+      auto EHIt = llvm::find_if(EHFunctions, [T](const FunctionEH &Entry) {
+        return Entry.Function == T;
+      });
+      if (EHIt != EHFunctions.end()) {
+        if (Compiler.Producer == revenant::Compiler::Rustc)
+          EHIt->Model = EHModel::Rust;
+        EH = &*EHIt;
+      }
       auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
                                   Sigs.get(), /*TM=*/nullptr,
-                                  /*RunPasses=*/false);
+                                  /*RunPasses=*/false, EH);
       if (!L) {
         std::string Message = toString(L.takeError());
         std::string Note = formatv("0x{0:x}: {1}", T.Value, Message).str();
@@ -532,6 +607,124 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       }
       OpaqueSites += L->AsmFallbacks.size();
     }
+    // MSVC catch funclets return their continuation VA in rax.
+    auto continuationVA = [](const llvm::Function &F)
+        -> std::optional<uint64_t> {
+      const llvm::AllocaInst *Rax = nullptr;
+      for (const llvm::Instruction &I : F.getEntryBlock())
+        if (auto *AI = dyn_cast<llvm::AllocaInst>(&I);
+            AI && AI->getName() == "rax") {
+          Rax = AI;
+          break;
+        }
+      if (!Rax)
+        return std::nullopt;
+      std::optional<uint64_t> Result;
+      for (const llvm::BasicBlock &BB : F)
+        for (const llvm::Instruction &I : BB)
+          if (auto *Store = dyn_cast<llvm::StoreInst>(&I);
+              Store && Store->getPointerOperand()->stripPointerCasts() == Rax)
+            if (auto *V = dyn_cast<llvm::ConstantInt>(Store->getValueOperand())) {
+              uint64_t VA = V->getZExtValue();
+              if (Result && *Result != VA)
+                return std::nullopt;
+              Result = VA;
+            }
+      return Result;
+    };
+    if (!Funclets.empty()) {
+    SmallVector<llvm::Function *, 32> Parents;
+    for (llvm::Function &F : *M)
+      Parents.push_back(&F);
+    for (llvm::Function *ParentPtr : Parents) {
+      llvm::Function &Parent = *ParentPtr;
+      if (Parent.isDeclaration())
+        continue;
+      auto ParentVA = ir::getFunctionVA(Parent);
+      if (ParentVA && FuncletAddresses.contains(*ParentVA))
+        continue;
+      llvm::Value *ParentStack = nullptr;
+      for (llvm::Instruction &I : Parent.getEntryBlock())
+        if (I.getName() == "sp0")
+          ParentStack = &I;
+      if (!ParentStack)
+        continue;
+      SmallVector<llvm::BasicBlock *, 8> HandlerBlocks;
+      for (llvm::BasicBlock &BB : Parent)
+        for (llvm::Instruction &I : BB)
+          if (isa<llvm::FuncletPadInst>(&I)) {
+            HandlerBlocks.push_back(&BB);
+            break;
+          }
+      for (llvm::BasicBlock *BBPtr : HandlerBlocks) {
+        llvm::BasicBlock &BB = *BBPtr;
+        llvm::FuncletPadInst *Pad = nullptr;
+        for (llvm::Instruction &I : BB)
+          if (auto *P = dyn_cast<llvm::FuncletPadInst>(&I)) {
+            Pad = P;
+            break;
+          }
+        if (!Pad)
+          continue;
+        llvm::MDNode *Handler = Pad->getMetadata("revenant.handler");
+        if (!Handler || Handler->getNumOperands() != 1)
+          continue;
+        auto *AddressMD =
+            dyn_cast<llvm::ConstantAsMetadata>(Handler->getOperand(0));
+        auto *Address = AddressMD
+                            ? dyn_cast<llvm::ConstantInt>(AddressMD->getValue())
+                            : nullptr;
+        if (!Address)
+          continue;
+        auto Alias = FuncletAliases.find(Address->getZExtValue());
+        if (Alias == FuncletAliases.end())
+          continue;
+        llvm::Function *Funclet = Funclets.lookup(Alias->second);
+        if (!Funclet || Funclet->arg_size() != 1 || BB.empty())
+          continue;
+        std::optional<uint64_t> ContinueVA;
+        if (llvm::MDNode *Continuations =
+                Pad->getMetadata("revenant.continuations"))
+          if (Continuations->getNumOperands() == 1)
+            if (auto *MD = dyn_cast<llvm::ConstantAsMetadata>(
+                    Continuations->getOperand(0)))
+              if (auto *Value =
+                      dyn_cast<llvm::ConstantInt>(MD->getValue()))
+                ContinueVA = Value->getZExtValue();
+        if (!ContinueVA)
+          ContinueVA = continuationVA(*Funclet);
+        if (!Ret)
+          continue;
+        llvm::IRBuilder<> Builder(Ret);
+        llvm::Value *FrameArg =
+            Builder.CreatePtrToInt(ParentStack, Funclet->getArg(0)->getType());
+        SmallVector<llvm::Value *, 1> BundleInputs{Pad};
+        SmallVector<OperandBundleDef, 1> Bundles{
+            OperandBundleDef("funclet", BundleInputs)};
+        SmallVector<llvm::Value *, 1> Args{FrameArg};
+        llvm::CallInst *Call = Builder.CreateCall(
+            Funclet->getFunctionType(), Funclet, Args, Bundles, "eh.funclet");
+        llvm::InlineFunctionInfo IFI;
+        if (!llvm::InlineFunction(*Call, IFI).isSuccess())
+          return createStringError(inconvertibleErrorCode(),
+                                   "failed to inline EH funclet into %s",
+                                   Parent.getName().str().c_str());
+        if (ContinueVA)
+          if (auto *CatchRet =
+                  dyn_cast<llvm::CatchReturnInst>(BB.getTerminator())) {
+            std::string Name = formatv("bb_{0:x}", *ContinueVA).str();
+            for (llvm::BasicBlock &Next : Parent)
+              if (Next.getName() == Name) {
+                CatchRet->setSuccessor(&Next);
+                break;
+              }
+          }
+      }
+    }
+    }
+    for (auto &Entry : Funclets)
+      if (Entry.second->use_empty())
+        Entry.second->eraseFromParent();
     if (Error E = verifyStage("lift", *M))
       return E;
     record(

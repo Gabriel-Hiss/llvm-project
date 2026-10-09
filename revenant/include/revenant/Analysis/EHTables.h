@@ -32,6 +32,10 @@ struct EHHandler {
   HandlerKind Kind = HandlerKind::Catch;
   std::string TypeName;
   int32_t State = -1;
+  /// RTTI descriptor VA used by native MSVC catchpad selectors.
+  std::optional<Va> TypeDescriptor;
+  /// Catch funclet continuation VAs encoded in FH4 handler metadata.
+  std::vector<Va> Continuations;
 };
 
 struct EHCleanup {
