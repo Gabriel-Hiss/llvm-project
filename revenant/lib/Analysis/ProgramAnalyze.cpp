@@ -11,6 +11,7 @@
 #include "llvm/Support/Error.h"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -368,6 +369,7 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
   llvm::sort(Functions, [](const Function &A, const Function &B) {
     return A.Start < B.Start;
   });
+  std::set<Va> StrongStarts = Starts;
   std::map<Va, Va> OrphanClaims = Claims;
   for (unsigned Pass = 0; Pass < 2; ++Pass) {
     const std::vector<Range> ProbeRanges =
@@ -446,7 +448,100 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
       return A.Start < B.Start;
     });
   }
-  propagateNoreturn(Functions, *P.Externs, *P.Names, Hooks);
+  for (unsigned Iteration = 0; Iteration < 8; ++Iteration) {
+    std::vector<Va> NewStarts;
+    for (const Function &F : Functions)
+      for (Va Call : F.CallTargets)
+        enqueueStrong(Call, StrongStarts, NewStarts);
+    if (NewStarts.empty())
+      break;
+    Starts.insert(NewStarts.begin(), NewStarts.end());
+
+    std::vector<Function> OtherFunctions;
+    for (Function &F : Functions)
+      if (!StrongStarts.count(F.Start))
+        OtherFunctions.push_back(std::move(F));
+    std::vector<Function> Rebuilt;
+    Rebuilt.reserve(StrongStarts.size());
+    std::map<Va, Va> StrongClaims;
+    for (Va Start : StrongStarts) {
+      analysis_detail::BuildResult Result = analysis_detail::buildFunction(
+          *P.Img, Dis, Hooks, Start, Starts, Pdata, Groups, SharedRipRefs,
+          IsNoreturn);
+      setFunctionName(Result.F, *P.Names);
+      SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
+      for (const Range &R : Result.F.Chunks)
+        addClaim(StrongClaims, R.first, R.second);
+      Rebuilt.push_back(std::move(Result.F));
+    }
+    std::vector<Function> Survivors;
+    for (Function &F : OtherFunctions) {
+      const bool AllCovered =
+          !F.Chunks.empty() &&
+          std::all_of(F.Chunks.begin(), F.Chunks.end(), [&](const Range &R) {
+            auto It = StrongClaims.upper_bound(R.first);
+            if (It == StrongClaims.begin())
+              return false;
+            --It;
+            return It->first <= R.first && It->second >= R.second;
+          });
+      if (!AllCovered)
+        Survivors.push_back(std::move(F));
+    }
+    Rebuilt.insert(Rebuilt.end(),
+                   std::make_move_iterator(Survivors.begin()),
+                   std::make_move_iterator(Survivors.end()));
+    Functions = std::move(Rebuilt);
+    llvm::sort(Functions, [](const Function &A, const Function &B) {
+      return A.Start < B.Start;
+    });
+  }
+
+  std::set<Va> NoreturnStarts =
+      propagateNoreturn(Functions, *P.Externs, *P.Names, Hooks);
+  for (unsigned Pass = 0; Pass < 4; ++Pass) {
+    auto IsNoreturn2 = [&](Va Target) {
+      return IsNoreturn(Target) || NoreturnStarts.count(Target) != 0;
+    };
+    std::set<Va> Dirty;
+    for (const Function &F : Functions) {
+      for (const Instr &I : F.Instrs) {
+        auto Target = callSiteTarget(I);
+        if (!Target || !IsNoreturn2(*Target))
+          continue;
+        const BasicBlock *B = F.blockContaining(I.Addr);
+        if (!B || B->EndKind == BlockEnd::Noreturn ||
+            B->InstrsEnd == B->InstrsBegin)
+          continue;
+        if (I.Addr != F.Instrs[B->InstrsEnd - 1].Addr)
+          Dirty.insert(F.Start);
+      }
+    }
+    if (Dirty.empty())
+      break;
+    for (Va Start : Dirty) {
+      analysis_detail::BuildResult Result = analysis_detail::buildFunction(
+          *P.Img, Dis, Hooks, Start, Starts, Pdata, Groups, SharedRipRefs,
+          IsNoreturn2);
+      setFunctionName(Result.F, *P.Names);
+      auto It = std::find_if(Functions.begin(), Functions.end(),
+                             [&](const Function &F) {
+                               return F.Start == Start;
+                             });
+      if (It != Functions.end())
+        *It = std::move(Result.F);
+      SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
+    }
+    NoreturnStarts =
+        propagateNoreturn(Functions, *P.Externs, *P.Names, Hooks);
+  }
+  llvm::sort(Functions, [](const Function &A, const Function &B) {
+    return A.Start < B.Start;
+  });
+  for (Function &F : Functions) {
+    setFunctionName(F, *P.Names);
+    P.Names->insert_or_assign(F.Start, F.Name);
+  }
   P.Xr = collectXrefs(*P.Img, Functions, Dis);
   *P.Strings = collectStrings(*P.Img, P.Xr);
 
@@ -456,6 +551,8 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
     AllChunks.insert(AllChunks.end(), F.Chunks.begin(), F.Chunks.end());
     AllData.insert(AllData.end(), F.DataRanges.begin(), F.DataRanges.end());
   }
+  llvm::sort(AllData);
+  AllData.erase(std::unique(AllData.begin(), AllData.end()), AllData.end());
   P.Padding = decodePadding(Pe, AllChunks, AllData);
   for (Function &F : Functions)
     insertFunction(P, std::move(F));
