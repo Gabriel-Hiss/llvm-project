@@ -179,7 +179,8 @@ llvm::StringRef regionKindName(RegionKind K);
 bool isOpaqueAsmCallee(const llvm::Function &F);
 /// True if I is a call-like instruction carrying `!revenant.opaque`.
 bool isOpaqueAsmCall(const llvm::Instruction &I);
-/// Get or create `declare <RetTy> @revenant.asm.<Mnemonic>(ArgTys)`.
+/// Get or create `declare <RetTy> @revenant.asm.<Mnemonic>(...)`. The
+/// variadic declaration allows an opcode to carry differing operand counts.
 llvm::Function *getOrCreateOpaqueAsmFn(llvm::Module &M,
                                        llvm::StringRef Mnemonic,
                                        llvm::Type *RetTy,

@@ -824,7 +824,8 @@ Value *LiftState::globalPtr(Va Addr) {
     Sz = 16;
   auto *G = new GlobalVariable(
       Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/!!Init,
-      GlobalValue::InternalLinkage, nullptr, Name);
+      Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
+      nullptr, Name);
   if (Init) {
     SmallVector<Constant *, 16> Vals;
     Vals.reserve(Init->size());
@@ -1070,15 +1071,6 @@ Value *LiftState::condFor(unsigned CC, Va JccVa) {
   if (Prod) {
     FlagProd P2 = *Prod;
     Prod.reset();
-    // If this jcc guards a jump table, the producer's compared operand is
-    // the table index — remember it for emitSwitch.
-    Value *A = nullptr;
-    if (P2.K == FlagProd::Cmp)
-      A = P2.A;
-    else if (P2.K == FlagProd::Arith)
-      A = P2.A ? P2.A : P2.Res;
-    if (A)
-      SwOperand = {JccVa, A};
     if (auto C = fuseCond(CC, P2))
       return *C;
   }
@@ -1140,18 +1132,19 @@ std::string lift::mnemonicOf(const Instr &I, const Disasm &D) {
   std::string Text = D.format(I, {});
   // First non-prefix token, lowercased.
   StringRef T(Text);
-  T = T.trim();
   std::string Mn;
   while (!T.empty()) {
-    auto Tok = T.split(' ');
-    StringRef W = Tok.first.trim();
+    size_t Split = T.find_first_of(" \t");
+    StringRef W = T.take_front(Split).trim();
     if (!W.empty() && W != "rep" && W != "repe" && W != "repz" &&
         W != "repne" && W != "repnz" && W != "lock" && W != "rex64" &&
-        W != "data16")
+        W != "data16") {
       Mn = W.lower();
-    T = Tok.second;
-    if (!Mn.empty())
       break;
+    }
+    if (Split == StringRef::npos)
+      break;
+    T = T.drop_front(Split + 1).trim();
   }
   if (Mn.empty())
     Mn = X86MCTools::get().MII->getName(I.Inst.getOpcode()).lower();
