@@ -5,6 +5,7 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   StringsTest.cpp
   ResolverTest.cpp
   JumpTableTest.cpp
+  EHTablesTest.cpp
 )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
