@@ -27,12 +27,6 @@ namespace revenant::clangx {
 // Concrete TypeBuilder with the C++ registration hooks.
 class RealTypeBuilder : public TypeBuilder {
 public:
-  /// Register a vtable global: `@Class_vftable = constant [N x ptr] [...]`
-  /// (MSVC `??_7Class@@6B@` spelling included). Slots map to function
-  /// values whose DISubprogram (or demangled name) recovers the virtual
-  /// method. Mirrors emit-cpp's class vtable map.
-  void addVTable(llvm::StringRef ClassName,
-                 llvm::GlobalVariable *GV) override;
 
   /// Recover method decls from a mangled function name (MSVC or Itanium
   /// via LLVM Demangle) and attach the method to its record.
