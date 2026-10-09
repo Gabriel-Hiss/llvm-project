@@ -170,23 +170,24 @@ not evidence used by structural matching. New calls preserve instruction
 metadata and VA provenance. Structural matching rejects opaque instructions
 and region annotations rather than discarding them during normalization.
 
-Measured with the standalone plugin and `revenant-unipo,verify` on the fresh
-normalized `cpp-gcc-o2` lift (`fresh-cpp-gcc-o2.ll`, 916 definitions):
+Measured with the standalone plugin and `revenant-unipo,verify` on fresh
+normalized GCC lifts:
 
-| Oracle entries | Recoveries | Remaining |
-| --- | ---: | ---: |
-| 7 named clones | 2 signatures restored, 0 bodies merged | 5 not restored |
-| 2 `.cold` partitions | 0 changed | 2 left intact |
+| Target | Oracle clone entries | Recovered / 9 | Named clone entries merged/restored | Cold partitions |
+| --- | ---: | ---: | --- | --- |
+| cpp-gcc-o2 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
+| cpp-gcc-o3 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
 
-The two recovered signatures are the pool `free` and `allocate` constprop
-clones. Their folded pool pointer is reconstructed as an extra formal, but
-the pass does not merge them because callers disagree on the surviving `n`
-argument. The `.isra` equivalence test covers distinct lifted string globals
-with identical contents and VA-specific `sub_0x` trap declarations. The
-outlined `.part.0` and `.cold` regions remain ineligible for clone folding.
-The corpus output retains all 916 definitions; it passes LLVM verification.
-The other five named entries did not meet the pass's structural or caller
-evidence checks, so they remain unresolved rather than being guessed.
+The pool constprop clones regain their folded pool-object formal by rebinding
+the equivalent internal constant global. Their remaining arguments stay
+site-specific, so callers retain distinct allocation sizes rather than
+requiring a unanimous constant. The `_S_construct.isra` pair folds only when
+the body match proves equivalent initialized string data and equivalent
+trap-only `sub_0x` callees; pooled data is treated as equal only when constant
+initializers match and its address is not compared. Outlined `.part.0` and
+`.cold` owners are kept intact. Across both targets, four of seven named
+entries remain unresolved (including the outlined `.part.0` owners); no
+oracle/PDB data is consulted by the pass.
 
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`

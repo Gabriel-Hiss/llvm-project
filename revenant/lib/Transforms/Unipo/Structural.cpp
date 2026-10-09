@@ -4,6 +4,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
@@ -25,6 +26,33 @@ namespace {
 // re-emitted under a dotted suffix. Two globals are equivalent when they
 // describe the same bytes: identical !revenant.va, or same-typed internal
 // constants with identical initializers.
+bool globalAddressCompared(const GlobalVariable &GV) {
+  SmallVector<const Value *, 8> Worklist{&GV};
+  SmallPtrSet<const Value *, 16> Seen;
+  while (!Worklist.empty()) {
+    const Value *V = Worklist.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    for (const User *U : V->users()) {
+      if (isa<ICmpInst>(U) || isa<StoreInst>(U) || isa<ReturnInst>(U))
+        return true;
+      if (const auto *CB = dyn_cast<CallBase>(U)) {
+        if (CB->getCalledOperand() == V)
+          return true;
+        // Scalar diagnostic-call arguments do not expose the pointer value.
+        continue;
+      }
+      if (isa<LoadInst>(U))
+        continue;
+      if (isa<Constant>(U) || isa<Instruction>(U)) {
+        Worklist.push_back(cast<Value>(U));
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
 std::optional<uint64_t> globalVA(const GlobalObject &GV) {
   MDNode *N =
       GV.getMetadata(GV.getContext().getMDKindID("revenant.va"));
@@ -59,7 +87,8 @@ bool globalEquivalent(const GlobalValue *A, const GlobalValue *B) {
   if (X && Y && *X == *Y)
     return true;
   return VA->isConstant() && VB->isConstant() && VA->hasInitializer() &&
-         VB->hasInitializer() && VA->getInitializer() == VB->getInitializer();
+         VB->hasInitializer() && VA->getInitializer() == VB->getInitializer() &&
+         !globalAddressCompared(*VA) && !globalAddressCompared(*VB);
 }
 
 
@@ -95,6 +124,19 @@ std::optional<uint64_t> functionVA(const Function &F) {
   if (N.getAsInteger(16, V))
     return std::nullopt;
   return V;
+}
+
+bool sameFunctionAttributes(const Function &A, const Function &B) {
+  SmallVector<Attribute, 8> AA, BA;
+  for (Attribute Attr : A.getAttributes().getFnAttrs())
+    if (!Attr.isStringAttribute() ||
+        Attr.getKindAsString() != "revenant.va")
+      AA.push_back(Attr);
+  for (Attribute Attr : B.getAttributes().getFnAttrs())
+    if (!Attr.isStringAttribute() ||
+        Attr.getKindAsString() != "revenant.va")
+      BA.push_back(Attr);
+  return AA == BA;
 }
 } // namespace
 
@@ -158,7 +200,7 @@ hash_code bodyHash(Function &F) {
     for (Instruction &I : BB) {
       H = hash_combine(H, I.getOpcode(), I.getType(), I.getNumOperands());
       for (Value *V : I.operands())
-        H = hash_combine(H, V->getType(), isa<Constant>(V));
+        H = hash_combine(H, V->getType());
     }
   return H;
 }
@@ -304,7 +346,6 @@ bool foldStructuralIPO(Module &M) {
   for (Function &F : M)
     if (eligible(F))
       Functions.push_back(&F);
-  // Remove erased entries immediately, rather than retaining dangling
   // worklist pointers. Normalized copies never become candidates.
   for (unsigned BI = 0; BI < Functions.size();) {
     Function &B = *Functions[BI];
@@ -315,15 +356,10 @@ bool foldStructuralIPO(Module &M) {
         Function &A = *Functions[AI];
         bool Dropped = A.arg_size() == B.arg_size() + 1;
         if (&A == &B || (!Dropped && A.arg_size() != B.arg_size()) ||
-            A.getReturnType() != B.getReturnType() ||
-            A.getCallingConv() != B.getCallingConv() ||
-            A.getAttributes()
-                    .getFnAttrs()
-                    .removeAttribute(M.getContext(), "revenant.va") !=
-                B.getAttributes()
-                    .getFnAttrs()
-                    .removeAttribute(M.getContext(), "revenant.va") ||
+            !sameFunctionAttributes(A, B) ||
             A.getAttributes().getRetAttrs() != B.getAttributes().getRetAttrs())
+          continue;
+        if (bodyHash(A) != bodyHash(B))
           continue;
         for (unsigned P = 0; P < A.arg_size() && !Folded; ++P) {
           bool TypesMatch = true;
@@ -430,8 +466,10 @@ bool foldStructuralIPO(Module &M) {
           std::optional<uint64_t> BV = functionVA(B);
           bool Earlier = AV && BV ? *AV < *BV : AI < BI;
           bool DataGlobal = false;
-          if (Earlier && equalBodies(A, B, ~0u, false, &DataGlobal) &&
-              DataGlobal) {
+          bool BodiesEqual =
+              Earlier && bodyHash(A) == bodyHash(B) &&
+              equalBodies(A, B, ~0u, false, &DataGlobal);
+          if (BodiesEqual && DataGlobal) {
             redirect(A, B, ~0u, nullptr, false);
             Functions.erase(Functions.begin() + BI);
             Folded = Changed = true;

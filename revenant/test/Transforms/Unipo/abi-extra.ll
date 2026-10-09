@@ -139,3 +139,30 @@ define i64 @constant_case_caller(i64 %x) {
   %v = call i64 @constant_case(i64 %x)
   ret i64 %v
 }
+
+; GCC pool constprop keeps the object global inline but retains a caller-
+; specific size argument. Each site must preserve its own size when the
+; folded object formal is restored.
+; CHECK: define i64 @pool_clone(i64 %ipa0, i64 %n)
+; CHECK: define i64 @pool_caller(i64 %x, i64 %y)
+; CHECK: call i64 @pool_clone(i64 ptrtoint (ptr @pool_data to i64), i64 11)
+; CHECK: call i64 @pool_clone(i64 ptrtoint (ptr @pool_data to i64), i64 29)
+@pool_data = internal constant [8 x i8] zeroinitializer, !revenant.va !6
+declare void @pool_touch(i64)
+
+define i64 @pool_clone(i64 %n) {
+  call void @pool_touch(i64 ptrtoint (ptr @pool_data to i64))
+  call void @pool_touch(i64 ptrtoint (ptr @pool_data to i64))
+  ret i64 %n
+}
+
+define i64 @pool_caller(i64 %x, i64 %y) {
+  %a = call i64 @pool_clone(i64 11)
+  %b = call i64 @pool_clone(i64 29)
+  %r = add i64 %a, %b
+  %s = add i64 %r, %x
+  %t = add i64 %s, %y
+  ret i64 %t
+}
+
+!6 = !{i64 8400}
