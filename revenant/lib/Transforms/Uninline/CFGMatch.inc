@@ -16,6 +16,8 @@ CFGBody analyzeCFG(Function &F) {
       F.arg_size() > MaxOperands || !F.front().phis().empty())
     return B;
   unsigned Count = 0;
+  unsigned Evidence = 0;
+  bool HasControlFlow = false;
   AttributeSet ReturnAttrs = F.getAttributes().getRetAttrs();
   if (ReturnAttrs.hasAttribute(Attribute::SExt) ||
       ReturnAttrs.hasAttribute(Attribute::ZExt) ||
@@ -44,6 +46,7 @@ CFGBody analyzeCFG(Function &F) {
       } else if (I.isTerminator()) {
         if (!isa<BranchInst>(I) && !isa<SwitchInst>(I))
           return B;
+        HasControlFlow |= I.getNumSuccessors() > 1;
       } else if (const auto *Call = dyn_cast<CallInst>(&I)) {
         if (!Call->getCalledFunction() || Call->isInlineAsm() ||
             Call->getCalledFunction()->isIntrinsic() ||
@@ -54,9 +57,10 @@ CFGBody analyzeCFG(Function &F) {
       } else if (I.isVolatile() || isa<VAArgInst>(I) || isa<FenceInst>(I)) {
         return B;
       }
+      Evidence += !I.isTerminator();
     }
   }
-  B.Valid = !B.Returns.empty();
+  B.Valid = !B.Returns.empty() && (HasControlFlow || Evidence >= 3);
   return B;
 }
 

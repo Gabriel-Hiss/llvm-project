@@ -96,3 +96,11 @@ location. Deleted callers and deleted callees remain in the denominator as
 none. If repeated identical targets have only some calls restored, their
 individual sites are unresolved rather than arbitrarily assigning successes
 to source locations. These rows are reported separately.
+
+The corpus fixtures use `mz_zip_get_mode` and `mz_zip_set_last_error` from
+miniz-clang-o3. Additional controlled cases cover loop PHIs, reordered PHI
+inputs, multiple returns, caller context, metadata, side edges and extra live
+values. A multiblock callee needs actual branching or at least three ordinary
+instructions. An outlined call plus an unconditional continuation is not new
+evidence for another callee, which prevents replacement calls from turning
+into chains of unrelated forwarding functions during the same module run.
