@@ -1011,35 +1011,39 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   const DenseSet<const PHINode *> *Resume = &C.Resume;
   if (!Secondary) {
     collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, C.Resume);
-    if (C.Resume.empty()) {
-      // No-resume (versioned) form: the scalar side is a full-trip
-      // fallback loop on the same N, not a resumed remainder, so S
-      // reads nothing from R. Accepted only when the versioned flag
-      // held (every R pred of S is a conditional restart guard), no
-      // R value flows into S at all, and R is memory-only: loads,
-      // stores, and pure computation with no calls (the memory-only
-      // body rule -- reductions route values through intrinsics or
-      // chains this rule rejects).
-      bool SReadsR = false;
-      for (PHINode &Phi : C.S->phis())
-        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
-          if (C.R.count(Phi.getIncomingBlock(I)))
-            SReadsR = true;
-      bool HasCalls = false;
-      for (BasicBlock *BB : C.R)
-        for (Instruction &I : *BB)
-          if (isa<CallBase>(&I) && !isa<DbgInfoIntrinsic>(&I))
-            HasCalls = true;
-      if (!C.Versioned || SReadsR || HasCalls)
-        return false;
-    }
   } else if (C.Resume.empty()) {
     collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, Local);
     Resume = &Local;
   }
-  if (!matchTierBound(B, V, C, F, Bound, Step, *Resume))
-    return false;
-  return true;
+  if (matchTierBound(B, V, C, F, Bound, Step, *Resume))
+    return true;
+  if (!Secondary && C.Versioned) {
+    // If the scalar fallback starts at its normal initial values from D,
+    // the whole scalar path can replay N after deleting the vector tier.
+    // Keep this separate from the usual resumed-tail bound proof.
+    for (PHINode &Phi : C.S->phis()) {
+      bool HasStart = false;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+        if (C.Starts.count(Phi.getIncomingBlock(I))) {
+          HasStart = true;
+          if (auto *D = dyn_cast<Instruction>(Phi.getIncomingValue(I)))
+            if (C.R.count(D->getParent()))
+              return false;
+        }
+      if (!HasStart)
+        return false;
+    }
+    for (const PHINode *P : C.CondPhis)
+      for (unsigned I = 0; I < P->getNumIncomingValues(); ++I)
+        if (C.R.count(P->getIncomingBlock(I)))
+          return false;
+    for (BasicBlock *BB : C.R)
+      for (Instruction &I : *BB)
+        if (isa<CallBase>(&I) && !isa<DbgInfoIntrinsic>(&I))
+          return false;
+    return true;
+  }
+  return false;
 }
 
 // Full candidate match for one dispatch block D: S is the successor
@@ -1057,6 +1061,35 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 Value *broadcastScalar(Value *V);
 bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F);
 
+bool isZeroStartValue(Value *V, BasicBlock *S,
+                      const DenseSet<BasicBlock *> &Starts,
+                      DenseSet<Value *> &Seen) {
+  if (!Seen.insert(V).second)
+    return true;
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->isZero();
+  if (auto *P = dyn_cast<PHINode>(V)) {
+    if (P->getParent() != S)
+      return false;
+    bool Found = false;
+    for (unsigned I = 0; I < P->getNumIncomingValues(); ++I)
+      if (Starts.count(P->getIncomingBlock(I))) {
+        Found = true;
+        auto *C = dyn_cast<ConstantInt>(P->getIncomingValue(I));
+        if (!C || !C->isZero())
+          return false;
+      }
+    return Found;
+  }
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    return isZeroStartValue(Cast->getOperand(0), S, Starts, Seen);
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1)))
+      return C->isZero() &&
+             isZeroStartValue(BO->getOperand(0), S, Starts, Seen);
+  }
+  return false;
+}
 bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
   auto *Br = dyn_cast<BranchInst>(D->getTerminator());
   if (!Br || !Br->isConditional())
@@ -1331,7 +1364,7 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     // other tail phis start at S phis or outside-R values. In header
     // mode (S == L) the S-phi rules above plus the resume post check
     // after the body match cover this, so this block is skipped.
-    if (Cand.L != Cand.S) {
+    if (Cand.L != Cand.S && !Cand.Versioned) {
       bool IVOK = false;
       for (unsigned I = 0; I < Cand.TailLoop.IV->getNumIncomingValues(); ++I) {
         BasicBlock *IB = Cand.TailLoop.IV->getIncomingBlock(I);
@@ -1345,20 +1378,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
         if (auto *CZ = dyn_cast<ConstantInt>(Inc)) {
           if (CZ->isZero())
             IVOK = true;
-        } else if (auto *P = dyn_cast<PHINode>(Inc)) {
-          if (P->getParent() != S) {
-            ULV_BAIL();
-            goto next_pick;
-          }
-          bool Zero = false;
-          for (unsigned J = 0; J < P->getNumIncomingValues(); ++J)
-            if (Cand.Starts.count(P->getIncomingBlock(J))) {
-              if (auto *CZ = dyn_cast<ConstantInt>(P->getIncomingValue(J)))
-                if (CZ->isZero())
-                  Zero = true;
-            }
-          if (Zero)
-            IVOK = true;
+        } else {
+          DenseSet<Value *> Seen;
+          IVOK = isZeroStartValue(Inc, S, Cand.Starts, Seen);
         }
       }
       if (!IVOK) {
