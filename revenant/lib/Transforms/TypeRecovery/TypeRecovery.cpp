@@ -193,6 +193,8 @@ DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
     OS << "rv_struct_" << F.getName() << "_";
     if (Base->hasName())
       OS << displayName(Base->getName());
+    else if (const auto *A = dyn_cast<Argument>(Base))
+      OS << "arg" << A->getArgNo();
     else
       OS << "anon";
   }
