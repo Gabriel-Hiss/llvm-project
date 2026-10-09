@@ -50,6 +50,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -1104,8 +1105,73 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
   return false;
 }
 
-bool runOnFunction(Function &F) {
+// GCC's O3 fill loop is a counted self-loop whose body writes repeated
+// vector splats, with scalar peel and remainder blocks around it. Expand
+// only splat stores in such loops; arithmetic vector loops need a separate
+// proof and remain unchanged.
+Value *broadcastScalar(Value *V) {
+  auto *Shuffle = dyn_cast<ShuffleVectorInst>(V);
+  if (!Shuffle)
+    return nullptr;
+  auto *Insert = dyn_cast<InsertElementInst>(Shuffle->getOperand(0));
+  if (!Insert)
+    return nullptr;
+  auto *Index = dyn_cast<ConstantInt>(Insert->getOperand(2));
+  if (!Index || !Index->isZero())
+    return nullptr;
+  for (int I = 0; I != static_cast<int>(Shuffle->getShuffleMask().size()); ++I)
+    if (Shuffle->getMaskValue(I) != 0)
+      return nullptr;
+  return Insert->getOperand(1);
+}
+
+bool scalarizeGCCSplatStores(Function &F) {
+  SmallVector<StoreInst *, 8> Stores;
+  for (BasicBlock &BB : F) {
+    auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Br || !Br->isConditional() ||
+        (Br->getSuccessor(0) != &BB && Br->getSuccessor(1) != &BB))
+      continue;
+    ScalarLoopInfo Loop;
+    if (!matchScalarLoop(&BB, Loop))
+      continue;
+    for (Instruction &I : BB)
+      if (auto *Store = dyn_cast<StoreInst>(&I))
+        if (Store->getValueOperand()->getType()->isVectorTy() &&
+            broadcastScalar(Store->getValueOperand()))
+          Stores.push_back(Store);
+  }
   bool Changed = false;
+  for (StoreInst *Store : Stores) {
+    auto *VT = cast<FixedVectorType>(Store->getValueOperand()->getType());
+    Value *Scalar = broadcastScalar(Store->getValueOperand());
+    Type *ElementTy = VT->getElementType();
+    IRBuilder<> B(Store);
+    for (unsigned I = 0; I < VT->getNumElements(); ++I) {
+      Value *Ptr = Store->getPointerOperand();
+      if (I)
+        Ptr = B.CreateGEP(ElementTy, Ptr, B.getInt32(I));
+      if (auto *GEP = dyn_cast<Instruction>(Ptr))
+        copyVA(Store, GEP);
+      auto *ScalarStore = B.CreateStore(Scalar, Ptr);
+      ScalarStore->setAlignment(Store->getAlign());
+      copyVA(Store, ScalarStore);
+    }
+    Value *Vector = Store->getValueOperand();
+    auto *Shuffle = cast<Instruction>(Vector);
+    auto *Insert = cast<Instruction>(Shuffle->getOperand(0));
+    Store->eraseFromParent();
+    if (Shuffle->use_empty())
+      Shuffle->eraseFromParent();
+    if (Insert->use_empty())
+      Insert->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
+bool runOnFunction(Function &F) {
+  bool Changed = scalarizeGCCSplatStores(F);
   SmallVector<Candidate, 4> Cands;
   // Collect-then-rewrite: matching never mutates.
   for (BasicBlock &BB : F) {
