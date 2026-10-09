@@ -296,11 +296,12 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
   if (!Def)
     return std::nullopt;
 
-  // Index must derive from the same offset value the range check used.
+  // The table address may be indexed as an element pointer (one index) or
+  // as an array pointer (leading zero plus element index).
   auto *GEP = cast<GetElementPtrInst>(Ld->getPointerOperand());
-  if (GEP->getNumIndices() != 2)
+  if (GEP->getNumIndices() != 1 && GEP->getNumIndices() != 2)
     return std::nullopt;
-  Value *Idx = GEP->getOperand(2);
+  Value *Idx = GEP->getOperand(GEP->getNumIndices());
   Value *Stripped = Idx->stripPointerCasts();
   if (auto *Z = dyn_cast<ZExtInst>(Stripped))
     Stripped = Z->getOperand(0);
@@ -390,7 +391,7 @@ bool buildSwitchFromTable(LookupShape &S) {
   // default destination is the join itself, that edge comes directly from
   // Head; otherwise the default block remains the join's predecessor.
   S.Phi->removeIncomingValue(S.Lookup);
-  if (S.Head != S.Default && S.Head != Join)
+  if (S.Default != Join && S.Head != S.Default)
     S.Phi->removeIncomingValue(S.Head);
   if (S.Default != S.Head && S.Default != Join)
     S.Phi->removeIncomingValue(S.Default);
@@ -1216,10 +1217,9 @@ bool trySelectToSwitch(Function &F, BasicBlock &BB) {
 //   %s = select %c, C1, C2   (C1, C2 constants)
 //   switch %s, ... [ C1 -> BB1, C2 -> BB2, ... ]
 //
-// becomes  br %c, BB1, BB2  when both arms route to single-case
-// destinations. Only fires when C1/C2 each appear as a case value whose
-// successor is distinct, and the switch has no other cases (default goes
-// to one of them or is unreachable).
+// becomes br %c, BB1, BB2 when both select constants have distinct
+// destinations and the switch has no other cases. The default is
+// unreachable because the select can produce only the two matched constants.
 bool trySwitchOfSelect(Function &F, BasicBlock &BB) {
   (void)F;
   auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
@@ -1244,10 +1244,9 @@ bool trySwitchOfSelect(Function &F, BasicBlock &BB) {
   // No other cases allowed (they would be lost).
   if (SI->getNumCases() != 2)
     return false;
-  // Default must route to one of the two (or be unreachable).
   BasicBlock *Def = SI->getDefaultDest();
-  if (Def != BB1 && Def != BB2 && !SI->defaultDestUnreachable())
-    return false;
+  // Both select arms are covered by the only two cases, so the default
+  // destination cannot be reached, regardless of its block contents.
   Value *C = Sel->getCondition();
   IRBuilder<> B(SI);
   Instruction *Br = B.CreateCondBr(C, BB1, BB2);

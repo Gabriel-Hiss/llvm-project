@@ -18,7 +18,7 @@ define i32 @twolevel(i32 %0) {
 
 3:
   %4 = zext i32 %0 to i64
-  %5 = getelementptr [20 x i32], ptr @switch.table.switch_twolevel, i64 0, i64 %4
+  %5 = getelementptr i32, ptr @switch.table.switch_twolevel, i64 %4
   %6 = load i32, ptr %5, align 4
   br label %7
 

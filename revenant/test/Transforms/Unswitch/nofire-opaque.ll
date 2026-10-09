@@ -1,7 +1,8 @@
 ; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
-; Negative: an opaque call inside the lookup region vetoes the rewrite.
+; An opaque call prevents table reconstruction; range-to-switch may still fire.
 ; CHECK-LABEL: define i32 @opaquekept(
-; CHECK: icmp ult i32 %0, 20
+; CHECK: switch i32 %0
+; CHECK: load i32, ptr
 ; CHECK: call i32 @revenant.asm.nop(i32 %x)
 declare i32 @revenant.asm.nop(i32) #0
 
