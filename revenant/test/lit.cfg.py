@@ -111,6 +111,7 @@ def _tool(name, env_names):
 opt = _tool("opt", ("RV_OPT",))
 filecheck = _tool("FileCheck", ("RV_FILECHECK", "FILECHECK"))
 revenant_opt = _tool("revenant-opt", ("REVENANT_OPT", "RV_REVENANT_OPT"))
+revenant_decompile = _tool("revenant-decompile", ("REVENANT_DECOMPILE",))
 
 # rv-structure-tool ships with the Structure slice build.
 rv_tool_dir = _first_env("RV_STRUCTURE_TOOL_DIR")
@@ -135,6 +136,9 @@ if filecheck:
 if revenant_opt:
     config.substitutions.append(("%revenant-opt", revenant_opt))
     config.substitutions.append(("%{revenant-opt}", revenant_opt))
+if revenant_decompile:
+    config.substitutions.append(("%revenant-decompile", revenant_decompile))
+    config.substitutions.append(("%{revenant-decompile}", revenant_decompile))
 config.substitutions.append(("%{rv-structure-tool}", rv_structure_tool))
 config.substitutions.append(("%{rv-structure-tool-exe}", rv_structure_tool))
 
@@ -144,6 +148,7 @@ missing = [
         ("%opt", opt),
         ("%FileCheck", filecheck),
         ("%revenant-opt", revenant_opt),
+        ("%revenant-decompile", revenant_decompile),
     )
     if not path
 ]

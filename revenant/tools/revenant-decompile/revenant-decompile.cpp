@@ -49,8 +49,8 @@ static cl::opt<std::string>
             cl::value_desc("lang"));
 static cl::opt<std::string>
     EmitOpt("emit",
-            cl::desc("what to print/write: asm|ir-raw|ir-clean|ir-final|"
-                     "source (default: source)"),
+            cl::desc("what to print/write: asm|ir-raw|ir-clean|ir-pre-like|"
+                     "ir-final|source (default: source)"),
             cl::value_desc("kind"));
 static cl::opt<std::string> Output("o", cl::desc("output file (default stdout)"),
                                    cl::value_desc("file"));
