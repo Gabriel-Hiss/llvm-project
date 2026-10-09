@@ -233,17 +233,40 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
       continue;
     }
 
-    // Convert the call to an invoke along the same edges.
+    // Convert the call to an invoke along the same edges. splitBasicBlock
+    // left a `br Normal` terminator in BB: drop it, insert the invoke at
+    // the call's position (the new terminator), then erase the call.
     SmallVector<OperandBundleDef, 2> Bundles;
     CI->getOperandBundlesAsDefs(Bundles);
+    BB->getTerminator()->eraseFromParent();
     InvokeInst *II = InvokeInst::Create(
         CI->getFunctionType(), CI->getCalledOperand(), Normal, Dispatch,
-        SmallVector<Value *, 8>(CI->args()), Bundles, CI->getName(), BB);
+        SmallVector<Value *, 8>(CI->args()), Bundles, CI->getName(), CI);
     II->setCallingConv(CI->getCallingConv());
     II->setAttributes(CI->getAttributes());
     ir::copyInstructionVA(*CI, *II);
-    CI->replaceAllUsesWith(II);
-    CI->eraseFromParent();
+    if (CI->use_empty()) {
+      CI->eraseFromParent();
+    } else if (pred_size(Normal) == 1 && !II->getType()->isVoidTy()) {
+      // Single-predecessor normal edge: uses stay dominated, replace all.
+      CI->replaceAllUsesWith(II);
+      CI->eraseFromParent();
+    } else {
+      // The handler's catchret also targets Normal, so the invoke result
+      // no longer dominates its uses: route them through a PHI (invoke
+      // value on the BB edge, undef on handler edges).
+      PHINode *Phi = PHINode::Create(II->getType(), 2, CI->getName() + ".eh",
+                                     &Normal->front());
+      for (BasicBlock *Pred : predecessors(Normal)) {
+        Value *V = Pred == BB ? static_cast<Value *>(II)
+                              : static_cast<Value *>(
+                                    UndefValue::get(II->getType()));
+        Phi->addIncoming(V, Pred);
+      }
+      ir::copyInstructionVA(*CI, *Phi);
+      CI->replaceAllUsesWith(Phi);
+      CI->eraseFromParent();
+    }
     (void)Pad;
     ++Converted;
   }
