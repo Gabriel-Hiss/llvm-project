@@ -377,9 +377,10 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
 
   while (!Fn->empty())
     Fn->begin()->eraseFromParent();
-  llvm::BasicBlock *Entry =
-      llvm::BasicBlock::Create(M.getContext(), "entry", Fn);
+  llvm::BasicBlock *Entry = llvm::BasicBlock::Create(M.getContext(), "", Fn);
+  ir::nameBlock(*Entry, F.Start.Value);
   LiftState LS(M, *Fn, P, F, D, Sigs, std::move(*StackOrErr), Instrs);
+  LS.Blocks.emplace(F.Start, Entry);
   LS.B.SetInsertPoint(Entry);
 
   // Register file: 15 GPR roots as i64, xmm0-15 as i128, 5 flags as i1.
@@ -480,7 +481,6 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     ir::nameBlock(*BB, Start.Value);
     LS.Blocks.emplace(Start, BB);
   }
-  LS.B.CreateBr(LS.Blocks.find(F.Start)->second);
 
   for (const BlockRec &BR : F.Blocks) {
     Va Start = BR.startVa(*P.Img);

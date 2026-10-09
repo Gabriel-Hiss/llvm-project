@@ -378,7 +378,7 @@ void LiftState::liftOpaque(const Instr &I) {
     ArgTys.push_back(A->getType());
   llvm::Function *Stub = ir::getOrCreateOpaqueAsmFn(
       Mod, Mn, llvm::Type::getVoidTy(Mod.getContext()), ArgTys);
-  llvm::CallInst *Call = B.CreateCall(Stub, Args, "xq");
+  llvm::CallInst *Call = B.CreateCall(Stub, Args);
   Call->setMetadata(ir::MDKindOpaque,
                     llvm::MDNode::get(Mod.getContext(), {}));
   ir::setInstructionVA(*Call, I.Addr.Value);

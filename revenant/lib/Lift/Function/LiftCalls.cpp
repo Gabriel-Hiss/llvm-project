@@ -169,7 +169,9 @@ void LiftState::emitCall(const Instr &I) {
                          llvm::formatv("0x{0:x}", I.MemTarget.Value).str());
       std::vector<llvm::Value *> Args = callArgs(Sig, std::nullopt);
       coerceArgs(Callee, Args);
-      llvm::CallInst *Call = B.CreateCall(Callee, Args, "c");
+      llvm::CallInst *Call =
+          B.CreateCall(Callee, Args,
+                       Callee->getReturnType()->isVoidTy() ? "" : "c");
       ir::setInstructionVA(*Call, I.Addr.Value);
       if (llvm::StringRef(Callee->getName()) == "__security_check_cookie")
         clobberFlags();
@@ -219,7 +221,9 @@ void LiftState::emitCall(const Instr &I) {
     llvm::Function *Callee = calleeFn(T, Sigs ? Sigs->of(T) : nullptr);
     std::vector<llvm::Value *> Args = callArgs(Sig, std::nullopt);
     coerceArgs(Callee, Args);
-    llvm::CallInst *Call = B.CreateCall(Callee, Args, "c");
+    llvm::CallInst *Call =
+        B.CreateCall(Callee, Args,
+                     Callee->getReturnType()->isVoidTy() ? "" : "c");
     ir::setInstructionVA(*Call, I.Addr.Value);
     clobberVolatile();
     if (Call->getType()->isIntegerTy())

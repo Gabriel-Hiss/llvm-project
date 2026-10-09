@@ -10,6 +10,7 @@ add_llvm_library(RevenantLift
   InstCombine
   MC
   MCDisassembler
+  Passes
   ScalarOpts
   Support
   TargetParser
