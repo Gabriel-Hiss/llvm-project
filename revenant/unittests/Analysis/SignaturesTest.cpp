@@ -1,4 +1,5 @@
 #include "revenant/Analysis/Signatures.h"
+#include "revenant/Analysis/LibMatch.h"
 
 #include "revenant/Core/Program.h"
 #include "revenant/Disasm/Disasm.h"
@@ -224,6 +225,49 @@ TEST(SignaturesTest, TailJumpThunkInheritsTargetParameters) {
   ASSERT_EQ(Sig->Params.size(), 1u);
   EXPECT_EQ(Sig->Params[0].Loc.Tag, ParamLoc::Kind::Reg);
   EXPECT_EQ(Sig->Params[0].Bits, 32u);
+}
+
+TEST(SignaturesTest, LibraryPrototypeOverridesInferredSignature) {
+  constexpr uint64_t Base = 0x140007000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x10;
+  Text.Flags = SectionFlags::rx();
+  Text.Data = {0x8B, 0xC1, 0xC3};
+  P.Img->Sections.push_back(std::move(Text));
+  Va Start(Base);
+  P.Functions.emplace(Start, record(Start, 0, 3, {0, 2}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+  Signatures S = analyzeSignatures(P, *D);
+
+  LibraryDatabase DB;
+  LibraryFunction F;
+  F.Name = "memcpy";
+  F.MangledName = "memcpy";
+  F.Size = 3;
+  F.Bytes = {0x8B, 0xC1, 0xC3};
+  LibraryPrototype Prototype;
+  Prototype.ReturnType = "void *";
+  Prototype.ReturnBits = 64;
+  Prototype.Params = {{"destination", "void *", 64, false},
+                      {"source", "const void *", 64, false},
+                      {"count", "size_t", 64, false}};
+  F.Prototype = Prototype;
+  DB.Functions.push_back(F);
+  LibraryMatch Match{Start, 0};
+  applyLibraryMatches(P, S, llvm::ArrayRef<LibraryMatch>(&Match, 1), DB);
+
+  ASSERT_NE(S.of(Start), nullptr);
+  EXPECT_EQ(P.Names->at(Start), "memcpy");
+  EXPECT_EQ(S.of(Start)->SigSource, Signature::Source::Library);
+  ASSERT_EQ(S.of(Start)->Params.size(), 3u);
+  EXPECT_EQ(S.of(Start)->Params[0].Name, "destination");
+  EXPECT_EQ(S.of(Start)->Params[2].Loc.Tag, ParamLoc::Kind::Reg);
 }
 
 TEST(SignaturesTest, LookupUsesFunctionStart) {
