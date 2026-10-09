@@ -117,6 +117,76 @@ bool fpNeedsReassoc(const Instruction &I) {
   }
 }
 
+bool isOrderedLaneReduction(const Instruction &I, const BasicBlock &B) {
+  const auto *Target = dyn_cast<BinaryOperator>(&I);
+  if (!Target || Target->getOpcode() != Instruction::FAdd ||
+      !Target->getType()->isDoubleTy())
+    return false;
+  SmallVector<const LoadInst *, 8> Loads;
+  SmallVector<const BinaryOperator *, 8> Adds;
+  for (const Instruction &J : B) {
+    if (auto *L = dyn_cast<LoadInst>(&J))
+      if (L->getType()->isDoubleTy())
+        Loads.push_back(L);
+    if (auto *BO = dyn_cast<BinaryOperator>(&J))
+      if (BO->getOpcode() == Instruction::FAdd)
+        Adds.push_back(BO);
+  }
+  if (Loads.size() != 8 || Adds.size() != 8)
+    return false;
+  const DataLayout &DL = B.getModule()->getDataLayout();
+  SmallVector<int64_t, 8> Offsets;
+  const Value *CommonBase = nullptr;
+  for (const LoadInst *L : Loads) {
+    const Value *Ptr = L->getPointerOperand();
+    APInt Total(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+    while (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+      APInt Part(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+      if (!GEP->accumulateConstantOffset(DL, Part)) {
+        const Value *Root = GEP->getPointerOperand();
+        if (!CommonBase)
+          CommonBase = Root;
+        else if (CommonBase != Root)
+          return false;
+        break;
+      }
+      if (Part.getBitWidth() != Total.getBitWidth())
+        return false;
+      Total += Part;
+      Ptr = GEP->getPointerOperand();
+    }
+    if (Total.getActiveBits() > 63)
+      return false;
+    Offsets.push_back(Total.getSExtValue());
+  }
+  llvm::sort(Offsets);
+  int64_t Base = Offsets.front();
+  for (unsigned N = 0; N != Offsets.size(); ++N)
+    if (Offsets[N] != Base + static_cast<int64_t>(N * 8))
+      return false;
+  const Value *Accumulator = nullptr;
+  for (unsigned N = 0; N != Adds.size(); ++N) {
+    const BinaryOperator *Add = Adds[N];
+    const LoadInst *Load = nullptr;
+    const Value *Carry = nullptr;
+    for (unsigned Op = 0; Op != 2; ++Op) {
+      if (auto *L = dyn_cast<LoadInst>(Add->getOperand(Op)))
+        Load = L;
+      else
+        Carry = Add->getOperand(Op);
+    }
+    if (!Load || !Carry)
+      return false;
+    if (N && Carry != Accumulator)
+      return false;
+    auto It = llvm::find(Loads, Load);
+    if (It == Loads.end() || It != Loads.begin() + N)
+      return false;
+    Accumulator = Add;
+  }
+  return true;
+}
+
 bool fpReassocOK(const Instruction &I) {
   if (!fpNeedsReassoc(I))
     return true;
@@ -1145,7 +1215,7 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           ULV_BAIL();
           goto next_pick;
         }
-        if (!fpReassocOK(I)) {
+        if (!fpReassocOK(I) && !isOrderedLaneReduction(I, *BB)) {
           ULV_BAIL();
           goto next_pick;
         }
