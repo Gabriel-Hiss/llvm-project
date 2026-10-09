@@ -1986,6 +1986,7 @@ static bool matchIndexPlus(Value *V, const PHINode *IP, int64_t &Offset,
     return false;
   }
 }
+
 // The horizontal lane fold GCC emits for a packed integer reduction:
 // repeated (bitcast to the double width, shift the high half down,
 // bitcast back, add) until one lane remains, then extractelement 0.
@@ -2059,6 +2060,8 @@ static Value *matchLaneFold(Value *V, unsigned VF, unsigned ElemBits,
     return nullptr;
   return EE;
 }
+
+
 // Match the whole packed-reduction arm behind one small-N guard D and
 // prove it computes sum(a[0..N)) for the i32 count N:
 //   D:      br ult i32 N, K  (true -> remainder chain, false -> vector)
@@ -2342,6 +2345,7 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
   }
   if (!HeadFromReduce || !Exit || Exit == Head)
     return false;
+
   // Chain head: the index and accumulator phis, started at 0 on the
   // guard's small arm and resumed from the reduction on the vector arm.
   unsigned HeadPhis = 0;
@@ -2580,6 +2584,179 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
   PR.VATerm = Body->getTerminator();
   return true;
 }
+
+// Fold one matched packed reduction: replace the guarded arm with the
+// scalar counted loop the vectorizer started from,
+//   Loop: i = phi [0, D], [i + 1, Loop]; s = phi [0, D], [s + a[i], Loop]
+//         exit to the merge block when i + 1 == N.
+// Soundness: the erased arm reads a[0..N) exactly once (vector loop
+// over [0, N & ~(VF-1)) plus the guarded chain over the rest) and
+// accumulates with wrapping integer adds, so its result is
+// sum(a[0..N)); the synthesized loop computes that same sum. The
+// entry guard above D already established N >= 1, so the loop's
+// zext(N32) trip count is the element count on every path here.
+static void foldOnePackedReduction(Function &F, PackedReduction &PR,
+                                   bool &Changed) {
+  Type *Int64Ty = Type::getInt64Ty(F.getContext());
+  BasicBlock *Loop = BasicBlock::Create(F.getContext(), "", &F);
+  Loop->moveAfter(PR.D);
+  unsigned Idx = 0;
+  for (BasicBlock &B : F) {
+    if (&B == Loop)
+      break;
+    ++Idx;
+  }
+  Loop->setName("bb_x" + Twine(Idx));
+  // Trip-count bound first: insert before D's terminator (the builder's
+  // block-level insert point lands after it, which would strip the
+  // block's terminator).
+  IRBuilder<> DB(PR.D);
+  DB.SetInsertPoint(PR.D->getTerminator());
+  Value *NB = DB.CreateZExt(PR.N32, Int64Ty);
+  if (PR.VABound)
+    copyVA(PR.VABound, cast<Instruction>(NB));
+  auto *OldBr = cast<BranchInst>(PR.D->getTerminator());
+  auto *NewBr = BranchInst::Create(Loop);
+  NewBr->insertBefore(OldBr);
+  copyVA(OldBr, NewBr);
+  NewBr->setDebugLoc(OldBr->getDebugLoc());
+  OldBr->eraseFromParent();
+
+  IRBuilder<> LB(Loop);
+  PHINode *IP = LB.CreatePHI(Int64Ty, 2);
+  PHINode *AP = LB.CreatePHI(PR.ElemTy, 2);
+  Value *Gep = LB.CreateGEP(PR.ElemTy, PR.PtrArg, IP);
+  auto *Ld = LB.CreateLoad(PR.ElemTy, Gep);
+  Ld->setAlignment(Align(1));
+  Value *Acc = LB.CreateAdd(AP, Ld);
+  Value *INext = LB.CreateAdd(IP, ConstantInt::get(Int64Ty, 1));
+  Value *Done = LB.CreateICmpEQ(INext, NB);
+  auto *Back = LB.CreateCondBr(Done, PR.Exit, Loop);
+  IP->addIncoming(ConstantInt::get(Int64Ty, 0), PR.D);
+  AP->addIncoming(ConstantInt::get(PR.ElemTy, 0), PR.D);
+  IP->addIncoming(INext, Loop);
+  AP->addIncoming(Acc, Loop);
+  if (PR.VAGep)
+    copyVA(PR.VAGep, cast<Instruction>(Gep));
+  if (PR.VALoad)
+    copyVA(PR.VALoad, Ld);
+  if (PR.VAAdd)
+    copyVA(PR.VAAdd, cast<Instruction>(Acc));
+  if (PR.VAStep)
+    copyVA(PR.VAStep, cast<Instruction>(INext));
+  if (PR.VABound)
+    copyVA(PR.VABound, cast<Instruction>(Done));
+  if (PR.VATerm)
+    copyVA(PR.VATerm, Back);
+
+  // Erase the guarded arm: preheader, vector loop, lane fold, relays
+  // and the unrolled remainder.
+  SmallVector<BasicBlock *, 8> Dead;
+  Dead.push_back(PR.Pre);
+  Dead.push_back(PR.Body);
+  Dead.push_back(PR.Reduce);
+  for (BasicBlock *BB : PR.Chain)
+    Dead.push_back(BB);
+  for (BasicBlock *BB : PR.SmallRelays)
+    Dead.push_back(BB);
+  for (BasicBlock *BB : PR.VecRelays)
+    Dead.push_back(BB);
+  DenseSet<BasicBlock *> DeadSet(Dead.begin(), Dead.end());
+  for (BasicBlock *BB : Dead) {
+    if (Instruction *T = BB->getTerminator())
+      if (T->getMetadata(LLVMContext::MD_loop))
+        T->setMetadata(LLVMContext::MD_loop, nullptr);
+  }
+  // Rewire the exit merge before any block disappears: keep the phi
+  // alive while dropping the dead-edges (an emptied phi destroys
+  // itself), so add the new incoming first.
+  PR.ExitPhi->addIncoming(Acc, Loop);
+  PR.ExitPhi->removeIncomingValueIf(
+      [&](unsigned I) {
+        return DeadSet.count(PR.ExitPhi->getIncomingBlock(I));
+      },
+      /*DeletePHIIfEmpty=*/false);
+  for (BasicBlock *BB : Dead) {
+    Instruction *OldT = BB->getTerminator();
+    auto *Unr = new UnreachableInst(F.getContext());
+    Unr->insertInto(BB, BB->end());
+    OldT->eraseFromParent();
+  }
+  for (BasicBlock &BB : F) {
+    if (DeadSet.count(&BB))
+      continue;
+    for (PHINode &Phi : BB.phis()) {
+      SmallVector<BasicBlock *, 4> Kill;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+        if (DeadSet.count(Phi.getIncomingBlock(I)))
+          Kill.push_back(Phi.getIncomingBlock(I));
+      if (Kill.size() == Phi.getNumIncomingValues())
+        continue;
+      for (BasicBlock *KB : Kill)
+        Phi.removeIncomingValue(KB);
+    }
+  }
+  for (BasicBlock *BB : Dead)
+    BB->dropAllReferences();
+  for (BasicBlock *BB : Dead)
+    BB->eraseFromParent();
+  Changed = true;
+
+  // Drop the pure instructions the fold orphaned (the guard compare,
+  // the bound derivation, the old pointer base).
+  bool Sweeping = true;
+  while (Sweeping) {
+    Sweeping = false;
+    SmallVector<Instruction *, 16> DeadI;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (I.use_empty() && isSweepableDead(I))
+          DeadI.push_back(&I);
+    for (Instruction *I : DeadI) {
+      I->eraseFromParent();
+      Sweeping = true;
+    }
+  }
+}
+
+static bool foldPackedReduction(Function &F, DenseSet<BasicBlock *> &Taken) {
+  SmallVector<PackedReduction, 2> Found;
+  for (BasicBlock &BB : F) {
+    PackedReduction PR;
+    if (!matchPackedReduction(&BB, F, PR))
+      continue;
+    bool Overlap = false;
+    for (BasicBlock *Dead : PR.Chain)
+      Overlap |= Taken.count(Dead);
+    for (BasicBlock *Dead : PR.SmallRelays)
+      Overlap |= Taken.count(Dead);
+    for (BasicBlock *Dead : PR.VecRelays)
+      Overlap |= Taken.count(Dead);
+    Overlap |= Taken.count(PR.Pre) || Taken.count(PR.Body) ||
+               Taken.count(PR.Reduce) || Taken.count(PR.Exit) ||
+               Taken.count(PR.D) || Taken.count(PR.D->getTerminator()->getSuccessor(0)) ||
+               Taken.count(PR.D->getTerminator()->getSuccessor(1));
+    if (Overlap)
+      continue;
+    Taken.insert(PR.D);
+    Taken.insert(PR.Pre);
+    Taken.insert(PR.Body);
+    Taken.insert(PR.Reduce);
+    Taken.insert(PR.Exit);
+    for (BasicBlock *Dead : PR.Chain)
+      Taken.insert(Dead);
+    for (BasicBlock *Dead : PR.SmallRelays)
+      Taken.insert(Dead);
+    for (BasicBlock *Dead : PR.VecRelays)
+      Taken.insert(Dead);
+    Found.push_back(std::move(PR));
+  }
+  bool Changed = false;
+  for (PackedReduction &PR : Found)
+    foldOnePackedReduction(F, PR, Changed);
+  return Changed;
+}
+
 // Counted loops can lower wide copies to i128 load/store pairs, or repeated
 // fills to vector splats. Split only these proven memory shapes. Keep all
 // copy loads before their stores so each chunk retains read-before-write
@@ -2838,8 +3015,6 @@ bool eraseDeadValues(Function &F) {
 bool runOnFunction(Function &F) {
   bool Changed = scalarizeCountedWideMemory(F);
   Changed |= lowerUniformStoreUnroll(F);
-  DenseSet<BasicBlock *> Taken;
-  Changed |= foldPackedReduction(F, Taken);
   DenseSet<BasicBlock *> Taken;
   Changed |= foldPackedReduction(F, Taken);
   SmallVector<Candidate, 4> Cands;
