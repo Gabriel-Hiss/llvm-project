@@ -119,10 +119,20 @@ paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
   return Out;
 }
 
+static StringRef vtableClassName(StringRef Name) {
+  if (!Name.starts_with("??_7"))
+    return {};
+  return Name.drop_front(4).split("@@").first;
+}
+
 static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
                          TypeBuilder &Types) {
   c::ASTContext &AST = FCtx.ast();
   for (llvm::GlobalVariable &GV : M.globals()) {
+    StringRef Name = GV.getName();
+    StringRef Class = vtableClassName(Name);
+    if (!Class.empty())
+      Types.addVTable(Class, &GV);
     c::VarDecl *VD = FCtx.globalDecl(GV, Types);
     if (GV.isDeclaration())
       continue;
@@ -261,16 +271,19 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
-  for (unsigned Pass = 0; Pass != 2; ++Pass)
+  for (unsigned Pass = 0; Pass != 3; ++Pass)
     for (c::Decl *D : TU->decls()) {
       if (D->isImplicit())
         continue;
+      auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
       bool IsRecord = llvm::isa<c::RecordDecl>(D);
-      if (IsRecord != (Pass == 0))
+      bool IsPrototype = FD && !FD->doesThisDeclarationHaveABody();
+      if ((Pass == 0 && !IsRecord) ||
+          (Pass == 1 && !IsPrototype) ||
+          (Pass == 2 && (IsRecord || IsPrototype)))
         continue;
       D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
-      if (auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
-          !FD || !FD->doesThisDeclarationHaveABody())
+      if (!FD || IsPrototype)
         OS << ";";
       OS << "\n";
     }

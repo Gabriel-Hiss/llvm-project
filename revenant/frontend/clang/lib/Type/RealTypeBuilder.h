@@ -31,8 +31,8 @@ public:
   /// (MSVC `??_7Class@@6B@` spelling included). Slots map to function
   /// values whose DISubprogram (or demangled name) recovers the virtual
   /// method. Mirrors emit-cpp's class vtable map.
-  virtual void addVTable(llvm::StringRef ClassName,
-                         llvm::GlobalVariable *GV) = 0;
+  void addVTable(llvm::StringRef ClassName,
+                 llvm::GlobalVariable *GV) override;
 
   /// Recover method decls from a mangled function name (MSVC or Itanium
   /// via LLVM Demangle) and attach the method to its record.
