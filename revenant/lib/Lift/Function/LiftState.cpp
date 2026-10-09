@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LiftState.h"
+#include "LiftX86.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 

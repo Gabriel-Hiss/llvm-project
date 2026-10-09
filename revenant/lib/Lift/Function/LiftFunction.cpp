@@ -141,10 +141,8 @@ static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
 
   if (I.Flow == FlowKind::CondBranch) {
     llvm::Value *Cond = LS.B.getFalse();
-    if (I.Inst.getNumOperands() && I.Inst.getOperand(0).isImm()) {
-      unsigned CC = static_cast<unsigned>(I.Inst.getOperand(0).getImm());
-      Cond = LS.condFor(CC, I.Addr);
-    }
+    if (auto CC = LS.condCodeOf(I))
+      Cond = LS.condFor(*CC, I.Addr);
     // The taken edge is whichever edge targets the jcc operand (the
     // SwitchDefault edge is the taken side for `ja` guards).
     std::optional<size_t> Taken, Other;
@@ -521,10 +519,13 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
         }
       }
     } else {
-      // Fallthrough end: the last instruction carries real work.
-      if (llvm::Error E = LS.liftInstr(Last)) {
-        Fn->deleteBody();
-        return std::move(E);
+      // Fallthrough end. Conditional branches, returns and traps carry no
+      // work of their own: liftTerminator lowers them.
+      if (Last.Flow == FlowKind::None) {
+        if (llvm::Error E = LS.liftInstr(Last)) {
+          Fn->deleteBody();
+          return std::move(E);
+        }
       }
       if (llvm::Error E = liftTerminator(LS, F, BR, Last, *P.Img)) {
         Fn->deleteBody();

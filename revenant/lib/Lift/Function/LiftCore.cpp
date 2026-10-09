@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LiftState.h"
+#include "LiftX86.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 
@@ -219,24 +220,19 @@ bool LiftState::liftPop(const Instr &I) {
   return true;
 }
 
-/// SETcc/CMOVcc/Jcc condition codes. MC encodes the cc as an immediate
-/// operand on SETcc/CMOVcc/Jcc (X86 OPERAND_COND_CODE); the immediate is the
-/// X86::CondCode value (O=0..G=15) that condFor consumes.
-static bool condCodeOf(const Instr &I, const LiftState &LS, unsigned &CC) {
-  auto Ops = LS.opsOf(I);
-  for (unsigned L = 0; L < Ops.size(); ++L) {
-    if (Ops[L].Kind != LogOpKind::Imm)
+/// The X86 condition code of SETcc/CMOVcc/Jcc/FCMOVcc: the operand the
+/// descriptor types OPERAND_COND_CODE.
+std::optional<unsigned> LiftState::condCodeOf(const Instr &I) const {
+  const llvm::MCInstrDesc &Desc = MC.MII->get(I.Inst.getOpcode());
+  for (unsigned K = 0; K < Desc.NumOperands && K < I.Inst.getNumOperands();
+       ++K) {
+    if (Desc.operands()[K].OperandType != llvm::X86::OPERAND_COND_CODE)
       continue;
-    const llvm::MCOperand &O = I.Inst.getOperand(Ops[L].MI);
-    if (!O.isImm())
-      continue;
-    int64_t V = O.getImm();
-    if (V >= 0 && V <= 15) {
-      CC = (unsigned)V;
-      return true;
-    }
+    const llvm::MCOperand &O = I.Inst.getOperand(K);
+    if (O.isImm())
+      return static_cast<unsigned>(O.getImm());
   }
-  return false;
+  return std::nullopt;
 }
 
 bool LiftState::liftCore(const Instr &I) {
@@ -268,20 +264,20 @@ bool LiftState::liftCore(const Instr &I) {
     return liftPop(I);
   // SETcc: i8 = zext(cond).
   if (N.starts_with("SET")) {
-    unsigned CC = 0;
-    if (!condCodeOf(I, *this, CC))
+    auto CC = condCodeOf(I);
+    if (!CC)
       return false;
-    llvm::Value *Cond = condFor(CC, I.Addr);
+    llvm::Value *Cond = condFor(*CC, I.Addr);
     opWriteInt(I, 0, B.CreateZExt(Cond, iN(8), "z"));
     Prod.reset();
     return true;
   }
   // CMOVcc: dst = cond ? src : dst.
   if (N.starts_with("CMOV")) {
-    unsigned CC = 0;
-    if (!condCodeOf(I, *this, CC))
+    auto CC = condCodeOf(I);
+    if (!CC)
       return false;
-    llvm::Value *Cond = condFor(CC, I.Addr);
+    llvm::Value *Cond = condFor(*CC, I.Addr);
     unsigned Bits = dstBits(I, *this);
     llvm::Value *A = opReadInt(I, 0, Bits);
     llvm::Value *Bv = opReadInt(I, 1, Bits);
@@ -331,6 +327,8 @@ bool LiftState::liftCore(const Instr &I) {
   return false;
 }
 
+LiftState::~LiftState() = default;
+
 llvm::Error LiftState::liftInstr(const Instr &I) {
   setVA(I.Addr);
   // A non-constant rsp point becomes the dynamic alloca.
@@ -338,16 +336,37 @@ llvm::Error LiftState::liftInstr(const Instr &I) {
     emitDynAlloca(I);
     return llvm::Error::success();
   }
+  llvm::BasicBlock *BB = B.GetInsertBlock();
+  llvm::Instruction *Before = BB->empty() ? nullptr : &BB->back();
+  liftInstrBody(I);
+  // Provenance for everything this instruction created through LiftState's
+  // builder (the generated table tags its own).
+  llvm::BasicBlock::iterator It =
+      Before ? std::next(Before->getIterator()) : BB->begin();
+  for (; It != BB->end(); ++It)
+    if (!ir::getInstructionVA(*It))
+      ir::setInstructionVA(*It, I.Addr.Value);
+  return llvm::Error::success();
+}
+
+void LiftState::liftInstrBody(const Instr &I) {
+  // The generated table lowers every straight-line instruction; the
+  // hand-lifted core only covers opcodes whose generated case is opaque.
+  if (I.Flow == FlowKind::None) {
+    if (!Gen)
+      Gen = std::make_unique<GenContext>(*this);
+    if (Gen->lift(I))
+      return;
+  }
   if (liftCore(I))
-    return llvm::Error::success();
+    return;
   // Calls are terminators here; mid-block calls still lower through emitCall
   // when LiftFunction routes them.
   if (I.Flow == FlowKind::Call) {
     emitCall(I);
-    return llvm::Error::success();
+    return;
   }
   liftOpaque(I);
-  return llvm::Error::success();
 }
 
 void LiftState::liftOpaque(const Instr &I) {

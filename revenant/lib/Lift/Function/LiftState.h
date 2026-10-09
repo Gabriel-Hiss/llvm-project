@@ -140,6 +140,8 @@ struct FlagProd {
   char Mn = 0;
 };
 
+class GenContext;
+
 /// The per-function lifter state (Rust `struct Lift`).
 class LiftState {
 public:
@@ -173,10 +175,13 @@ public:
   /// Dynamic-alloca pointer slot + delta recorded at the dynamic point.
   llvm::AllocaInst *DynSp = nullptr;
   int64_t DynDelta = 0;
+  /// The generated lift table's context over this state (LiftX86.h).
+  std::unique_ptr<GenContext> Gen;
 
   LiftState(llvm::Module &M, llvm::Function &Fn, const Program &P,
             const FuncRecord &F, const Disasm &D, const Signatures *Sigs,
             StackInfo S, llvm::ArrayRef<Instr> Instrs);
+  ~LiftState();
 
   // ---- types / constants ---------------------------------------------------
   llvm::IntegerType *iN(unsigned Bits) const {
@@ -285,6 +290,10 @@ public:
   // ---- per-instruction lowering ---------------------------------------------------
   /// Lift one non-terminator-position instruction.
   llvm::Error liftInstr(const Instr &I);
+  /// Generated table first, then the hand-lifted core, then opaque.
+  void liftInstrBody(const Instr &I);
+  /// Condition code operand of SETcc/CMOVcc/Jcc.
+  std::optional<unsigned> condCodeOf(const Instr &I) const;
   /// Hand-lifted core ops; returns false when the opcode is not covered.
   bool liftCore(const Instr &I);
   bool liftMov(const Instr &I);
