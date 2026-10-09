@@ -829,6 +829,372 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
   return 0;
 }
 
+// Straight-line synthesis: find the longest run of K >= 4 identical-shape
+// windows of size M and build a counted loop around window 0. Returns the
+// trip count K on success.
+unsigned trySynthesize(Function &F, BasicBlock &B,
+                       SmallVectorImpl<StringRef> &Notes) {
+  SmallVector<Instruction *, 32> Insns;
+  for (Instruction &I : B) {
+    if (isa<PHINode>(&I))
+      return 0; // PHIs cannot move into the synthesized body
+    Insns.push_back(&I);
+  }
+  size_t N = Insns.size();
+  if (N < 12)
+    return 0;
+
+  // Interned shape keys so the run check is cheap.
+  SmallVector<ShapeKey, 32> Keys;
+  for (Instruction *I : Insns)
+    Keys.push_back(shapeOf(*I));
+
+  auto SameKey = [&](size_t A, size_t B) {
+    return Keys[A] == Keys[B];
+  };
+
+  for (size_t M = 1; M <= N / MinWindowsForSynth; ++M) {
+    // same[i]: run length of key[j] == key[j+M] from i.
+    std::vector<size_t> Same(N - M + 1, 0);
+    for (size_t i = N - M; i-- > 0;) {
+      Same[i] = SameKey(i, i + M) ? Same[i + 1] + 1 : 0;
+      if (i == 0)
+        break;
+    }
+    for (size_t Start = 0; Start + MinWindowsForSynth * M <= N; ++Start) {
+      if (Same[Start] < 3 * M) {
+        continue;
+      }
+      // Candidate accumulator leaves: values window 0 reads that are
+      // defined outside the run.
+      SmallPtrSet<Value *, 8> RunDsts;
+      for (size_t i = Start; i < std::min(Start + 4 * M, N); ++i)
+        if (!Insns[i]->getType()->isVoidTy())
+          RunDsts.insert(Insns[i]);
+      SmallVector<Value *, 4> AccLeaves;
+      for (size_t p = 0; p < M; ++p) {
+        Instruction *I = Insns[Start + p];
+        for (Use &U : I->operands()) {
+          Value *V = U.get();
+          if (isa<Constant>(V) || RunDsts.count(V))
+            continue;
+          if (auto *D = dyn_cast<Instruction>(V))
+            if (D->getParent() == &B)
+              continue;
+          if (!llvm::is_contained(AccLeaves, V))
+            AccLeaves.push_back(V);
+        }
+      }
+      DenseMap<Value *, unsigned> W0Pos;
+      for (size_t p = 0; p < M; ++p)
+        if (!Insns[Start + p]->getType()->isVoidTy())
+          W0Pos[Insns[Start + p]] = (unsigned)p;
+
+      // Scan forward for matching windows with a uniform delta.
+      DenseMap<std::pair<unsigned, unsigned>, std::pair<Value *, Type *>>
+          Threads;
+      std::optional<int64_t> Delta;
+      size_t K = 1;
+      bool ScanOK = true;
+      std::vector<std::vector<Instruction *>> WSets;
+      {
+        std::vector<Instruction *> W0;
+        for (size_t p = 0; p < M; ++p)
+          W0.push_back(Insns[Start + p]);
+        WSets.push_back(W0);
+      }
+      while (Start + (K + 1) * M <= N && ScanOK) {
+        std::vector<Instruction *> WJ, WPrev;
+        for (size_t p = 0; p < M; ++p) {
+          WJ.push_back(Insns[Start + K * M + p]);
+          WPrev.push_back(Insns[Start + (K - 1) * M + p]);
+        }
+        auto &W0 = WSets[0];
+        std::optional<int64_t> WinDelta;
+        bool SawOff = false;
+        for (size_t p = 0; p < M && ScanOK; ++p) {
+          Instruction *A = W0[p], *C = WJ[p];
+          if (!(shapeOf(*A) == shapeOf(*C))) {
+            ScanOK = false;
+            break;
+          }
+          if (A->getNumOperands() != C->getNumOperands()) {
+            ScanOK = false;
+            break;
+          }
+          for (unsigned o = 0; o < A->getNumOperands(); ++o) {
+            Value *VA = A->getOperand(o), *VC = C->getOperand(o);
+            if (VA == VC)
+              continue;
+            if (auto *IA = dyn_cast<ConstantInt>(VA))
+              if (auto *IC = dyn_cast<ConstantInt>(VC)) {
+                int64_t D = IC->getSExtValue() - IA->getSExtValue();
+                if (D != 0) {
+                  SawOff = true;
+                  int64_t Per = D / (int64_t)K;
+                  if (!WinDelta)
+                    WinDelta = Per;
+                  else if (*WinDelta != Per) {
+                    ScanOK = false;
+                    break;
+                  }
+                }
+                continue;
+              }
+            // Acc thread: leaf from outside vs previous window dst.
+            if (llvm::is_contained(AccLeaves, VA) &&
+                WPrev[p] == VC) {
+              Threads[{p, o}] = {VA, A->getOperand(o)->getType()};
+              continue;
+            }
+            // Same-position def pair.
+            auto PA = W0Pos.find(VA);
+            if (PA != W0Pos.end() && PA->second < WJ.size() &&
+                WJ[PA->second] == VC)
+              continue;
+            // Equal-valued pair only; a differing var pair would reread
+            // window 0 every iteration (reference rejects it).
+            if (VA != VC) {
+              ScanOK = false;
+              break;
+            }
+          }
+        }
+        if (!ScanOK)
+          break;
+        if (!SawOff) {
+          ScanOK = false;
+          break;
+        }
+        if (!WinDelta)
+          break;
+        if (!Delta)
+          Delta = WinDelta;
+        else if (*Delta != *WinDelta)
+          break;
+        WSets.push_back(WJ);
+        ++K;
+      }
+      if (K < MinWindowsForSynth)
+        continue;
+      if (Threads.empty())
+        continue; // independent windows: vector work, not a loop
+      if (!Delta)
+        continue;
+      // An earlier window's value read outside the run blocks synthesis
+      // (no single loop value exists for it).
+      size_t RunEnd = Start + K * M;
+      SmallPtrSet<Value *, 16> RunSet;
+      for (size_t i = Start; i < RunEnd; ++i)
+        if (!Insns[i]->getType()->isVoidTy())
+          RunSet.insert(Insns[i]);
+      bool Blocked = false;
+      for (size_t i = Start; i < Start + (K - 1) * M && !Blocked; ++i) {
+        Value *D = Insns[i];
+        if (D->getType()->isVoidTy())
+          continue;
+        for (User *U : D->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI || UI->getParent() != &B || !RunSet.count(UI)) {
+            // A user outside the run (or outside the block).
+            if (!UI || UI->getParent() != &B || !RunSet.count(UI)) {
+              Blocked = true;
+              break;
+            }
+          }
+        }
+      }
+      if (Blocked)
+        continue;
+
+      // Live-out last-window dsts become exit PHIs.
+      SmallVector<std::pair<Value *, Value *>, 4> LiveOut; // (last, w0eq)
+      for (size_t p = 0; p < M; ++p) {
+        Value *D = Insns[Start + (K - 1) * M + p];
+        if (D->getType()->isVoidTy())
+          continue;
+        bool Outside = false;
+        for (User *U : D->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI || UI->getParent() != &B || !RunSet.count(UI)) {
+            Outside = true;
+            break;
+          }
+        }
+        if (Outside)
+          LiveOut.push_back({D, Insns[Start + p]});
+      }
+
+      // Build: preheader (instrs[..Start]) -> loop -> exit.
+      LLVMContext &Ctx = F.getContext();
+      BasicBlock *Pre = &B;
+      // Carve the run out: Exit takes [RunEnd, end) (or just the
+      // terminator when the run reaches the block end), then Loop takes
+      // [Start, RunEnd), leaving Pre with [..Start).
+      BasicBlock *Exit = (RunEnd < N)
+                              ? Pre->splitBasicBlock(Insns[RunEnd], "unroll.exit")
+                              : Pre->splitBasicBlock(Pre->getTerminator(),
+                                                     "unroll.exit");
+      // Now split the run head: Pre keeps [..Start), Loop gets [Start, end).
+      // (With Start == 0, Pre is left empty with just the branch.)
+      BasicBlock *Loop = Pre->splitBasicBlock(Insns[Start], "unroll");
+      // Pre = [..Start), Loop = [Start, RunEnd), ExitTail holds the rest.
+      // The middle block's terminator is the unconditional split branch;
+      // replace it below with the latch. First drop windows 1.. from Loop.
+      SmallPtrSet<Instruction *, 16> DropSet;
+      // Loop currently holds [Start, RunEnd); erase windows 1...
+      {
+        SmallVector<Instruction *, 16> InLoop;
+        for (Instruction &I : *Loop)
+          if (!I.isTerminator())
+            InLoop.push_back(&I);
+        for (size_t i = M; i < InLoop.size(); ++i)
+          DropSet.insert(InLoop[i]);
+      }
+
+      // Snapshot the kept window-0 body now: creating the counter/acc
+      // phis below inserts into Loop, and they must not join the rewire
+      // walk (they are not window-0 members).
+      SmallVector<Instruction *, 8> BodyInsns;
+      for (size_t p = 0; p < M; ++p)
+        BodyInsns.push_back(Insns[Start + p]);
+      IRBuilder<> LB(Loop->getContext());
+      // PHIs must open the block: insert at its head (Loop holds only
+      // window-0 body code here, no phis yet).
+      LB.SetInsertPoint(Loop, Loop->begin());
+      Type *I64 = Type::getInt64Ty(Ctx);
+      PHINode *IPhi = LB.CreatePHI(I64, 2, "u0i");
+      IPhi->addIncoming(ConstantInt::get(I64, 0), Pre);
+      DenseMap<std::pair<unsigned, unsigned>, PHINode *> AccPhi;
+      for (auto &T : Threads) {
+        Value *Leaf = T.second.first;
+        Type *Ty = T.second.second;
+        PHINode *P = LB.CreatePHI(Ty, 2, "u0a");
+        // Backedge from the produced body dst (window-0 def kept).
+        Value *Prod = Insns[Start + T.first.first];
+        P->addIncoming(Leaf, Pre);
+        P->addIncoming(Prod, Loop);
+        AccPhi[T.first] = P;
+        copyProvenance(Insns[Start + T.first.first], P);
+      }
+      if (MDNode *N = Pre->getTerminator()->getMetadata(VA_MD))
+        IPhi->setMetadata(VA_MD, N);
+
+      // Rewire the kept body: constants shifted by Delta become
+      // i*Delta + c0 (truncated/extended to the operand width), acc
+      // leaves become their acc phis.
+      auto &W0 = WSets[0];
+      std::vector<Instruction *> W1(WSets[1].begin(), WSets[1].end());
+      IRBuilder<> BB(&Loop->front());
+      for (size_t p = 0; p < BodyInsns.size(); ++p) {
+        Instruction *NI = BodyInsns[p];
+        Instruction *W0I = W0[p];
+        Instruction *W1I = W1[p];
+        for (unsigned o = 0; o < NI->getNumOperands(); ++o) {
+          Value *VA = W0I->getOperand(o), *VC = W1I->getOperand(o);
+          auto *IA = dyn_cast<ConstantInt>(VA);
+          auto *IC = dyn_cast<ConstantInt>(VC);
+          if (IA && IC && IC->getSExtValue() - IA->getSExtValue() == *Delta) {
+            // Emit i*Delta + c0 ahead of NI.
+            IRBuilder<> EB(NI);
+            Value *Scaled = EB.CreateMul(IPhi, ConstantInt::get(I64, *Delta),
+                                         "u0o");
+            Value *Wide = Scaled;
+            if (IA->getSExtValue() != 0)
+              Wide = EB.CreateAdd(Scaled,
+                                  ConstantInt::get(I64, IA->getSExtValue()),
+                                  "u0o");
+            Type *OpTy = NI->getOperand(o)->getType();
+            Value *Final = Wide;
+            if (OpTy->isIntegerTy() && OpTy->getIntegerBitWidth() != 64) {
+              unsigned W = OpTy->getIntegerBitWidth();
+              Final = W < 64 ? EB.CreateTrunc(Wide, OpTy, "u0o")
+                             : EB.CreateSExt(Wide, OpTy, "u0o");
+            }
+            if (auto *MDBC = dyn_cast<Instruction>(Scaled))
+              copyProvenance(NI, MDBC);
+            if (auto *MDBC2 = dyn_cast<Instruction>(Final))
+              if (Final != Scaled)
+                copyProvenance(NI, MDBC2);
+            NI->setOperand(o, Final);
+          } else {
+            // Acc rewiring: operand equals the thread leaf.
+            for (auto &T : Threads) {
+              if (T.first.first == p && T.first.second == o &&
+                  VA == T.second.first) {
+                NI->setOperand(o, AccPhi[T.first]);
+                break;
+              }
+            }
+          }
+        }
+      }
+      // Latch: i_next = i + 1; c = i_next ult K; cbr.
+      Instruction *LatchBr = Loop->getTerminator();
+      {
+        IRBuilder<> EB(LatchBr);
+        Value *Next = EB.CreateAdd(IPhi, ConstantInt::get(I64, 1), "u0inext");
+        Value *Cond = EB.CreateICmpULT(Next, ConstantInt::get(I64, (int64_t)K),
+                                       "u0c");
+        copyProvenance(LatchBr, cast<Instruction>(Next));
+        copyProvenance(LatchBr, cast<Instruction>(Cond));
+        // Register the counter backedge (the phi had only the preheader
+        // entry so far).
+        IPhi->addIncoming(Next, Loop);
+        EB.CreateCondBr(Cond, Loop, Exit);
+        LatchBr->eraseFromParent();
+      }
+      // Exit PHIs for live-outs first (they reference kept window-0
+      // values), then redirect outside users of dropped last-window
+      // values to the exit phis. Only then erase the dropped windows.
+      BasicBlock *ExitBlk = Exit;
+      IRBuilder<> XB(&ExitBlk->front());
+      DenseMap<Value *, Value *> Rename;
+      for (auto &LO : LiveOut) {
+        PHINode *P = XB.CreatePHI(LO.second->getType(), 1, "u0x");
+        P->addIncoming(LO.second, Loop);
+        if (auto *D = dyn_cast<Instruction>(LO.second))
+          copyProvenance(D, P);
+        Rename[LO.first] = P;
+      }
+      for (auto &KV : Rename)
+        KV.first->replaceAllUsesWith(KV.second);
+      // Erase dropped window instructions in reverse program order so
+      // users vanish before their operands. (Outside users were
+      // redirected above; remaining uses are inside dropped code.)
+      SmallVector<Instruction *, 16> DropDead;
+      for (auto It = Loop->rbegin(); It != Loop->rend(); ++It)
+        if (DropSet.count(&*It))
+          DropDead.push_back(&*It);
+      for (Instruction *I : DropDead)
+        I->eraseFromParent();
+      // Pre branches to Loop (splitBasicBlock already did); fix PHI
+      // incoming blocks: IPhi/acc phis list Pre and Loop.
+      for (PHINode &P : Loop->phis()) {
+        for (unsigned i = 0; i < P.getNumIncomingValues(); ++i) {
+          if (P.getIncomingBlock(i) != Pre && P.getIncomingBlock(i) != Loop) {
+            P.setIncomingBlock(i, P.getIncomingBlock(i) == Exit ? Loop
+                                                                : Pre);
+          }
+        }
+      }
+      for (Function::iterator BI = F.begin(), BE = F.end(); BI != BE; ++BI) {
+        BasicBlock *OB = &*BI;
+        if (OB == Loop || OB == ExitBlk)
+          continue;
+        for (Instruction &I : *OB)
+          if (auto *P = dyn_cast<PHINode>(&I))
+            for (unsigned i = 0; i < P->getNumIncomingValues(); ++i)
+              if (P->getIncomingBlock(i) == Pre)
+                P->setIncomingBlock(i, ExitBlk);
+      }
+      // The new counter (phi 0 / +1) is an add recurrence by construction.
+      Notes.push_back(Pre->getName());
+      return (unsigned)K;
+    }
+  }
+  return 0;
+}
 } // namespace
 
 PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
@@ -837,9 +1203,9 @@ PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
   SmallVector<StringRef, 8> Notes;
   bool Changed = false;
 
-  // In-loop folding (up to 4 rounds: folding can expose a further fold).
+  // In-loop folding first (up to 4 rounds: folding can expose a further
+  // fold, e.g. nested unroll factors), then straight-line synthesis.
   // Backedges are found directly (no LoopInfo: see tryFoldLoop).
-  // Straight-line synthesis lands in the next commit.
   for (int Round = 0; Round < 4; ++Round) {
     bool RoundChanged = false;
     SmallVector<BasicBlock *, 8> Headers;
@@ -857,9 +1223,16 @@ PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
     if (!RoundChanged)
       break;
   }
+  SmallVector<BasicBlock *, 16> Blocks;
+  for (BasicBlock &B : F)
+    Blocks.push_back(&B);
+  for (BasicBlock *B : Blocks)
+    if (trySynthesize(F, *B, Notes))
+      Changed = true;
 
   if (!Changed)
     return PreservedAnalyses::all();
+  // CFG changed in both shapes; keep it simple and invalidate.
   return PreservedAnalyses::none();
 }
 
