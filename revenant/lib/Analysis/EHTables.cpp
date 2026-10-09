@@ -103,7 +103,8 @@ void readSEH(const Image &I, FunctionEH &F, Va Data) {
 void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
   auto Magic = u32(I, Data);
   if (!Magic || (*Magic != EH_MAGIC && *Magic != EH_MAGIC_1 &&
-                 *Magic != EH_MAGIC_2 && *Magic != EH_MAGIC_3))
+                 *Magic != EH_MAGIC_2 && *Magic != EH_MAGIC_3 &&
+                 *Magic != EH_MAGIC_4))
     return;
   auto MaxState = i32(I, Data.wrappingAdd(4));
   auto UnwindRva = u32(I, Data.wrappingAdd(8));
@@ -493,7 +494,8 @@ std::vector<FunctionEH> revenant::decodeEHTables(const PeFile &PE) {
     F.Metadata = U->Data;
     auto Magic = u32(I, U->Data);
     if (Magic && (*Magic == EH_MAGIC || *Magic == EH_MAGIC_1 ||
-                  *Magic == EH_MAGIC_2 || *Magic == EH_MAGIC_3)) {
+                  *Magic == EH_MAGIC_2 || *Magic == EH_MAGIC_3 ||
+                  *Magic == EH_MAGIC_4)) {
       readFuncInfo3(I, F, U->Data);
     } else {
       auto First = I.dataAt(U->Data, 1);
