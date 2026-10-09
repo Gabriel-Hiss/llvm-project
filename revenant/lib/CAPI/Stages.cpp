@@ -194,11 +194,12 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline) {
 }
 
 /// ir-clean: normalize lifted stack/address/width shapes, then cleanup +
-/// idioms, then module-level ABI recovery followed by cleanup for ptr casts.
+/// idioms, then the module-level ABI/struct recovery passes plus one
+/// cleanup round to fold the ptrtoint/inttoptr seams they introduce.
 std::string cleanPipeline() {
   return formatv("function({0},{1}),revenant-lift-abi,"
                  "function(instcombine<no-verify-fixpoint>,early-cse,"
-                 "revenant-lift-normalize)",
+                 "revenant-lift-normalize),revenant-lift-structs",
                  CleanupPipeline, IdiomsPipeline)
       .str();
 }

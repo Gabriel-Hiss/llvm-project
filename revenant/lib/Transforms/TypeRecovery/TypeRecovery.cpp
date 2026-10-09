@@ -87,6 +87,15 @@ DIType *diTypeForInteger(DIBuilder &DIB, TypeInference &TI,
 DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
                        Function &F, TypeInference &TI, const Value *Base,
                        const TypeInference::FieldAccess *FA) {
+  // Module normalization shares one layout across direct callers. Keep its
+  // named LLVM struct and DI schema together instead of creating a second,
+  // function-local layout from the subset of fields observed here.
+  for (const User *U : Base->users())
+    if (const auto *G = dyn_cast<GetElementPtrInst>(U))
+      if (MDNode *MD = G->getMetadata("revenant.pointee"))
+        if (MD->getNumOperands() == 1)
+          if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
+            return Ty;
   if (!FA || FA->Fields.empty()) {
     // No field evidence: opaque byte pointee (reference Unknown(8)).
     DIType *Byte = intDIType(DIB, 8, /*Unsigned=*/true);

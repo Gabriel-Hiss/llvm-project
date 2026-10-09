@@ -209,6 +209,10 @@ void registerRevenantPasses(PassBuilder &PB) {
           MPM.addPass(LiftABIPass());
           return true;
         }
+        if (Name == "revenant-lift-structs") {
+          MPM.addPass(LiftStructsPass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());
