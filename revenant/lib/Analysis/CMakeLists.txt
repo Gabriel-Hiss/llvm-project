@@ -4,6 +4,7 @@ add_llvm_library(RevenantAnalysis
   Xrefs.cpp
   Strings.cpp
   Resolver.cpp
+  JumpTable.cpp
 
   LINK_COMPONENTS
   MC

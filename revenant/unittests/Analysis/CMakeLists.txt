@@ -4,11 +4,13 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   XrefsTest.cpp
   StringsTest.cpp
   ResolverTest.cpp
+  JumpTableTest.cpp
   )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
   RevenantAnalysis
   RevenantObject
+  RevenantTargetX86
   RevenantDisasm)
 
 target_compile_definitions(RevenantAnalysisTests PRIVATE
