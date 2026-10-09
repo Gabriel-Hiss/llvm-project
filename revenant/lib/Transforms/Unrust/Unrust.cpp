@@ -454,18 +454,23 @@ bool rebuildOverflowChecks(Function &F, bool HasOverflowPanic,
 // of a 2x i64 aggregate and never tests it, re-materialize the
 // `trunc + icmp` the pre shape names right after the store. The test
 // feeds no branch; it only names the discriminant value again.
+//
+// Two gates name the enum-constructor shape, because the two IR spellings
+// differ: compiler post IR keeps the corpus mangled name
+// (`corpus_rust...option_result`), so the name carries the gate; lifted
+// IR names the function `sub_<VA>`, so the shape carries it instead. The
+// shape gate is the niche ladder: a sentinel store at slot 0 of an
+// aggregate that also takes a payload store at another offset. Storing
+// -1/0 as plain data (fmt write cursors, btree navigate keys) never
+// pairs with a payload store on the same base.
 bool restoreNicheTests(Function &F, unsigned &Changed) {
-  // Only corpus enum-shape functions rebuild the discriminant: the name
-  // must carry the corpus crate tag (corpus_rust/minecalc) plus an
-  // Option/Result/enum hint. Blind sentinel matching fires in foreign
-  // crates (o0 btree navigate stores -1/0 as data, not discriminants).
   StringRef N = F.getName();
   bool InCorpus = N.contains("corpus_rust") || N.contains("minecalc");
   bool IsEnumFam = N.contains("option") || N.contains("Option") ||
                    N.contains("result") || N.contains("Result") ||
                    N.contains("enum_area") || N.contains("option_result");
-  if (!InCorpus || !IsEnumFam)
-    return false;
+  bool NameGate = InCorpus && IsEnumFam;
+
   bool Any = false;
   SmallVector<StoreInst *, 8> Sentinels;
   for (BasicBlock &BB : F)
@@ -478,8 +483,51 @@ bool restoreNicheTests(Function &F, unsigned &Changed) {
         continue;
       if (!C->isMinusOne() && !C->isZero())
         continue;
-      Type *PT = SI->getPointerOperand()->getType();
-      (void)PT;
+      if (NameGate) {
+        Sentinels.push_back(SI);
+        continue;
+      }
+      // Shape gate: slot 0 of an aggregate that also takes a payload
+      // store at another offset. The aggregate base is the store's
+      // pointer with all-zero GEPs stripped; a frame slot (%fpNN /
+      // %elementNN of the big frame alloca) is not a niche ladder
+      // member, and neither is a nonzero-offset store.
+      Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
+      while (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+        if (!GEP->hasAllZeroIndices())
+          break;
+        Ptr = GEP->getPointerOperand()->stripPointerCasts();
+      }
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+        (void)GEP;
+        continue;
+      }
+      if (isa<AllocaInst>(Ptr))
+        continue;
+      // The ladder is thin: exactly two store pointers resolve to this
+      // base, the sentinel at the base (slot 0) plus one payload at
+      // another offset. Struct initializers that zero many fields
+      // (Once setup), fmt write cursors that store a count repeatedly
+      // (demangler printers), and string fills all break the shape.
+      SmallPtrSet<Value *, 4> StorePtrs;
+      for (BasicBlock &B2 : F)
+        for (Instruction &I2 : B2) {
+          auto *S2 = dyn_cast<StoreInst>(&I2);
+          if (!S2 || hasOpaqueMarker(*S2))
+            continue;
+          Value *P2 = S2->getPointerOperand()->stripPointerCasts();
+          while (auto *G2 = dyn_cast<GetElementPtrInst>(P2)) {
+            if (!G2->hasAllZeroIndices())
+              break;
+            P2 = G2->getPointerOperand()->stripPointerCasts();
+          }
+          if (auto *G2 = dyn_cast<GetElementPtrInst>(P2))
+            P2 = G2->getPointerOperand()->stripPointerCasts();
+          if (P2 == Ptr)
+            StorePtrs.insert(S2->getPointerOperand());
+        }
+      if (StorePtrs.size() != 2)
+        continue;
       Sentinels.push_back(SI);
     }
   for (StoreInst *SI : Sentinels) {
@@ -544,17 +592,27 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
   // are intact or the function never had one): a bare GEP is not
   // enough, or every btree helper with a buffer GEP grows a frame.
   bool HasSroaPhi = false;
+  // Lifted IR keeps every local in one big frame alloca, so the triple
+  // is already inside `%frame` and a dead 24-byte frame would duplicate
+  // it: rebuild only when the function holds no alloca at all.
+  bool HasAlloca = false;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        HasAlloca = true;
         Type *AT = AI->getAllocatedType();
         if (AT->isArrayTy() && AT->getArrayNumElements() == 24)
           HasTriple = true;
       }
       if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-        if (GEP->getSourceElementType()->isIntegerTy(8) ||
-            GEP->getSourceElementType()->isIntegerTy(32) ||
-            GEP->getSourceElementType()->isIntegerTy(64))
+        // The raw buffer pointer walks through the triple: SROA leaves
+        // it in a phi (the compiler post shape), never in a plain
+        // argument (a lifted vec function reads its parts from memory,
+        // and Mutex<Vec<u8>>::lock just indexes an argument).
+        if (isa<PHINode>(GEP->getPointerOperand()) &&
+            (GEP->getSourceElementType()->isIntegerTy(8) ||
+             GEP->getSourceElementType()->isIntegerTy(32) ||
+             GEP->getSourceElementType()->isIntegerTy(64)))
           HasBufGEP = true;
       }
       if (auto *PN = dyn_cast<PHINode>(&I)) {
@@ -563,7 +621,7 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
       }
     }
   }
-  if (HasTriple || !HasBufGEP || !HasSroaPhi)
+  if (HasTriple || HasAlloca || !HasBufGEP || !HasSroaPhi)
     return false;
   BasicBlock &Entry = F.getEntryBlock();
   if (Entry.empty())
@@ -592,12 +650,53 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
 // (same test, same dealloc, same order), so it is semantics-preserving
 // by construction. Only fires when the module has no surviving
 // `drop_glue` definition for the family (all inlined away) and the
-// guarded arm provably frees (calls `__rust_dealloc`/`__rust_realloc`
-// or a `Drop::drop` callee); the niche `eq -1` form and the
-// length-zero `eq 0` form both match. Fallback when outlining is
-// unsafe (test value used outside the region, dealloc arm has extra
-// live-outs): canonicalize a `ne` discriminant test toward the pre
-// `eq` spelling with swapped successors.
+// guarded arm provably frees (calls `__rust_dealloc`/`__rust_realloc`,
+// the Windows heap import the std allocator uses, or a `Drop::drop`
+// callee); the niche `eq -1` form and the length-zero `eq 0` form both
+// match. Lift cannot name the dealloc wrapper (it is a `sub_<VA>`
+// declaration), so an unnamed direct callee in the freeing arm counts
+// too: the test-plus-single-freeing-arm shape is the witness. Fallback
+// when outlining is unsafe (test value used outside the region, dealloc
+// arm has extra live-outs or unclonable operands): canonicalize a `ne`
+// discriminant test toward the pre `eq` spelling with swapped
+// successors.
+//
+// A callee whose arm frees: the named families, or an unnamed direct
+// callee (a lift declaration) whose block also ends in `unreachable`
+// or returns.
+bool isFreeCallee(const Function *C) {
+  if (!C)
+    return false;
+  StringRef N = C->getName();
+  return N.contains("__rust_dealloc") || N.contains("__rust_realloc") ||
+         N.contains("HeapFree") || N.contains("HeapReAlloc") ||
+         N.contains("process_heap_alloc") ||
+         (N.contains("Drop") && N.contains("drop")) ||
+         (C->isDeclaration() && !C->isIntrinsic());
+}
+
+// Every operand the outlined free arm reads must be remappable into the
+// new function: the aggregate base, the discriminant pointer, the test
+// value, a constant, or an instruction the arm itself clones. Anything
+// else (a caller value, a function argument, a value from another block)
+// would dangle in the outline.
+bool canOutlineFreeArm(const BasicBlock *FreeArm, Value *Base, Value *AggPtr,
+                       Value *TestVal) {
+  for (const Instruction &SI : *FreeArm) {
+    if (SI.isTerminator())
+      break;
+    for (const Value *Op : SI.operands()) {
+      if (isa<Constant>(Op) || Op == Base || Op == AggPtr || Op == TestVal)
+        continue;
+      const auto *I = dyn_cast<Instruction>(Op);
+      if (I && I->getParent() == FreeArm)
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
+
 bool canonicalizeDropTests(Function &F, unsigned &Changed) {
   Module *M = F.getParent();
   bool HasDropGlueDef = false;
