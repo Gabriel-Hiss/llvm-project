@@ -33,11 +33,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DataLayout.h"
-#include "llvm/IR/DebugInfoMetadata.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/Module.h"
 
 using namespace llvm;
 
@@ -266,13 +263,14 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
       // No spill slot for this argument: create the parameter variable so
       // the name survives, and point it at the argument with a dbg.value
       // at the entry block.
+      BasicBlock &Entry = F.getEntryBlock();
+      BasicBlock::iterator Pos = Entry.getFirstNonPHIIt();
       const DILocation *DL = nullptr;
-      if (Instruction *Pos = F.getEntryBlock().getFirstNonPHI())
+      if (Pos != Entry.end())
         DL = Pos->getDebugLoc().get();
       if (!DL)
         DL = DILocation::get(M->getContext(), 1, 1, Scope);
-      DIB.insertDbgValueIntrinsic(&A, Var, DIB.createExpression(), DL,
-                                  &F.getEntryBlock());
+      DIB.insertDbgValueIntrinsic(&A, Var, DIB.createExpression(), DL, Pos);
       Changed = true;
     }
     ++ArgNo;
