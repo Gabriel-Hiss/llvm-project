@@ -51,6 +51,7 @@ llvm_map_components_to_libnames(LLVM_LIBS
 target_link_libraries(RevenantTransformSsaOut PRIVATE ${LLVM_LIBS})
 target_include_directories(RevenantTransformSsaOut PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
 )
 set_property(TARGET RevenantTransformSsaOut PROPERTY CXX_STANDARD 17)
 set_property(TARGET RevenantTransformSsaOut PROPERTY CXX_STANDARD_REQUIRED ON)
