@@ -26,17 +26,31 @@
 //      of the union extent and addressing each slot by its byte offset is
 //      a refinement because no member is address-taken (checked) and the
 //      offsets are disjoint (checked).
-//   B. Scalar copy runs -> memcpy. Adjacent scalar load/store pairs moving
-//      the same widths between two bases fold into one llvm.memcpy. The
-//      widths/offsets must tile both sides contiguously from offset 0 of
-//      the moved range.
+//   B. Scalar copy runs -> memcpy. Adjacent scalar load/store pairs
+//      moving the same widths between two bases fold into one
+//      llvm.memcpy, but only when the run is explainable as a source
+//      struct copy: either it covers a whole known object (alloca/global
+//      of matching size), a field-aligned window of a struct-typed base,
+//      or -- for opaque roots -- a byte window whose size and internal
+//      boundaries match a module struct type. Byte-dispatch copy code
+//      (CRT memcpy expansions) has no such evidence and is left scalar.
 //   C. Byte GEPs -> typed struct GEPs. A byte GEP whose base carries a
-//      known struct type in the module and whose offset lands exactly on a
-//      field start becomes the typed field GEP the pre-IR had. This is the
-//      c-clang-o2 `struct_access` rewrite: `gep i8, ptr %0, i64 4` with
-//      `%struct.Point = type { i32, i32, ptr }` in the module becomes
-//      `gep %struct.Point, ptr %0, i32 0, i32 1`.
-//
+//      known struct type in the module and whose offset lands exactly on
+//      a field start becomes the typed field GEP the pre-IR had. This is
+//      the c-clang-o2 `struct_access` rewrite: `gep i8, ptr %0, i64 4`
+//      with `%struct.Point = type { i32, i32, ptr }` in the module
+//      becomes `gep %struct.Point, ptr %0, i32 0, i32 1`.
+//   D. Split aggregate values back to aggregate stores (extractvalue-fed
+//      scalar store webs covering one struct).
+//   E. Field-access clusters -> synthesized struct types. Lifted modules
+//      have no struct types, so C never fires there; E rebuilds the
+//      shape instead. Two or more distinct constant-offset scalar
+//      accesses through one pointer root (an argument, an inttoptr, a
+//      PHI, or a byte-array alloca window) with non-overlapping
+//      footprints become a `struct.agg.*` type and struct GEPs, matching
+//      TypeRecovery's "two offsets make a struct" rule. Uniform-stride
+//      runs read as arrays; adjacent same-type pairs and copy-routine
+//      roots (several inttoptrs of one value) are vetoed.
 // Sharing with TypeRecovery: the grouping rule (constant byte offsets
 // through one base, two or more distinct offsets) matches the FieldAccess
 // rule in TypeRecovery/TypeInference.cpp, so a group this pass rebuilds is
@@ -74,6 +88,7 @@
 #include "llvm/Support/Casting.h"
 
 #include <cstdlib>
+#include <optional>
 
 using namespace llvm;
 
@@ -139,6 +154,81 @@ const Value *resolveByteBase(const Value *Ptr, const DataLayout &DL,
     Cur = GEP->getPointerOperand();
   }
   return Cur;
+}
+
+// Resolve Ptr to (ultimate base, total byte offset) through ANY constant-
+// index GEP layers (byte or typed-element). Returns nullptr when a GEP
+// index varies: the address walks, so a fixed window means nothing.
+// Unlike resolveByteBase this accepts element GEPs because rebuilder E
+// reads footprints from the typed `element` GEPs LiftNormalize emits.
+const Value *resolveFootprintBase(const Value *Ptr, const DataLayout &DL,
+                                  uint64_t &Total) {
+  Total = 0;
+  const Value *Cur = Ptr;
+  SmallPtrSet<const Value *, 8> Seen;
+  while (const auto *GEP = dyn_cast<GetElementPtrInst>(Cur)) {
+    if (!Seen.insert(GEP).second || !GEP->hasAllConstantIndices())
+      return nullptr;
+    APInt Off(DL.getIndexSizeInBits(0), 0);
+    if (!GEP->accumulateConstantOffset(DL, Off) || Off.isNegative() ||
+        Off.getActiveBits() > 64)
+      return nullptr;
+    uint64_t Step = Off.getZExtValue();
+    if (Step > UINT64_MAX - Total)
+      return nullptr;
+    Total += Step;
+    Cur = GEP->getPointerOperand();
+  }
+  return Cur;
+
+}
+
+// Peel a root down to the value that produced its address: inttoptr and
+// casts are transparent, constant-offset arithmetic too. Used to detect
+// copy-routine roots: a size-switch memcpy materializes one inttoptr per
+// case, all scalarizing to the same argument.
+const Value *scalarizePtrRoot(const Value *V) {
+  const Value *Cur = V;
+  SmallPtrSet<const Value *, 8> Seen;
+  while (Cur && Seen.insert(Cur).second) {
+    const Value *Next = nullptr;
+    if (const auto *Cast = dyn_cast<CastInst>(Cur)) {
+      if (Cast->getOpcode() == Instruction::IntToPtr ||
+          Cast->getOpcode() == Instruction::BitCast ||
+          Cast->getOpcode() == Instruction::AddrSpaceCast)
+        Next = Cast->getOperand(0);
+    } else if (const auto *BO = dyn_cast<BinaryOperator>(Cur)) {
+      if ((BO->getOpcode() == Instruction::Add ||
+           BO->getOpcode() == Instruction::Sub) &&
+          isa<ConstantInt>(BO->getOperand(1)))
+        Next = BO->getOperand(0);
+    } else if (const auto *GEP = dyn_cast<GetElementPtrInst>(Cur)) {
+      if (GEP->hasAllConstantIndices())
+        Next = GEP->getPointerOperand();
+    }
+    if (!Next || Next == Cur)
+      break;
+    Cur = Next;
+  }
+  return Cur;
+}
+
+// Erase P when it is a now-dead address instruction (GEP or cast), then
+// recurse into its pointer operand while that stays single-use and dead.
+void eraseDeadAddressChain(Value *P) {
+  while (auto *I = dyn_cast_or_null<Instruction>(P)) {
+    if (!I->use_empty())
+      return;
+    Value *Next = nullptr;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(I))
+      Next = GEP->getPointerOperand();
+    else if (auto *Cast = dyn_cast<CastInst>(I))
+      Next = Cast->getOperand(0);
+    else
+      return;
+    I->eraseFromParent();
+    P = Next;
+  }
 }
 
 // True when the alloca's address escapes anywhere except simple loads,
@@ -396,6 +486,150 @@ bool rebuildScalarGroups(Function &F, const DataLayout &DL) {
   return Changed;
 }
 
+// True when byte offset B inside T (whose object starts at Base) falls
+// on an elementary boundary: a scalar/field edge at any nesting depth.
+// Copy runs never split an elementary field, so a boundary inside a
+// leaf scalar is not a copy boundary.
+bool typeBoundaryAt(Type *T, const DataLayout &DL, uint64_t Base,
+                    uint64_t B, unsigned Depth = 0) {
+  if (B == Base)
+    return true;
+  uint64_t Sz = DL.getTypeAllocSize(T);
+  if (B == Base + Sz)
+    return true;
+  if (B < Base || B >= Base + Sz || Depth >= 8)
+    return false;
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned i = 0, e = ST->getNumElements(); i < e; ++i) {
+      uint64_t FO = Base + SL->getElementOffset(i);
+      if (B >= FO && B <= FO + DL.getTypeAllocSize(ST->getElementType(i)))
+        if (typeBoundaryAt(ST->getElementType(i), DL, FO, B, Depth + 1))
+          return true;
+    }
+    return false;
+  }
+  if (auto *AT = dyn_cast<ArrayType>(T)) {
+    uint64_t ES = DL.getTypeAllocSize(AT->getElementType());
+    if (ES == 0)
+      return false;
+    uint64_t EBase = Base + (B - Base) / ES * ES;
+    return typeBoundaryAt(AT->getElementType(), DL, EBase, B, Depth + 1);
+  }
+  return false; // inside a scalar leaf
+}
+
+// True when [RelOff, RelOff+Width) covers whole elementary fields of ST:
+// both edges and every internal boundary of the folded run land on
+// field boundaries at any depth. A scalarized copy of a struct never
+// splits a leaf field, so a run whose pairs cut through one cannot be a
+// struct copy.
+bool fieldAlignedWindow(StructType *ST, const DataLayout &DL,
+                        uint64_t RelOff, uint64_t Width,
+                        ArrayRef<uint64_t> Bounds) {
+  if (!typeBoundaryAt(ST, DL, 0, RelOff) ||
+      !typeBoundaryAt(ST, DL, 0, RelOff + Width))
+    return false;
+  for (uint64_t B : Bounds)
+    if (B != 0 && !typeBoundaryAt(ST, DL, 0, RelOff + B))
+      return false;
+  return true;
+}
+
+// True when the folded window [RelOff, RelOff+Width) at Root is provably
+// an aggregate region on this side:
+//  - a whole known object: alloca/global sized exactly Width at offset 0
+//    (aggregate, or a scalar slot of >=16 bytes the compiler would have
+//    copied as a unit),
+//  - a field-aligned window of a struct-typed base, or
+//  - for an opaque root (argument, inttoptr, call result, ...): a
+//    byte window starting at 0 whose size and internal boundaries match
+//    an identified module struct -- the shape rebuilder E writes for
+//    real field clusters. The matching type is returned in Match so the
+//    caller can require both sides to agree on one layout.
+// Byte-dispatch code (CRT memcpy size switches over opaque inttoptr
+// roots) satisfies none of these and must not fold.
+bool copyWindowEvidence(Module &M, const DataLayout &DL, const Value *Root,
+                        uint64_t RelOff, uint64_t Width,
+                        ArrayRef<uint64_t> Bounds, StructType *&Match) {
+  Match = nullptr;
+  Type *ObjTy = nullptr;
+  if (const auto *AI = dyn_cast<AllocaInst>(Root))
+    ObjTy = AI->getAllocatedType();
+  else if (const auto *GV = dyn_cast<GlobalValue>(Root))
+    ObjTy = GV->getValueType();
+  if (ObjTy) {
+    if (auto *ST = dyn_cast<StructType>(ObjTy))
+      return !ST->isOpaque() &&
+             fieldAlignedWindow(ST, DL, RelOff, Width, Bounds);
+    uint64_t ObjSize = DL.getTypeAllocSize(ObjTy);
+    if (ObjSize == 0 || RelOff != 0 || Width != ObjSize)
+      return false;
+    return ObjTy->isAggregateType() || Width >= 16;
+  }
+  if (RelOff != 0)
+    return false;
+  for (StructType *ST : M.getIdentifiedStructTypes()) {
+    if (ST->isOpaque() || ST->isPacked() || ST->getNumElements() < 2)
+      continue;
+    if (DL.getTypeAllocSize(ST) != Width)
+      continue;
+    if (fieldAlignedWindow(ST, DL, 0, Width, Bounds)) {
+      Match = ST;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Corroboration for opaque-side matches: Root must show field traffic
+// beyond the copy run -- loads, or stores whose value is not itself a
+// load (a load/store pair is copy traffic, not evidence), hitting >=2
+// distinct fields of ST with the exact field types. Size alone is a
+// coincidence (a 20-byte memcpy is not a {i64,i64,i32}); non-copy field
+// traffic on the same root is what makes the window a struct copy.
+bool hasFieldEvidence(Function &F, const DataLayout &DL, const Value *Root,
+                      StructType *ST) {
+  const StructLayout *SL = DL.getStructLayout(ST);
+  SmallVector<char, 8> Seen(ST->getNumElements(), 0);
+  unsigned SeenCount = 0;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      Value *Ptr = nullptr;
+      Type *Ty = nullptr;
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (LI->isVolatile() || LI->isAtomic())
+          continue;
+        // A load feeding one store is copy traffic, not field traffic.
+        if (LI->hasOneUse() && isa<StoreInst>(*LI->user_begin()))
+          continue;
+        Ptr = LI->getPointerOperand();
+        Ty = LI->getType();
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (SI->isVolatile() || SI->isAtomic() ||
+            isa<LoadInst>(SI->getValueOperand()))
+          continue;
+        Ptr = SI->getPointerOperand();
+        Ty = SI->getValueOperand()->getType();
+      } else {
+        continue;
+      }
+      uint64_t Off = 0;
+      const Value *R = resolveFootprintBase(skipCopies(Ptr), DL, Off);
+      if (!R || skipCopies(R) != Root)
+        continue;
+      for (unsigned i = 0, e = ST->getNumElements(); i < e; ++i)
+        if (SL->getElementOffset(i) == Off &&
+            ST->getElementType(i) == Ty && !Seen[i]) {
+          Seen[i] = 1;
+          if (++SeenCount >= 2)
+            return true;
+        }
+    }
+  }
+  return false;
+}
+
 // Rebuild B: fold adjacent scalar load/store copy runs into llvm.memcpy.
 // Returns true on any fold.
 bool rebuildCopyRuns(Function &F, const DataLayout &DL) {
@@ -415,32 +649,15 @@ bool rebuildCopyRuns(Function &F, const DataLayout &DL) {
       uint64_t Width = 0;
     };
     auto baseAndOffset = [&](Value *Ptr, const Value *&Base,
-                             uint64_t &Off) -> Type * {
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
-        APInt ByteOff(DL.getIndexSizeInBits(0), 0);
-        // Peel one constant GEP layer; the base may itself be a GEP
-        // (test IR threads field GEPs through byte GEPs). Only the
-        // outermost constant offset matters for contiguity.
-        if (GEP->accumulateConstantOffset(DL, ByteOff)) {
-          Base = skipCopies(GEP->getPointerOperand());
-          Off = ByteOff.getZExtValue();
-          return GEP->getSourceElementType();
-        }
-        return nullptr;
-      }
-      // Direct base: an alloca, argument, or global at offset 0.
-      const Value *B = skipCopies(Ptr);
-      if (auto *AI = dyn_cast<AllocaInst>(B)) {
-        Base = AI;
-        Off = 0;
-        return AI->getAllocatedType();
-      }
-      if (isa<Argument>(B) || isa<GlobalValue>(B)) {
-        Base = B;
-        Off = 0;
-        return nullptr;
-      }
-      return nullptr;
+                             uint64_t &Off) -> bool {
+      // Peel every constant-index GEP layer; the base may itself be a
+      // GEP (test IR threads field GEPs through byte GEPs). Only the
+      // total constant offset matters for contiguity.
+      const Value *Root = resolveFootprintBase(skipCopies(Ptr), DL, Off);
+      if (!Root)
+        return false;
+      Base = skipCopies(Root);
+      return true;
     };
 
     SmallVector<CopyPair, 8> Run;
@@ -472,6 +689,41 @@ bool rebuildCopyRuns(Function &F, const DataLayout &DL) {
         SrcCursor += P.Width;
         DstCursor += P.Width;
       }
+      // Aggregate evidence: a fold must be explainable as one source
+      // struct copy -- a field-aligned window of a struct-typed base, a
+      // whole known object, or a byte window matching a module struct
+      // type. Both bases must address the same relative offset. Byte-
+      // dispatch copy code carries no such evidence and stays scalar.
+      // When opaque roots match a module struct type, both sides must
+      // agree on one layout and show corroborating field traffic.
+      if (Run.front().SrcOff != Run.front().DstOff) {
+        Run.clear();
+        return;
+      }
+      SmallVector<uint64_t, 8> Bounds;
+      for (const CopyPair &P : Run)
+        Bounds.push_back(P.SrcOff - Run.front().SrcOff);
+      StructType *SrcST = nullptr, *DstST = nullptr;
+      Module *M = F.getParent();
+      if (!copyWindowEvidence(*M, DL, SB, Run.front().SrcOff, Total,
+                              Bounds, SrcST) ||
+          !copyWindowEvidence(*M, DL, DB, Run.front().DstOff, Total,
+                              Bounds, DstST)) {
+        Run.clear();
+        return;
+      }
+      if (SrcST && DstST) {
+        // Both sides opaque: the window must match ONE layout and each
+        // root must show corroborating field traffic -- size alone
+        // proves nothing (a 20-byte memcpy is not a {i64,i64,i32}).
+        // When only one side matched a type, the other's known-object
+        // evidence already anchors the layout.
+        if (SrcST != DstST || !hasFieldEvidence(F, DL, SB, SrcST) ||
+            !hasFieldEvidence(F, DL, DB, DstST)) {
+          Run.clear();
+          return;
+        }
+      }
       // Emit one memcpy before the first store. The declaration is built
       // manually and left bare (no attributes): IRBuilder's CreateMemCpy
       // attaches the intrinsic's canonical attribute list, whose interning
@@ -482,7 +734,6 @@ bool rebuildCopyRuns(Function &F, const DataLayout &DL) {
       // (inferattrs) re-derive canonical attributes by name.
       StoreInst *First = Run.front().Store;
       IRBuilder<> B(First);
-      Module *M = F.getParent();
       LLVMContext &Ctx = M->getContext();
       auto *I8Ptr = PointerType::getUnqual(Ctx);
       FunctionType *McTy = FunctionType::get(
@@ -573,10 +824,10 @@ bool rebuildCopyRuns(Function &F, const DataLayout &DL) {
       }
       const Value *SB = nullptr, *DB = nullptr;
       uint64_t SO = 0, DO = 0;
-      Type *STE = baseAndOffset(LI->getPointerOperand(), SB, SO);
-      Type *DTE = baseAndOffset(SI->getPointerOperand(), DB, DO);
-      (void)STE;
-      (void)DTE;
+      bool SOk = baseAndOffset(LI->getPointerOperand(), SB, SO);
+      bool DOk = baseAndOffset(SI->getPointerOperand(), DB, DO);
+      if (!SOk || !DOk)
+        SB = DB = nullptr;
       if (!SB || !DB || SB == DB) {
         if (!Run.empty())
           flushRun();
@@ -946,6 +1197,645 @@ bool rebuildTypedGeps(Function &F, const DataLayout &DL, unsigned Skip) {
   return Changed;
 }
 
+// Rebuild E: field-access clusters -> synthesized struct types.
+//
+// Lifted modules carry no struct types, so rebuilder C's module-type
+// matching never fires there. The aggregate evidence still exists: a
+// pointer root whose scalar loads/stores hit two or more distinct
+// constant offsets is a struct to TypeRecovery ("two offsets make a
+// struct"), and to the pre-IR it was one. E rebuilds that shape: it
+// groups constant-offset footprints by their root value, vetoes the
+// shapes that are not aggregates, synthesizes `struct.agg.<fn>.<n>`
+// from the survivors, and retitles each access to a struct field GEP.
+//
+// Cluster rules, per root:
+//  - eligibility: an Argument or Instruction root (inttoptr, PHI, call),
+//    or an alloca whose allocated type is a byte container ([N x i8]/i8)
+//    or a struct. Globals never cluster (module arrays and vtables are
+//    not local objects) and neither do constants.
+//  - >=2 distinct offsets, each accessed with one unanimous scalar type;
+//    offsets+widths never overlap; extent <= 256 bytes.
+//  - struct-likeness: a dense uniform run of >=3 same-type offsets reads
+//    as an array (unrolled dot products) and is vetoed; an adjacent
+//    same-type pair likewise. Mixed kinds, mixed widths, or a gap pass.
+//  - copy-routine veto: distinct roots that scalarize to the same value
+//    are per-case windows of byte-dispatch code (CRT memcpy switches
+//    inttoptr the same argument in every case); all of them drop.
+//  - alloca windows: every foreign access overlapping the window must be
+//    contained in one field or cover the whole window. An access cutting
+//    across a field edge means the window was guessed wrong.
+//
+// Emission: the observed window [Lo, Hi) becomes the struct; gaps become
+// [N x i8] padding fields. Each member access gets
+// `gep %struct.agg.*, base-at-Lo, 0, field` built before it; the old
+// pointer chain dies with the rewrite. The layout is checked against the
+// DataLayout; a mismatch (ABI padding disagreeing with observed gaps)
+// abandons the cluster. Field types keep what the IR observed --
+// pointer fields lifted as i64 stay i64; TypeRecovery/ABI passes refine.
+bool isStackCookieStore(const StoreInst &SI, const DataLayout &DL) {
+  auto *Xor = dyn_cast<BinaryOperator>(SI.getValueOperand());
+  if (!Xor || Xor->getOpcode() != Instruction::Xor)
+    return false;
+  uint64_t DstOff = 0;
+  const Value *DstRoot =
+      resolveFootprintBase(skipCopies(SI.getPointerOperand()), DL, DstOff);
+  if (!DstRoot)
+    return false;
+  auto IsStackPtr = [](const Value *V) {
+    SmallPtrSet<const Value *, 8> Seen;
+    while (V && Seen.insert(V).second) {
+      if (isa<AllocaInst>(V))
+        return true;
+      if (const auto *Cast = dyn_cast<CastInst>(V))
+        V = Cast->getOperand(0);
+      else if (const auto *GEP = dyn_cast<GetElementPtrInst>(V))
+        V = GEP->getPointerOperand();
+      else
+        break;
+    }
+    return false;
+  };
+  for (const Value *Operand : Xor->operand_values())
+    if (auto *PTI = dyn_cast<PtrToIntInst>(Operand))
+      if (IsStackPtr(PTI->getPointerOperand()))
+        return true;
+  return false;
+}
+
+bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
+  Module *M = F.getParent();
+  if (!M)
+    return false;
+  LLVMContext &Ctx = F.getContext();
+
+  struct Access {
+    Instruction *Inst = nullptr;
+    Value *Ptr = nullptr;
+    const Value *Root = nullptr;
+    uint64_t Off = 0;
+    uint64_t Width = 0;
+    Type *Ty = nullptr;
+    unsigned Kind = 0;
+    unsigned Bits = 0;
+    bool Store = false;
+    bool Member = false; // scalar access that can join a cluster
+  };
+  SmallVector<Access, 32> Accesses;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      Value *Ptr = nullptr;
+      Type *Ty = nullptr;
+      bool IsStore = false;
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (LI->isVolatile() || LI->isAtomic())
+          continue;
+        Ptr = LI->getPointerOperand();
+        Ty = LI->getType();
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (SI->isVolatile() || SI->isAtomic() ||
+            isStackCookieStore(*SI, DL))
+          continue;
+        Ptr = SI->getPointerOperand();
+        Ty = SI->getValueOperand()->getType();
+        IsStore = true;
+      } else {
+        continue;
+      }
+      // An access that already walks a struct-typed GEP carries the
+      // pre-IR's own type; it is neither evidence nor foreign.
+      bool StructStep = false;
+      for (const Value *V = Ptr; auto *GEP = dyn_cast<GetElementPtrInst>(V);
+           V = GEP->getPointerOperand())
+        if (GEP->getSourceElementType()->isStructTy()) {
+          StructStep = true;
+          break;
+        }
+      if (StructStep)
+        continue;
+      uint64_t Off = 0;
+      const Value *Root = resolveFootprintBase(skipCopies(Ptr), DL, Off);
+      if (!Root || !Root->getType()->isPointerTy())
+        continue;
+      Root = skipCopies(Root);
+      Access A;
+      A.Inst = &I;
+      A.Ptr = Ptr;
+      A.Root = Root;
+      A.Off = Off;
+      A.Store = IsStore;
+      A.Ty = Ty;
+      A.Width = DL.getTypeStoreSize(Ty);
+      // i128+ is an SSE spill slot in lifted code, not a C field: wide
+      // integers may be foreign accesses but never join a cluster.
+      if (accessKindBits(Ty, A.Kind, A.Bits) && A.Width > 0 &&
+          !(Ty->isIntegerTy() && Ty->getIntegerBitWidth() > 64))
+        A.Member = true;
+      Accesses.push_back(A);
+    }
+  }
+  if (Accesses.empty())
+    return false;
+
+  // Group access indices per root, first-seen order for determinism.
+  DenseMap<const Value *, SmallVector<unsigned, 8>> ByRoot;
+  SmallVector<const Value *, 8> RootOrder;
+  for (unsigned i = 0, e = Accesses.size(); i < e; ++i) {
+    const Value *R = Accesses[i].Root;
+    auto It = ByRoot.find(R);
+    if (It == ByRoot.end()) {
+      RootOrder.push_back(R);
+      ByRoot[R].push_back(i);
+    } else {
+      It->second.push_back(i);
+    }
+  }
+
+  // Copy-routine veto: roots sharing one scalarized producer are
+  // per-case windows, not objects.
+  DenseMap<const Value *, unsigned> ScalarUsers;
+  SmallVector<const Value *, 8> RootScalar;
+  for (const Value *R : RootOrder) {
+    const Value *S = isa<Argument>(R) ? R : scalarizePtrRoot(R);
+    RootScalar.push_back(S);
+    ++ScalarUsers[S];
+  }
+
+  auto eligibleRoot = [](const Value *Root) -> bool {
+    if (const auto *AI = dyn_cast<AllocaInst>(Root)) {
+      Type *AT = AI->getAllocatedType();
+      if (auto *Arr = dyn_cast<ArrayType>(AT))
+        return Arr->getElementType()->isIntegerTy(8);
+      return AT->isIntegerTy(8) || AT->isStructTy();
+    }
+    if (isa<Constant>(Root))
+      return false;
+    return isa<Instruction>(Root) || isa<Argument>(Root);
+  };
+
+  bool Changed = false;
+  unsigned Synth = 0;
+  for (size_t RI = 0, RE = RootOrder.size(); RI < RE; ++RI) {
+    const Value *Root = RootOrder[RI];
+    if (ScalarUsers[RootScalar[RI]] > 1 || !eligibleRoot(Root))
+      continue;
+    const SmallVector<unsigned, 8> &Idxs = ByRoot[Root];
+
+    // Cluster fields keyed by offset: scalar members only, unanimous
+    // type per offset.
+    struct Field {
+      uint64_t Off = 0;
+      uint64_t Width = 0;
+      Type *Ty = nullptr;
+      SmallVector<unsigned, 4> Idx;
+    };
+    SmallVector<Field, 8> Fields;
+    SmallVector<unsigned, 8> Demoted; // member accesses demoted to foreign
+    {
+      SmallVector<unsigned, 8> MemberIdx;
+      for (unsigned I : Idxs)
+        if (Accesses[I].Member)
+          MemberIdx.push_back(I);
+      // Wider first at each offset: the widest access claims the field,
+      // narrower same-offset reads (an i8 peek into an i32) demote.
+      llvm::sort(MemberIdx, [&](unsigned A, unsigned B) {
+        if (Accesses[A].Off != Accesses[B].Off)
+          return Accesses[A].Off < Accesses[B].Off;
+        return Accesses[A].Width > Accesses[B].Width;
+      });
+      bool Veto = false;
+      for (size_t k = 0; k < MemberIdx.size();) {
+        size_t kEnd = k;
+        uint64_t Off = Accesses[MemberIdx[k]].Off;
+        while (kEnd < MemberIdx.size() &&
+               Accesses[MemberIdx[kEnd]].Off == Off)
+          ++kEnd;
+        const Access &A0 = Accesses[MemberIdx[k]];
+        // Same-offset disagreement: the widest access owns the field,
+        // narrower ones demote to foreign peeks.
+        SmallVector<unsigned, 4> GroupIdx;
+        bool GroupVeto = false;
+        for (size_t m = k; m < kEnd; ++m) {
+          const Access &A = Accesses[MemberIdx[m]];
+          if (A.Ty == A0.Ty) {
+            GroupIdx.push_back(MemberIdx[m]);
+            continue;
+          }
+          if (A.Width < A0.Width) {
+            Demoted.push_back(MemberIdx[m]);
+            continue;
+          }
+          GroupVeto = true; // disagreeing wider-than-owner type
+          break;
+        }
+        if (GroupVeto || GroupIdx.empty()) {
+          Veto = true;
+          break;
+        }
+        // Overlap with earlier fields: contained or whole-field overlay
+        // demotes the whole group; an edge cut vetoes the cluster.
+        uint64_t GEnd = Off + A0.Width;
+        bool Overlaps = !Fields.empty() && Off < Fields.back().Off +
+                                                  Fields.back().Width;
+        if (Overlaps) {
+          bool InsideSome = false, Covers = true;
+          for (const Field &Fd : Fields) {
+            uint64_t FS = Fd.Off, FE = Fd.Off + Fd.Width;
+            if (GEnd <= FS || Off >= FE)
+              continue;
+            if (Off >= FS && GEnd <= FE)
+              InsideSome = true;
+            else if (!(Off <= FS && GEnd >= FE))
+              Covers = false; // edge cut
+          }
+          if (!Covers && !InsideSome) {
+            Veto = true;
+            break;
+          }
+          for (unsigned I : GroupIdx)
+            Demoted.push_back(I);
+        } else {
+          Field Fd;
+          Fd.Off = Off;
+          Fd.Width = A0.Width;
+          Fd.Ty = A0.Ty;
+          Fd.Idx = GroupIdx;
+          Fields.push_back(std::move(Fd));
+        }
+        k = kEnd;
+      }
+      for (unsigned I : Demoted)
+        Accesses[I].Member = false;
+      if (Veto)
+        continue;
+    }
+    if (Fields.size() < 2)
+      continue;
+    bool Veto = false;
+    uint64_t Lo = Fields.front().Off;
+    uint64_t Hi = Fields.back().Off + Fields.back().Width;
+    // A large byte-array frame is a set of unrelated local objects. Carve
+    // small neighboring runs rather than treating the entire frame as one
+    // aggregate; only touch fields in the chosen run.
+    if (isa<AllocaInst>(Root)) {
+      size_t BestStart = 0, BestEnd = 0;
+      auto ConfirmsRun = [&](size_t Start, size_t End) {
+        for (BasicBlock &CallBB : F)
+          for (Instruction &CallI : CallBB) {
+            auto *CB = dyn_cast<CallBase>(&CallI);
+            Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+            if (!Callee || Callee->isDeclaration())
+              continue;
+            for (unsigned AI = 0; AI < CB->arg_size(); ++AI) {
+              uint64_t CallOff = 0;
+              if (resolveFootprintBase(skipCopies(CB->getArgOperand(AI)),
+                                       DL, CallOff) != Root ||
+                  CallOff != Fields[Start].Off || AI >= Callee->arg_size())
+                continue;
+              Argument *CA = Callee->getArg(AI);
+              bool AllSeen = true;
+              for (size_t FI = Start; FI < End; ++FI) {
+                const Field &Fd = Fields[FI];
+                bool Seen = false;
+                for (BasicBlock &CBB : *Callee)
+                  for (Instruction &CI : CBB) {
+                    Value *Ptr = nullptr;
+                    Type *AT = nullptr;
+                    if (auto *LI = dyn_cast<LoadInst>(&CI)) {
+                      Ptr = LI->getPointerOperand();
+                      AT = LI->getType();
+                    } else if (auto *SI = dyn_cast<StoreInst>(&CI)) {
+                      Ptr = SI->getPointerOperand();
+                      AT = SI->getValueOperand()->getType();
+                    }
+                    if (!Ptr || !AT)
+                      continue;
+                    bool SameStorage =
+                        AT == Fd.Ty ||
+                        (DL.getTypeStoreSize(AT) == Fd.Width &&
+                         DL.getTypeStoreSize(Fd.Ty) == Fd.Width &&
+                         ((AT->isPointerTy() && Fd.Ty->isIntegerTy(64)) ||
+                          (Fd.Ty->isPointerTy() &&
+                           AT->isIntegerTy(64))));
+                    if (!SameStorage)
+                      continue;
+                    uint64_t AccessOff = 0;
+                    if (resolveFootprintBase(skipCopies(Ptr), DL,
+                                             AccessOff) == CA &&
+                        AccessOff == Fd.Off - Fields[Start].Off) {
+                      Seen = true;
+                      if (AT->isPointerTy())
+                        Fields[FI].Ty = AT;
+                    }
+                  }
+                AllSeen &= Seen;
+              }
+              if (AllSeen)
+                return true;
+            }
+          }
+        return false;
+      };
+      for (size_t Start = 0; Start < Fields.size();) {
+        size_t GroupEnd = Start + 1;
+        while (GroupEnd < Fields.size() &&
+               Fields[GroupEnd].Off - (Fields[GroupEnd - 1].Off +
+                                       Fields[GroupEnd - 1].Width) <= 16)
+          ++GroupEnd;
+        for (size_t End = Start + 1; End <= GroupEnd; ++End)
+          if (End - Start > BestEnd - BestStart &&
+              ConfirmsRun(Start, End)) {
+            BestStart = Start;
+            BestEnd = End;
+          }
+        Start = GroupEnd;
+      }
+      if (BestEnd == BestStart)
+        continue;
+      SmallVector<Field, 8> Local;
+      for (size_t I = BestStart; I < BestEnd; ++I)
+        Local.push_back(std::move(Fields[I]));
+      Fields = std::move(Local);
+    }
+    Lo = Fields.front().Off;
+    Hi = Fields.back().Off + Fields.back().Width;
+    if (Hi - Lo > 256)
+      continue;
+    if (isa<AllocaInst>(Root)) {
+      bool CalleeConfirms = false;
+      for (BasicBlock &CallBB : F)
+        for (Instruction &CallI : CallBB) {
+          auto *CB = dyn_cast<CallBase>(&CallI);
+          Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+          if (!Callee || Callee->isDeclaration())
+            continue;
+          for (unsigned AI = 0; AI < CB->arg_size(); ++AI) {
+            uint64_t CallOff = 0;
+            const Value *CallRoot = resolveFootprintBase(
+                skipCopies(CB->getArgOperand(AI)), DL, CallOff);
+            if (CallRoot != Root || CallOff != Lo ||
+                AI >= Callee->arg_size())
+              continue;
+            Argument *CA = Callee->getArg(AI);
+            bool AllFieldsSeen = true;
+            for (const Field &Fd : Fields) {
+              bool Seen = false;
+              for (BasicBlock &CBB : *Callee)
+                for (Instruction &CI : CBB) {
+                  Value *Ptr = nullptr;
+                  Type *AT = nullptr;
+                  if (auto *LI = dyn_cast<LoadInst>(&CI)) {
+                    Ptr = LI->getPointerOperand();
+                    AT = LI->getType();
+                  } else if (auto *SI = dyn_cast<StoreInst>(&CI)) {
+                    Ptr = SI->getPointerOperand();
+                    AT = SI->getValueOperand()->getType();
+                  }
+                  if (!Ptr || AT != Fd.Ty)
+                    continue;
+                  uint64_t AccessOff = 0;
+                  if (resolveFootprintBase(skipCopies(Ptr), DL, AccessOff) ==
+                          CA &&
+                      AccessOff == Fd.Off - Lo)
+                    Seen = true;
+                }
+              AllFieldsSeen &= Seen;
+            }
+            CalleeConfirms |= AllFieldsSeen;
+          }
+        }
+      if (!CalleeConfirms)
+        continue;
+    }
+    if (!isa<AllocaInst>(Root)) {
+      auto *RA = dyn_cast<Argument>(Root);
+      if (!RA)
+        continue;
+      unsigned ConfirmingCallers = 0;
+      for (Function &Caller : *M)
+        if (!Caller.isDeclaration())
+          for (BasicBlock &CallerBB : Caller)
+            for (Instruction &CI : CallerBB) {
+              auto *CB = dyn_cast<CallBase>(&CI);
+              if (!CB || CB->getCalledFunction() != &F ||
+                  RA->getArgNo() >= CB->arg_size())
+                continue;
+              uint64_t BaseOff = 0;
+              const Value *Base = resolveFootprintBase(
+                  skipCopies(CB->getArgOperand(RA->getArgNo())), DL, BaseOff);
+              if (!Base)
+                continue;
+              bool AllSeen = true;
+              for (const Field &Fd : Fields) {
+                bool Seen = false;
+                for (BasicBlock &CallerBlock : Caller)
+                  for (Instruction &AccessI : CallerBlock) {
+                    Value *Ptr = nullptr;
+                    Type *AccessTy = nullptr;
+                    if (auto *LI = dyn_cast<LoadInst>(&AccessI)) {
+                      Ptr = LI->getPointerOperand();
+                      AccessTy = LI->getType();
+                    } else if (auto *SI = dyn_cast<StoreInst>(&AccessI)) {
+                      Ptr = SI->getPointerOperand();
+                      AccessTy = SI->getValueOperand()->getType();
+                    }
+                    if (!Ptr || AccessTy != Fd.Ty)
+                      continue;
+                    uint64_t Off = 0;
+                    if (resolveFootprintBase(skipCopies(Ptr), DL, Off) ==
+                            Base &&
+                        Off == BaseOff + Fd.Off - Lo)
+                      Seen = true;
+                  }
+                AllSeen &= Seen;
+              }
+              ConfirmingCallers += AllSeen;
+            }
+      if (ConfirmingCallers < 1)
+        continue;
+    }
+    // Struct-likeness: veto a dense uniform run of >=3 offsets (an
+    // unrolled array) and an adjacent same-type pair.
+    if (Fields.size() >= 3) {
+      const Field &A = Fields[0];
+      bool Uniform = true;
+      for (size_t k = 1; k < Fields.size(); ++k) {
+        if (Fields[k].Off != Fields[k - 1].Off + Fields[k - 1].Width ||
+            Fields[k].Ty != A.Ty) {
+          Uniform = false;
+          break;
+        }
+      }
+      if (Uniform)
+        continue;
+    } else {
+      const Field &A = Fields[0], &Bf = Fields[1];
+      if (Bf.Off == A.Off + A.Width && A.Ty == Bf.Ty)
+        continue;
+    }
+    // Alloca windows: foreign accesses (non-scalar or demoted members)
+    // must not cut a field edge. Each is tolerated only when fully
+    // inside one field (a byte peek into a field) or a union of whole
+    // fields (an i64 overlay of two adjacent i32 fields).
+    if (isa<AllocaInst>(Root)) {
+      for (unsigned I : Idxs) {
+        const Access &A = Accesses[I];
+        bool IsMember = false;
+        for (const Field &Fd : Fields)
+          if (Fd.Off == A.Off && Fd.Ty == A.Ty && A.Member)
+            IsMember = true;
+        if (IsMember)
+          continue;
+        uint64_t AEnd = A.Off + std::max<uint64_t>(A.Width, 1);
+        if (AEnd <= Lo || A.Off >= Hi)
+          continue;
+        bool Ok = false;
+        for (const Field &Fd : Fields) {
+          uint64_t FS = Fd.Off, FE = Fd.Off + Fd.Width;
+          if (AEnd <= FS || A.Off >= FE)
+            continue;
+          if (A.Off >= FS && AEnd <= FE) {
+            Ok = true; // inside one field
+            break;
+          }
+          if ((A.Off > FS && A.Off < FE) || (AEnd > FS && AEnd < FE)) {
+            Ok = false; // edge cut
+            break;
+          }
+          Ok = true; // covers this field whole; keep checking
+        }
+        if (!Ok) {
+          Veto = true;
+          break;
+        }
+      }
+      if (Veto)
+        continue;
+    }
+
+    // Prefer an existing module struct whose layout reproduces the
+    // observed window exactly: every observed (offset, type) must be a
+    // field, and no field may start inside the window without being
+    // observed (a missed member means the cluster is a different
+    // struct). Only when nothing matches do we synthesize
+    // `struct.agg.<fn>.<n>`: observed fields plus [N x i8] gap padding.
+    SmallVector<Type *, 8> Elems;
+    DenseMap<uint64_t, unsigned> OffToIdx;
+    Type *I8 = Type::getInt8Ty(Ctx);
+    StructType *ST = nullptr;
+    bool Reused = false;
+    for (StructType *Cand : M->getIdentifiedStructTypes()) {
+      if (Cand->isOpaque() || Cand->isPacked())
+        continue;
+      const StructLayout *CL = DL.getStructLayout(Cand);
+      bool Match = true;
+      for (unsigned i = 0, e = Cand->getNumElements(); i < e; ++i) {
+        uint64_t CO = CL->getElementOffset(i);
+        if (CO < Lo || CO >= Hi)
+          continue;
+        bool Seen = false;
+        for (const Field &Fd : Fields)
+          if (Fd.Off == CO && Fd.Ty == Cand->getElementType(i))
+            Seen = true;
+        if (!Seen) {
+          Match = false;
+          break;
+        }
+      }
+      if (!Match)
+        continue;
+      bool AllSeen = true;
+      for (const Field &Fd : Fields) {
+        bool Seen = false;
+        for (unsigned i = 0, e = Cand->getNumElements(); i < e; ++i)
+          if (CL->getElementOffset(i) == Fd.Off &&
+              Cand->getElementType(i) == Fd.Ty)
+            Seen = true;
+        if (!Seen) {
+          AllSeen = false;
+          break;
+        }
+      }
+      if (!AllSeen)
+        continue;
+      ST = Cand;
+      Reused = true;
+      for (unsigned i = 0, e = ST->getNumElements(); i < e; ++i)
+        for (const Field &Fd : Fields)
+          if (CL->getElementOffset(i) == Fd.Off)
+            OffToIdx[Fd.Off] = i;
+      break;
+    }
+    if (!ST) {
+      uint64_t Cursor = Lo;
+      for (const Field &Fd : Fields) {
+        if (Fd.Off > Cursor)
+          Elems.push_back(ArrayType::get(I8, Fd.Off - Cursor));
+        OffToIdx[Fd.Off] = Elems.size();
+        Elems.push_back(Fd.Ty);
+        Cursor = Fd.Off + Fd.Width;
+      }
+      ST = StructType::create(
+          Ctx, Elems,
+          "struct.agg." + (F.getName() + "." + Twine(Synth++)).str());
+      const StructLayout *SL = DL.getStructLayout(ST);
+      bool LayoutOk = true;
+      for (const Field &Fd : Fields)
+        if (SL->getElementOffset(OffToIdx[Fd.Off]) != Fd.Off - Lo) {
+          LayoutOk = false;
+          break;
+        }
+      if (!LayoutOk)
+        continue;
+    }
+
+    // Base addressing the struct start: for a reused type the fields
+    // are absolute offsets off the root, so the base is the root
+    // itself; for a synthesized window [Lo, Hi) it is root + Lo (a
+    // shared byte GEP placed right after the root).
+    Value *BaseAtLo = const_cast<Value *>(Root);
+    if (!Reused && Lo != 0) {
+      Instruction *IP = nullptr;
+      if (auto *RI = dyn_cast<Instruction>(BaseAtLo))
+        if (std::optional<BasicBlock::iterator> OptIP =
+                RI->getInsertionPointAfterDef())
+          IP = &**OptIP;
+      if (!IP)
+        IP = &*F.getEntryBlock().getFirstInsertionPt();
+      IRBuilder<> LB(IP);
+      auto *LG = cast<GetElementPtrInst>(
+          LB.CreateGEP(I8, BaseAtLo, LB.getInt64(Lo), "rv.agg.base"));
+      if (auto *RI = dyn_cast<Instruction>(Root))
+        copyVA(RI, LG);
+      BaseAtLo = LG;
+    }
+
+    // Retitle each member access to a field GEP; dead address chains go
+    // with it.
+    for (const Field &Fd : Fields) {
+      for (unsigned I : Fd.Idx) {
+        Access &A = Accesses[I];
+        IRBuilder<> AB(A.Inst);
+        auto *Typed = cast<GetElementPtrInst>(AB.CreateGEP(
+            ST, BaseAtLo,
+            {AB.getInt32(0), AB.getInt32(OffToIdx[Fd.Off])}, "rv.field"));
+        // Preserve the original pointer's nowrap flags (the lifted IR
+        // marks frame and object GEPs `inbounds nuw`).
+        if (auto *PG = dyn_cast<GetElementPtrInst>(A.Ptr))
+          Typed->setNoWrapFlags(PG->getNoWrapFlags());
+        if (auto *PI = dyn_cast<Instruction>(A.Ptr))
+          copyVA(PI, Typed);
+        else
+          copyVA(A.Inst, Typed);
+        A.Inst->setOperand(A.Store ? 1 : 0, Typed);
+        eraseDeadAddressChain(A.Ptr);
+      }
+    }
+    Changed = true;
+  }
+  return Changed;
+}
+
+
 // Rebuild split aggregate values: insertvalue chains that were scalarized
 // into per-field SSA plus extractvalue uses. When a call/return/insertvalue
 // web carries every field of a struct value as scalars that all feed one
@@ -1108,13 +1998,14 @@ PreservedAnalyses UnsroaPass::run(Function &F, FunctionAnalysisManager &) {
   const DataLayout &DL = M->getDataLayout();
 
   bool Changed = false;
-  // Order: regroup scalar allocas first (creates byte GEPs), fold copy
-  // runs (needs scalar pairs), retitle byte GEPs to struct GEPs (needs
-  // module struct types), then rebuild split aggregate values.
+  // Order: regroup scalar allocas first (creates byte GEPs), synthesize
+  // field-cluster structs (writes the struct types rebuilder B's
+  // aggregate evidence reads), fold proven copy runs, retitle byte GEPs
+  // to struct GEPs (needs module struct types), then rebuild split
+  // aggregate values.
   // Debug gate (no functional effect): RV_UNSROA_DISABLE=groups,copies,
-  // geps,values skips that rebuilder; arr,fld skip only the array- or
-  // struct-GEP emission inside rebuildTypedGeps. Used once to bisect a
-  // crash; the committed tests cover everything enabled.
+  // geps,values,clusters skips that rebuilder; arr,fld skip only the
+  // array- or struct-GEP emission inside rebuildTypedGeps.
   unsigned Skip = 0;
   if (const char *Dis = std::getenv("RV_UNSROA_DISABLE")) {
     StringRef S(Dis);
@@ -1130,9 +2021,13 @@ PreservedAnalyses UnsroaPass::run(Function &F, FunctionAnalysisManager &) {
       Skip |= 16;
     if (S.contains("fld"))
       Skip |= 32;
+    if (S.contains("clusters"))
+      Skip |= 64;
   }
   if (!(Skip & 1))
     Changed |= rebuildScalarGroups(F, DL);
+  if (!(Skip & 64))
+    Changed |= rebuildFieldClusters(F, DL);
   if (!(Skip & 2))
     Changed |= rebuildCopyRuns(F, DL);
   if (!(Skip & 4))

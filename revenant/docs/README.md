@@ -24,6 +24,13 @@ Areas and their libraries: `Object` (RevenantObject, PE32+ loader),
 `Image`, `Instr`, `Function`, `BasicBlock`, `Edge`/`EdgeKind`,
 `BlockEnd`, `Program`, `Xrefs`, `PaddingRun`, `Va`/`VaRange`.
 
+`Transforms` includes Unsroa, which reverses aggregate scalarization on
+LLVM IR. It regroups split allocas, rebuilds field-cluster structs, folds
+only evidence-backed scalar copies, restores typed field GEPs, and
+reassembles split aggregate values. Inferred fields must come from
+constant, nonnegative offsets; byte-dispatch copies and array-like access
+runs stay scalar.
+
 ## Build
 
 Standalone against the shared build tree:
