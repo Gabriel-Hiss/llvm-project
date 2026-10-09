@@ -802,10 +802,22 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-pre-like --------------------------------------------------------
-    // Emit right after cleanup + idioms, before any deopt passes. This gives
-    // a baseline to compare against ir-final and the compiler's ir-pre.
+    // Run the deopt pipeline with locals-to-slots as the terminal pass
+    // instead of ssaout. This gives a baseline that matches the compiler's
+    // pre-optimization IR shape (SSA form with allocas, no registers).
     if (Opts.Emit == EmitKind::IrPreLike) {
-      R.Text = CleanText;
+      std::string PreLikePipeline =
+          formatv("function({0},revenant-unloopvec,revenant-structure,"
+                  "revenant-types,revenant-locals-to-slots)",
+                  UnoptPipeline)
+              .str();
+      if (auto E = runPipelineText("ir-pre-like", M, PreLikePipeline,
+                                   R.Stages, uncxxFlavor(Compiler.Producer),
+                                   &UserFunctions))
+        return std::move(E);
+      record(R.Stages, "ir-pre-like", "ok",
+             "deopt + structure + types + locals-to-slots");
+      R.Text = moduleText(*M);
       break;
     }
 
