@@ -117,6 +117,77 @@ bool fpNeedsReassoc(const Instruction &I) {
   }
 }
 
+bool isOrderedLaneReduction(const Instruction &I, const BasicBlock &B) {
+  const auto *Target = dyn_cast<BinaryOperator>(&I);
+  if (!Target || Target->getOpcode() != Instruction::FAdd ||
+      !Target->getType()->isDoubleTy())
+    return false;
+  SmallVector<const LoadInst *, 8> Loads;
+  SmallVector<const BinaryOperator *, 8> Adds;
+  for (const Instruction &J : B) {
+    if (auto *L = dyn_cast<LoadInst>(&J))
+      if (L->getType()->isDoubleTy())
+        Loads.push_back(L);
+    if (auto *BO = dyn_cast<BinaryOperator>(&J))
+      if (BO->getOpcode() == Instruction::FAdd)
+        Adds.push_back(BO);
+  }
+  if (Loads.size() != Adds.size() ||
+      (Loads.size() != 2 && Loads.size() != 4 && Loads.size() != 8))
+    return false;
+  const DataLayout &DL = B.getModule()->getDataLayout();
+  SmallVector<int64_t, 8> Offsets;
+  const Value *CommonBase = nullptr;
+  for (const LoadInst *L : Loads) {
+    const Value *Ptr = L->getPointerOperand();
+    APInt Total(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+    while (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+      APInt Part(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+      if (!GEP->accumulateConstantOffset(DL, Part)) {
+        const Value *Root = GEP->getPointerOperand();
+        if (!CommonBase)
+          CommonBase = Root;
+        else if (CommonBase != Root)
+          return false;
+        break;
+      }
+      if (Part.getBitWidth() != Total.getBitWidth())
+        return false;
+      Total += Part;
+      Ptr = GEP->getPointerOperand();
+    }
+    if (Total.getActiveBits() > 63)
+      return false;
+    Offsets.push_back(Total.getSExtValue());
+  }
+  llvm::sort(Offsets);
+  int64_t Base = Offsets.front();
+  for (unsigned N = 0; N != Offsets.size(); ++N)
+    if (Offsets[N] != Base + static_cast<int64_t>(N * 8))
+      return false;
+  const Value *Accumulator = nullptr;
+  for (unsigned N = 0; N != Adds.size(); ++N) {
+    const BinaryOperator *Add = Adds[N];
+    const LoadInst *Load = nullptr;
+    const Value *Carry = nullptr;
+    for (unsigned Op = 0; Op != 2; ++Op) {
+      if (auto *L = dyn_cast<LoadInst>(Add->getOperand(Op)))
+        Load = L;
+      else
+        Carry = Add->getOperand(Op);
+    }
+    if (!Load || !Carry)
+      return false;
+    if (N && Carry != Accumulator)
+      return false;
+    auto It = llvm::find(Loads, Load);
+    if (It == Loads.end() || It != Loads.begin() + N)
+      return false;
+    Accumulator = Add;
+  }
+  return true;
+}
+
 bool fpReassocOK(const Instruction &I) {
   if (!fpNeedsReassoc(I))
     return true;
@@ -447,8 +518,18 @@ uint64_t matchScaledVecBound(Value *VecBound, Value *N, uint64_t ElemBytes,
 // n.vec is a multiple of 2^K below N, so the erased vector loop ran
 // whole steps and the tail restarted at 0 covers the full range.
 uint64_t matchVecBound(Value *VecBound, Value *N, uint64_t &StepOut) {
-  Value *RootN = stripCountDerivation(N, *cast<Instruction>(VecBound)->getParent()->getParent());
-  if (auto *And = dyn_cast<BinaryOperator>(VecBound)) {
+  const Function &F =
+      *cast<Instruction>(VecBound)->getParent()->getParent();
+  Value *RootN = stripCountDerivation(N, F);
+  Value *Shape = VecBound;
+  while (auto *Cast = dyn_cast<CastInst>(Shape)) {
+    if (Cast->getOpcode() != Instruction::ZExt &&
+        Cast->getOpcode() != Instruction::SExt &&
+        Cast->getOpcode() != Instruction::Trunc)
+      break;
+    Shape = Cast->getOperand(0);
+  }
+  if (auto *And = dyn_cast<BinaryOperator>(Shape)) {
     if (And->getOpcode() == Instruction::And) {
       if (auto *C = dyn_cast<ConstantInt>(And->getOperand(1))) {
         unsigned Width = C->getBitWidth();
@@ -797,6 +878,25 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
     C.TailLoop = L;
     return true;
   }
+  SmallVector<BasicBlock *, 8> Work;
+  DenseSet<BasicBlock *> Seen;
+  for (BasicBlock *Succ : successors(S))
+    if (!R.count(Succ) && Seen.insert(Succ).second)
+      Work.push_back(Succ);
+  while (!Work.empty()) {
+    BasicBlock *BB = Work.pop_back_val();
+    if (R.count(BB))
+      continue;
+    ScalarLoopInfo Loop;
+    if (matchScalarLoop(BB, Loop)) {
+      C.L = BB;
+      C.TailLoop = Loop;
+      return true;
+    }
+    for (BasicBlock *Succ : successors(BB))
+      if (!R.count(Succ) && Seen.insert(Succ).second)
+        Work.push_back(Succ);
+  }
   return false;
 }
 // Loose: find L under S before R is known (D edge only).
@@ -931,35 +1031,43 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   const DenseSet<const PHINode *> *Resume = &C.Resume;
   if (!Secondary) {
     collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, C.Resume);
-    if (C.Resume.empty()) {
-      // No-resume (versioned) form: the scalar side is a full-trip
-      // fallback loop on the same N, not a resumed remainder, so S
-      // reads nothing from R. Accepted only when the versioned flag
-      // held (every R pred of S is a conditional restart guard), no
-      // R value flows into S at all, and R is memory-only: loads,
-      // stores, and pure computation with no calls (the memory-only
-      // body rule -- reductions route values through intrinsics or
-      // chains this rule rejects).
-      bool SReadsR = false;
-      for (PHINode &Phi : C.S->phis())
-        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
-          if (C.R.count(Phi.getIncomingBlock(I)))
-            SReadsR = true;
-      bool HasCalls = false;
-      for (BasicBlock *BB : C.R)
-        for (Instruction &I : *BB)
-          if (isa<CallBase>(&I) && !isa<DbgInfoIntrinsic>(&I))
-            HasCalls = true;
-      if (!C.Versioned || SReadsR || HasCalls)
-        return false;
-    }
   } else if (C.Resume.empty()) {
     collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, Local);
     Resume = &Local;
   }
-  if (!matchTierBound(B, V, C, F, Bound, Step, *Resume))
-    return false;
-  return true;
+  if (matchTierBound(B, V, C, F, Bound, Step, *Resume))
+    return true;
+  if (!Secondary && C.Versioned) {
+    for (Instruction &I : *B)
+      if (isOrderedLaneReduction(I, *B))
+        return true;
+  }
+  if (!Secondary && C.Versioned) {
+    // the whole scalar path can replay N after deleting the vector tier.
+    // Keep this separate from the usual resumed-tail bound proof.
+    for (PHINode &Phi : C.S->phis()) {
+      bool HasStart = false;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+        if (C.Starts.count(Phi.getIncomingBlock(I))) {
+          HasStart = true;
+          if (auto *D = dyn_cast<Instruction>(Phi.getIncomingValue(I)))
+            if (C.R.count(D->getParent()))
+              return false;
+        }
+      if (!HasStart)
+        return false;
+    }
+    for (const PHINode *P : C.CondPhis)
+      for (unsigned I = 0; I < P->getNumIncomingValues(); ++I)
+        if (C.R.count(P->getIncomingBlock(I)))
+          return false;
+    for (BasicBlock *BB : C.R)
+      for (Instruction &I : *BB)
+        if (isa<CallBase>(&I) && !isa<DbgInfoIntrinsic>(&I))
+          return false;
+    return true;
+  }
+  return false;
 }
 
 // Full candidate match for one dispatch block D: S is the successor
@@ -968,15 +1076,44 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 // through S, L, or L's exit.
 
 #define DEBUG_TYPE "unloopvec"
-#define ULV_BAIL()                                                           \
-  do {                                                                       \
+#define ULV_BAIL()                                                            \
+  do {                                                                        \
     LLVM_DEBUG(::llvm::dbgs() << "unloopvec bail " << __LINE__ << " in "      \
-                              << F.getName() << "\n");                       \
+                              << F.getName() << "\n");                        \
   } while (0)
 
 Value *broadcastScalar(Value *V);
 bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F);
 
+bool isZeroStartValue(Value *V, BasicBlock *S,
+                      const DenseSet<BasicBlock *> &Starts,
+                      DenseSet<Value *> &Seen) {
+  if (!Seen.insert(V).second)
+    return true;
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->isZero();
+  if (auto *P = dyn_cast<PHINode>(V)) {
+    if (P->getParent() != S)
+      return false;
+    bool Found = false;
+    for (unsigned I = 0; I < P->getNumIncomingValues(); ++I)
+      if (Starts.count(P->getIncomingBlock(I))) {
+        Found = true;
+        auto *C = dyn_cast<ConstantInt>(P->getIncomingValue(I));
+        if (!C || !C->isZero())
+          return false;
+      }
+    return Found;
+  }
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    return isZeroStartValue(Cast->getOperand(0), S, Starts, Seen);
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1)))
+      return C->isZero() &&
+             isZeroStartValue(BO->getOperand(0), S, Starts, Seen);
+  }
+  return false;
+}
 bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
   auto *Br = dyn_cast<BranchInst>(D->getTerminator());
   if (!Br || !Br->isConditional())
@@ -997,6 +1134,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     for (BasicBlock *ES : successors(L))
       if (ES != L)
         Stop.insert(ES);
+    for (BasicBlock &BB : F)
+      if (isa<ReturnInst>(BB.getTerminator()))
+        Stop.insert(&BB);
     DenseSet<BasicBlock *> R;
     if (!collectRegion(V, Stop, R, F)) {
       continue;
@@ -1145,7 +1285,7 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           ULV_BAIL();
           goto next_pick;
         }
-        if (!fpReassocOK(I)) {
+        if (!fpReassocOK(I) && !isOrderedLaneReduction(I, *BB)) {
           ULV_BAIL();
           goto next_pick;
         }
@@ -1251,7 +1391,7 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     // other tail phis start at S phis or outside-R values. In header
     // mode (S == L) the S-phi rules above plus the resume post check
     // after the body match cover this, so this block is skipped.
-    if (Cand.L != Cand.S) {
+    if (Cand.L != Cand.S && !Cand.Versioned) {
       bool IVOK = false;
       for (unsigned I = 0; I < Cand.TailLoop.IV->getNumIncomingValues(); ++I) {
         BasicBlock *IB = Cand.TailLoop.IV->getIncomingBlock(I);
@@ -1265,20 +1405,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
         if (auto *CZ = dyn_cast<ConstantInt>(Inc)) {
           if (CZ->isZero())
             IVOK = true;
-        } else if (auto *P = dyn_cast<PHINode>(Inc)) {
-          if (P->getParent() != S) {
-            ULV_BAIL();
-            goto next_pick;
-          }
-          bool Zero = false;
-          for (unsigned J = 0; J < P->getNumIncomingValues(); ++J)
-            if (Cand.Starts.count(P->getIncomingBlock(J))) {
-              if (auto *CZ = dyn_cast<ConstantInt>(P->getIncomingValue(J)))
-                if (CZ->isZero())
-                  Zero = true;
-            }
-          if (Zero)
-            IVOK = true;
+        } else {
+          DenseSet<Value *> Seen;
+          IVOK = isZeroStartValue(Inc, S, Cand.Starts, Seen);
         }
       }
       if (!IVOK) {
