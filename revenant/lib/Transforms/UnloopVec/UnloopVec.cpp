@@ -132,7 +132,8 @@ bool isOrderedLaneReduction(const Instruction &I, const BasicBlock &B) {
       if (BO->getOpcode() == Instruction::FAdd)
         Adds.push_back(BO);
   }
-  if (Loads.size() != 8 || Adds.size() != 8)
+  if (Loads.size() != Adds.size() ||
+      (Loads.size() != 2 && Loads.size() != 4 && Loads.size() != 8))
     return false;
   const DataLayout &DL = B.getModule()->getDataLayout();
   SmallVector<int64_t, 8> Offsets;
@@ -877,6 +878,25 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
     C.TailLoop = L;
     return true;
   }
+  SmallVector<BasicBlock *, 8> Work;
+  DenseSet<BasicBlock *> Seen;
+  for (BasicBlock *Succ : successors(S))
+    if (!R.count(Succ) && Seen.insert(Succ).second)
+      Work.push_back(Succ);
+  while (!Work.empty()) {
+    BasicBlock *BB = Work.pop_back_val();
+    if (R.count(BB))
+      continue;
+    ScalarLoopInfo Loop;
+    if (matchScalarLoop(BB, Loop)) {
+      C.L = BB;
+      C.TailLoop = Loop;
+      return true;
+    }
+    for (BasicBlock *Succ : successors(BB))
+      if (!R.count(Succ) && Seen.insert(Succ).second)
+        Work.push_back(Succ);
+  }
   return false;
 }
 // Loose: find L under S before R is known (D edge only).
@@ -1017,8 +1037,12 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   }
   if (matchTierBound(B, V, C, F, Bound, Step, *Resume))
     return true;
+  if (!Secondary) {
+    for (Instruction &I : *B)
+      if (isOrderedLaneReduction(I, *B))
+        return true;
+  }
   if (!Secondary && C.Versioned) {
-    // If the scalar fallback starts at its normal initial values from D,
     // the whole scalar path can replay N after deleting the vector tier.
     // Keep this separate from the usual resumed-tail bound proof.
     for (PHINode &Phi : C.S->phis()) {
@@ -1052,10 +1076,10 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 // through S, L, or L's exit.
 
 #define DEBUG_TYPE "unloopvec"
-#define ULV_BAIL()                                                           \
-  do {                                                                       \
+#define ULV_BAIL()                                                            \
+  do {                                                                        \
     LLVM_DEBUG(::llvm::dbgs() << "unloopvec bail " << __LINE__ << " in "      \
-                              << F.getName() << "\n");                       \
+                              << F.getName() << "\n");                        \
   } while (0)
 
 Value *broadcastScalar(Value *V);
