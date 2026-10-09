@@ -732,16 +732,15 @@ def : RVMatch {
   string Glob = "VPTESTrr";
   dag Body = (rv_ptest (rv_op 0), (rv_op 1));
 }
-// pblendvb selects per byte from xmm0's sign bits: dst = (mask & b) | (~mask & a).
+// pblendvb selects per byte from xmm0's sign bits: (mask, if-set, if-clear).
+def rv_vec : RVOp; // (rv_vec "kind", ebits, args...): typed vecOp at the operand width
 def : RVMatch {
   string Glob = "PBLENDVBrr0";
-  dag Body = (rv_set $dst, (rv_or (rv_and (rv_pmovmskb (rv_reg "XMM0")), (rv_op 1)),
-                                     (rv_and (rv_not (rv_pmovmskb (rv_reg "XMM0"))), (rv_op 0))));
+  dag Body = (rv_set $dst, (rv_vec "blendv", 8, (rv_reg "XMM0"), (rv_op 1), (rv_op 0)));
 }
 def : RVMatch {
   string Glob = "PBLENDVBrm0";
-  dag Body = (rv_set $dst, (rv_or (rv_and (rv_pmovmskb (rv_reg "XMM0")), (rv_op 1)),
-                                     (rv_and (rv_not (rv_pmovmskb (rv_reg "XMM0"))), (rv_op 0))));
+  dag Body = (rv_set $dst, (rv_vec "blendv", 8, (rv_reg "XMM0"), (rv_op 1), (rv_op 0)));
 }
 
 // ---- string-search compares (flags only; vector results stay opaque) ------------------

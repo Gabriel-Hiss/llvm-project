@@ -25,6 +25,21 @@ class RevenantLiftEmitter {
     return DI ? DI->getDef() : nullptr;
   }
 
+  /// Width of the widest vector register class among the operands, 0 when
+  /// the instruction has none.
+  static unsigned vectorWidthOf(const CodeGenInstruction &I) {
+    unsigned W = 0;
+    for (unsigned K = 0, E = I.Operands.size(); K != E; ++K) {
+      StringRef C = I.Operands[K].Rec->getName();
+      unsigned Bits = C.starts_with("VR512")   ? 512
+                      : C.starts_with("VR256") ? 256
+                      : C.starts_with("VR128") ? 128
+                                               : 0;
+      W = std::max(W, Bits);
+    }
+    return W;
+  }
+
   static unsigned widthFor(const Record &Insn) {
     StringRef Name = Insn.getName();
     if (Name.starts_with("MOVSS") || Name.starts_with("VMOVSS"))
@@ -607,6 +622,26 @@ class RevenantLiftEmitter {
             .str();
       }
 
+      if (Name == "rv_vec" && D->getNumArgs() >= 3) {
+        // (rv_vec "kind", ebits, args...): a typed vecOp over Width-bit
+        // operands viewed as lanes of ebits.
+        const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
+        const auto *EB = dyn_cast<IntInit>(D->getArg(1));
+        if (!Kind || !EB || !EB->getValue() || Width % EB->getValue())
+          return {};
+        std::string Args;
+        for (unsigned I = 2; I < D->getNumArgs(); ++I) {
+          std::string A =
+              expression(D->getArg(I), Inst, Width, D->getArgNameStr(I));
+          if (A.empty())
+            return {};
+          Args += (I > 2 ? ", " : "") + A;
+        }
+        return (Twine("LC.vecOp(\"") + Kind->getValue() +
+                "\", LC.vecTy(LC.iN(" + Twine(EB->getValue()) + "), " +
+                Twine(Width / EB->getValue()) + "), {" + Args + "})")
+            .str();
+      }
       if (Name == "rv_fshift" && D->getNumArgs() == 3) {
         const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
         if (!Kind)
@@ -1897,13 +1932,19 @@ public:
       if (Instructions.count(Insn))
         Semantics[Insn] = bodyOf(*R);
     }
-    for (const Record *R : Records.getAllDerivedDefinitions("RVMatch")) {
-      StringRef Glob = R->getValueAsString("Glob");
-      const DagInit *Body = bodyOf(*R);
-      for (const auto &I : Instructions)
-        if (!Semantics.count(I.first) && globMatches(Glob, I.first->getName()))
-          Semantics[I.first] = Body;
-    }
+    // An exact name beats a wildcard, so `MOV*rm` (the general-register
+    // moves) cannot capture MOVSDrm and friends.
+    for (bool Wild : {false, true})
+      for (const Record *R : Records.getAllDerivedDefinitions("RVMatch")) {
+        StringRef Glob = R->getValueAsString("Glob");
+        if (Glob.contains('*') != Wild)
+          continue;
+        const DagInit *Body = bodyOf(*R);
+        for (const auto &I : Instructions)
+          if (!Semantics.count(I.first) &&
+              globMatches(Glob, I.first->getName()))
+            Semantics[I.first] = Body;
+      }
     std::map<const Record *, std::string> PatternBodies;
     for (const PatternToMatch &P : Patterns.ptms()) {
       const TreePatternNode &Dst = P.getDstPattern();
@@ -1945,7 +1986,8 @@ public:
       const CodeGenInstruction &Inst = *Instructions[R];
       std::string Buffer;
       raw_string_ostream BodyOS(Buffer);
-      bool Emits = emitBody(BodyOS, *Body, Inst, widthFor(*R));
+      unsigned VW = vectorWidthOf(Inst);
+      bool Emits = emitBody(BodyOS, *Body, Inst, VW ? VW : widthFor(*R));
       BodyOS.flush();
       if (Emits && !operandRefsValid(Buffer, Inst)) {
         Rejected.push_back(R->getName().str());
