@@ -625,14 +625,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       auto ParentVA = ir::getFunctionVA(Parent);
       if (ParentVA && FuncletAddresses.contains(*ParentVA))
         continue;
-      llvm::AllocaInst *Frame = nullptr;
+      llvm::Value *ParentStack = nullptr;
       for (llvm::Instruction &I : Parent.getEntryBlock())
-        if (auto *AI = dyn_cast<llvm::AllocaInst>(&I);
-            AI && AI->getName() == "frame") {
-          Frame = AI;
-          break;
-        }
-      if (!Frame)
+        if (I.getName() == "sp0")
+          ParentStack = &I;
+      if (!ParentStack)
         continue;
       SmallVector<llvm::BasicBlock *, 8> HandlerBlocks;
       for (llvm::BasicBlock &BB : Parent)
@@ -667,13 +664,22 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         llvm::Function *Funclet = Funclets.lookup(Alias->second);
         if (!Funclet || Funclet->arg_size() != 1 || BB.empty())
           continue;
-        std::optional<uint64_t> ContinueVA = continuationVA(*Funclet);
-        llvm::Instruction *Ret = BB.getTerminator();
+        std::optional<uint64_t> ContinueVA;
+        if (llvm::MDNode *Continuations =
+                Pad->getMetadata("revenant.continuations"))
+          if (Continuations->getNumOperands() == 1)
+            if (auto *MD = dyn_cast<llvm::ConstantAsMetadata>(
+                    Continuations->getOperand(0)))
+              if (auto *Value =
+                      dyn_cast<llvm::ConstantInt>(MD->getValue()))
+                ContinueVA = Value->getZExtValue();
+        if (!ContinueVA)
+          ContinueVA = continuationVA(*Funclet);
         if (!Ret)
           continue;
         llvm::IRBuilder<> Builder(Ret);
         llvm::Value *FrameArg =
-            Builder.CreatePtrToInt(Frame, Funclet->getArg(0)->getType());
+            Builder.CreatePtrToInt(ParentStack, Funclet->getArg(0)->getType());
         SmallVector<llvm::Value *, 1> BundleInputs{Pad};
         SmallVector<OperandBundleDef, 1> Bundles{
             OperandBundleDef("funclet", BundleInputs)};

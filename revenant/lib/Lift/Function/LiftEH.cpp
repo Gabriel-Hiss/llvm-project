@@ -202,11 +202,15 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
         CatchPadInst *PadI = nullptr;
         Value *NullPtr =
             ConstantPointerNull::get(PointerType::getUnqual(C));
+        Value *TypeInfo = NullPtr;
+        if (H->TypeDescriptor)
+          TypeInfo = ConstantExpr::getIntToPtr(
+              ConstantInt::get(Type::getInt64Ty(C),
+                               H->TypeDescriptor->Value),
+              PointerType::getUnqual(C));
         if (EH.Model == EHModel::MSVC) {
-          // The lifted module has no RTTI globals. Retain the source type
-          // spelling in metadata while keeping the selector verifiable.
-          Value *Args[] = {NullPtr, ConstantInt::get(Type::getInt32Ty(C), 0),
-                           NullPtr};
+          Value *Args[] = {TypeInfo,
+                           ConstantInt::get(Type::getInt32Ty(C), 0), NullPtr};
           PadI = CatchPadInst::Create(SW, Args, "eh.catchpad", HandlerBB);
         } else {
           PadI = CatchPadInst::Create(SW, {NullPtr}, "eh.catchpad", HandlerBB);
@@ -221,6 +225,14 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
         if (!H->TypeName.empty())
           PadI->setMetadata("revenant.catchtype",
                             MDNode::get(C, MDString::get(C, H->TypeName)));
+        if (!H->Continuations.empty()) {
+          SmallVector<Metadata *, 2> Continuations;
+          for (Va Continuation : H->Continuations)
+            Continuations.push_back(ConstantAsMetadata::get(
+                ConstantInt::get(Type::getInt64Ty(C), Continuation.Value)));
+          PadI->setMetadata("revenant.continuations",
+                            MDNode::get(C, Continuations));
+        }
         Pad = PadI;
       }
       ir::copyInstructionVA(*CI, *SW);

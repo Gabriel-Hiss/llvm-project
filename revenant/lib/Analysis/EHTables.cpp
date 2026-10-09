@@ -254,13 +254,16 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
           if (!TypeRva || !HandlerRva)
             break;
           std::string Name;
-          if (*TypeRva)
-            if (auto Nme = typeName(I, I.vaOfRva(*TypeRva)))
+          std::optional<Va> TypeDescriptor;
+          if (*TypeRva) {
+            TypeDescriptor = I.vaOfRva(*TypeRva);
+            if (auto Nme = typeName(I, *TypeDescriptor))
               Name = *Nme;
+          }
           Region.Handlers.push_back(F.Handlers.size());
           if (*HandlerRva)
             F.Handlers.push_back({I.vaOfRva(*HandlerRva), HandlerKind::Catch,
-                                  Name, *Lo});
+                                  Name, *Lo, TypeDescriptor});
         }
       }
       F.TryRegions.push_back(std::move(Region));
@@ -308,8 +311,20 @@ std::optional<int32_t> relativeDword(const Image &I, Va &P) {
 
 void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
   auto HeaderBytes = I.dataAt(Data, 1);
-  if (HeaderBytes.empty() || (HeaderBytes[0] & 0x80))
+  if (HeaderBytes.empty())
     return;
+  if (HeaderBytes[0] & 0x80) {
+    auto TargetRva = u32(I, Data);
+    if (!TargetRva)
+      return;
+    Va IndirectInfo = I.vaOfRva(*TargetRva);
+    if (!I.sectionOf(IndirectInfo) || IndirectInfo == Data)
+      return;
+    Data = IndirectInfo;
+    HeaderBytes = I.dataAt(Data, 1);
+    if (HeaderBytes.empty() || (HeaderBytes[0] & 0x80))
+      return;
+  }
   uint8_t Header = HeaderBytes[0];
   Va P = Data.wrappingAdd(1);
   if (Header & 0x04) {
@@ -371,28 +386,46 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
           uint8_t Flags = HB[0]; H = H.wrappingAdd(1);
           if (Flags & 1) if (!fh4int(I, H)) break;
           std::string Name;
+          std::optional<Va> TypeDescriptor;
           if (Flags & 2) {
             auto TypeDisp = relativeDword(I, H);
-            if (!TypeDisp) break;
-            if (auto TypeName = typeName(I, Va(I.Base.Value + *TypeDisp)))
+            if (!TypeDisp)
+              break;
+            TypeDescriptor = Va(I.Base.Value + *TypeDisp);
+            if (auto TypeName = typeName(I, *TypeDescriptor))
               Name = *TypeName;
           }
-          if (Flags & 4) if (!fh4int(I, H)) break;
+          if (Flags & 4)
+            if (!fh4int(I, H))
+              break;
           auto Catch = relativeDword(I, H);
-          if (!Catch) break;
+          if (!Catch)
+            break;
+          uint8_t ContinuationCount = (Flags >> 4) & 3;
+          SmallVector<Va, 2> ContinuationVAs;
+          for (uint8_t K = 0; K < ContinuationCount; ++K) {
+            if (Flags & 8) {
+              auto Continuation = relativeDword(I, H);
+              if (!Continuation)
+                break;
+              ContinuationVAs.push_back(Va(I.Base.Value + *Continuation));
+            } else {
+              auto Continuation = fh4int(I, H);
+              if (!Continuation)
+                break;
+              ContinuationVAs.push_back(
+                  F.Function.wrappingAdd(*Continuation));
+            }
+          }
           if (*Catch) {
             Va Target(I.Base.Value + *Catch);
             if (I.sectionOf(Target)) {
               Region.Handlers.push_back(F.Handlers.size());
               F.Handlers.push_back({Target, HandlerKind::Catch, Name,
-                                    static_cast<int32_t>(*Lo)});
+                                    static_cast<int32_t>(*Lo), TypeDescriptor,
+                                    std::vector<Va>(ContinuationVAs.begin(),
+                                                    ContinuationVAs.end())});
             }
-          }
-          uint8_t Continuations = (Flags >> 4) & 3;
-          for (uint8_t K = 0; K < Continuations; ++K) {
-            if (Flags & 8) {
-              if (!relativeDword(I, H)) break;
-            } else if (!fh4int(I, H)) break;
           }
         }
       }
@@ -666,7 +699,16 @@ std::vector<FunctionEH> revenant::decodeEHTables(const PeFile &PE) {
         uint8_t B = First[0];
         if (B == 0xff || B == 0x1b) {
           readLSDA(I, F, U->Data);
-        } else if (!(B & 0x80) && (B & 0x78)) {
+        } else if (B & 0x80) {
+          auto TargetRva = u32(I, U->Data);
+          Va Info = TargetRva ? I.vaOfRva(*TargetRva) : Va();
+          auto Header = I.dataAt(Info, 1);
+          if (!Header.empty() && !(Header[0] & 0x80) &&
+              (Header[0] & 0x78))
+            readFuncInfo4(I, F, U->Data);
+          else
+            readSEH(I, F, U->Data);
+        } else if (B & 0x78) {
           readFuncInfo4(I, F, U->Data);
         } else {
           readSEH(I, F, U->Data);

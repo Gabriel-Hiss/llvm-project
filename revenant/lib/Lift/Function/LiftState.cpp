@@ -787,7 +787,12 @@ Value *LiftState::memPtr(const Instr &I, unsigned L) {
     return B.CreateInBoundsGEP(iN(8), Sp0, {Sum}, "fp");
   }
   if (isRbp(M.Base) && Stack.rbpOff(M.Disp)) {
-    return framePtrOff(*Stack.rbpOff(M.Disp));
+    int64_t Off = *Stack.rbpOff(M.Disp);
+    if (Fn.hasFnAttribute("revenant.msvc.funclet")) {
+      Value *Base = B.CreateIntToPtr(regRead(X86::RDX), ptrTy(), "eh.frame");
+      return B.CreateInBoundsGEP(iN(8), Base, {ci((uint64_t)Off)}, "eh.fp");
+    }
+    return framePtrOff(Off);
   }
   // General address: base + idx*scale + disp.
   Value *Addr = M.Base == X86::NoRegister ? ci(0) : extTo(regRead(M.Base), 64);

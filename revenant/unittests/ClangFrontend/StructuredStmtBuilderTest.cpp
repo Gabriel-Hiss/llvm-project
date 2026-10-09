@@ -345,12 +345,16 @@ TEST(StructuredStmtBuilderTest, TryCatch) {
   llvm::Value *NullPtr = llvm::ConstantPointerNull::get(Ptr);
   auto *Pad = B.CreateCatchPad(SW, {NullPtr, llvm::ConstantInt::get(I32, 0),
                                     NullPtr});
+  Pad->setMetadata("revenant.catchtype",
+                   MDNode::get(C, MDString::get(C, ".?AVruntime_error@std@@")));
   B.CreateCatchRet(Pad, Ret);
   B.SetInsertPoint(Ret);
   B.CreateRet(llvm::ConstantInt::get(I32, 0));
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("try"), std::string::npos);
   EXPECT_NE(S.find("catch"), std::string::npos);
+  EXPECT_NE(S.find("catch (const ::std::runtime_error &e)"),
+            std::string::npos);
 }
 
 TEST(StructuredStmtBuilderTest, SehTryExcept) {

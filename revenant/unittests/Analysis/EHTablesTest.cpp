@@ -167,6 +167,24 @@ TEST(EHTablesTest, DecodesExceptionMetadataFromCorpus) {
     auto Loaded = PeFile::load(Path);
     ASSERT_TRUE(!!Loaded) << Path;
     auto EH = decodeEHTables(*Loaded);
+    if (llvm::StringRef(Path) == REVENANT_TEST_CPP_O2) {
+      const FunctionEH *Exceptions = nullptr;
+      for (const FunctionEH &F : EH)
+        if (F.Function == Va(0x140003200))
+          Exceptions = &F;
+      ASSERT_NE(Exceptions, nullptr);
+      EXPECT_EQ(Exceptions->Model, EHModel::MSVC);
+      EXPECT_EQ(Exceptions->TryRegions.size(), 1u);
+      ASSERT_EQ(Exceptions->Handlers.size(), 2u);
+      EXPECT_EQ(Exceptions->Handlers[0].Address, Va(0x14006fb00));
+      EXPECT_EQ(Exceptions->Handlers[0].TypeName, ".?AVruntime_error@std@@");
+      EXPECT_EQ(Exceptions->Handlers[1].Address, Va(0x14006fae0));
+      EXPECT_EQ(Exceptions->Handlers[1].TypeName, ".?AVexception@std@@");
+      ASSERT_EQ(Exceptions->Handlers[0].Continuations.size(), 1u);
+      EXPECT_EQ(Exceptions->Handlers[0].Continuations[0], Va(0x140003219));
+      ASSERT_EQ(Exceptions->Handlers[1].Continuations.size(), 1u);
+      EXPECT_EQ(Exceptions->Handlers[1].Continuations[0], Va(0x14000320f));
+    }
     EXPECT_FALSE(EH.empty()) << Path;
     size_t WithContent = 0;
     for (const FunctionEH &F : EH) {
