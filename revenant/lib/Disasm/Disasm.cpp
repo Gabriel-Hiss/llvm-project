@@ -149,6 +149,7 @@ static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
 static std::optional<Instr>
 decodeWithPrefixes(const MCDisassembler &Dis, const MCInstrAnalysis &MIA,
                    const MCInstrInfo &MII, const MCSubtargetInfo &STI,
+                   Va Addr, ArrayRef<uint8_t> Bytes) {
   std::optional<Instr> Prefix = decodeAt(Dis, MIA, MII, STI, Addr, Bytes);
   if (!Prefix)
     return std::nullopt;
