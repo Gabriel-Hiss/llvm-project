@@ -173,9 +173,9 @@ Value *pointerFor(Value *V, Type *PT, IRBuilder<> &B, const DataLayout &DL,
     return P;
   }
   auto *Op = dyn_cast<BinaryOperator>(V);
-  if (!Op || Op->hasNoUnsignedWrap() || Op->hasNoSignedWrap() ||
-      (Op->getOpcode() != Instruction::Add &&
-       Op->getOpcode() != Instruction::Sub))
+  if (!Op || (Op->getOpcode() != Instruction::Add &&
+              Op->getOpcode() != Instruction::Sub) ||
+      Op->hasNoUnsignedWrap() || Op->hasNoSignedWrap())
     return nullptr;
   Value *Base = pointerFor(Op->getOperand(0), PT, B, DL, PointerPhis, Depth + 1);
   Value *Offset = Op->getOperand(1);
@@ -228,7 +228,10 @@ bool typeGEP(GetElementPtrInst &G, const DataLayout &DL) {
       return false;
     Index = ConstantInt::get(Index->getType(), C->getSExtValue() / int64_t(Bytes));
   } else if (auto *Op = dyn_cast<BinaryOperator>(Index)) {
-    if (!Index->getType()->isIntegerTy(DL.getIndexTypeSizeInBits(G.getType())) ||
+    if (G.getNoWrapFlags() != GEPNoWrapFlags::none() ||
+        (Op->getOpcode() != Instruction::Mul &&
+         Op->getOpcode() != Instruction::Shl) ||
+        !Index->getType()->isIntegerTy(DL.getIndexTypeSizeInBits(G.getType())) ||
         Op->hasNoUnsignedWrap() || Op->hasNoSignedWrap())
       return false;
     auto *C = dyn_cast<ConstantInt>(Op->getOperand(1));
@@ -245,6 +248,8 @@ bool typeGEP(GetElementPtrInst &G, const DataLayout &DL) {
     return false;
   IRBuilder<> B(&G);
   Value *Typed = B.CreateGEP(Ty, G.getPointerOperand(), Index, "element");
+  if (auto *TG = dyn_cast<GetElementPtrInst>(Typed))
+    TG->setNoWrapFlags(G.getNoWrapFlags());
   provenance(Typed, G);
   G.replaceAllUsesWith(Typed);
   G.eraseFromParent();
@@ -252,11 +257,13 @@ bool typeGEP(GetElementPtrInst &G, const DataLayout &DL) {
 }
 bool narrow(TruncInst &T) {
   auto *Op = dyn_cast<BinaryOperator>(T.getOperand(0));
-  if (!Op || !Op->getType()->isIntegerTy(64) ||
-      Op->hasNoUnsignedWrap() || Op->hasNoSignedWrap())
+  if (!Op || !Op->getType()->isIntegerTy(64))
     return false;
   switch (Op->getOpcode()) {
   case Instruction::Add: case Instruction::Sub: case Instruction::Mul:
+    if (Op->hasNoUnsignedWrap() || Op->hasNoSignedWrap())
+      return false;
+    break;
   case Instruction::And: case Instruction::Or: case Instruction::Xor:
     break;
   default:

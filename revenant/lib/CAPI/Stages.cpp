@@ -193,7 +193,7 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline) {
   return verifyStage(Stage, M);
 }
 
-/// ir-clean: lifter cleanup plus the IR idiom stage.
+/// ir-clean: normalize lifted stack/address/width shapes, then cleanup + idioms.
 std::string cleanPipeline() {
   return formatv("function({0},{1})", CleanupPipeline, IdiomsPipeline).str();
 }
