@@ -109,6 +109,7 @@ set(REVENANT_AREA_DIRS
     tools/revenant-opt
     tools/revenant-sigs-check
     tools/revenant-decompile
+    tools/revenant-libdb
     unittests)
 foreach(dir ${REVENANT_AREA_DIRS})
   if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${dir} AND
