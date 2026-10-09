@@ -17,6 +17,7 @@
 
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Target/TargetMachine.h"
 
 using namespace llvm;
 
@@ -34,6 +35,27 @@ std::string defaultPipeline(bool withPatterns) {
     P += ",revenant-patterns";
   P += ",revenant-structure)";
   return P;
+}
+
+bool runLiftCleanup(Module &M, TargetMachine *TM, std::string &ErrMsg) {
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PassBuilder PB(TM);
+  registerRevenantPasses(PB);
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  ModulePassManager MPM;
+  if (Error Err = PB.parsePassPipeline(MPM, CleanupPipeline)) {
+    ErrMsg = toString(std::move(Err));
+    return false;
+  }
+  MPM.run(M, MAM);
+  return true;
 }
 
 void addDefaultPipeline(FunctionPassManager &FPM, bool withPatterns) {

@@ -22,7 +22,9 @@
 #include "llvm/Support/Compiler.h"
 
 namespace llvm {
+class Module;
 class PassBuilder;
+class TargetMachine;
 } // namespace llvm
 
 namespace revenant {
@@ -63,6 +65,13 @@ inline constexpr llvm::StringLiteral IdiomsPipeline = "revenant-idioms";
 /// structuring). Lift itself is not an LLVM pass; the driver lifts first
 /// and then runs this text with revenant-opt/opt.
 LLVM_ABI std::string defaultPipeline(bool withPatterns = false);
+
+/// Run the cleanup pipeline (`CleanupPipeline`, stock LLVM passes only) over
+/// M in-process, exactly as the lifter does after lifting and before
+/// deoptimization. Returns true on success, false + ErrMsg on parse/run
+/// failure. TM may be null (cleanup passes do not need a TargetMachine).
+LLVM_ABI bool runLiftCleanup(llvm::Module &M, llvm::TargetMachine *TM,
+                             std::string &ErrMsg);
 
 /// Register every Revenant `revenant-<name>` pass with PB's Function
 /// pipeline parsing callbacks. Called once by revenant-opt startup and by
