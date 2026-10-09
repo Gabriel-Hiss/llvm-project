@@ -1,0 +1,4 @@
+revenant_add_unittest(RevenantUnitTests RevenantCompilerProfileTests
+  CompilerProfileTest.cpp
+)
+target_link_libraries(RevenantCompilerProfileTests PRIVATE RevenantCompilerProfile)
