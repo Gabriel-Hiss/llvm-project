@@ -1,3 +1,4 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 cmake_minimum_required(VERSION 3.20)
 project(RevenantSsaOut CXX)
 
@@ -29,7 +30,7 @@ if(MSVC)
 else()
   add_compile_options(-fno-exceptions -fno-rtti)
 endif()
-
+endif()
 add_library(RevenantTransformSsaOut MODULE
   SsaOut.cpp
 )
