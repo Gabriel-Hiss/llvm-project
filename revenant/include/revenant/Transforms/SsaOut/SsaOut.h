@@ -23,12 +23,13 @@ namespace revenant {
 //     phi incoming edges share one local (the classic `sum` loop web).
 //     The canonical member carries the name; other members become
 //     bitcast-free aliases resolved at copy insertion.
-//  2. Copy insertion on predecessor edges: every phi becomes a set of
-//     `store incoming, local` placed at the end of each predecessor.
-//     Critical edges are split first (LLVM `SplitCriticalEdge`) so a copy
-//     runs only on its own edge. Parallel copies on one edge are ordered
-//     so no copy clobbers a value another pending copy still reads;
-//     cycles (`x = y; y = x`) spill through a temporary alloca.
+//  2. Copy insertion: ordinary phi copies run at the end of their predecessor;
+//     critical edges split first so a copy runs only on its own path. A
+//     catchswitch must stay first in its block, so copies for its handler pads
+//     follow the selected catchpad instead. Multi-use invoke results are stored
+//     on the normal edge, splitting it when other predecessors share its block.
+//     Parallel copies are ordered to avoid clobbering pending reads; cycles
+//     (`x = y; y = x`) spill through a temporary alloca.
 //  3. Expression propagation: a pure single-use definition (binop, cmp,
 //     cast, gep, select, single-use call) stays where it is and is left
 //     for the frontend to inline — the pass only guarantees its operands

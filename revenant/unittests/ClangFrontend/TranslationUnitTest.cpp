@@ -99,6 +99,45 @@ TEST(TranslationUnitTest, DeclaresCalleesBeforeWholeUnitDefinitions) {
   EXPECT_EQ(Source.count("caller("), 2u);
   EXPECT_EQ(Source.count("callee("), 3u);
 }
+TEST(TranslationUnitTest, CastsStringArgumentsToOpaquePointerParameters) {
+  LLVMContext Context;
+  Module M("opaque-string-argument", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Type *PtrTy = PointerType::get(Context, 0);
+  Type *VoidTy = Type::getVoidTy(Context);
+  Function *Callee = Function::Create(
+      FunctionType::get(VoidTy, {PtrTy}, false), Function::ExternalLinkage,
+      "opaque_string", M);
+  auto *Text = new GlobalVariable(
+      M, ArrayType::get(Type::getInt8Ty(Context), 2), true,
+      GlobalValue::PrivateLinkage,
+      ConstantDataArray::getString(Context, "x", true), "str_opaque");
+  Function *Caller = Function::Create(
+      FunctionType::get(VoidTy, false), Function::ExternalLinkage, "caller",
+      M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", Caller);
+  IRBuilder<> Builder(Entry);
+  Builder.CreateCall(Callee, {Text});
+  Builder.CreateRetVoid();
+
+  ClangFrontendOptions Options;
+  Options.Lang = "cpp";
+  auto TUOrErr = createASTContext(M, Options);
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  SmallString<256> Source;
+  raw_svector_ostream OS(Source);
+  printTranslationUnit(TU->tu(), OS, {});
+  EXPECT_NE(StringRef(OS.str()).find("(void *)\"x\""), StringRef::npos);
+}
 
 TEST(TranslationUnitTest, EmitsInfinityWithoutNonportableInfToken) {
   LLVMContext Context;

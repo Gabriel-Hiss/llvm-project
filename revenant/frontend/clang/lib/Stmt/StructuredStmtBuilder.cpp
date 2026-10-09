@@ -1215,26 +1215,47 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
       IsSEH = GV->getName() == "__C_specific_handler";
   }
 
-  // Try body: spell the invoke's call through a scratch CallInst so
-  // ExprBuilder (which only takes CallInst) prints the real call.
+  // A decoded try-table entry can protect several invoke sites. Gather the
+  // calls carrying its region ID and emit one AST try around them, using the
+  // first site's shared handler set.
+  SmallVector<InvokeInst *, 8> RegionInvokes{II};
+  SmallVector<BasicBlock *, 8> RegionBlocks{BB};
+  if (MDNode *Region = II->getMetadata("revenant.eh.region")) {
+    for (BasicBlock *Candidate : Blocks) {
+      if (Candidate == BB || EHClaimed.contains(Candidate))
+        continue;
+      auto *Other = dyn_cast<InvokeInst>(Candidate->getTerminator());
+      if (!Other || Other->getMetadata("revenant.eh.region") != Region)
+        continue;
+      RegionInvokes.push_back(Other);
+      RegionBlocks.push_back(Candidate);
+    }
+  }
+
+  // Try body: spell each invoke's call through a scratch CallInst so
+  // ExprBuilder (which only takes CallInst) prints the real calls.
   SmallVector<Stmt *, 8> TryBody;
-  {
-    // Unparented scratch call: never inserted into the function, so no
-    // CFG or dominator invalidation. Deleted after spelling.
-    SmallVector<Value *, 8> Args(II->args());
+  for (InvokeInst *Protected : RegionInvokes) {
+    SmallVector<Value *, 8> Args(Protected->args());
     CallInst *ScratchCall = CallInst::Create(
-        II->getFunctionType(), II->getCalledOperand(), Args);
-    ScratchCall->setCallingConv(II->getCallingConv());
-    ScratchCall->setAttributes(II->getAttributes());
+        Protected->getFunctionType(), Protected->getCalledOperand(), Args);
+    ScratchCall->setCallingConv(Protected->getCallingConv());
+    ScratchCall->setAttributes(Protected->getAttributes());
     if (Stmt *S = Exprs->instr(*ScratchCall, *Scope))
       TryBody.push_back(S);
     delete ScratchCall;
   }
 
-  EHClaimed.insert(BB);
-  for (BasicBlock *H : Handlers)
-    EHClaimed.insert(H);
-  EHClaimed.insert(Dispatch);
+  for (BasicBlock *Protected : RegionBlocks) {
+    EHClaimed.insert(Protected);
+    BasicBlock *ProtectedDispatch =
+        cast<InvokeInst>(Protected->getTerminator())->getUnwindDest();
+    EHClaimed.insert(ProtectedDispatch);
+    for (Instruction &I : *ProtectedDispatch)
+      if (auto *ProtectedSwitch = dyn_cast<CatchSwitchInst>(&I))
+        for (BasicBlock *H : ProtectedSwitch->handlers())
+          EHClaimed.insert(H);
+  }
 
   if (IsSEH && CP && CP->getMetadata("revenant.finally")) {
     SmallVector<Stmt *, 4> FinallyBody;
@@ -1311,12 +1332,13 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
         auto *RI = dyn_cast<ReturnInst>(Continuation->getTerminator());
         if (RI) {
           Value *ReturnValue = RI->getReturnValue();
-          if (auto *Load = dyn_cast<LoadInst>(ReturnValue))
-            for (Instruction &I : *H)
-              if (auto *Store = dyn_cast<StoreInst>(&I);
-                  Store && Store->getPointerOperand() ==
-                               Load->getPointerOperand())
-                ReturnValue = Store->getValueOperand();
+          if (ReturnValue)
+            if (auto *Load = dyn_cast<LoadInst>(ReturnValue))
+              for (Instruction &I : *H)
+                if (auto *Store = dyn_cast<StoreInst>(&I);
+                    Store &&
+                    Store->getPointerOperand() == Load->getPointerOperand())
+                  ReturnValue = Store->getValueOperand();
           if (ReturnValue)
             HandlerBody.push_back(ReturnStmt::Create(
                 *AST, SourceLocation(), Exprs->retVal(ReturnValue, *Scope),

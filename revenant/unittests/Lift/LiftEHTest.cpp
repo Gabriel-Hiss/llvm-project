@@ -93,6 +93,19 @@ TEST(LiftEHTest, MsvcCallInTryBecomesInvokeWithCatchswitch) {
       if (isa<CatchPadInst>(I))
         ++Pads;
     }
+  InvokeInst *Invoke = nullptr;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB)
+      if (auto *II = dyn_cast<InvokeInst>(&I))
+        Invoke = II;
+  ASSERT_NE(Invoke, nullptr);
+  MDNode *Region = Invoke->getMetadata("revenant.eh.region");
+  ASSERT_NE(Region, nullptr);
+  auto *RegionValue =
+      dyn_cast<ConstantInt>(cast<ConstantAsMetadata>(Region->getOperand(0))
+                                ->getValue());
+  ASSERT_NE(RegionValue, nullptr);
+  EXPECT_EQ(RegionValue->getZExtValue(), 0u);
   EXPECT_EQ(Invokes, 1u);
   EXPECT_EQ(Switches, 1u);
   EXPECT_EQ(Pads, 1u);

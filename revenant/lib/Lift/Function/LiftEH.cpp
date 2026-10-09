@@ -300,6 +300,10 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     II->setCallingConv(CI->getCallingConv());
     II->setAttributes(CI->getAttributes());
     ir::copyInstructionVA(*CI, *II);
+    II->setMetadata(
+        "revenant.eh.region",
+        MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
+                        Type::getInt32Ty(C), RI))}));
     if (CI->use_empty()) {
       CI->eraseFromParent();
     } else if (pred_size(Normal) == 1 && !II->getType()->isVoidTy()) {
