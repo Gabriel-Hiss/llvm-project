@@ -133,8 +133,6 @@ private:
   }
   /// Smallest region strictly containing BB (BB may be a header itself).
   Region *enclosingRegion(BasicBlock *BB);
-  bool isLoopBreak(BasicBlock *To, const Region *Rgn) const;
-  bool isLoopContinue(BasicBlock *To, const Region *Rgn) const;
   /// Whether To is emitted immediately after From inside Rgn: either the
   /// next member in block order, or the region follow.
   bool flowsIntoNext(BasicBlock *To, BasicBlock *From, const Region *Rgn);
@@ -343,14 +341,13 @@ void StructuredStmtBuilder::collectRegions() {
     Instruction *T = BB.getTerminator();
     for (unsigned I = 0, E = T->getNumSuccessors(); I != E; ++I) {
       BasicBlock *S = T->getSuccessor(I);
-      Region *Target = regionOf(S);
-      if (Target && Target->Header == S && &BB != S)
-        ensureLabel(S);
+      // Region emission order does not follow CFG reachability. Determine
+      // label needs before emitting any region so later gotos can target
+      // blocks whose structured bodies already printed.
+      ensureLabel(S);
       Region *SR = enclosingRegion(S);
-      if (SR && !SR->Members.contains(&BB) && SR->Header != &BB) {
-        ensureLabel(S);
+      if (SR && !SR->Members.contains(&BB) && SR->Header != &BB)
         SR->Degraded = true;
-      }
     }
   }
 }
@@ -366,57 +363,13 @@ Region *StructuredStmtBuilder::enclosingRegion(BasicBlock *BB) {
   }
   return Best;
 }
-
-bool StructuredStmtBuilder::isLoopBreak(BasicBlock *To,
-                                        const Region *Rgn) const {
-  for (const Region *R = Rgn; R;) {
-    if (isLoopKind(R->Kind) && To == R->Follow)
-      return true;
-    const Region *Up = nullptr;
-    for (auto &KV : Regions)
-      if (KV.second->Members.contains(const_cast<Region *>(R)->Header) &&
-          KV.second->Header != R->Header &&
-          (!Up || Up->Members.contains(KV.second->Header)))
-        Up = KV.second.get();
-    R = Up;
-  }
-  return false;
-}
-
-bool StructuredStmtBuilder::isLoopContinue(BasicBlock *To,
-                                           const Region *Rgn) const {
-  for (const Region *R = Rgn; R;) {
-    if (isLoopKind(R->Kind)) {
-      if (R->Kind == RegionKind::DoWhile && To == R->Header)
-        return true;
-      if (R->Kind != RegionKind::DoWhile && To == R->Latch) {
-        bool HasWork = llvm::any_of(*R->Latch, [](const Instruction &I) {
-          return !I.isTerminator() && !isa<PHINode>(I) &&
-                 !isa<DbgInfoIntrinsic>(I);
-        });
-        if (!HasWork)
-          return true;
-      }
-    }
-    const Region *Up = nullptr;
-    for (auto &KV : Regions)
-      if (KV.second->Members.contains(const_cast<Region *>(R)->Header) &&
-          KV.second->Header != R->Header &&
-          (!Up || Up->Members.contains(KV.second->Header)))
-        Up = KV.second.get();
-    R = Up;
-  }
-  return false;
-}
 bool StructuredStmtBuilder::flowsIntoNext(BasicBlock *To, BasicBlock *From,
                                           const Region *Rgn) {
   if (!Rgn)
     return false;
-  if (To == Rgn->Follow || To == From)
-    return To == Rgn->Follow;
-  if (!Rgn->Members.contains(To))
-    return false;
-  // "Next emitted" is the next member in block order.
+  // "Next emitted" is the next member in block order. Edges landing
+  // mid-region need a real terminator; only the tail member may fall
+  // through to the region follow.
   bool AfterFrom = false;
   for (BasicBlock *BB : Blocks) {
     if (BB == From) {
@@ -509,10 +462,13 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     if (BI->isUnconditional()) {
       BasicBlock *S = BI->getSuccessor(0);
       if (Rgn && !Rgn->Degraded) {
-        if (isLoopBreak(S, Rgn))
+        // Rgn is the construct this block is emitted inside, so an edge
+        // to its follow is lexically within it: break is valid. Edges
+        // reaching an outer construct's exit stay gotos (membership does
+        // not prove lexical containment).
+        if ((isLoopKind(Rgn->Kind) || Rgn->Kind == RegionKind::Switch) &&
+            S == Rgn->Follow)
           return new (*AST) BreakStmt(SourceLocation());
-        if (isLoopContinue(S, Rgn))
-          return new (*AST) ContinueStmt(SourceLocation());
         // The latch's backedge is implicit in the loop construct.
         if (isLoopKind(Rgn->Kind) && S == Rgn->Header)
           return nullptr;
@@ -527,10 +483,11 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     BasicBlock *TS = BI->getSuccessor(0), *FS = BI->getSuccessor(1);
     auto arm = [&](BasicBlock *S) -> Stmt * {
       if (Rgn && !Rgn->Degraded) {
-        if (isLoopBreak(S, Rgn))
+        // Same rule as the unconditional edge: break only when the arm
+        // exits the construct it is lexically emitted inside.
+        if ((isLoopKind(Rgn->Kind) || Rgn->Kind == RegionKind::Switch) &&
+            S == Rgn->Follow)
           return new (*AST) BreakStmt(SourceLocation());
-        if (isLoopContinue(S, Rgn))
-          return new (*AST) ContinueStmt(SourceLocation());
         if (flowsIntoNext(S, BB, Rgn))
           return nullptr;
       }
@@ -596,14 +553,14 @@ void StructuredStmtBuilder::emitMembers(
       continue; // header/latch code is consumed by the construct
     // Each block prints once per function: nested regions sharing a
     // follow all claim the shared tail.
-    if (!Emitted.insert(BB).second)
-      continue;
-    // A nested header whose block carries a forced label degrades to a
-    // leaf: goto emission keeps the target reachable.
     if (Region *Nested = regionOf(BB); Nested && !Nested->Degraded) {
+      if (!Emitted.insert(BB).second)
+        continue;
       Out.push_back(emitRegionHeader(*Nested, &R));
       continue;
     }
+    if (!Emitted.insert(BB).second)
+      continue;
     bool Labeled = NeededLabels.contains(BB);
     size_t Start = Out.size();
     emitBlockStmts(BB, Out);
@@ -850,12 +807,14 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
     for (BasicBlock *BB : Blocks) {
       if (!R.Members.contains(BB) || BB == R.Header || BB == R.Latch)
         continue;
-      if (!Emitted.insert(BB).second)
-        continue;
       if (Region *Nested = regionOf(BB); Nested && !Nested->Degraded) {
+        if (!Emitted.insert(BB).second)
+          continue;
         Body.push_back(emitRegionHeader(*Nested, &R));
         continue;
       }
+      if (!Emitted.insert(BB).second)
+        continue;
       if (NeededLabels.contains(BB))
         Body.push_back(new (*AST)
                            LabelStmt(SourceLocation(), labelFor(BB),
@@ -864,11 +823,15 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
       if (Stmt *T = emitTerminator(BB, &R))
         Body.push_back(T);
     }
-    if (NeededLabels.contains(R.Latch))
-      Body.push_back(new (*AST)
-                         LabelStmt(SourceLocation(), labelFor(R.Latch),
-                                   new (*AST) NullStmt(SourceLocation())));
-    emitBlockStmts(R.Latch, Body);
+    // The latch may already have printed through an overlapping region's
+    // arm; skip it then, otherwise its label is defined twice.
+    if (Emitted.insert(R.Latch).second) {
+      if (NeededLabels.contains(R.Latch))
+        Body.push_back(new (*AST)
+                           LabelStmt(SourceLocation(), labelFor(R.Latch),
+                                     new (*AST) NullStmt(SourceLocation())));
+      emitBlockStmts(R.Latch, Body);
+    }
     Stmt *B = CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                    SourceLocation(), SourceLocation());
     return new (*AST) DoStmt(B, Cond, SourceLocation(), SourceLocation(),
@@ -917,7 +880,8 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
     // construct. Its leaf instructions remain in the body. If an external
     // edge targets the latch, collectRegions requests a label here.
     if (BB == R.Latch) {
-      Emitted.insert(BB);
+      if (!Emitted.insert(BB).second)
+        continue;
       if (NeededLabels.contains(BB))
         Body.push_back(new (*AST)
                            LabelStmt(SourceLocation(), labelFor(BB),
@@ -925,12 +889,14 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
       emitBlockStmts(BB, Body);
       continue;
     }
-    if (!Emitted.insert(BB).second)
-      continue;
     if (Region *Nested = regionOf(BB); Nested && !Nested->Degraded) {
+      if (!Emitted.insert(BB).second)
+        continue;
       Body.push_back(emitRegionHeader(*Nested, &R));
       continue;
     }
+    if (!Emitted.insert(BB).second)
+      continue;
     if (NeededLabels.contains(BB))
       Body.push_back(new (*AST)
                          LabelStmt(SourceLocation(), labelFor(BB),
@@ -1042,7 +1008,7 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
   if (Def)
     Body.push_back(new (*AST)
                        DefaultStmt(SourceLocation(), SourceLocation(),
-                                   emitCase(Def)));
+                                   gotoTo(Def)));
   SW->setBody(CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                    SourceLocation(), SourceLocation()));
   return SW;
