@@ -473,9 +473,14 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   while (!UserPending.empty()) {
     Va At = UserPending.front();
     UserPending.pop();
-    if (Result.LibraryStarts.count(At) || MinGWRuntimeHooks.count(At) ||
+    if (MinGWRuntimeHooks.count(At) ||
         !Result.UserReachable.insert(At).second)
       continue;
+    // GCC .text.unlikely cold parts are reached by jumps from the hot body.
+    // The library matcher can match them (same code as a library function),
+    // but they are user code. Remove from library starts so the classification
+    // is correct.
+    Result.LibraryStarts.erase(At);
     auto FOrErr = materialize(At);
     if (!FOrErr) {
       consumeError(FOrErr.takeError());
