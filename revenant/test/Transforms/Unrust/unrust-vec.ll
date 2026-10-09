@@ -10,11 +10,16 @@
 define i64 @alloc_vec_shape(ptr %buf, i64 %len) {
 ; CHECK-LABEL: define i64 @alloc_vec_shape(
 entry:
-  %e = getelementptr inbounds i8, ptr %buf, i64 8, !revenant.va !{i64 4096}
+  br label %loop
+loop:
+  %p = phi ptr [ %buf, %entry ], [ %g, %loop ]
+  %e = getelementptr inbounds i8, ptr %p, i64 8, !revenant.va !{i64 4096}
   %v = load i64, ptr %e, align 8
-  %g = getelementptr inbounds i64, ptr %buf, i64 %len
+  %g = getelementptr inbounds i64, ptr %p, i64 %len
   %x = load i64, ptr %g, align 8
   %s = add i64 %v, %x
+  br i1 true, label %loop, label %exit
+exit:
   ret i64 %s
 ; CHECK: %vec.unrust = alloca [24 x i8], align 8
 }
