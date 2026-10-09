@@ -161,6 +161,11 @@ Value *pointerFor(Value *V, Type *PT, IRBuilder<> &B, const DataLayout &DL,
     provenance(P, *Phi);
     for (unsigned J = 0; J < Phi->getNumIncomingValues(); ++J) {
       BasicBlock *Pred = Phi->getIncomingBlock(J);
+      int Prior = P->getBasicBlockIndex(Pred);
+      if (Prior >= 0) {
+        P->addIncoming(P->getIncomingValue(Prior), Pred);
+        continue;
+      }
       IRBuilder<> Edge(Pred->getTerminator());
       Value *Incoming = Phi->getIncomingValue(J);
       Value *Ptr = pointerFor(Incoming, PT, Edge, DL, PointerPhis, Depth + 1);

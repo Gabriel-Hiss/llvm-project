@@ -160,4 +160,49 @@ join:
   ret i32 %v
 }
 
+; CHECK-LABEL: define void @duplicate_switch_edge
+; CHECK: %r.ptr = phi ptr [ [[P:%[^ ,]+]], %entry ], [ [[P]], %entry ], [ [[P]], %entry ]
+; Reduced from raw c-o2 repeated bb_14006d19e switch predecessor edges.
+define void @duplicate_switch_edge(i32 %tag, i64 %arg) {
+entry:
+  switch i32 %tag, label %join [ i32 0, label %join
+                               i32 1, label %join ]
+join:
+  %r = phi i64 [ %arg, %entry ], [ %arg, %entry ], [ %arg, %entry ]
+  %p = inttoptr i64 %r to ptr
+  store i8 0, ptr %p
+  ret void
+}
+
+; CHECK-LABEL: define i32 @volatile_frame
+; CHECK: %frame = alloca [304 x i8]
+; CHECK: load volatile i32
+define i32 @volatile_frame() {
+  %frame = alloca [304 x i8], align 1
+  %fp = getelementptr i8, ptr %frame, i64 16
+  %v = load volatile i32, ptr %fp, align 1
+  ret i32 %v
+}
+
+; CHECK-LABEL: define i32 @dynamic_frame
+; CHECK: %frame = alloca [304 x i8]
+; CHECK: getelementptr i32, ptr %frame, i64 %index
+define i32 @dynamic_frame(i64 %index) {
+  %frame = alloca [304 x i8], align 1
+  %bytes = mul i64 %index, 4
+  %fp = getelementptr i8, ptr %frame, i64 %bytes
+  %v = load i32, ptr %fp, align 1
+  ret i32 %v
+}
+
+; CHECK-LABEL: define i32 @wide_overflow_flags
+; CHECK: add nsw i64
+; CHECK: trunc i64
+; Keep the wide poison condition instead of dropping it when narrowing.
+define i32 @wide_overflow_flags(i64 %reg) {
+  %sum = add nsw i64 %reg, 1
+  %v = trunc i64 %sum to i32
+  ret i32 %v
+}
+
 !0 = !{i64 5368858749}
