@@ -43,6 +43,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -51,6 +52,27 @@ using namespace llvm;
 
 namespace revenant {
 namespace {
+
+// Store references only; format diagnostics when a crash actually occurs.
+class FunctionStageTrace final : public PrettyStackTraceEntry {
+  StringRef Stage;
+  StringRef Pass;
+  StringRef Name;
+  uint64_t Address;
+
+public:
+  FunctionStageTrace(StringRef Stage, StringRef Pass, StringRef Name,
+                     uint64_t Address = 0)
+      : Stage(Stage), Pass(Pass), Name(Name), Address(Address) {}
+
+  void print(raw_ostream &OS) const override {
+    OS << "Revenant stage=" << Stage << " pass=" << Pass
+       << " function=" << Name;
+    if (Address)
+      OS << " va=" << format_hex(Address, 0);
+    OS << "\n";
+  }
+};
 
 //==--------------------------------------------------------------------==//
 // Small helpers
@@ -172,10 +194,12 @@ Error verifyStage(StringRef Stage, const Module &M) {
   return Error::success();
 }
 
+SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
+
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
-Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
-                      std::vector<StageReport> &Reports) {
+Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
+                          std::vector<StageReport> &Reports) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -190,8 +214,7 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
   // Verify each function pass independently and retain its last valid body.
   if (!Pipeline.consume_front("function(") || !Pipeline.consume_back(")"))
     return createStringError("expected a function pipeline");
-  SmallVector<StringRef, 16> Passes;
-  Pipeline.split(Passes, ',');
+  auto Passes = pipelineElements(Pipeline);
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
     if (Error E = PB.parsePassPipeline(FPM, Pass))
@@ -202,6 +225,7 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
       if (!F.isDeclaration())
         Functions.push_back(&F);
     for (llvm::Function *F : Functions) {
+      FunctionStageTrace Trace(Stage, Pass, F->getName());
       ValueToValueMapTy SavedMap;
       llvm::Function *Saved = CloneFunction(F, SavedMap);
       FPM.run(*F, FAM);
@@ -229,6 +253,75 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
     }
   }
   return verifyStage(Stage, M);
+}
+
+// Split only between pipeline elements, never inside adaptors or options.
+SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline) {
+  SmallVector<StringRef, 16> Elements;
+  unsigned Depth = 0;
+  size_t Start = 0;
+  for (size_t I = 0; I != Pipeline.size(); ++I) {
+    char C = Pipeline[I];
+    if (C == '(' || C == '<')
+      ++Depth;
+    else if ((C == ')' || C == '>') && Depth)
+      --Depth;
+    else if (C == ',' && !Depth) {
+      Elements.push_back(Pipeline.slice(Start, I));
+      Start = I + 1;
+    }
+  }
+  Elements.push_back(Pipeline.drop_front(Start));
+  return Elements;
+}
+
+Error runModulePass(Module &M, StringRef Pass) {
+  PassBuilder PB;
+  registerRevenantPasses(PB);
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PB.registerLoopAnalyses(LAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerModuleAnalyses(MAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  ModulePassManager MPM;
+  if (Error E = PB.parsePassPipeline(MPM, Pass))
+    return E;
+  MPM.run(M, MAM);
+  return verifyStage(Pass, M);
+}
+
+Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
+                      StringRef Pipeline, std::vector<StageReport> &Reports) {
+  // Validate the whole pipeline first: unknown pass names are configuration
+  // errors, not recoverable failures of a particular function or module.
+  PassBuilder PB;
+  registerRevenantPasses(PB);
+  ModulePassManager Parsed;
+  if (Error E = PB.parsePassPipeline(Parsed, Pipeline))
+    return E;
+  for (StringRef Element : pipelineElements(Pipeline)) {
+    if (Element.starts_with("function(")) {
+      if (Error E = runFunctionPipeline(Stage, *M, Element, Reports))
+        return E;
+      continue;
+    }
+    FunctionStageTrace Trace(Stage, Element, "module");
+    auto Saved = CloneModule(*M);
+    // Analysis managers die inside runModulePass before the module is swapped.
+    if (Error E = runModulePass(*M, Element)) {
+      std::string Message = toString(std::move(E));
+      M.swap(Saved);
+      record(Reports, Stage, "failed",
+             "module: " + Element.str() + ": " + Message);
+      errs() << "[failed] " << Stage << ": module: " << Element << ": "
+             << Message << "\n";
+    }
+  }
+  return verifyStage(Stage, *M);
 }
 
 /// ir-clean: lifter cleanup plus the IR idiom stage.
@@ -340,13 +433,25 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   // ---- asm -----------------------------------------------------------
   std::string AsmText;
   size_t InstrCount = 0;
+  std::vector<Va> Ready;
   for (Va T : Todo) {
     auto FOrErr = materialize(T);
-    if (!FOrErr)
-      return FOrErr.takeError();
+    if (!FOrErr) {
+      std::string Note =
+          formatv("0x{0:x}: {1}", T.Value, toString(FOrErr.takeError())).str();
+      record(R.Stages, "asm", "failed", Note);
+      errs() << "[failed] asm: " << Note << "\n";
+      continue;
+    }
     auto A = disasmFunction(T);
-    if (!A)
-      return A.takeError();
+    if (!A) {
+      std::string Note =
+          formatv("0x{0:x}: {1}", T.Value, toString(A.takeError())).str();
+      record(R.Stages, "asm", "failed", Note);
+      errs() << "[failed] asm: " << Note << "\n";
+      continue;
+    }
+    Ready.push_back(T);
     AsmText += *A;
     InstrCount += FOrErr->Instrs.size();
     if (Opts.Emit == EmitKind::Asm)
@@ -354,6 +459,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         R.LineVas.push_back(
             {static_cast<uint32_t>(R.LineVas.size() + 1), {I.Addr}});
   }
+  Todo = std::move(Ready);
   record(
       R.Stages, "asm", "ok",
       formatv("{0} instructions across {1} functions", InstrCount, Todo.size())
@@ -381,6 +487,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     auto M = moduleFor(Ctx, Out);
     size_t OpaqueSites = 0;
     for (Va T : Todo) {
+      FunctionStageTrace Trace("lift", "liftFunction", Prog.Functions.at(T).Name,
+                               T.Value);
       auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
                                   Sigs.get(), /*TM=*/nullptr,
                                   /*RunPasses=*/false);
@@ -406,7 +514,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-clean ----------------------------------------------------------
-    if (auto E = runPipelineText("ir-clean", *M, cleanPipeline(), R.Stages))
+    if (auto E = runPipelineText("ir-clean", M, cleanPipeline(), R.Stages))
       return std::move(E);
     record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
     CleanText = moduleText(*M);
@@ -417,7 +525,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- ir-final ----------------------------------------------------------
     if (auto E =
-            runPipelineText("ir-final", *M, finalPipeline(Opts.Patterns),
+            runPipelineText("ir-final", M, finalPipeline(Opts.Patterns),
                             R.Stages))
       return std::move(E);
     record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");
@@ -429,6 +537,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- source ------------------------------------------------------------
     if (Opts.Emit == EmitKind::Source) {
+      FunctionStageTrace Trace("source", Out == Lang::Rust ? "rustc" : "clang",
+                               "module");
       Expected<EmitResult> Em = Out == Lang::Rust
                                     ? emitRustcSource(FinalText)
                                     : emitClangSource(*M, Out == Lang::Cpp);

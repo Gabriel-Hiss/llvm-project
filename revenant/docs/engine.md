@@ -6,8 +6,9 @@ analysis and producer detection once, then decompiles any set of functions.
 
 ## Stages
 
-Every stage is the real implementation. A stage that cannot run fails the
-run with its error; nothing falls back to a stub.
+Every stage runs its real implementation. Binary-level setup and artifact
+errors fail the run. A returned per-function asm or lift error records a
+failed stage and skips that function while the remaining functions continue.
 
 | stage | implementation |
 |---|---|
@@ -21,8 +22,13 @@ run with its error; nothing falls back to a stub.
 | ir-final | unopt passes, `revenant-structure`, `revenant-types`, `revenant-ssaout` (and `revenant-patterns` with `--patterns`), then the verifier |
 | source | C/C++: `RevenantClangCore` + `printTranslationUnit`; Rust: the rustc fork |
 
-The verifier runs after lift, ir-clean and ir-final, so a pass that emits
-malformed IR is named in the error instead of crashing a frontend.
+The verifier runs after lift and after each individual cleanup or final
+function pass. Invalid pass output restores the function's previous valid
+body and records the function, stage and pass. Subsequent passes and source
+emission continue. Assertions are pass bugs, not valid output.
+Mixed pipelines also support module passes. Their cross-function changes
+are verified together and, on verifier failure, the entire module pass is
+rolled back. Function-pass adaptors still retain per-function isolation.
 `--emit asm|ir-raw|ir-clean|ir-final|source` stops after the requested stage.
 
 ## Driver
@@ -56,3 +62,24 @@ clang-cl /c out\c-o0.source.c
 
 On `c-o0`, `cpp-o2` and `rust-o0` the first 20 functions take 0.2 to 0.7 s per
 run; the analysis stage dominates.
+
+## Corpus robustness
+
+`tools/revenant-decompile/robustness.py` scans every immediate corpus
+directory for PE headers, including files without an executable extension.
+It runs final IR and C/C++ emission for every PE with a separate timeout.
+It copies the executable and adjacent DLLs before starting, so runs never
+lock the integrator's executable. Results resume only for the same
+executable SHA-256. A changed executable reruns every target.
+
+```text
+python tools/revenant-decompile/robustness.py --exe <revenant-decompile.exe> \
+  --corpus <target/parity> --output <scratch/results> \
+  --report docs/robustness.md --timeout 180 --workers 6
+```
+
+The report includes completed/expected invocation counts, final definition
+counts, returned failures by stage and process-failure clusters. `unknown`
+counts mean the process stopped before producing final IR. Crash stack
+entries identify the current lift VA or function-pass name without logging
+every successful function.

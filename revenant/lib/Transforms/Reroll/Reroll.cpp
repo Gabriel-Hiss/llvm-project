@@ -133,9 +133,6 @@ void copyProvenance(const Instruction *Src, Instruction *Dst) {
 }
 
 
-// Match `Phi = phi [Init, Pre] [Next, Self]` where Next = Phi +/- Step
-// with |Step| in [MinStep, MaxStep]. Returns the step magnitude and the
-// increment instruction.
 // Constants in lifted IR include i128 masks. Reroll's affine model is
 // signed i64, so reject values and differences it cannot represent.
 std::optional<int64_t> signedConstant(const ConstantInt *C) {
@@ -154,6 +151,9 @@ std::optional<int64_t> constantDifference(const ConstantInt *A,
   return D.getSExtValue();
 }
 
+// Match `Phi = phi [Init, Pre] [Next, Self]` where Next = Phi +/- Step
+// with |Step| in [MinStep, MaxStep]. Returns the step magnitude and the
+// increment instruction.
 bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
                    Instruction *&StepInstOut) {
   if (Phi->getNumIncomingValues() != 2)
@@ -450,6 +450,8 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
       return true;
     }
     if (It == Deltas.end() || It->second == 0)
+      return false;
+    if (D == INT64_MIN && It->second == -1)
       return false;
     // Linear shift (d == w*d1) or a periodic multiple of it.
     return D % It->second == 0 && D / It->second <= W;

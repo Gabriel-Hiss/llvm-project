@@ -32,16 +32,19 @@ def source_language(target):
 def classify(log, status):
     if status == 'timeout':
         return 'timeout'
+    context = re.search(r'Revenant stage=(\S+) pass=(\S+)', log)
+    prefix = ('stage=' + context.group(1) + ' pass=' + context.group(2) + ': '
+              if context else 'stage=unknown: ')
     assertion = re.search(r'Assertion failed: ([^\n]+)', log)
     if assertion:
-        return 'assertion: ' + assertion.group(1)
+        return prefix + 'assertion: ' + assertion.group(1)
     verifier = re.search(r'(?:IR verifier failed after|LLVM verification failed)[^\n]*', log)
     if verifier:
         return verifier.group(0)
     error = re.search(r'revenant-decompile: ([^\n]+)', log)
     if error:
         return error.group(1)
-    return 'success' if status == 0 else 'process exit ' + str(status)
+    return 'success' if status == 0 else prefix + 'process exit ' + str(status)
 
 
 def run_one(exe, pe, kind, output, timeout, fingerprint):
@@ -79,17 +82,20 @@ def run_one(exe, pe, kind, output, timeout, fingerprint):
     if final_ir.exists():
         functions = sum(line.startswith('define ') for line in
                         final_ir.read_text(errors='replace').splitlines())
+    crash_context = re.search(r'Revenant stage=[^\n]+', log)
     result = dict(target=pe.parent.name, pe=str(pe), kind=kind, status=status,
                   seconds=round(time.monotonic() - started, 2), log=str(log_path),
                   fingerprint=fingerprint, cluster=classify(log, status),
-                  functions_ok=functions, failures=failures)
+                  functions_ok=functions, failures=failures,
+                  crash_context=crash_context.group(0) if crash_context else None)
     result_path.write_text(json.dumps(result, indent=2))
     return result
 
 
-def report(rows, destination, fingerprint, timeout):
+def report(rows, destination, fingerprint, timeout, expected):
     lines = ['# Pipeline robustness', '',
              'Executable SHA-256: `' + fingerprint + '`.', '',
+             'Completed invocations: ' + str(len(rows)) + ' / ' + str(expected) + '.', '',
              'Every immediate corpus child is inspected for PE files by its MZ header.',
              'Each PE runs ir-final and C/C++ source emission without a function filter.',
              'Each invocation has a ' + str(timeout) + ' second timeout. A private executable',
@@ -100,11 +106,15 @@ def report(rows, destination, fingerprint, timeout):
              '| target / PE | emission | exit | functions ok | failed by stage | seconds |',
              '|---|---|---|---:|---|---:|']
     clusters = {}
+    function_clusters = {}
     for row in sorted(rows, key=lambda r: (r['target'], r['pe'], r['kind'])):
         counts = {}
         for failure in row['failures']:
             stage = failure['stage']
             counts[stage] = counts.get(stage, 0) + 1
+            message = failure['message'].split(': ', 1)[-1]
+            key = stage + ': ' + message
+            function_clusters.setdefault(key, set()).add(row['target'])
         failed = ', '.join(stage + '=' + str(count) for stage, count in sorted(counts.items()))
         if not failed:
             failed = '0' if row['status'] == 0 else 'unknown'
@@ -119,6 +129,12 @@ def report(rows, destination, fingerprint, timeout):
         lines.append('No crashes, assertions, binary-level verifier errors or timeouts.')
     for message, targets in sorted(clusters.items()):
         lines += ['### ' + message.replace('|', '\\|'), '', ', '.join(targets), '']
+    lines += ['', '## Per-function failure clusters', '']
+    if not function_clusters:
+        lines.append('No returned per-function failures were recorded.')
+    for message, targets in sorted(function_clusters.items()):
+        lines += ['### ' + message.replace('|', '\\|'), '',
+                  ', '.join(sorted(targets)), '']
     destination.write_text('\n'.join(lines) + '\n')
 
 
@@ -145,6 +161,7 @@ def main():
     jobs = [(pe, kind) for pe in pe_files(args.corpus)
             for kind in ('ir-final', source_language(pe.parent.name))]
     rows = []
+    report(rows, args.report, fingerprint, args.timeout, len(jobs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(run_one, copied, pe, kind, args.output,
                                args.timeout, fingerprint) for pe, kind in jobs]
@@ -152,7 +169,7 @@ def main():
             row = future.result()
             rows.append(row)
             print(row['target'], row['kind'], row['status'], flush=True)
-            report(rows, args.report, fingerprint, args.timeout)
+            report(rows, args.report, fingerprint, args.timeout, len(jobs))
     (args.output / 'summary.json').write_text(json.dumps(rows, indent=2))
     failed = any(row['status'] != 0 for row in rows)
     return 1 if failed else 0
