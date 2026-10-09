@@ -143,12 +143,14 @@ CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
   }
   if (hasText(Symbols, "__security_cookie") ||
       hasImport(PE, "__security_check_cookie") || hasImport(PE, "__stack_chk_fail") ||
-      hasImport(PE, "__stack_chk_guard")) {
+      hasImport(PE, "__stack_chk_guard") ||
+      hasImageText(*PE.Img, "__security_check_cookie")) {
     T.StackProtection = true;
     I.Evidence.emplace_back("stack-protection runtime marker");
   }
   if (hasSection(PE, ".gfids") || hasSection(PE, ".giats") ||
-      hasImport(PE, "guard_check_icall") || hasImport(PE, "guard_dispatch_icall")) {
+      hasImport(PE, "guard_check_icall") || hasImport(PE, "guard_dispatch_icall") ||
+      hasImageText(*PE.Img, ".gfids") || hasImageText(*PE.Img, ".giats")) {
     T.ControlFlowGuard = true;
     I.Evidence.emplace_back("CFG guard table or dispatch import");
   }
