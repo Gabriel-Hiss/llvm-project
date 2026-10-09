@@ -96,9 +96,10 @@ test block plus body. Guarantees the rewrite only on proven-equal
 conditions with safe `continue` behavior.
 
 **revenant-untailrec (owner: MuseTxUnrotate).** Expects unrotated IR.
-Turns exact self tail-calls (`return f(args)`, arity matching) into loop
-back-edges through phi'ized parameters. Guarantees only exact tail calls
-are taken; anything else stays recursive.
+Undoes TailCallElim/loop-to-recursive-call: turns the recursive-call form
+back into the loop it came from (toward IR 1:1 with the compiler's ir-pre).
+Guarantees vetoes on any existing self-call, impure latch, or non-covering
+phis; anything vetoed stays as-is.
 
 **revenant-patterns (owner: MuseTxPatterns, opt-in).** Expects unopt
 output. Matches oracle-generated library-idiom patterns (anchor-seeded
