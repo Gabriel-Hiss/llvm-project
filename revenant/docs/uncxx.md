@@ -15,7 +15,17 @@ Vector empty detection requires both compared operands to load the same object's
 For MSVC, accept a string-size candidate at +16 only when the same object also has string capacity at +24 and lacks the vector middle pointer at +8. Ambiguous layouts stay unchanged.
 ## Rewrite eligibility
 
-`revenant-uncxx` runs only on functions tagged `"revenant.user"="true"`. A field layout alone is not enough: the pass also needs a call on that same object to a function tagged with a libdb-derived `"revenant.lib"` name. It resolves the call target after `stripPointerCastsAndAliases()` and reads the attribute from the callee `Function`, not the call site. The attributes survive every metadata mode.
+
+`revenant-uncxx` runs only on functions tagged `"revenant.user"="true"`. A field layout alone is not enough. The pass also requires a call on the same object to a function tagged with a libdb-derived `"revenant.lib"` name. It resolves the target after `stripPointerCastsAndAliases()` and reads the attribute from the callee `Function`, not the call site. These attributes survive every metadata mode.
+
+
+## Template signature database
+
+Header-only STL functions are compiled into the user object, so archive-only libdbs do not name them. `tools/revenant-libdb/generate-stl-db.ps1` compiles `stl-instantiations.cpp` with cl `/O1`, `/O2`, `/Ox`, clang-cl `/O1`, `/O2`, `/O3`, `/Oz`, and MinGW-w64 GCC 13.2 `-O2`, `-O3`, `-Os`. It builds each signature set with `revenant-libdb` and merges them with an existing database. Work products and output stay under `rv-scratch`; pass `-LibdbTool`, `-LLVMBuildBin`, `-BaseDatabase`, `-OutputDatabase`, and `-WorkDirectory`.
+
+`tools/revenant-libdb/stl-signatures-results.json` records the measured database sizes and cpp-o2 match comparison. The run generated 24,015 records across ten compiler/optimization configurations. Merging with the base DB kept 62,452 records after folding 13,959 duplicates. On cpp-o2, the merged DB preserved all 1,161 base matches and added 18, including `std::vector<int>::_Change_array` at `0x140002C20`. Uncxx still emitted zero helpers. `vector_ops` and `sum_vec<int>` have no direct call to a libdb-named STL member on their container object, so the required corroboration is absent in this IR.
+
+The generated-DB decompile also exposed a `revenant-lift-abi` PHI type mismatch (`ptr` versus `i64`) in `sub_140061c81`, before it could produce clean IR. The base-DB run reaches `ir-clean` with a duplicate lift failure at `0x140062f70`; its `ir-final` run then fails verification in `revenant-ssaout` on `nonnull`/`noundef` metadata attached to an alloca and store.
 
 
 ## Regression coverage
