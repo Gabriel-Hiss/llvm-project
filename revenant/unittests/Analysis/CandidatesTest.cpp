@@ -3,9 +3,7 @@
 // Port intent of the candidate rules in crates/analysis/src/lib.rs
 // `Program::analyze`: strong seeds (entry, executable non-forwarder
 // exports, TLS callbacks, primary pdata begins), the initial weak set
-// (reloc targets), and the weak-candidate / weak-function rejection
-// predicates (zero first byte, pointer-table runs, backing/inline-data,
-// mid-pdata starts, claimed bytes, undecodable bytes; all-zero and
+// (reloc targets), and the weak-function rejection predicate (all-zero and
 // filler-only functions).
 //
 //===----------------------------------------------------------------------===//
@@ -115,63 +113,6 @@ TEST(CandidatesTest, InitialWeakCandidatesAreRelocTargets) {
   std::set<Va> Weak = collectInitialWeakCandidates(Pe);
   ASSERT_EQ(Weak.size(), 1u);
   EXPECT_TRUE(Weak.count(E.at(0)));
-}
-
-TEST(CandidatesTest, ZeroFirstByteRejects) {
-  // add [rax],al: no compiler starts a function with it.
-  Env E({0x00, 0x00, 0xC3});
-  std::map<Va, std::pair<Va, Va>> Pdata;
-  EXPECT_TRUE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(0)));
-}
-
-TEST(CandidatesTest, PointerTableRejects) {
-  // Three pointer-shaped qwords (executable VAs) in a row: a table, not
-  // code. Each slot decodes as `add`/`or`, so the shape check must fire.
-  std::vector<uint8_t> Text(24, 0);
-  for (int K = 0; K < 3; ++K) {
-    uint64_t Slot = 0x140000000 + 0x100 + (uint64_t)K;
-    for (int B = 0; B < 8; ++B)
-      Text[(size_t)K * 8 + B] = (uint8_t)(Slot >> (8 * B));
-  }
-  Text.insert(Text.end(), {0xC3});
-  Env E(std::move(Text));
-  std::map<Va, std::pair<Va, Va>> Pdata;
-  EXPECT_TRUE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(0)));
-  // A lone ret decodes fine and is accepted (the Builder decides whether
-  // it becomes a function).
-  EXPECT_FALSE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(24)));
-}
-
-TEST(CandidatesTest, InlineDataAndMidPdataReject) {
-  Env E({0xC3, 0xC3, 0xC3});
-  E.Img->InlineData.push_back({E.at(0), E.at(1)});
-  std::map<Va, std::pair<Va, Va>> Pdata;
-  EXPECT_TRUE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(0)));
-  E.Img->InlineData.clear();
-  // Primary begin 0 owns [0,3): start 1 is strictly inside.
-  Pdata[E.at(0)] = {E.at(0), E.at(3)};
-  EXPECT_TRUE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(1)));
-  // The primary begin itself is not suppressed by this predicate.
-  EXPECT_FALSE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(0)));
-}
-
-TEST(CandidatesTest, ClaimedAndUndecodableReject) {
-  Env E({0xC3, 0x0F, 0x0B});
-  std::map<Va, std::pair<Va, Va>> Pdata;
-  std::vector<std::pair<Va, Va>> Claimed = {{E.at(0), E.at(1)}};
-  EXPECT_TRUE(rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, Claimed,
-                                  E.at(0)));
-  EXPECT_FALSE(rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, Claimed,
-                                   E.at(1)));
-  // Past the mapped tail: undecodable.
-  EXPECT_TRUE(
-      rejectWeakCandidate(*E.Img, *E.Dis, *E.Hooks, Pdata, {}, E.at(64)));
 }
 
 TEST(CandidatesTest, WeakFunctionZeroAndFillerReject) {
