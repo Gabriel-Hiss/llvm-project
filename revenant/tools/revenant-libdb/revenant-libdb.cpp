@@ -142,25 +142,37 @@ public:
   }
 };
 static Error parseHeader(StringRef Path, bool IsCXX) {
-  auto Invocation = std::make_shared<clang::CompilerInvocation>();
-  clang::Language Lang =
-      IsCXX ? clang::Language::CXX : clang::Language::C;
-  Invocation->getFrontendOpts().Inputs.push_back(
-      clang::FrontendInputFile(Path, clang::InputKind(Lang)));
-  Invocation->getFrontendOpts().ProgramAction = clang::frontend::ParseSyntaxOnly;
-  Invocation->getTargetOpts().Triple = "x86_64-pc-windows-msvc";
-  Invocation->getLangOpts().LangStd =
-      IsCXX ? clang::LangStandard::lang_cxx17 : clang::LangStandard::lang_c17;
-  Invocation->getLangOpts().CPlusPlus = IsCXX;
-  Invocation->getLangOpts().MicrosoftExt = true;
-  Invocation->getLangOpts().MSVCCompat = true;
-  Invocation->getLangOpts().DeclSpecKeyword = true;
-  for (const std::string &Dir : IncludeDirs)
-    Invocation->getHeaderSearchOpts().AddPath(
-        Dir, clang::frontend::System, false, false);
-  clang::CompilerInstance Compiler(std::move(Invocation));
+  clang::CompilerInstance Compiler;
   Compiler.setVirtualFileSystem(vfs::getRealFileSystem());
   Compiler.createDiagnostics();
+
+  std::vector<std::string> Args = {
+      "-x", IsCXX ? "c++" : "c",
+      IsCXX ? "-std=c++20" : "-std=c17",
+      "-triple", "x86_64-pc-windows-msvc"};
+  Args.push_back("-fms-compatibility");
+  Args.push_back("-fms-extensions");
+  Args.push_back("-fdeclspec");
+  Args.push_back("-fms-compatibility-version=19.51");
+  if (IsCXX)
+    Args.push_back("-fdelayed-template-parsing");
+  for (const std::string &Dir : IncludeDirs) {
+    Args.push_back("-isystem");
+    Args.push_back(Dir);
+  }
+  std::vector<const char *> Argv;
+  for (const std::string &Arg : Args)
+    Argv.push_back(Arg.c_str());
+  if (!clang::CompilerInvocation::CreateFromArgs(
+          Compiler.getInvocation(), Argv, Compiler.getDiagnostics()))
+    return createStringError(inconvertibleErrorCode(),
+                             "cannot configure prototype parser");
+  Compiler.getInvocation().getFrontendOpts().Inputs.push_back(
+      clang::FrontendInputFile(
+          Path, clang::InputKind(IsCXX ? clang::Language::CXX
+                                       : clang::Language::C)));
+  Compiler.getInvocation().getFrontendOpts().ProgramAction =
+      clang::frontend::ParseSyntaxOnly;
   PrototypeAction Action;
   if (!Compiler.ExecuteAction(Action))
     return createStringError(inconvertibleErrorCode(),
