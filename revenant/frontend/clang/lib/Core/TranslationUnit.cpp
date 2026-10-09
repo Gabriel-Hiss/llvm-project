@@ -59,7 +59,8 @@ createASTContext(llvm::Module &M, const ClangFrontendOptions &Opts) {
   LO.CPlusPlus = Lang == SourceLang::CPlusPlus;
   LO.CPlusPlus11 = LO.CPlusPlus14 = LO.CPlusPlus17 = LO.CPlusPlus;
   LO.Bool = true;
-  LO.MicrosoftExt = LO.MSVCCompat = true;
+  // The emitted text must also compile with GCC/Clang, not just MSVC.
+  LO.MicrosoftExt = LO.MSVCCompat = false;
   LO.DeclSpecKeyword = true;
   LO.WChar = true;
 
@@ -262,6 +263,25 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
     buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
 }
 
+
+static c::FunctionDecl *prototypeFor(c::FunctionDecl *Definition,
+                                     c::ASTContext &AST) {
+  auto *Prototype = c::FunctionDecl::Create(
+      AST, AST.getTranslationUnitDecl(), c::SourceLocation(),
+      c::SourceLocation(), Definition->getDeclName(), Definition->getType(),
+      Definition->getTypeSourceInfo(), Definition->getStorageClass(),
+      Definition->UsesFPIntrin(), Definition->isInlineSpecified());
+  SmallVector<c::ParmVarDecl *, 8> Parameters;
+  for (c::ParmVarDecl *Parameter : Definition->parameters()) {
+    Parameters.push_back(c::ParmVarDecl::Create(
+        AST, Prototype, c::SourceLocation(), c::SourceLocation(),
+        Parameter->getIdentifier(), Parameter->getType(), nullptr,
+        c::SC_None, nullptr));
+  }
+  Prototype->setParams(Parameters);
+  return Prototype;
+}
+
 void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
                           ArrayRef<StringRef> Includes) {
   c::PrintingPolicy Policy = TU->getASTContext().getPrintingPolicy();
@@ -269,21 +289,28 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
-  for (unsigned Pass = 0; Pass != 3; ++Pass)
+  for (unsigned Pass = 0; Pass != 3; ++Pass) {
     for (c::Decl *D : TU->decls()) {
       if (D->isImplicit())
         continue;
       auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
       bool IsRecord = llvm::isa<c::RecordDecl>(D);
-      bool IsPrototype = FD && !FD->doesThisDeclarationHaveABody();
-      if ((Pass == 0 && !IsRecord) || (Pass == 1 && !IsPrototype) ||
-          (Pass == 2 && (IsRecord || IsPrototype)))
+      bool HasBody = FD && FD->doesThisDeclarationHaveABody();
+      if ((Pass == 0 && !IsRecord) || (Pass == 1 && !FD) ||
+          (Pass == 2 && (IsRecord || (FD && !HasBody))))
         continue;
+      if (Pass == 1 && HasBody) {
+        prototypeFor(FD, TU->getASTContext())
+            ->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
+        OS << ";\n";
+        continue;
+      }
       D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
-      if (!FD || IsPrototype)
+      if (!FD || !HasBody)
         OS << ";";
       OS << "\n";
     }
+  }
 }
 
 } // namespace revenant::clangx
