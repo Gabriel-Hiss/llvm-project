@@ -61,10 +61,17 @@ const X86Tables &x86Tables() {
   return *Tables;
 }
 
-/// Test hooks: the six stack queries delegate to x86_stack (production
-/// code under test).
-class TestHooks final : public StackHooks {
+/// Test hooks: stack queries delegate to x86_stack, the production code
+/// under test; unrelated target queries are neutral.
+class TestHooks final : public TargetHooks {
 public:
+  llvm::StringRef mnemonic(const Instr &) const override { return {}; }
+  bool isFiller(const Instr &) const override { return false; }
+  TrapKind trapKind(const Instr &) const override { return TrapKind::NotTrap; }
+  bool isNopOrInt3(const Instr &) const override { return false; }
+  bool isOpaqueTailJmp(const Image &, const Instr &) const override {
+    return false;
+  }
   std::optional<int64_t> stackDelta(const Instr &I) const override {
     return x86_stack::stackDelta(*x86Tables().MII, *x86Tables().MRI, I);
   }
@@ -75,8 +82,7 @@ public:
     return x86_stack::fpEstablish(*x86Tables().MII, *x86Tables().MRI, I);
   }
   bool restoresSpFromFp(const Instr &I) const override {
-    return x86_stack::restoresSpFromFp(*x86Tables().MII, *x86Tables().MRI,
-                                       I);
+    return x86_stack::restoresSpFromFp(*x86Tables().MII, *x86Tables().MRI, I);
   }
   std::optional<int64_t> movEaxImm(const Instr &I) const override {
     return x86_stack::movEaxImm(*x86Tables().MII, *x86Tables().MRI, I);
@@ -84,6 +90,13 @@ public:
   bool writesSpDynamically(const Instr &I) const override {
     return x86_stack::writesSpDynamically(*x86Tables().MII,
                                           *x86Tables().MRI, I);
+  }
+  std::optional<JumpTableInfo>
+  matchJumpTable(const Image &, llvm::ArrayRef<std::pair<Va, Va>>,
+                 llvm::ArrayRef<BasicBlock>, llvm::ArrayRef<Instr>, size_t,
+                 const std::vector<Va> &, const std::vector<Va> &,
+                 const std::map<Va, uint64_t> &) const override {
+    return std::nullopt;
   }
 };
 

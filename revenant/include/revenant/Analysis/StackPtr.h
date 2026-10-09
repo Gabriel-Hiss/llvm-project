@@ -20,6 +20,7 @@
 
 #include "revenant/Core/Program.h"
 #include "revenant/Core/Va.h"
+#include "revenant/Target/TargetHooks.h"
 
 #include <cstdint>
 #include <map>
@@ -32,43 +33,6 @@
 
 namespace revenant {
 
-/// Stack-slot base class for memory references (mirrors the `StackBase`
-/// declared in Target/TargetHooks.h on LunaDiscovery's branch; defined
-/// here transitionally so this slice builds standalone until that
-enum class StackBase : uint8_t { Rsp, Rbp };
-
-/// Memory slots rooted at rsp/rbp without an index register, plus whether
-/// an indexed rsp/rbp reference was seen (transitional; see StackBase).
-struct StackSlots {
-  std::vector<std::pair<StackBase, int64_t>> Slots;
-  bool HasDynamicMem = false;
-};
-
-/// Frame-pointer establishment (transitional; see StackBase).
-struct FpEstablish {
-  enum class Kind : uint8_t { None, MovRbpRsp, LeaRbpRsp } Tag = Kind::None;
-  int64_t Disp = 0;
-};
-/// Target stack queries analyzeStack needs. Transitional spelling of the
-/// six methods LunaDiscovery adds to TargetHooks
-/// (stackDelta/stackSlots/fpEstablish/restoresSpFromFp/movEaxImm/
-/// writesSpDynamically): X86TargetHooks will implement them, and this
-/// interface (plus the StackBase/StackSlots/FpEstablish types above) is
-/// removed once TargetHooks declares them.
-class StackHooks {
-public:
-  virtual ~StackHooks() = default;
-  /// Persistent delta *change* (push=+8, sub rsp,imm=+imm); nullopt = no
-  /// simple effect (consult writesSpDynamically).
-  virtual std::optional<int64_t> stackDelta(const Instr &I) const = 0;
-  virtual StackSlots stackSlots(const Instr &I) const = 0;
-  virtual FpEstablish fpEstablish(const Instr &I) const = 0;
-  virtual bool restoresSpFromFp(const Instr &I) const = 0;
-  virtual std::optional<int64_t> movEaxImm(const Instr &I) const = 0;
-  virtual bool writesSpDynamically(const Instr &I) const = 0;
-};
-
-class TargetHooks;
 
 /// Per-instruction rsp deltas plus frame-pointer info for one function
 /// (Rust `analysis::stackptr::StackInfo`).
@@ -137,7 +101,7 @@ struct StackError {
 /// dynamic rsp writes record `DynVa` and continue with the pre-dynamic
 /// delta for frame bookkeeping.
 llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
-                                       const StackHooks &Hooks);
+                                       const TargetHooks &Hooks);
 
 } // end namespace revenant
 

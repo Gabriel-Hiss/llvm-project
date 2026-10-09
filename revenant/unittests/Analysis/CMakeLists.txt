@@ -1,15 +1,15 @@
 revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
-  PaddingTest.cpp
-  NoreturnTest.cpp
-  XrefsTest.cpp
-  StringsTest.cpp
-  ResolverTest.cpp
-  JumpTableTest.cpp
   CandidatesTest.cpp
-  OverlapsTest.cpp
-  StackPtrTest.cpp
-  SignaturesTest.cpp
+  JumpTableTest.cpp
+  NoreturnTest.cpp
   OrphanTest.cpp
+  OverlapsTest.cpp
+  PaddingTest.cpp
+  ResolverTest.cpp
+  StackPtrTest.cpp
+  StringsTest.cpp
+  XrefsTest.cpp
+  SignaturesTest.cpp
 )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE

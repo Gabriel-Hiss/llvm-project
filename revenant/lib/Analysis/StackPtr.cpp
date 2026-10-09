@@ -86,7 +86,7 @@ bool terminates(BlockEnd K) {
 } // end anonymous namespace
 
 llvm::Expected<StackInfo> analyzeStack(const Program &Prog, const Function &F,
-                                       const StackHooks &Hooks) {
+                                       const TargetHooks &Hooks) {
   StackInfo Out;
   std::map<Va, int64_t> BlockIn;
   std::vector<std::pair<Va, int64_t>> Work;
