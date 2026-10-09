@@ -419,6 +419,10 @@ Expr *StructuredStmtBuilder::inverted(Value *V) {
 }
 
 Expr *StructuredStmtBuilder::caseValue(const ConstantInt *V, QualType CT) {
+  if (CT->isEnumeralType())
+    CT = AST->getPromotedIntegerType(CT);
+  if (!CT->isIntegerType())
+    CT = AST->IntTy;
   unsigned W = (unsigned)AST->getIntWidth(CT);
   APInt Raw = V->getValue();
   if (CT->isSignedIntegerType())
