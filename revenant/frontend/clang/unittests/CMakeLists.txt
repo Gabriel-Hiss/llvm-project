@@ -12,12 +12,10 @@ find_package(LLVM REQUIRED CONFIG PATHS "${LLVM_DIR}" NO_DEFAULT_PATH)
 find_package(Clang REQUIRED CONFIG PATHS "${CLANG_CMAKE_DIR}" NO_DEFAULT_PATH)
 
 if(NOT DEFINED REVENANT_CLANG_INCLUDE_DIR)
-  set(REVENANT_CLANG_INCLUDE_DIR
-      "C:/Users/User/RustroverProjects/rv-wt/Swe2ClangCore/revenant/frontend/clang/include")
+  set(REVENANT_CLANG_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../include")
 endif()
 if(NOT DEFINED REVENANT_TYPE_SRC_DIR)
-  set(REVENANT_TYPE_SRC_DIR
-      "C:/Users/User/RustroverProjects/rv-wt/MuseClangCpp/revenant/frontend/clang/lib/Type")
+  set(REVENANT_TYPE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../lib/Type")
 endif()
 
 llvm_map_components_to_libnames(LLVM_LIBS Demangle DebugInfoDWARF
