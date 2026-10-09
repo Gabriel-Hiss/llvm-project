@@ -393,6 +393,33 @@ bool matchVectorIndex(const DataLayout &DL, LoadInst *L, Value *&Vec,
   }
   return true;
 }
+// back(): load from `(load Base+last) - 1`. This differs from front/index:
+// the element address is based on the vector's last pointer, not its first.
+bool matchVectorBack(const DataLayout &DL, LoadInst *L, Value *&Vec) {
+  auto *G = dyn_cast<GEPOperator>(L->getPointerOperand());
+  if (!G)
+    return false;
+  auto *Last = dyn_cast<LoadInst>(stripPtr(G->getPointerOperand()));
+  if (!Last || !Last->getType()->isPointerTy())
+    return false;
+  auto R = rootOff(DL, Last->getPointerOperand());
+  if (!R || R->second != VecLast)
+    return false;
+  bool SawMinusOne = false;
+  for (Value *Ix : G->indices()) {
+    auto *C = dyn_cast<ConstantInt>(Ix);
+    if (!C)
+      return false;
+    if (C->isMinusOne())
+      SawMinusOne = true;
+    else if (!C->isZero())
+      return false;
+  }
+  if (!SawMinusOne)
+    return false;
+  Vec = R->first;
+  return true;
+}
 
 // string.size(): load of the size field (MSVC +16, gnu/libc++ +8).
 // The load must be the only string-field access feeding the value and
@@ -512,6 +539,29 @@ bool matchEmpty(const DataLayout &DL, ICmpInst *Cmp, CxxFlavor Fl,
   return true;
 }
 
+bool isVectorEmptyOperand(const DataLayout &DL, LoadInst *L) {
+  auto R = rootOff(DL, L->getPointerOperand());
+  if (!R || (R->second != VecFirst && R->second != VecLast))
+    return false;
+  int64_t OtherOff = R->second == VecFirst ? VecLast : VecFirst;
+  for (User *U : L->users()) {
+    auto *Cmp = dyn_cast<ICmpInst>(U);
+    if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+                 Cmp->getPredicate() != ICmpInst::ICMP_NE))
+      continue;
+    Value *Other = Cmp->getOperand(0) == L ? Cmp->getOperand(1)
+                                           : Cmp->getOperand(0);
+    auto *OtherLoad = dyn_cast<LoadInst>(stripPtr(Other));
+    if (!OtherLoad)
+      continue;
+    auto OtherRoot = rootOff(DL, OtherLoad->getPointerOperand());
+    if (OtherRoot && OtherRoot->first == R->first &&
+        OtherRoot->second == OtherOff)
+      return true;
+  }
+  return false;
+}
+
 // Match `icmp (pred) (load Base+Field) <const>`; returns the base on
 // success. Used for capacity-guard and SSO-capacity comparisons.
 LoadInst *matchFieldCmp(const DataLayout &DL, ICmpInst &Cmp, Value *Base,
@@ -589,7 +639,8 @@ unsigned runScalarIdioms(Function &F, const DataLayout &DL, CxxFlavor Fl) {
         }
         // vector.data / begin_ptr: bare first load.
         if (auto *L = dyn_cast<LoadInst>(&I)) {
-          if (L->isUnordered() && matchVectorData(DL, L, Obj)) {
+          if (L->isUnordered() && matchVectorData(DL, L, Obj) &&
+              !isVectorEmptyOperand(DL, L)) {
             // String data loads share offset +0 on MSVC: disambiguate
             // by requiring the vector end field to exist nearby
             // (a load of Base+16 in the same function) when the
@@ -603,6 +654,18 @@ unsigned runScalarIdioms(Function &F, const DataLayout &DL, CxxFlavor Fl) {
             Type *PT = L->getType();
             auto *C =
                 emitCxxCall(*M, "vector.data", PT, {Obj}, L, L);
+            L->replaceAllUsesWith(C);
+            eraseIfDead(L);
+            ++N;
+            Any = true;
+            continue;
+          }
+          if (L->isUnordered() && matchVectorBack(DL, L, Obj)) {
+            if (!KnownFlavor || !stableBase(Obj, F) ||
+                containerKind(DL, Obj, F) != 1)
+              continue;
+            auto *C = emitCxxCall(*M, "vector.back", L->getType(),
+                                  {Obj}, L, L);
             L->replaceAllUsesWith(C);
             eraseIfDead(L);
             ++N;
