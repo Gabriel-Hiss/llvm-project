@@ -448,6 +448,10 @@ private:
   clang::QualType buildFunctionType(clang::QualType Ret,
                                     ArrayRef<clang::QualType> Params,
                                     bool Variadic) {
+    // C and C++ cannot return arrays. Lifted aggregate-array returns decay
+    // to pointers in the emitted source signature.
+    if (const auto *AT = Ret->getAsArrayTypeUnsafe())
+      Ret = Ctx.ast().getPointerType(AT->getElementType());
     // C has no `f(...)` without a named parameter before C23; the opaque
     // revenant.asm.* declarations are unprototyped there instead.
     if (Variadic && Params.empty() && !Ctx.isCPlusPlus())
