@@ -75,6 +75,13 @@ struct RichEntry {
   uint16_t Build = 0;
   uint32_t Count = 0;
 };
+/// A name retained in the image's COFF symbol table.
+struct CoffSymbol {
+  Va Address;
+  std::string Name;
+  bool IsFunction = false;
+};
+
 
 /// A section's extent in the raw file (PointerToRawData/SizeOfRawData),
 /// kept distinct from the mapped virtual extent: zero-filled virtual
@@ -107,6 +114,7 @@ struct PeFile {
   std::vector<Va> TlsCallbacks;
   std::optional<CodeView> Cv;
   std::vector<RichEntry> RichHeader;
+  std::vector<CoffSymbol> CoffSymbols;
   /// Total input file length in bytes.
   uint64_t FileSize = 0;
   /// SizeOfHeaders clamped to `FileSize` — file extent of the headers.
