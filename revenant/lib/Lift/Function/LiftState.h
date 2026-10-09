@@ -67,6 +67,8 @@ struct StackInfo {
   /// VA of the instruction that modifies rsp non-constantly
   /// (`sub rsp, rax`, `and rsp,-N`, non-const `__chkstk`), if any.
   std::optional<Va> DynVA;
+  /// Blocks reached at more than one rsp depth.
+  unsigned JoinMismatches = 0;
 
   int64_t deltaAt(Va Addr) const {
     auto It = Deltas.find(Addr);

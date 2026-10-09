@@ -466,7 +466,7 @@ Value *X86LiftContext::flagsShift2(StringRef Name, Value *V, Value *Extra,
   Value *Wide = B.CreateOr(
       B.CreateShl(B.CreateZExt(V, iN(2 * W)), constI(W, 2 * W)),
       B.CreateZExt(E, iN(2 * W)));
-  Value *CW = B.CreateTrunc(C8, iN(2 * W));
+  Value *CW = B.CreateZExtOrTrunc(C8, iN(2 * W));
   Value *Res;
   if (Name == "shld")
     Res = B.CreateTrunc(
@@ -486,7 +486,7 @@ Value *X86LiftContext::flagsShift2(StringRef Name, Value *V, Value *Extra,
     Cfc = B.CreateTrunc(
         B.CreateLShr(Wide,
                      B.CreateSub(constI(2 * W, 2 * W),
-                                 B.CreateTrunc(C8, iN(2 * W)))),
+                                 B.CreateZExtOrTrunc(C8, iN(2 * W)))),
         iN(1));
   else
     Cfc = B.CreateTrunc(B.CreateLShr(
@@ -833,7 +833,7 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
         B.CreateInsertElement(Vec, S, uint64_t(0)), iN(128));
   }
   if (Name == "xnewlane0f32") {
-    Value *Vec = UndefValue::get(Vec128(F32));
+    Value *Vec = Constant::getNullValue(Vec128(F32));
     Value *S = Bv && Bv->getType()->isFloatTy()
                    ? Bv
                    : B.CreateBitCast(toInt(Bv, 32), F32);
@@ -841,7 +841,7 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
         B.CreateInsertElement(Vec, S, uint64_t(0)), iN(128));
   }
   if (Name == "xnewlane0f64") {
-    Value *Vec = UndefValue::get(Vec128(F64));
+    Value *Vec = Constant::getNullValue(Vec128(F64));
     Value *S = Bv && Bv->getType()->isDoubleTy()
                    ? Bv
                    : B.CreateBitCast(toInt(Bv, 64), F64);
