@@ -82,18 +82,18 @@ std::map<std::string, long long> countsOf(StringRef Text) {
   SmallVector<StringRef, 32> Lines;
   Text.split(Lines, '\n');
   for (StringRef L : Lines) {
-    if (!L.trim().starts_with("counts:"))
+    L = L.trim();
+    if (!L.starts_with("counts:"))
       continue;
+    L = L.drop_front(StringRef("counts:").size()).trim();
     SmallVector<StringRef, 8> Parts;
     L.split(Parts, ',');
     for (StringRef P : Parts) {
-      SmallVector<StringRef, 4> Words;
-      P.split(Words, ' ');
-      if (Words.size() < 2)
-        continue;
+      P = P.trim();
+      auto [Number, Name] = P.split(' ');
       long long N;
-      if (!Words[0].getAsInteger(10, N))
-        Out[Words[1].str()] = N;
+      if (!Number.getAsInteger(10, N))
+        Out[Name.trim().split(' ').first.str()] = N;
     }
   }
   return Out;

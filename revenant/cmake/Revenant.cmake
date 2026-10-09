@@ -24,7 +24,7 @@ function(revenant_add_unittest suite name)
   find_library(REVENANT_GTEST_MAIN_LIB NAMES llvm_gtest_main
                PATHS "${LLVM_LIBRARY_DIRS}" NO_DEFAULT_PATH REQUIRED)
   target_link_libraries(${name} PRIVATE
-    ${REVENANT_GTEST_MAIN_LIB} ${REVENANT_GTEST_LIB} LLVMTestingSupport)
+    ${REVENANT_GTEST_MAIN_LIB} ${REVENANT_GTEST_LIB})
 
   target_compile_definitions(${name} PRIVATE
     LLVM_BUILDING_REVENANT_TEST=1
