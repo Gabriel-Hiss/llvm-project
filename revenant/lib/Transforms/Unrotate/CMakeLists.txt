@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.20)
 #   `revenant-untailrec` name registration in Pipeline/Register.cpp.
 #   A MODULE/DLL must never reach the superbuild link: lld-link takes the
 #   .dll as an input and the link fails.
-set(UNROTATE_SOURCES Unrotate.cpp UntailRec.cpp)
+set(UNROTATE_SOURCES Unrotate.cpp UntailRec.cpp UnrotatePlugin.cpp)
 
 if(COMMAND add_llvm_library)
   add_llvm_library(RevenantTransformUnrotate STATIC ${UNROTATE_SOURCES}
