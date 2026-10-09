@@ -889,6 +889,11 @@ unsigned runScalarIdioms(Function &F, const DataLayout &DL, CxxFlavor Fl) {
 
 llvm::PreservedAnalyses
 revenant::UncxxPass::run(llvm::Function &F, llvm::FunctionAnalysisManager &) {
+  if (Metadata *Language = F.getParent()->getModuleFlag("revenant.lang")) {
+    auto *Name = dyn_cast<MDString>(Language);
+    if (!Name || Name->getString() != "cpp")
+      return llvm::PreservedAnalyses::all();
+  }
   const llvm::DataLayout &DL = F.getParent()->getDataLayout();
   CxxFlavor Fl = uncxx::flavorOf(*F.getParent());
   unsigned N = 0;
