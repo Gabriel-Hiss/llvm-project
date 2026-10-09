@@ -643,12 +643,13 @@ Value *X86LiftContext::bitTestOp(StringRef Op, Value *Base, Value *Off,
                                  unsigned EltWidth) {
   Value *Idx = B.CreateZExtOrTrunc(Off, iN(64));
   if (IsMem) {
-    // Bit offsets address the full bitstring: elt = Idx / EltWidth.
-    Value *Elt = B.CreateUDiv(Idx, constI(EltWidth, 64));
+    // The offset is a signed bit index into a bit string: element =
+    // floor(Idx / EltWidth), bit = Idx mod EltWidth.
+    Value *Elt = B.CreateAShr(Idx, constI(Log2_32(EltWidth), 64));
     Value *Addr =
         B.CreateAdd(MemAddr, B.CreateMul(Elt, constI(EltWidth / 8, 64)));
     Value *W = memReadAddr(Addr, iN(EltWidth));
-    Value *BitOff = B.CreateURem(Idx, constI(EltWidth, 64));
+    Value *BitOff = B.CreateAnd(Idx, constI(EltWidth - 1, 64));
     Value *Bit = B.CreateTrunc(
         B.CreateLShr(W, B.CreateTrunc(BitOff, iN(EltWidth))), iN(1));
     flagWrite(CF, Bit);
