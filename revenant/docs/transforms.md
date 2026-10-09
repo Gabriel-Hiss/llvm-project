@@ -184,10 +184,23 @@ site-specific, so callers retain distinct allocation sizes rather than
 requiring a unanimous constant. The `_S_construct.isra` pair folds only when
 the body match proves equivalent initialized string data and equivalent
 trap-only `sub_0x` callees; pooled data is treated as equal only when constant
-initializers match and its address is not compared. Outlined `.part.0` and
-`.cold` owners are kept intact. Across both targets, four of seven named
-entries remain unresolved (including the outlined `.part.0` owners); no
-oracle/PDB data is consulted by the pass.
+initializers match and its address is not compared. Four named entries remain:
+`_M_construct.isra` at VA `0x14001bca0` (O2) / `0x14001bf40` (O3), whose body
+CFG/opcode shapes differ from unspecialized `_M_construct` at `0x14001bbf0` /
+`0x14001be90`; `d_demangle_callback.constprop` at `0x14000aa20` / `0x14000ac30`
+(no equivalent general body survived; its two callers pass different callback
+values); `next_is_type_qual.isra` at `0x140002430` / `0x140002640` (no matching
+general body/call evidence); and `is_designated_init.part.0.isra` at
+`0x1400023f0` / `0x140002600` (an outlined `.part.0` region, intentionally
+excluded). The outlined `.part.0` owners `d_encoding` and
+`d_index_template_argument` are likewise left intact. No oracle/PDB data is
+consulted by the pass.
+
+The same pass was attempted on fresh normalized `c-clang-o2lto` IR. It did not
+produce a measurable result: after `revenant-unipo`, LLVM asserted in constant
+uniquing (`Constant not found in constant table`) and verification reported
+attribute/module-context mismatches. Baseline `opt -passes=verify` on the input
+passed, so this failure is in the pass path and remains open.
 
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
