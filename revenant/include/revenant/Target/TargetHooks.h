@@ -24,6 +24,12 @@
 
 namespace revenant {
 
+/// Per-target instruction operations for jump-table recovery
+/// (revenant/Analysis/JumpTable.h). Forward-declared so this header
+/// stays free of the Analysis layer.
+class JtInsnOps;
+const JtInsnOps *getX86JumpTableInsnOps();
+
 /// Result of jump-table shape matching at an indirect `jmp` (Rust
 /// `analysis::jump_table::SwitchResolution`).
 struct JumpTableInfo {
@@ -67,6 +73,12 @@ public:
   /// doesn't touch rsp or the effect isn't statically known (e.g. `leave`
   /// handles fine: it is `mov rsp,rbp; pop rbp`).
   virtual std::optional<int64_t> stackDelta(const Instr &I) const = 0;
+
+  /// Instruction operand decoding for jump-table analysis (iced-level
+  /// operand view). Implemented by the target's X86JumpTables; null when
+  /// the target has no jump-table support.
+  /// Return the target's jump-table instruction adapter.
+  virtual const JtInsnOps *jumpTableInsnOps() const { return nullptr; }
 
   /// Try to resolve the indirect `jmp` terminating `Blocks[Dispatch]`
   /// through a jump table. Mirrors `analysis::jump_table::resolve`.
