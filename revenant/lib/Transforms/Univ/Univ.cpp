@@ -2,30 +2,40 @@
 //
 // Part of the Revenant LLVM fork.
 //
-// Undoes `indvars` IV widening plus `loop-reduce` strength reduction on the
-// two loop shapes the corpus actually shows:
+// Undoes `indvars` IV rewriting plus `loop-reduce` strength reduction on the
+// loop shapes the corpus actually shows:
 //
-// 1. Widened integer-IV scalar tails: the loop walks an `i64` IV PHI from 0
-//    stepping by 1, exits on `icmp eq %next, %wide.trip.count`, and reads
+// 1. Widened integer-IV loops: the loop walks an `i64` IV PHI from 0
+//    stepping by 1, exits on `icmp eq %next, %wide.trip.count` (or `eq %n,
+//    %next` with the bound already narrow, the MSVC/GCC form), and touches
 //    one element per iteration through a typed `getelementptr <elem>` (the
 //    O2 `sum_vec` scalar tail after the vector main loop, `fill_vec`/`add`
-//    tails, `sum_vec_d` tails; c-clang-o2/o3 ir-post).
-// 2. Pointer-increment byte loops: the loop threads one (copy: two) `ptr`
+//    tails, `sum_vec_d` tails; c-clang-o2/o3 ir-post). The touched GEP may
+//    index the IV directly, index a widening of it (`getelementptr i32,
+//    %base, i64 %sext`, the -O0/clang and MSVC form), or walk bytes with
+//    the IV stride equal to the element size (`getelementptr i8` + `add
+//    %iv, 4` on i32 elements, the GCC LSR form), and its base may be an
+//    invariant expression materialized inside the loop.
+// 2. Byte-stride IV loops with a scaled bound: GCC keeps a byte index
+//    (`getelementptr i8, %base, %iv`, `add %iv, 4`) and compares against
+//    `shl (zext %n), 2`; the bound is divided back out to the source `%n`.
+// 3. Pointer-increment byte loops: the loop threads one (copy: two) `ptr`
 //    PHI stepped by `getelementptr i8, %p, 1` and counts iterations with a
 //    kept `i32` counter PHI tested by `icmp eq %count, %trip` (O2/O3
 //    `copy_bytes` scalar tail and 8x-unrolled remainder; ir-pre shows the
 //    same pointers next to an `i32` index tested with `icmp slt i32 %i,
 //    %n`, which is the shape we rebuild).
+// 4. Pointer loops with an integer address mirror: the loop threads a `ptr`
+//    PHI stepped by a constant-stride byte GEP plus an `i64` mirror PHI of
+//    the same stride, and exits on `icmp eq %mirror-step, %end` where
+//    `%end = %start + %n * stride` (GCC `sum_vec`/`hash_vec` LSR form).
 //
-// Both rewrite to the ir-pre shape: a single `i32` index PHI from 0,
+// All four rewrite to the ir-pre shape: a single `i32` index PHI from 0,
 // `add i32 %i, 1` in the latch, `icmp slt i32 %i, %n` in the header, one
 // `getelementptr <elem>, %base, i32 %i` per touched element, and the pointer
-// PHIs/counters replaced by the equivalent address expression. rustc
-// iterator loops (`for &x in a`, filter/map folds) do not survive as loops
-// in `rust-o3` ir-post: small cases fold to constants or a single vector
-// reduction, so there is no IV left to invert there; the pointer half below
-// covers the shape they would leave if present (`icmp eq %ptr, %end` +
-// 1-element GEP step), and the measurement section reports that finding.
+// PHIs/counters replaced by the equivalent address expression. Loops whose
+// IV steps by more than 1, that keep a coupled countdown trip counter, or
+// that were unrolled stay for the unroll/vector passes.
 //
 // Corpus:
 // - `c-clang-o2` `sum_vec` (ir-pre `icmp slt i32` + `sext` + `getelementptr
@@ -33,13 +43,30 @@
 // - `c-clang-o2`/`c-clang-o3` `copy_bytes` scalar tail (`phi ptr` pair +
 //   `i32` counter + `icmp eq %46, %35`) and 8x remainder (`phi i32` +
 //   `phi ptr` pair, exit `icmp eq %89, %2`).
+// - `c-clang-o2` `break_continue` (`phi i32` + `add %iv, 1` + `icmp eq %n,
+//   %next`, the counter also feeding the in-body `%3` magic division, no
+//   memory touch), `cmp_vec` (IV escaping into the early-exit block as
+//   `trunc i64 %iv to i32`), `hash_vec`/`sum_vec_d` scalar tails (base GEP
+//   materialized inside the loop from invariant operands), `sum_vec`/
+//   `fill_vec` tails (three-entry IV PHI: entry, latch, vector exit).
+// - `c-o2` (MSVC) `break_continue`/`hash_vec`/`map_call_vec`/`copy_vec`/
+//   `cmp_vec`: already `icmp slt %next, %n` with a narrow `i32` IV, so the
+//   pass leaves them; MSVC defers indvars to `-O2` only for the trips it
+//   rewrites, and these loops are already source-shaped.
+// - `c-gcc-o2` `sum_vec`/`hash_vec` (`phi ptr` + `phi i64` mirror + `icmp
+//   eq %mirror-step, %start + %n * 4`), `copy_vec`/`add_vec` (`getelementptr
+//   i8` + `add %iv, 4` + `icmp eq %iv-next, shl (zext %n), 2`), `copy_bytes`
+//   (`getelementptr i8` + `add %iv, 1` + `icmp eq %iv-next, zext %n`).
 //
-// Safety: single-IV loops only. The IV PHI must start at constant 0, step
-// by constant 1, and every use must be the step, the exit compare, or one of
+// Safety: single-IV loops only. The IV PHI must step by constant 1 (byte
+// loops: by the touched element size), and every use must be the step, the
+// exit compare, a `trunc` escape into an i32 result, a loop-invariant-valued
+// base expression, an in-loop value use of an already-narrow IV, or one of
 // the recognized addresses. The new exit `icmp slt %i, %n` computes the
 // same trip count (0..n-1) when the bound `%n` dominates and the old bound
-// provably equals its widening. `!revenant.va` moves to each rebuilt
-// instruction; `!revenant.opaque` is copied over, never dropped.
+// provably equals its widening (or its stride scaling of it). `!revenant.va`
+// moves to each rebuilt instruction; `!revenant.opaque` is copied over,
+// never dropped.
 //
 // Alive2-style argument for the integer half: with start 0 and step 1 the
 // old exit fires at the first `%iv == %wide`. When `%wide == zext %n` the
@@ -48,7 +75,13 @@
 // (`icmp sgt %n, 0`) skips the loop. The rebuilt GEP `base + %i * sizeof`
 // addresses the same bytes as the old typed GEP `base + %iv * sizeof` at
 // equal iteration values, and both PHIs step together so the values stay
-// equal.
+// equal. Byte-stride loops: the old exit fires when the byte index reaches
+// `%n * sizeof`; since the byte index starts at 0 and advances by `sizeof`
+// that is exactly `%n` iterations, and `base + %i * sizeof` addresses the
+// same bytes as `base + %byte_index`. Mirror loops: the old exit fires when
+// the mirror reaches `%start + %n * stride`, which is `%n` iterations for
+// `%n >= 0`, and each pointer touch `%p + %k * stride` equals the rebuilt
+// `%start + %k * sizeof` while `sizeof` equals the stride.
 //
 //===----------------------------------------------------------------------===//
 
@@ -137,38 +170,40 @@ static bool isLoopInvariant(Value *V, BasicBlock *Header, BasicBlock *Latch) {
 }
 
 // Integer PHI in Header stepping by constant StepC in Latch. Returns the
-// step instruction, which must live in Latch and consume the PHI, plus
-// the loop-entry start value in StartV. The start must be constant 0 or a
-// value defined outside the loop (vector-tail remainders start at the
-// main loop's end count).
-static Instruction *matchStep(PHINode *Phi, BasicBlock *Header,
-                              BasicBlock *Latch, int64_t &StepC,
-                              Value *&StartV) {
-  if (Phi->getNumIncomingValues() != 2)
-    return nullptr;
+// step instruction, which must live in Latch and consume the PHI, and
+// records every loop-entry (non-latch) value in Starts. Each start must be
+// constant 0 or loop-invariant: vector-tail remainders start at the main
+// loop's end count, and lifted merged headers enter from several guards.
+static Instruction *
+matchStep(PHINode *Phi, BasicBlock *Header, BasicBlock *Latch,
+          int64_t &StepC,
+          SmallVectorImpl<std::pair<Value *, BasicBlock *>> &Starts) {
+  Starts.clear();
   Value *Back = nullptr;
-  Value *Start = nullptr;
   for (unsigned i = 0, e = Phi->getNumIncomingValues(); i != e; ++i) {
-    if (Phi->getIncomingBlock(i) == Latch) {
+    BasicBlock *Pred = Phi->getIncomingBlock(i);
+    Value *V = Phi->getIncomingValue(i);
+    if (Pred == Latch) {
       if (Back)
         return nullptr;
-      Back = Phi->getIncomingValue(i);
-    } else {
-      if (Start)
-        return nullptr;
-      Start = Phi->getIncomingValue(i);
+      Back = V;
+      continue;
     }
-  }
-  if (!Back || !Start)
-    return nullptr;
-  // Start: constant 0, or loop-invariant (defined outside header/latch).
-  if (auto *C = dyn_cast<ConstantInt>(Start)) {
-    if (!C->isZero())
+    // A header edge is a self edge, impossible unless header == latch;
+    // anything else is a loop entry.
+    if (Pred == Header)
       return nullptr;
-  } else if (!isLoopInvariant(Start, Header, Latch)) {
-    return nullptr;
+    if (auto *C = dyn_cast<ConstantInt>(V)) {
+      if (!C->isZero())
+        return nullptr;
+    } else if (!isLoopInvariant(V, Header, Latch)) {
+      return nullptr;
+    }
+    Starts.emplace_back(V, Pred);
   }
-  auto *Step = Back ? dyn_cast<Instruction>(Back) : nullptr;
+  if (!Back || Starts.empty())
+    return nullptr;
+  auto *Step = dyn_cast<Instruction>(Back);
   if (!Step || Step->getParent() != Latch)
     return nullptr;
   if (Step->getOpcode() != Instruction::Add)
@@ -180,7 +215,6 @@ static Instruction *matchStep(PHINode *Phi, BasicBlock *Header,
   if (!C)
     return nullptr;
   StepC = C->getValue().getSExtValue();
-  StartV = Start;
   return Step;
 }
 
@@ -192,6 +226,65 @@ static Value *peelWidening(Value *V) {
     return Ext->getOperand(0);
   return nullptr;
 }
+
+// A value defined outside the loop, or a pure address computation inside
+// it whose operands are all loop-invariant: the lifter materializes byte
+// base GEPs (`getelementptr i8, %base, %scale`) and slot inttoptrs in the
+// loop header.
+static bool isInvariantBase(Value *V, BasicBlock *Header, BasicBlock *Latch) {
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return true;
+  if (isLoopInvariant(V, Header, Latch))
+    return true;
+  if (!isa<IntToPtrInst>(I) && !isa<GetElementPtrInst>(I) && !isa<BitCastInst>(I))
+    return false;
+  for (Value *Op : I->operands())
+    if (!isLoopInvariant(Op, Header, Latch))
+      return false;
+  return true;
+}
+
+// The narrow `i32` bound behind a byte-stride scaling of the trip count:
+// `shl (zext %n), k` or `mul %zext, K`/`mul K, %zext` where `K` equals the
+// loop's byte stride. GCC LSR compares the byte index against the byte
+// length `%n * sizeof`; dividing the stride back out yields the source `%n`.
+static Value *scaledBound(Value *V, int64_t Stride) {
+  if (Stride <= 0)
+    return nullptr;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return nullptr;
+  if (I->getOpcode() == Instruction::Shl) {
+    auto *C = dyn_cast<ConstantInt>(I->getOperand(1));
+    if (!C)
+      return nullptr;
+    int64_t K = C->getSExtValue();
+    if (K < 0 || K >= 62 || Stride != (1LL << K))
+      return nullptr;
+    Value *N = peelWidening(I->getOperand(0));
+    return N && N->getType()->isIntegerTy(32) ? N : nullptr;
+  }
+  if (I->getOpcode() == Instruction::Mul) {
+    for (unsigned K = 0; K < 2; ++K) {
+      auto *C = dyn_cast<ConstantInt>(I->getOperand(K));
+      if (!C || C->getSExtValue() != Stride)
+        continue;
+      Value *N = peelWidening(I->getOperand(1 - K));
+      if (N && N->getType()->isIntegerTy(32))
+        return N;
+    }
+  }
+  if (I->getOpcode() == Instruction::Add) {
+    for (unsigned K = 0; K < 2; ++K) {
+      Value *N = scaledBound(I->getOperand(K), Stride);
+      if (N)
+        return N;
+    }
+  }
+  return nullptr;
+}
+
 // One element touch inside the loop: the memory op and the pointer it
 // touches (a GEP to rebuild, or a PHI stepped by a 1-element GEP).
 struct Touch {
@@ -209,40 +302,61 @@ struct LoopShape {
   Instruction *Step = nullptr; // add (integer) or 1-elem GEP (pointer)
   Value *Bound = nullptr; // narrow `%n` (integer) or trip `%rem` (ptr)
   ICmpInst *ExitCmp = nullptr;
-  Value *IVStart = nullptr; // entry value of the integer IV (0 or invariant)
+  // Loop-entry values of the integer IV, one per non-latch predecessor
+  // (constant 0 or loop-invariant).
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> Starts;
   PHINode *Count = nullptr; // optional countdown PHI for a lifted remainder
   Instruction *CountStep = nullptr;
   Value *CountStart = nullptr;
   bool IsPtr = false;
+  // Pointer loop whose trip count is an integer mirror of the pointers with
+  // an end-address compare (`%end = %start + %n * stride`).
+  bool Mirror = false;
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> PtrSteps;
   SmallVector<Touch, 4> Touches;
   Type *ElemTy = nullptr;
+  // `trunc i64 %iv to i32` escapes into the loop result (early-exit loops
+  // such as `cmp_vec`); rewritten to the new narrow IV.
+  SmallVector<TruncInst *, 2> TruncEscapes;
+  // `zext`/`sext` of the IV that only fed the rebuilt addresses; dead after
+  // the rewrite.
+  SmallVector<Instruction *, 2> Widenings;
+  // The old IV is already `i32`, so in-loop value uses of it keep working
+  // through an RAUW instead of being rebuilt away.
+  bool IVIsNarrow = false;
 };
 
-// Integer half: `phi i64 [0, pre], [%step, latch]`, `%step = add %iv, 1`,
-// `icmp eq %step-or-iv, %wide` where `%wide` peels to an `i32` bound, one
-// typed GEP per memory address, no other IV uses.
+// Integer half. The IV steps by 1 (typed addressing) or by the touched
+// element size (byte addressing), exits on `eq`/`ne` against a bound that
+// is already `i32` or a widening (or a stride scaling) of an `i32` value,
+// and touches memory through typed GEPs on the IV, on a widening of it, or
+// through byte GEPs. An i32 IV may also feed in-loop value uses (the loop
+// body computes on the index, e.g. the `i % 3` of `break_continue`) and
+// may escape as `trunc` into the result.
 static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   S = LoopShape();
   PHINode *IV = nullptr;
   Instruction *Step = nullptr;
+  int64_t StepC = 0;
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> Starts;
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
       break;
     if (!PN->getType()->isIntegerTy())
       continue;
-    int64_t StepC = 0;
-    Value *StartV = nullptr;
-    Instruction *St = matchStep(PN, Header, Latch, StepC, StartV);
-    if (!St || StepC != 1)
+    SmallVector<std::pair<Value *, BasicBlock *>, 2> Cand;
+    int64_t C = 0;
+    Instruction *St = matchStep(PN, Header, Latch, C, Cand);
+    if (!St)
       continue;
     if (IV)
-      return false;
+      return false; // two stepped integer PHIs: coupled IVs
     IV = PN;
     Step = St;
-    S.IVStart = StartV;
+    StepC = C;
+    Starts = std::move(Cand);
   }
   if (!IV)
     return false;
@@ -253,9 +367,9 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     if (!PN)
       break;
     if (PN != IV && PN->getType()->isIntegerTy()) {
-      int64_t StepC = 0;
-      Value *Dummy = nullptr;
-      if (matchStep(PN, Header, Latch, StepC, Dummy))
+      SmallVector<std::pair<Value *, BasicBlock *>, 2> Cand;
+      int64_t C = 0;
+      if (matchStep(PN, Header, Latch, C, Cand))
         return false;
     }
   }
@@ -293,6 +407,10 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       bool BIs = B == IV || B == Step;
       if (AIs == BIs)
         continue;
+      // The other operand must be loop-invariant: body compares on the IV
+      // (the `i % 3 == 0` of `break_continue`) are not trip counts.
+      if (!isLoopInvariant(AIs ? B : A, Header, Latch))
+        continue;
       if (Cmp)
         return false;
       Cmp = C;
@@ -301,15 +419,23 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (!Cmp || !Wide || !isLoopInvariant(Wide, Header, Latch))
     return false;
-  Value *Narrow = peelWidening(Wide);
-  // counts 0..n-1 under the preheader's `n > 0` guard. (dyn_cast is not
-  // null-safe: guard Narrow first.)
-  if (Narrow) {
-    if (auto *II = dyn_cast<IntrinsicInst>(Narrow)) {
-      if (II->getIntrinsicID() == Intrinsic::smax &&
-          isa<ConstantInt>(II->getOperand(1)) &&
-          cast<ConstantInt>(II->getOperand(1))->isZero())
-        Narrow = II->getOperand(0);
+  // The bound: an already-narrow `i32`, the widening of one, or (byte
+  // loops) its stride scaling.
+  Value *Narrow = nullptr;
+  if (Wide->getType()->isIntegerTy(32)) {
+    Narrow = Wide;
+  } else {
+    Narrow = peelWidening(Wide);
+    if (Narrow) {
+      // `smax (n, 0)` folds the preheader guard into the trip count.
+      if (auto *II = dyn_cast<IntrinsicInst>(Narrow)) {
+        if (II->getIntrinsicID() == Intrinsic::smax &&
+            isa<ConstantInt>(II->getOperand(1)) &&
+            cast<ConstantInt>(II->getOperand(1))->isZero())
+          Narrow = II->getOperand(0);
+      }
+    } else {
+      Narrow = scaledBound(Wide, StepC);
     }
   }
   if (!Narrow || !Narrow->getType()->isIntegerTy(32) ||
@@ -332,55 +458,136 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     return false;
   if (Cont != Header && Cont != Latch && !reachable(Cont, Latch))
     return false;
-  // Use discipline: IV feeds only step/compare/typed-GEP index; the step
-  // feeds only the PHI and the compare. Addresses may live in the header,
-  // the latch, or a body block between them.
+  // Use discipline: IV feeds only step/compare/recognized addresses, an
+  // early-exit `trunc`, or (when already narrow) in-loop value uses. The
+  // step feeds only the PHI and the compare. Addresses may live in the
+  // header, the latch, or a body block between them, and may index the IV
+  // directly or through one widening of it (`getelementptr i32, %base, i64
+  // %sext`, the -O0/MSVC form), so the widening's users are examined too.
+  bool NarrowIV = IV->getType()->isIntegerTy(32);
   SmallVector<GetElementPtrInst *, 4> GEPs;
+  SmallVector<TruncInst *, 2> Truncs;
+  bool ByteTouch = false;  // a touch walks bytes with the element-size stride
+  bool TypedTouch = false; // a touch walks elements (stride 1)
+  // Element of the touched memory type, for byte GEPs whose source element
+  // is `i8` but whose step is the element size.
+  auto memType = [&](GetElementPtrInst *GI) -> Type * {
+    for (User *G : GI->users()) {
+      if (auto *L = dyn_cast<LoadInst>(G))
+        return L->getType();
+      if (auto *St = dyn_cast<StoreInst>(G))
+        return St->getValueOperand()->getType();
+    }
+    return nullptr;
+  };
+  // Recognize one address GEP. Widen is the widening of the IV that indexes
+  // it, or null when the GEP indexes the IV directly. Records the touch.
+  auto touchGEP = [&](GetElementPtrInst *GI, Instruction *Widen) -> bool {
+    if (!GI || GI->getNumIndices() != 1 || !inLoop(GI->getParent()))
+      return false;
+    Value *Idx = GI->getOperand(GI->getNumOperands() - 1);
+    if (Idx == IV) {
+      Widen = nullptr;
+    } else if (Widen && Idx == Widen && Widen->getOperand(0) == IV) {
+      if (!Widen->hasOneUse())
+        return false; // the widening feeds other users too
+    } else {
+      return false;
+    }
+    Type *Elem = GI->getSourceElementType();
+    if (Elem->isIntegerTy(8)) {
+      // Byte addressing: the IV counts bytes, so its stride must be the
+      // touched element size.
+      Type *Mem = memType(GI);
+      if (StepC <= 0 || !Mem || !Mem->isSized() ||
+          StepC != (int64_t)Mem->getPrimitiveSizeInBits() / 8)
+        return false;
+      Elem = Mem;
+      ByteTouch = true;
+    } else {
+      // Element addressing: the index advances one element per iteration.
+      if (StepC != 1)
+        return false;
+      TypedTouch = true;
+    }
+    // The base must be loop-invariant-valued; the lifter materializes
+    // byte base GEPs and slot inttoptrs inside the loop.
+    if (!isInvariantBase(GI->getPointerOperand(), Header, Latch))
+      return false;
+    for (User *G : GI->users()) {
+      auto *MI = dyn_cast<Instruction>(G);
+      if (!MI || (!isa<LoadInst>(MI) && !isa<StoreInst>(MI)))
+        return false;
+      if (!inLoop(MI->getParent()))
+        return false;
+    }
+    GEPs.push_back(GI);
+    if (!S.ElemTy)
+      S.ElemTy = Elem;
+    else if (S.ElemTy != Elem)
+      return false;
+    return true;
+  };
+  SmallVector<Instruction *, 8> Widenings;
   for (User *U : IV->users()) {
     Instruction *I = dyn_cast<Instruction>(U);
     if (!I)
       return false;
     if (I == Step || I == Cmp)
       continue;
-    auto *GI = dyn_cast<GetElementPtrInst>(I);
-    if (!GI || !inLoop(GI->getParent()))
+    if ((isa<ZExtInst>(I) || isa<SExtInst>(I)) && I->getOperand(0) == IV) {
+      Widenings.push_back(I);
+      continue;
+    }
+    if (touchGEP(dyn_cast<GetElementPtrInst>(I), nullptr))
+      continue;
+    if (auto *T = dyn_cast<TruncInst>(I)) {
+      // Early-exit loops return the index: `trunc i64 %iv to i32` escapes
+      // into the loop result.
+      if (!NarrowIV && T->getType()->isIntegerTy(32))
+        Truncs.push_back(T);
+      continue;
+    }
+    // In-loop value uses are fine while the IV is already narrow: the
+    // rewrite RAUWs the old PHI onto the new one.
+    if (NarrowIV && inLoop(I->getParent()))
+      continue;
+    return false;
+  }
+  // A widening of the IV is the -O0 index form when it only feeds address
+  // GEPs; when it also feeds arithmetic it is a value use of the index and
+  // only survives an already-narrow IV.
+  for (Instruction *W : Widenings) {
+    bool OnlyGEPs = true;
+    for (User *G : W->users())
+      if (!isa<GetElementPtrInst>(G)) {
+        OnlyGEPs = false;
+        break;
+      }
+    if (!OnlyGEPs) {
+      if (NarrowIV && inLoop(W->getParent()))
+        continue;
       return false;
-    if (GI->getNumIndices() != 1 || GI->getOperand(1) != IV)
-      return false;
-    if (GI->getSourceElementType()->isIntegerTy(8))
-      return false; // unscaled byte GEP: unknown stride
-    // Lifting may materialize an invariant base pointer as an inttoptr in
-    // the loop header. Its integer source must still be loop-invariant.
-    Value *Base = GI->getPointerOperand();
-    auto *BaseCast = dyn_cast<IntToPtrInst>(Base);
-    if (!isLoopInvariant(Base, Header, Latch) &&
-        (!BaseCast ||
-         !isLoopInvariant(BaseCast->getOperand(0), Header, Latch)))
-      return false;
-    GEPs.push_back(GI);
+    }
+    for (User *G : W->users())
+      if (!touchGEP(dyn_cast<GetElementPtrInst>(G), W))
+        return false;
   }
   for (User *U : Step->users()) {
     if (U == IV || U == Cmp)
       continue;
     return false;
   }
-  if (GEPs.empty())
+  // Step discipline: count up by one per element, or by the touched element
+  // size per element on a byte loop. Countdowns, 2x-unrolled strides and
+  // compound steps stay for the unroll pass; mixing byte and element
+  // addressing on one IV is not a shape the corpus shows.
+  if (StepC < 1 || (ByteTouch && TypedTouch) ||
+      (StepC != 1 && !ByteTouch))
     return false;
-  // Every touch has its own invariant base; copies commonly read one array
-  // and write another. All touches still use the same indexed element type.
-  Type *ElemTy = GEPs[0]->getSourceElementType();
-  for (auto *GI : GEPs) {
-    if (GI->getSourceElementType() != ElemTy)
-      return false;
-    // Address users must be loads/stores in the loop.
-    for (User *U : GI->users()) {
-      auto *MI = dyn_cast<Instruction>(U);
-      if (!MI || (!isa<LoadInst>(MI) && !isa<StoreInst>(MI)))
-        return false;
-      if (!inLoop(MI->getParent()))
-        return false;
-    }
-  }
+  // Loops with no memory touch (pure accumulator loops such as
+  // `break_continue`) still restore: the exit compare itself is the
+  // indvars artifact that gets inverted.
 
   S.Header = Header;
   S.Latch = Latch;
@@ -389,22 +596,29 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   S.ExitCmp = Cmp;
   S.Bound = Narrow;
   S.IsPtr = false;
-  S.ElemTy = ElemTy;
+  S.Starts = std::move(Starts);
+  S.TruncEscapes = std::move(Truncs);
+  S.Widenings = std::move(Widenings);
+  S.IVIsNarrow = NarrowIV;
   for (auto *GI : GEPs)
     S.Touches.push_back({nullptr, GI, nullptr});
   return true;
 }
-// Pointer half: one or two `ptr` PHIs stepped by a 1-element GEP in the
-// latch, plus an `i32` counter PHI from 0 stepping by 1, exited by
-// `icmp eq %counter-step, %trip`. Loads/stores touch the ptr PHI directly
-// (byte loops) or through constant-offset GEPs only when the GEP is the
-// step itself; unrolled remainders with extra constant GEPs do not match.
+// Pointer half: one or two `ptr` PHIs stepped by a constant-stride byte GEP
+// in the latch, plus an integer trip PHI, exited by `icmp eq %trip-step,
+// %bound`. The trip PHI is either a kept `i32` counter from 0 stepping by 1
+// (bound: the `i32` trip count) or an integer mirror of the pointers
+// stepping by the same stride (bound: `%start + %n * stride`, the LSR end
+// address). Loads/stores touch the ptr PHIs directly; unrolled remainders
+// with extra constant GEPs do not match.
 static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   S = LoopShape();
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> Steps;
   Value *Start0 = nullptr;
   Type *ElemTy = nullptr;
+  int64_t Stride = 0;
+  unsigned Entries = 0;
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
@@ -413,6 +627,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       continue;
     Value *Back = nullptr;
     Value *Start = nullptr;
+    unsigned N = 0;
     for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
       if (PN->getIncomingBlock(i) == Latch) {
         if (Back)
@@ -420,6 +635,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
         Back = PN->getIncomingValue(i);
       } else {
         Start = PN->getIncomingValue(i);
+        ++N;
       }
     }
     auto *Step = Back ? dyn_cast<GetElementPtrInst>(Back) : nullptr;
@@ -428,8 +644,9 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     if (Step->getPointerOperand() != PN || Step->getNumIndices() != 1)
       return false;
     auto *C = dyn_cast<ConstantInt>(Step->getOperand(1));
-    if (!C || !C->isOne())
+    if (!C || C->getSExtValue() < 1)
       return false;
+    int64_t K = C->getSExtValue();
     if (!isLoopInvariant(Start, Header, Latch))
       return false;
     if (Ptrs.size() == 2)
@@ -438,49 +655,69 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     Steps.push_back(Step);
     if (!Start0)
       Start0 = Start;
-    if (!ElemTy)
-      ElemTy = Step->getSourceElementType();
-    else if (ElemTy != Step->getSourceElementType())
+    // Byte addressing with a 1-element GEP is the classic pointer loop;
+    // wider strides are the LSR form and their element type comes from the
+    // touched memory.
+    if (!Stride)
+      Stride = K;
+    else if (Stride != K)
       return false;
+    if (!N)
+      return false;
+    if (!Entries)
+      Entries = N;
+    else if (Entries != N)
+      return false; // pointer PHIs entered differently
+    if (!ElemTy && K == 1)
+      ElemTy = Step->getSourceElementType();
   }
   if (Ptrs.empty())
     return false;
 
-  // The counter: an i32 PHI from 0 stepping by 1 in the latch.
-  PHINode *Counter = nullptr;
-  Instruction *CountStep = nullptr;
+  // The trip PHI: an `i32` counter from 0 stepping by 1 (classic), or an
+  // integer PHI stepping by the pointer stride (address mirror). Other
+  // integer PHIs must be accumulators.
+  PHINode *Trip = nullptr;
+  Instruction *TripStep = nullptr;
+  bool Mirror = false;
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> MirrorStarts;
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
       break;
-    if (!PN->getType()->isIntegerTy(32))
+    if (!PN->getType()->isIntegerTy())
       continue;
-    int64_t StepC = 0;
-    Value *StartV = nullptr;
-    Instruction *St = matchStep(PN, Header, Latch, StepC, StartV);
-    if (!St || StepC != 1)
+    SmallVector<std::pair<Value *, BasicBlock *>, 2> Cand;
+    int64_t C = 0;
+    Instruction *St = matchStep(PN, Header, Latch, C, Cand);
+    if (!St)
       continue;
-    if (Counter)
-      return false;
-    Counter = PN;
-    CountStep = St;
+    if (C == 1 && PN->getType()->isIntegerTy(32)) {
+      if (Trip)
+        return false;
+      Trip = PN;
+      TripStep = St;
+      continue;
+    }
+    if (C == Stride && !Mirror) {
+      if (Trip && Trip != PN)
+        return false;
+      Mirror = true;
+      Trip = PN;
+      TripStep = St;
+      MirrorStarts = std::move(Cand);
+      continue;
+    }
+    return false; // coupled IV
   }
-  if (!Counter)
+  if (!Trip)
     return false;
-  // No other integer PHIs.
-  for (Instruction &I : *Header) {
-    auto *PN = dyn_cast<PHINode>(&I);
-    if (!PN)
-      break;
-    if (PN->getType()->isIntegerTy() && PN != Counter)
-      return false;
-  }
 
-  // Exit: `icmp eq %count-step, %trip`, false edge leaves the loop. A
+  // Exit: `icmp eq %trip-step, %bound`, false edge leaves the loop. A
   // single-block loop has Header == Latch; scan once so the exit compare
   // is not seen twice.
   ICmpInst *Cmp = nullptr;
-  Value *Trip = nullptr;
+  Value *Bound = nullptr;
   SmallVector<BasicBlock *, 2> CmpBlocks{Header};
   if (Latch != Header)
     CmpBlocks.push_back(Latch);
@@ -490,17 +727,39 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       if (!C || C->getPredicate() != ICmpInst::ICMP_EQ)
         continue;
       Value *A = C->getOperand(0), *B = C->getOperand(1);
-      bool AIs = A == Counter || A == CountStep;
-      bool BIs = B == Counter || B == CountStep;
+      bool AIs = A == Trip || A == TripStep;
+      bool BIs = B == Trip || B == TripStep;
       if (AIs == BIs)
+        continue;
+      if (!isLoopInvariant(AIs ? B : A, Header, Latch))
         continue;
       if (Cmp)
         return false;
       Cmp = C;
-      Trip = AIs ? B : A;
+      Bound = AIs ? B : A;
     }
   }
-  if (!Cmp || !isLoopInvariant(Trip, Header, Latch))
+  if (!Cmp || !Bound || !isLoopInvariant(Bound, Header, Latch))
+    return false;
+  if (Mirror) {
+    // `%end = %start + %n * stride`; the new index runs 0..%n-1.
+    if (MirrorStarts.size() != 1 || !MirrorStarts.front().first)
+      return false;
+    Value *MStart = MirrorStarts.front().first;
+    auto *Add = dyn_cast<BinaryOperator>(Bound);
+    if (!Add || Add->getOpcode() != Instruction::Add)
+      return false;
+    Value *N = scaledBound(Add->getOperand(1), Stride);
+    if (N && Add->getOperand(0) == MStart)
+      Bound = N;
+    else if ((N = scaledBound(Add->getOperand(0), Stride)) &&
+             Add->getOperand(1) == MStart)
+      Bound = N;
+    else
+      return false;
+  }
+  if (!Bound->getType()->isIntegerTy(32) ||
+      !isLoopInvariant(Bound, Header, Latch))
     return false;
   auto *Br = dyn_cast<BranchInst>(Cmp->getParent()->getTerminator());
   if (!Br || !Br->isConditional() || Br->getCondition() != Cmp)
@@ -520,6 +779,15 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
         continue;
       if ((isa<LoadInst>(I) || isa<StoreInst>(I)) &&
           (I->getParent() == Header || I->getParent() == Latch)) {
+        Type *Mem = isa<LoadInst>(I) ? cast<LoadInst>(I)->getType()
+                                     : cast<StoreInst>(I)->getValueOperand()->getType();
+        if (Mirror || Stride != 1) {
+          // Wider strides must match the touched element size exactly.
+          if (!Mem->isSized() ||
+              Stride != (int64_t)Mem->getPrimitiveSizeInBits() / 8)
+            return false;
+          ElemTy = Mem;
+        }
         Touches.push_back({I, nullptr, Ptrs[p]});
         continue;
       }
@@ -531,22 +799,25 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       return false;
     }
   }
-  // The counter feeds only its step and the compare.
-  for (User *U : Counter->users()) {
-    if (U == CountStep || U == Cmp)
+  // The trip PHI feeds only its step and the compare.
+  for (User *U : Trip->users()) {
+    if (U == TripStep || U == Cmp)
       continue;
     return false;
   }
   if (Touches.empty())
     return false;
+  if (Mirror && Entries != 1)
+    return false; // mirrored end addresses are only restored for one entry
 
   S.Header = Header;
   S.Latch = Latch;
-  S.IV = Counter;
-  S.Step = CountStep;
+  S.IV = Trip;
+  S.Step = TripStep;
   S.ExitCmp = Cmp;
-  S.Bound = Trip;
+  S.Bound = Bound;
   S.IsPtr = true;
+  S.Mirror = Mirror;
   S.Ptrs = std::move(Ptrs);
   S.PtrSteps = std::move(Steps);
   S.Touches = std::move(Touches);
@@ -564,39 +835,64 @@ static bool rewriteIntLoop(LoopShape &S) {
   LLVMContext &Ctx = S.Header->getContext();
   Type *I32 = Type::getInt32Ty(Ctx);
 
-  BasicBlock *Pre = nullptr;
-  for (BasicBlock *P : predecessors(S.Header)) {
-    if (P == S.Latch || P == S.Header)
-      continue;
-    if (Pre)
-      return false;
-    Pre = P;
+  // Every loop entry (non-latch predecessor of the header) feeds one
+  // incoming value of the new index: constant 0, an already-narrow value,
+  // or a `trunc` of the wider start (vector-tail remainders, lifted
+  // merged headers).
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> Entries = S.Starts;
+  if (Entries.empty()) {
+    for (BasicBlock *P : predecessors(S.Header)) {
+      if (P == S.Latch || P == S.Header)
+        continue;
+      Entries.emplace_back(nullptr, P);
+    }
   }
-  if (!Pre)
+  if (Entries.empty())
     return false;
+  {
+    SmallPtrSet<BasicBlock *, 4> Seen;
+    unsigned NonLatch = 0;
+    for (BasicBlock *P : predecessors(S.Header))
+      if (P != S.Latch && P != S.Header)
+        ++NonLatch;
+    for (auto &E : Entries) {
+      if (!Seen.insert(E.second).second || E.second == S.Latch ||
+          E.second == S.Header)
+        return false; // not a merge of loop entries
+      if (!E.first)
+        return false;
+    }
+    if (NonLatch != Entries.size())
+      return false;
+  }
 
   IRBuilder<> HB(&S.Header->front());
-  PHINode *NewIV = HB.CreatePHI(I32, 2, S.IV->getName() + ".idx");
+  PHINode *NewIV = HB.CreatePHI(I32, Entries.size() + 1, S.IV->getName() + ".idx");
   moveVA(S.IV, NewIV);
-  // Start the new index at the narrowed entry value: constant 0, or
-  // `trunc` of a wider invariant start (vector-tail remainders).
-  Value *NewStart = nullptr;
-  if (!S.IVStart)
-    return false;
-  if (auto *C = dyn_cast<ConstantInt>(S.IVStart)) {
-    NewStart = ConstantInt::get(I32, 0);
-  } else if (S.IVStart->getType() == I32) {
-    NewStart = S.IVStart;
-  } else {
-    IRBuilder<> PB(Pre->getTerminator());
-    NewStart = PB.CreateTrunc(S.IVStart, I32, S.IV->getName() + ".start");
-    moveVA(S.IV, cast<Instruction>(NewStart));
+  for (auto &E : Entries) {
+    // Start the new index at the narrowed entry value: constant 0, an
+    // already-narrow invariant, or `trunc` of a wider one.
+    Value *NewStart = nullptr;
+    if (auto *C = dyn_cast<ConstantInt>(E.first)) {
+      if (!C->isZero())
+        return false;
+      NewStart = ConstantInt::get(I32, 0);
+    } else if (E.first->getType() == I32) {
+      NewStart = E.first;
+    } else {
+      IRBuilder<> PB(E.second->getTerminator());
+      NewStart = PB.CreateTrunc(E.first, I32, S.IV->getName() + ".start");
+      moveVA(S.IV, cast<Instruction>(NewStart));
+    }
+    if (!isLoopInvariant(NewStart, S.Header, S.Latch))
+      return false;
+    NewIV->addIncoming(NewStart, E.second);
   }
-  NewIV->addIncoming(NewStart, Pre);
   // Insert the new step before the old step: same block, and it dominates
   // the latch compare plus every later use. (Inserting after the old step
   // puts it between the step and its compare, which breaks dominance of
   // the new PHI incoming when the step feeds the compare in the same
+  // block.)
   IRBuilder<> LB(S.Step);
   Value *NewStep =
       LB.CreateAdd(NewIV, ConstantInt::get(I32, 1), S.Step->getName() + ".idx");
@@ -630,13 +926,29 @@ static bool rewriteIntLoop(LoopShape &S) {
     Old->replaceAllUsesWith(NewGEP);
     Old->eraseFromParent();
   }
-  // Drop the old IV machinery. The matcher allows only step/compare/GEP
-  // uses, all rewritten or detached by now, so both die user-free.
-  // (No replaceAllUsesWith: it asserts on the deliberate i64 -> i32 type
-  // change even when no users remain.)
+  // Early-exit loops hand the index to the result as `trunc i64 %iv to i32`;
+  // the new index is already i32 and dominates the same blocks.
+  for (auto *T : S.TruncEscapes) {
+    T->replaceAllUsesWith(NewIV);
+    T->eraseFromParent();
+  }
+  // Widenings that only fed the rebuilt addresses are dead now.
+  for (auto *W : S.Widenings)
+    if (W->use_empty())
+      W->eraseFromParent();
+  // Drop the old IV machinery. Detach the latch incoming (it references the
+  // old step, erased next) before anything else; then rewrite any
+  // remaining in-loop value user of an already-narrow IV onto the new
+  // index. A widened IV has no users left by now: its only recognized uses
+  // were the step, the compare, the addresses and the trunc escapes, all
+  // rewritten or detached above.
+  // (No blind replaceAllUsesWith on a widened IV: it asserts on the
+  // deliberate i64 -> i32 type change even when no users remain.)
   for (unsigned i = 0, e = S.IV->getNumIncomingValues(); i != e; ++i)
     if (S.IV->getIncomingBlock(i) == S.Latch)
       S.IV->setIncomingValue(i, UndefValue::get(S.IV->getType()));
+  if (S.IVIsNarrow)
+    S.IV->replaceAllUsesWith(NewIV);
   S.Step->eraseFromParent();
   S.IV->eraseFromParent();
   return true;
@@ -645,7 +957,8 @@ static bool rewriteIntLoop(LoopShape &S) {
 // Rewrite a pointer loop: new i32 index from 0, `slt` exit against the
 // trip bound when it is the source `%n` (i32), typed GEPs replacing the
 // pointer PHIs. Trip bounds of the form `%n - %done` (vector remainders)
-// do not match: bail.
+// do not match: bail. The trip PHI is either the kept `i32` counter or the
+// integer address mirror; both die with their step.
 static bool rewritePtrLoop(LoopShape &S) {
   if (!S.Bound->getType()->isIntegerTy(32))
     return false;
