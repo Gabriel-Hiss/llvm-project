@@ -84,7 +84,7 @@ def load_meta(path):
 
 
 _RIPBR = re.compile(r"\[\s*rip\s*(?:\+|-)\s*(?:\.\.\.|0x[0-9a-fA-F]+|[0-9a-fA-F]+h)\s*\]")
-_BAREABS = re.compile(r"\[\s*(?:0x[0-9a-fA-F]+|[0-9a-fA-F]+h)\s*\]")
+_BAREABS = re.compile(r"\[\s*(?:0x[0-9a-fA-F]+|[0-9a-fA-F]+h|\d+)\s*\]")
 _PAREN = re.compile(r"\s*\([^)]*\)\s*$")
 _WS = re.compile(r"\s+")
 _PTR = re.compile(
@@ -157,6 +157,30 @@ def canon(text, near_branch=False, ip_rel_memory=False,
                         string.group(2) + string.group(3))
     if re.fullmatch(r"xchg\s+([a-z0-9]+)\s*,\s*\1", t):
         return "nop"
+    # Multi-prefix nops print differently (`nop word ptr cs:[rax+rax]` vs
+    # `nop [rax+rax]`); the bytes and length are already identical.
+    if re.match(r"nop\b", t):
+        return "nop[m]" if "[" in t else "nop"
+    head, _, rest = t.partition(" ")
+    head = {"fwait": "wait", "fucompi": "fucomip", "fcompi": "fcomip"}.get(
+        head, head)
+    operands = [o.strip() for o in rest.split(",")] if rest.strip() else []
+    if head.startswith("f") and head != "fs":
+        # x87 implicit operands: the stack top and (for pops/exchange) st(1)
+        # print explicitly in one syntax and not in the other.
+        implicit = {"st", "st(0)"}
+        if head == "fxch" or head.endswith("p"):
+            implicit.add("st(1)")
+        operands = [o for o in operands if o not in implicit]
+    if head in ("pblendvb", "blendvps", "blendvpd") and operands[-1:] == ["xmm0"]:
+        operands = operands[:-1]
+    if head == "xchg" and len(operands) == 2:
+        operands = sorted(operands)
+    if head == "push" and len(operands) == 1:
+        neg = re.fullmatch(r"-(0x[0-9a-f]+|[0-9a-f]+h|\d+)", operands[0])
+        if neg:
+            operands = [str((-_number_value(neg.group(1))) % (1 << 64))]
+    t = head + (" " + ", ".join(operands) if operands else "")
     width = _operand_width(t)
     def mask_negative_immediate(match):
         value = -_number_value(match.group(1))
@@ -291,6 +315,22 @@ def asm_metric(bindir: Path, revdir: Path, binary: Path):
                 memory_index=memory_index, memory_scale=memory_scale)
             ok = (revenant_text == oracle_text and
                   oracle_target == revenant_target and oracle_mem == revenant_mem)
+            if (not ok and ins is not None and
+                    oracle_target == revenant_target and
+                    oracle_mem == revenant_mem):
+                # The oracle's text comes from the object file: relocated
+                # immediates and displacements are still the unrelocated
+                # literal there. The linked bytes are the truth; accept when
+                # the fork matches them exactly and the oracle differs only
+                # in numeric literals.
+                linked = canon(
+                    formatter.format(ins), near_branch=oracle_target is not None,
+                    ip_rel_memory=oracle_mem is not None and symbol_mem is None,
+                    symbol_memory=symbol_mem is not None,
+                    memory_index=memory_index, memory_scale=memory_scale)
+                loose = lambda s: re.sub(r"#\d+", "#", s)
+                ok = (revenant_text == linked and
+                      loose(oracle_text) == loose(linked))
             checked += 1
             if not ok:
                 mism += 1

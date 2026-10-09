@@ -21,6 +21,7 @@
 #include "revenant/Target/TargetHooks.h"
 
 #include "revenant/Analysis/Analysis.h"
+#include "revenant/Analysis/StackPtr.h"
 
 #include <cstdint>
 #include <string>
@@ -99,7 +100,8 @@ static int writeFuncDump(const Program &Prog, StringRef OutDir) {
     errs() << "revenant: " << Path << ": " << Ec.message() << "\n";
     return 1;
   }
-  Os << "start\tpdata\torphan\tinstrs\tblocks\tunresolved\tchunks\tname\n";
+  Os << "start\tpdata\torphan\tinstrs\tblocks\tunresolved\tchunks\tname\tstack\n";
+  auto Hooks = createX86TargetHooks();
   for (const auto &[Start, F] : Prog.Functions) {
     Os << Twine::utohexstr(Start.Value - Prog.Img->Base.Value) << "\t"
        << (F.HasPdata ? 1 : 0) << "\t" << (F.Orphan ? 1 : 0) << "\t"
@@ -113,7 +115,35 @@ static int writeFuncDump(const Program &Prog, StringRef OutDir) {
       Os << Twine::utohexstr(A.Value - Prog.Img->Base.Value) << "-"
          << Twine::utohexstr(B.Value - Prog.Img->Base.Value);
     }
-    Os << "\t" << F.Name << "\n";
+    // Stack-pointer model result: "ok" or the analyzeStack error message.
+    std::string Stack = "ok";
+    if (auto Fat = revenant::function(Prog, Start)) {
+      auto Info = revenant::analyzeStack(Prog, *Fat, *Hooks);
+      if (!Info)
+        Stack = toString(Info.takeError());
+    }
+    Os << "\t" << F.Name << "\t" << Stack << "\n";
+  }
+  // One row per block: function, block range, end kind and outgoing edges.
+  SmallString<256> BlockPath(OutDir);
+  sys::path::append(BlockPath, "revenant-blocks.tsv");
+  raw_fd_ostream Bs(BlockPath, Ec, sys::fs::OF_Text);
+  if (Ec) {
+    errs() << "revenant: " << BlockPath << ": " << Ec.message() << "\n";
+    return 1;
+  }
+  Bs << "func\tstart\tend\tkind\tedges\n";
+  const uint64_t Base = Prog.Img->Base.Value;
+  for (const auto &[Start, F] : Prog.Functions) {
+    for (const BlockRec &B : F.Blocks) {
+      Bs << Twine::utohexstr(Start.Value - Base) << "\t"
+         << Twine::utohexstr(B.Start) << "\t" << Twine::utohexstr(B.End)
+         << "\t" << (int)B.EndKind << "\t";
+      for (uint32_t E = B.EdgesBegin; E < B.EdgesEnd; ++E)
+        Bs << Twine::utohexstr(F.edgeTo(*Prog.Img, E).Value - Base) << ":"
+           << (int)F.Edges[E].Kind << " ";
+      Bs << "\n";
+    }
   }
   return 0;
 }

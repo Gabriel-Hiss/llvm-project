@@ -57,6 +57,17 @@ std::optional<int64_t> movEaxImm(const llvm::MCInstrInfo &MII,
 bool writesSpDynamically(const llvm::MCInstrInfo &MII,
                          const llvm::MCRegisterInfo &MRI, const Instr &I);
 
+/// `lea reg,[rsp+disp]` / `mov reg,rsp` (reg id, disp). Nullopt otherwise.
+std::optional<std::pair<unsigned, int64_t>>
+spCopy(const llvm::MCInstrInfo &MII, const llvm::MCRegisterInfo &MRI,
+       const Instr &I);
+
+/// `mov rsp,reg` source register id (reg is not rbp: that form is
+/// `restoresSpFromFp`).
+std::optional<unsigned> spRestoreFrom(const llvm::MCInstrInfo &MII,
+                                      const llvm::MCRegisterInfo &MRI,
+                                      const Instr &I);
+
 } // end namespace x86_stack
 } // end namespace revenant
 

@@ -126,6 +126,15 @@ public:
     return x86_stack::writesSpDynamically(*MII, *MRI, I);
   }
 
+  std::optional<std::pair<unsigned, int64_t>>
+  spCopy(const Instr &I) const override {
+    return x86_stack::spCopy(*MII, *MRI, I);
+  }
+
+  std::optional<unsigned> spRestoreFrom(const Instr &I) const override {
+    return x86_stack::spRestoreFrom(*MII, *MRI, I);
+  }
+
   const JtInsnOps *jumpTableInsnOps() const override {
     return getX86JumpTableInsnOps();
   }
