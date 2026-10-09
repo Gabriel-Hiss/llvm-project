@@ -379,8 +379,7 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
       return declRef(D);
     // Forward reference: ask Core to materialize a declaration-only
     // FunctionDecl so the call still prints by name.
-    FunctionDecl *FD = Ctx.functionDecl(
-        *F, [&](llvm::Type *Ty, const llvm::DIType *DI) { return Types.typeOf(Ty, DI); });
+    FunctionDecl *FD = Ctx.functionDecl(*F, Types);
     if (FD)
       return declRef(FD);
     return IntegerLiteral::Create(*AST, llvm::APInt(64, 0u), uintptrTy(),

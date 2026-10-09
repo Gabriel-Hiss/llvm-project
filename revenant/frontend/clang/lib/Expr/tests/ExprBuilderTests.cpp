@@ -388,6 +388,25 @@ TEST_F(ExprTest, CondFlipsNotCmp) {
   EXPECT_EQ(print(E), "a >= b");
 }
 
+TEST_F(ExprTest, InvertedFlipsComparison) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpSLT(H.A, H.B, "cmp");
+  EXPECT_EQ(print(Exprs->inverted(Cmp, Scope)), "a >= b");
+}
+
+TEST_F(ExprTest, InvertedNonComparisonNegates) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  // `!(a + b)` keeps the negation spelling.
+  llvm::Value *Add = B.CreateAdd(H.A, H.B, "add");
+  EXPECT_EQ(print(Exprs->inverted(Add, Scope)), "!(a + b)");
+}
+
 TEST_F(ExprTest, RetValCastsToReturnType) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
