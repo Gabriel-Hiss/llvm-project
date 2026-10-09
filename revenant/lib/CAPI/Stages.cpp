@@ -662,6 +662,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       auto ParentVA = ir::getFunctionVA(Parent);
       if (ParentVA && FuncletAddresses.contains(*ParentVA))
         continue;
+      bool IsSEHParent = false;
+      if (Parent.hasPersonalityFn())
+        if (auto *Personality = dyn_cast<llvm::GlobalValue>(
+                Parent.getPersonalityFn()->stripPointerCasts()))
+          IsSEHParent = Personality->getName() == "__C_specific_handler";
       llvm::Value *ParentStack = nullptr;
       for (llvm::Instruction &I : Parent.getEntryBlock())
         if (I.getName() == "sp0")
@@ -701,6 +706,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         llvm::Function *Funclet = Funclets.lookup(Alias->second);
         if (!Funclet || Funclet->arg_size() != 1 || BB.empty())
           continue;
+        llvm::Instruction *Ret = BB.getTerminator();
+        if (!Ret)
+          continue;
         std::optional<uint64_t> ContinueVA;
         if (llvm::MDNode *Continuations =
                 Pad->getMetadata("revenant.continuations"))
@@ -710,11 +718,28 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               if (auto *Value =
                       dyn_cast<llvm::ConstantInt>(MD->getValue()))
                 ContinueVA = Value->getZExtValue();
-        if (!ContinueVA)
+        if (!ContinueVA && !IsSEHParent)
           ContinueVA = continuationVA(*Funclet);
-        llvm::Instruction *Ret = BB.getTerminator();
-        if (!Ret)
-          continue;
+        if (IsSEHParent)
+          ContinueVA.reset();
+        if (!Pad->getMetadata("revenant.catchtype"))
+          ContinueVA.reset();
+        if (ContinueVA)
+          if (auto *CatchRet = dyn_cast<llvm::CatchReturnInst>(Ret)) {
+            std::string Name = "bb_" + utohexstr(*ContinueVA, true);
+            for (llvm::BasicBlock &Next : Parent)
+              if (Next.getName() == Name) {
+                llvm::BasicBlock *Old = CatchRet->getSuccessor();
+                for (llvm::PHINode &Phi : Old->phis())
+                  Phi.removeIncomingValue(CatchRet->getParent(), false);
+                for (llvm::PHINode &Phi : Next.phis())
+                  if (Phi.getBasicBlockIndex(CatchRet->getParent()) < 0)
+                    Phi.addIncoming(llvm::UndefValue::get(Phi.getType()),
+                                    CatchRet->getParent());
+                CatchRet->setSuccessor(&Next);
+                break;
+              }
+          }
         llvm::IRBuilder<> Builder(Ret);
         llvm::Value *FrameArg =
             Builder.CreatePtrToInt(ParentStack, Funclet->getArg(0)->getType());
@@ -729,16 +754,6 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           return createStringError(inconvertibleErrorCode(),
                                    "failed to inline EH funclet into %s",
                                    Parent.getName().str().c_str());
-        if (ContinueVA)
-          if (auto *CatchRet =
-                  dyn_cast<llvm::CatchReturnInst>(BB.getTerminator())) {
-            std::string Name = formatv("bb_{0:x}", *ContinueVA).str();
-            for (llvm::BasicBlock &Next : Parent)
-              if (Next.getName() == Name) {
-                CatchRet->setSuccessor(&Next);
-                break;
-              }
-          }
       }
     }
     }
