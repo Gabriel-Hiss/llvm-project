@@ -64,6 +64,12 @@ and their names are used in the listing. The IR pipeline adds
 `"revenant.lib"="<name>"` to matched library definitions, independent of
 metadata mode. C++ deoptimization uses these attributes to keep runtime and
 startup functions out of user-code transformations.
+
+For MinGW executables, startup reaches `main` through the CRT after loading
+`argc`, `argv`, and `envp` into the Windows argument registers. The classifier
+uses that call setup to find `main` instead of selecting the largest reachable
+tail target. It also keeps the first `main` call that reaches a constructor-table
+dispatcher in the runtime set, rather than marking the dispatcher as user code.
 Without `--func` every discovered function is decompiled; a Windows command
 line holds a few hundred `--func` arguments, so chunk large sets.
 

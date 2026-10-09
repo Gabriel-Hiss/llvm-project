@@ -274,6 +274,100 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
         break;
     }
   }
+  // MinGW's CRT passes argc, argv, and envp to main from stored startup
+  // values. This register setup is stronger evidence than the largest
+  // reachable tail target, which can be an unrelated runtime helper.
+  auto isMoveFrom = [&](const Instr &I, StringRef Dest, StringRef Source,
+                        bool MemorySource) {
+    std::string Text = Dis->format(I);
+    StringRef Assembly = StringRef(Text).trim();
+    size_t Separator = Assembly.find_first_of(" \t");
+    if (Separator == StringRef::npos)
+      return false;
+    StringRef Opcode = Assembly.take_front(Separator).trim();
+    StringRef Operands = Assembly.drop_front(Separator).trim();
+    if (Opcode != "mov")
+      return false;
+    auto [ActualDest, ActualSource] = Operands.split(',');
+    if (ActualDest.trim() != Dest)
+      return false;
+    ActualSource = ActualSource.trim();
+    return MemorySource ? ActualSource.starts_with(Source)
+                        : ActualSource == Source;
+  };
+  auto isMingwMainCall = [&](const std::vector<Instr> &Instrs,
+                             size_t CallIndex) {
+    if (CallIndex < 5)
+      return false;
+    return isMoveFrom(Instrs[CallIndex - 5], "rcx", "qword ptr [", true) &&
+           isMoveFrom(Instrs[CallIndex - 4], "rdx", "qword ptr [", true) &&
+           isMoveFrom(Instrs[CallIndex - 3], "eax", "dword ptr [", true) &&
+           isMoveFrom(Instrs[CallIndex - 2], "r8", "rcx", false) &&
+           isMoveFrom(Instrs[CallIndex - 1], "ecx", "eax", false);
+  };
+
+  // GCC's __main hook walks an indexed constructor table through an indirect
+  // call. A one-time guard wrapper around that dispatcher is a runtime hook
+  // too, not user code.
+  auto isCtorTableDispatcher = [&](const Function &F) {
+    bool HasIndirectCall = false;
+    bool HasIndexedLoad = false;
+    bool HasBackwardLoop = false;
+    for (const Instr &I : F.Instrs) {
+      HasIndirectCall |= I.Flow == FlowKind::Call && !I.HasTarget;
+      if (I.Flow == FlowKind::CondBranch && I.HasTarget &&
+          I.Target.Value <= I.Addr.Value)
+        HasBackwardLoop = true;
+      std::string Text = Dis->format(I);
+      StringRef Assembly(Text);
+      HasIndexedLoad |= Assembly.contains("qword ptr [") &&
+                        Assembly.contains("*");
+    }
+    return HasIndirectCall && HasIndexedLoad && HasBackwardLoop;
+  };
+  auto callsCtorTableDispatcher = [&](Va Start) {
+    std::queue<std::pair<Va, unsigned>> Work;
+    std::set<Va> Seen;
+    Work.push({Start, 0});
+    while (!Work.empty()) {
+      auto [At, Depth] = Work.front();
+      Work.pop();
+      if (!Seen.insert(At).second)
+        continue;
+      auto FOrErr = materialize(At);
+      if (!FOrErr) {
+        consumeError(FOrErr.takeError());
+        continue;
+      }
+      if (isCtorTableDispatcher(*FOrErr))
+        return true;
+      if (Depth == 1)
+        continue;
+      for (const Instr &I : FOrErr->Instrs)
+        if (I.Flow == FlowKind::Call && I.HasTarget &&
+            Prog.Functions.count(I.Target))
+          Work.push({I.Target, Depth + 1});
+    }
+    return false;
+  };
+
+  std::set<Va> MinGWRuntimeHooks;
+  auto recordMinGWRuntimeHook = [&] {
+    auto MainOrErr = materialize(*Result.UserEntry);
+    if (!MainOrErr) {
+      consumeError(MainOrErr.takeError());
+      return;
+    }
+    for (const Instr &I : MainOrErr->Instrs) {
+      if (I.Flow != FlowKind::Call || !I.HasTarget ||
+          !Prog.Functions.count(I.Target))
+        continue;
+      if (callsCtorTableDispatcher(I.Target)) {
+        MinGWRuntimeHooks.insert(I.Target);
+        break;
+      }
+    }
+  };
 
   if (!Result.UserEntry) {
     auto PeEntry = Prog.Functions.upper_bound(Pe->EntryPoint);
@@ -295,7 +389,17 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
           continue;
         }
         std::optional<Va> PendingCodePointer;
-        for (const Instr &I : FunctionOrErr->Instrs) {
+
+        for (size_t InstrIndex = 0;
+             InstrIndex < FunctionOrErr->Instrs.size(); ++InstrIndex) {
+          const Instr &I = FunctionOrErr->Instrs[InstrIndex];
+          if (Out != Lang::Rust && I.Flow == FlowKind::Call && I.HasTarget &&
+              Prog.Functions.count(I.Target) &&
+              !Result.LibraryStarts.count(I.Target) &&
+              isMingwMainCall(FunctionOrErr->Instrs, InstrIndex)) {
+            Result.UserEntry = I.Target;
+            break;
+          }
           if (I.HasMemTarget && Prog.Functions.count(I.MemTarget))
             PendingCodePointer = I.MemTarget;
           if (!I.HasTarget || !Prog.Functions.count(I.Target))
@@ -329,10 +433,13 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
       }
       if (Out == Lang::Rust && PointerEntry)
         Result.UserEntry = PointerEntry->second;
-      else if (TailEntry)
+      else if (!Result.UserEntry && TailEntry)
         Result.UserEntry = std::get<2>(*TailEntry);
     }
   }
+  if (Out != Lang::Rust && Result.UserEntry)
+    recordMinGWRuntimeHook();
+
 
   auto Entry = Prog.Functions.upper_bound(Pe->EntryPoint);
   if (Entry != Prog.Functions.begin()) {
@@ -366,7 +473,7 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   while (!UserPending.empty()) {
     Va At = UserPending.front();
     UserPending.pop();
-    if (Result.LibraryStarts.count(At) ||
+    if (Result.LibraryStarts.count(At) || MinGWRuntimeHooks.count(At) ||
         !Result.UserReachable.insert(At).second)
       continue;
     auto FOrErr = materialize(At);
