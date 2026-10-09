@@ -10,9 +10,6 @@ add_llvm_library(RevenantTransformPipeline
   Pipeline.cpp
   Register.cpp
 
-  ADDITIONAL_HEADER_DIRS
-  ${REVENANT_SOURCE_DIR}/include/revenant/Transforms/Pipeline
-
   LINK_COMPONENTS
   Core
   Passes
