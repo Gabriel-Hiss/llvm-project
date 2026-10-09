@@ -29,6 +29,22 @@ bool hasSection(const PeFile &PE, llvm::StringRef Name) {
                      [&](const Section &S) { return S.Name == Name; });
 }
 
+bool hasImageText(const Image &Img, llvm::StringRef Needle) {
+  for (const Section &S : Img.Sections)
+    if (!S.Data.empty() &&
+        llvm::StringRef(reinterpret_cast<const char *>(S.Data.data()),
+                        S.Data.size()).contains_insensitive(Needle))
+      return true;
+  return false;
+}
+
+bool hasSymbolPrefix(const std::vector<std::string> &Names,
+                     llvm::StringRef Prefix) {
+  return std::any_of(Names.begin(), Names.end(), [&](const std::string &S) {
+    return llvm::StringRef(S).starts_with(Prefix);
+  });
+}
+
 CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
   CompilerInfo I;
   bool HasMsvc = false, HasLto = false, HasPgo = false, HasRust = false;
@@ -47,14 +63,18 @@ CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
 
   const bool IsGo = PE.GoBuildId.has_value() || hasSection(PE, ".gosymtab") ||
                     hasSection(PE, ".gopclntab") || hasText(Symbols, "runtime.");
-  const bool IsRust = HasRust || hasText(Symbols, "_R") || hasText(Symbols, "_$LT$");
+  const bool IsRust = HasRust || hasSymbolPrefix(Symbols, "_R") ||
+                     hasText(Symbols, "_$LT$") ||
+                     hasImageText(*PE.Img, "/rustc/") ||
+                     hasImageText(*PE.Img, "rustc version");
   const bool IsGcc = hasImport(PE, "mingw") || hasImport(PE, "libgcc") ||
                      hasImport(PE, "__gxx_personality_seh0") ||
                      hasSection(PE, ".eh_frame");
-  const bool IsClang = hasText(Symbols, "clang version") ||
+  const bool IsClang = hasImageText(*PE.Img, "clang version") ||
+                       hasText(Symbols, "clang version") ||
                        hasSection(PE, ".llvm") || hasSection(PE, ".clang");
   const bool IsCpp = hasText(Symbols, "?AV") || hasText(Symbols, "?AU") ||
-                     hasText(Symbols, "_Z") || hasText(Symbols, "__Z");
+                     hasSymbolPrefix(Symbols, "_Z");
 
   if (IsGo) {
     I.Producer = CompilerProducer::Go; I.Language = SourceLanguage::Go;
