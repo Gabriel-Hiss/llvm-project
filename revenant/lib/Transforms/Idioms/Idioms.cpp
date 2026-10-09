@@ -39,6 +39,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/NoFolder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -133,6 +134,12 @@ bool DagEval::evalInst(Instruction *I, APInt &Out128, unsigned &OutW) {
   if (Budget == 0)
     return false;
   --Budget;
+  // Integer arithmetic only: a pointer, vector or float anywhere in the node
+  // (ptrtoint, pointer select/icmp) ends the evaluation.
+  if (!I->getType()->isIntegerTy() ||
+      !llvm::all_of(I->operands(),
+                    [](const Use &U) { return U->getType()->isIntegerTy(); }))
+    return false;
   if (auto *BI = dyn_cast<BinaryOperator>(I)) {
     unsigned W = BI->getType()->getIntegerBitWidth();
     if (W < 8 || W > 64)
@@ -629,7 +636,9 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
         }
       }
     }
-    IRBuilder<> B(Ctx);
+    // NoFolder: the rewrites below cast the result to an Instruction, which a
+    // constant-folding builder would not return for constant operands.
+    IRBuilder<NoFolder> B(Ctx);
     for (Quotient &Q : Quotients) {
       B.SetInsertPoint(Q.Root);
       Instruction::BinaryOps Op =
@@ -689,7 +698,7 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
   for (int Iter = 0; Iter < 4; ++Iter) {
     (void)Iter;
     bool LocalChanged = false;
-    IRBuilder<> B(Ctx);
+    IRBuilder<NoFolder> B(Ctx);
     for (Instruction &I : make_early_inc_range(instructions(F))) {
       if (hasOpaque(&I))
         continue;

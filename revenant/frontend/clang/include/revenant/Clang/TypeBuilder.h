@@ -19,6 +19,7 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -51,6 +52,10 @@ public:
   /// The clang type a global's *storage* has: `GV.getValueType()` (a global
   /// is declared with the pointee type, not a pointer to it).
   virtual clang::QualType globalType(llvm::GlobalVariable &GV) = 0;
+  /// Register a vtable global for C++ virtual-dispatch recovery. Builders
+  /// without C++ record support may ignore this hook.
+  virtual void addVTable(llvm::StringRef,
+                         llvm::GlobalVariable *) {}
 
   /// Materialize (or return the cached) RecordDecl/CXXRecordDecl for a
   /// DICompositeType. Returns nullptr when `DI` is not a composite this

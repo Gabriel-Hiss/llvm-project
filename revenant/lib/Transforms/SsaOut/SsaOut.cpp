@@ -246,6 +246,18 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     Changed = true;
     return AI;
   };
+  // Web key: the canonical name, qualified by type when the same web name
+  // already holds a slot of another type (`rax.0` i64 next to `rax.1` i32
+  // must not share one alloca).
+  auto keyFor = [&](StringRef Name, Type *Ty) -> std::string {
+    std::string Base = Webs.canon(Name);
+    auto It = LocalByName.find(Base);
+    if (It == LocalByName.end() || It->second->getAllocatedType() == Ty)
+      return Base;
+    std::string TS;
+    raw_string_ostream(TS) << *Ty;
+    return Base + "." + TS;
+  };
   // Demote materialized defs: every non-inlineable instruction with
   // uses gets a local; its def becomes `store`, each use a `load`.
   // Phis always demote (their web's local).
@@ -263,7 +275,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
       continue; // stays inline for the frontend
     std::string Key;
     if (I->hasName())
-      Key = Webs.canon(I->getName());
+      Key = keyFor(I->getName(), I->getType());
     else
       Key = "tmp" + std::to_string(TmpN++);
     AllocaInst *AI = getOrCreateLocal(Key, I->getType(), I);
@@ -273,7 +285,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   // Phi webs always get a local, even before uses are rewritten.
   for (BasicBlock &BB : F) {
     for (PHINode &PN : BB.phis()) {
-      std::string Key = Webs.canon(PN.getName());
+      std::string Key = keyFor(PN.getName(), PN.getType());
       AllocaInst *AI = getOrCreateLocal(Key, PN.getType(), &PN);
       Materialized[&PN] = AI;
     }
@@ -361,8 +373,14 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     for (BasicBlock *Succ : Succs) {
       if (Succ->phis().empty())
         continue;
-      if (SplitCriticalEdge(&BB, Succ))
+      if (BasicBlock *EdgeBB = SplitCriticalEdge(&BB, Succ)) {
+        // `!revenant.region` operands are block-list indices; inserting
+        // the split block mid-list would shift every later index and
+        // mis-decode annotations written before this pass. Keep the new
+        // block at the end so existing indices stay valid.
+        EdgeBB->moveAfter(&F.back());
         Changed = true;
+      }
     }
   }
 
@@ -378,7 +396,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     std::map<BasicBlock *, SmallVector<std::pair<AllocaInst *, Value *>, 4>>
         EdgeCopies;
     for (PHINode &PN : Succ.phis()) {
-      std::string Key = Webs.canon(PN.getName());
+      std::string Key = keyFor(PN.getName(), PN.getType());
       auto LIt = LocalByName.find(Key);
       if (LIt == LocalByName.end())
         continue;
@@ -456,7 +474,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         // phi-to-phi edge reads the source web's slot.
         if (Instruction *PI = dyn_cast<Instruction>(V)) {
           if (PHINode *PPN = dyn_cast<PHINode>(PI)) {
-            std::string SKey = Webs.canon(PPN->getName());
+            std::string SKey = keyFor(PPN->getName(), PPN->getType());
             auto SLIt = LocalByName.find(SKey);
             if (SLIt != LocalByName.end() && SLIt->second != C.first) {
               B.SetCurrentDebugLocation(PPN->getDebugLoc());
@@ -476,7 +494,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         } else {
           // Fall back to the phi's own provenance.
           for (PHINode &PN : Succ.phis()) {
-            std::string K = Webs.canon(PN.getName());
+            std::string K = keyFor(PN.getName(), PN.getType());
             auto LIt = LocalByName.find(K);
             if (LIt != LocalByName.end() && LIt->second == C.first) {
               copyProvenance(&PN, ST);

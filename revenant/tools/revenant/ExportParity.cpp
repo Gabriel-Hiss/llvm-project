@@ -11,10 +11,6 @@
 // boundary; a non-partitioning map exits non-zero, matching the Rust
 // tool's asserts.
 //
-// The item list sits on top of the full `Program::analyze` port
-// (`analysis::Program::analyze(pe, None)`). Until `revenant/Analysis`
-// lands its entry point, `analyzeForExport` returns the empty program so
-// the byte map and meta still verify.
 //
 //===--------------------------------------------------------------------===//
 
@@ -24,15 +20,8 @@
 #include "revenant/Object/PeFile.h"
 #include "revenant/Target/TargetHooks.h"
 
-// Analysis entry locked by Swe2Discovery (header lands with
-// RevenantAnalysis): revenant::analyze(Pe, Hooks) and
-// revenant::instructionItems(Program).
-#if defined(REVENANT_HAVE_ANALYSIS) && defined(__has_include)
-#if __has_include("revenant/Analysis/Analysis.h")
 #include "revenant/Analysis/Analysis.h"
-#define REVENANT_CALL_ANALYSIS 1
-#endif
-#endif
+#include "revenant/Analysis/StackPtr.h"
 
 #include <cstdint>
 #include <string>
@@ -99,51 +88,72 @@ static int writeAsmSidecar(
   return 0;
 }
 
-/// The analyzed program the export lists items for. Mirrors
-/// `Session::open`: analysis always runs fresh, never from a cache, and
-/// never with a PDB (the fork has no PDB loading; the parity harness
-/// guarantees none is reachable).
-static Expected<Program> analyzeForExport(const PeFile &Pe) {
-#if defined(REVENANT_CALL_ANALYSIS)
+/// `revenant-funcs.tsv`, an opt-in debugging dump (`REVENANT_PARITY_FUNCS`):
+/// one row per recovered function with its pdata/orphan flags, instruction
+/// and block counts, unresolved indirect jumps, and chunk ranges (RVAs).
+static int writeFuncDump(const Program &Prog, StringRef OutDir) {
+  SmallString<256> Path(OutDir);
+  sys::path::append(Path, "revenant-funcs.tsv");
+  std::error_code Ec;
+  raw_fd_ostream Os(Path, Ec, sys::fs::OF_Text);
+  if (Ec) {
+    errs() << "revenant: " << Path << ": " << Ec.message() << "\n";
+    return 1;
+  }
+  Os << "start\tpdata\torphan\tinstrs\tblocks\tunresolved\tchunks\tname\tstack\n";
+  auto Hooks = createX86TargetHooks();
+  for (const auto &[Start, F] : Prog.Functions) {
+    Os << Twine::utohexstr(Start.Value - Prog.Img->Base.Value) << "\t"
+       << (F.HasPdata ? 1 : 0) << "\t" << (F.Orphan ? 1 : 0) << "\t"
+       << F.InstrRvas.size() << "\t" << F.Blocks.size() << "\t"
+       << F.UnresolvedIndirects.size() << "\t";
+    bool First = true;
+    for (const auto &[A, B] : F.Chunks) {
+      if (!First)
+        Os << ",";
+      First = false;
+      Os << Twine::utohexstr(A.Value - Prog.Img->Base.Value) << "-"
+         << Twine::utohexstr(B.Value - Prog.Img->Base.Value);
+    }
+    // Stack-pointer model result: "ok" or the analyzeStack error message.
+    std::string Stack = "ok";
+    if (auto Fat = revenant::function(Prog, Start)) {
+      auto Info = revenant::analyzeStack(Prog, *Fat, *Hooks);
+      if (!Info)
+        Stack = toString(Info.takeError());
+    }
+    Os << "\t" << F.Name << "\t" << Stack << "\n";
+  }
+  // One row per block: function, block range, end kind and outgoing edges.
+  SmallString<256> BlockPath(OutDir);
+  sys::path::append(BlockPath, "revenant-blocks.tsv");
+  raw_fd_ostream Bs(BlockPath, Ec, sys::fs::OF_Text);
+  if (Ec) {
+    errs() << "revenant: " << BlockPath << ": " << Ec.message() << "\n";
+    return 1;
+  }
+  Bs << "func\tstart\tend\tkind\tedges\n";
+  const uint64_t Base = Prog.Img->Base.Value;
+  for (const auto &[Start, F] : Prog.Functions) {
+    for (const BlockRec &B : F.Blocks) {
+      Bs << Twine::utohexstr(Start.Value - Base) << "\t"
+         << Twine::utohexstr(B.Start) << "\t" << Twine::utohexstr(B.End)
+         << "\t" << (int)B.EndKind << "\t";
+      for (uint32_t E = B.EdgesBegin; E < B.EdgesEnd; ++E)
+        Bs << Twine::utohexstr(F.edgeTo(*Prog.Img, E).Value - Base) << ":"
+           << (int)F.Edges[E].Kind << " ";
+      Bs << "\n";
+    }
+  }
+  return 0;
+}
+
+/// The analyzed program is always fresh and the fork never loads a PDB.
+static Program analyzeForExport(const PeFile &Pe) {
   auto Hooks = createX86TargetHooks();
   return revenant::analyze(Pe, *Hooks);
-#else
-  Program Prog;
-  Prog.Img = Pe.Img;
-  return Prog;
-#endif
 }
 
-/// Every instruction the listing shows — function code plus padding
-/// filler — as `(rva, len)`, sorted and unique. With RevenantAnalysis
-/// this delegates to its `instructionItems`; the local fallback is the
-/// 1:1 port of `analysis::Program::instruction_items` (re-decode for the
-/// length, an undecodable entry is an error carrying the RVA).
-static Expected<std::vector<std::pair<uint32_t, uint32_t>>>
-instructionItems(const Program &Prog, const Disasm &D) {
-  std::vector<std::pair<uint32_t, uint32_t>> Items;
-  auto Push = [&](Rva R) -> Error {
-    Va Addr = Prog.Img->vaOfRva(R);
-    std::optional<Instr> I = D.decodeOne(Addr);
-    if (!I)
-      return createStringError(std::make_error_code(std::errc::bad_message),
-                               "invalid instruction at " + Twine::utohexstr(R));
-    Items.push_back({R, I->Size});
-    return Error::success();
-  };
-  for (auto &[Start, Rec] : Prog.Functions)
-    for (Rva R : Rec.InstrRvas)
-      if (Error E = Push(R))
-        return std::move(E);
-
-  for (const PaddingRun &Run : Prog.Padding)
-    for (Rva R : Run.Instrs)
-      if (Error E = Push(R))
-        return std::move(E);
-  llvm::sort(Items);
-  Items.erase(std::unique(Items.begin(), Items.end()), Items.end());
-  return Items;
-}
 
 int exportParity(PeFile &Pe, StringRef OutDir) {
   if (auto Ec = sys::fs::create_directories(OutDir)) {
@@ -151,17 +161,7 @@ int exportParity(PeFile &Pe, StringRef OutDir) {
     return 1;
   }
 
-  auto ProgOrErr = analyzeForExport(Pe);
-  if (!ProgOrErr) {
-    errs() << "revenant: " << toString(ProgOrErr.takeError()) << "\n";
-    return 1;
-  }
-  Program &Prog = *ProgOrErr;
-#if !defined(REVENANT_CALL_ANALYSIS)
-  // Recorded by compare.py (exporter_stdout tail): the item list is
-  // empty because RevenantAnalysis is not merged yet — never silent.
-  outs() << "analysis=pending: empty item list (no RevenantAnalysis)\n";
-#endif
+  Program Prog = analyzeForExport(Pe);
 
   auto DOrErr = Disasm::create(*Pe.Img);
   if (!DOrErr) {
@@ -170,21 +170,12 @@ int exportParity(PeFile &Pe, StringRef OutDir) {
   }
   Disasm &D = *DOrErr;
 
-#if defined(REVENANT_CALL_ANALYSIS)
-  auto LibItems = revenant::instructionItems(Prog);
-  if (!LibItems) {
-    errs() << "revenant: " << toString(LibItems.takeError()) << "\n";
-    return 1;
-  }
-  const std::vector<std::pair<uint32_t, uint32_t>> &Items = *LibItems;
-#else
-  auto ItemsOrErr = instructionItems(Prog, D);
+  auto ItemsOrErr = revenant::instructionItems(Prog);
   if (!ItemsOrErr) {
     errs() << "revenant: " << toString(ItemsOrErr.takeError()) << "\n";
     return 1;
   }
   const std::vector<std::pair<uint32_t, uint32_t>> &Items = *ItemsOrErr;
-#endif
 
   SmallString<256> ItemsPath(OutDir);
   sys::path::append(ItemsPath, "revenant-items.bin");
@@ -206,6 +197,10 @@ int exportParity(PeFile &Pe, StringRef OutDir) {
   if (sys::Process::GetEnv("REVENANT_PARITY_ASM"))
     if (int Rc = writeAsmSidecar(Prog, D, Items, OutDir))
       return Rc;
+  if (sys::Process::GetEnv("REVENANT_PARITY_FUNCS"))
+    if (int Rc = writeFuncDump(Prog, OutDir))
+      return Rc;
+
 
   FileMap Map = FileMap::build(Pe, Prog);
   SmallString<256> SpansPath(OutDir);

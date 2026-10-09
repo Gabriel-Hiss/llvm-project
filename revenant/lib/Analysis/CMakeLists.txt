@@ -14,6 +14,7 @@ add_llvm_library(RevenantAnalysis
   StackPtr.cpp
   Strings.cpp
   Xrefs.cpp
+  EHTables.cpp
 
   LINK_COMPONENTS
   MC

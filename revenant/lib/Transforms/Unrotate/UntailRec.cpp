@@ -136,6 +136,12 @@ bool isPureForLatch(const Instruction &I) {
   }
 }
 
+// Splits a self-loop header H (Latch == H) into a header plus a dedicated
+// latch block, in place; defined after matchLoop.
+static bool splitSelfLoop(Function &F, BasicBlock *H,
+                           SmallVectorImpl<PHINode *> &PhiForArg,
+                           SmallVectorImpl<Value *> &NextForArg);
+
 // Match the TailCallElim loop shape. Returns true and fills S on success.
 bool matchLoop(Function &F, LoopShape &S) {
   unsigned NumArgs = F.arg_size();
@@ -212,13 +218,33 @@ bool matchLoop(Function &F, LoopShape &S) {
     }
     if (Bad || !Latch || Latch == &E)
       continue;
-    // A self-loop header (Latch == H, the shape clang -O2 leaves for
-    // @tail_gcd: one block, phis fed by its own body) is NOT matched:
-    // splitting the header's own body into latch-vs-exit needs loop info
-    // this peephole does not have. Only the split TailCallElim shape with
-    // a dedicated latch block fires.
-    if (Latch == H)
-      continue;
+    // A self-loop header (Latch == H: the single-block loop clang -O2
+    // leaves, e.g. @tail_gcd block %4 above) is split first: the latch
+    // computation moves into a dedicated latch block, turning this into
+    // the split TailCallElim shape the rewrite below handles. The split
+    // keeps only the backedge-taken path in the latch: pure next-value
+    // computation plus an unconditional branch to the header. Anything
+    // else (side effects, values the exit needs computed only in the
+    // header body) vetoes, same as the split-shape purity rule.
+    if (Latch == H) {
+      if (!splitSelfLoop(F, H, PhiForArg, NextForArg))
+        continue;
+      // The split created a new latch block and rewired the phis: rescan
+      // the non-entry incoming to find it.
+      Latch = nullptr;
+      for (unsigned k = 0; k != NumArgs; ++k) {
+        PHINode *PN = PhiForArg[k];
+        for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+          BasicBlock *Pred = PN->getIncomingBlock(i);
+          if (Pred == &E)
+            continue;
+          Latch = Pred;
+          NextForArg[k] = PN->getIncomingValue(i);
+        }
+      }
+      if (!Latch)
+        continue;
+    }
     for (Value *V : NextForArg)
       if (!V) {
         Bad = true;
@@ -275,6 +301,117 @@ bool matchLoop(Function &F, LoopShape &S) {
   return false;
 }
 
+// Splits a self-loop header H (the latch is H itself: phis fed by H's own
+// body, backedge from H's own conditional branch) into a header plus a
+// dedicated latch block, updating PhiForArg/NextForArg/Latch in place.
+// Returns false (no mutation) when the shape is not splittable.
+//
+// Preconditions (checked by the caller): H's PHIs cover every argument
+// exactly once with an entry incoming of the argument itself, every phi
+// has exactly two incomings (entry + H), and H ends in a conditional
+// branch with one edge back to H.
+//
+// Method: clone the pure backedge-taken computation (the transitive def
+// closure of the next-values, minus the phis) into a new latch block L
+// placed after H; rewire the phis' H incomings to L; retarget H's backedge
+// to the loop exit (H keeps the exit edge, L gets the backedge). Only the
+// taken-path values move: any next-value needing an impure def, or any
+// header body value the exit also reads that is not needed by the latch,
+// vetoes the split.
+static bool splitSelfLoop(Function &F, BasicBlock *H,
+                           SmallVectorImpl<PHINode *> &PhiForArg,
+                           SmallVectorImpl<Value *> &NextForArg) {
+  unsigned NumArgs = PhiForArg.size();
+  auto *Term = dyn_cast<BranchInst>(H->getTerminator());
+  if (!Term || !Term->isConditional())
+    return false;
+  // Identify the backedge (to H) and the exit edge.
+  unsigned BackIdx = Term->getSuccessor(0) == H   ? 0
+                       : Term->getSuccessor(1) == H ? 1
+                                                    : 2;
+  if (BackIdx > 1)
+    return false;
+  unsigned ExitIdx = 1 - BackIdx;
+  BasicBlock *Exit = Term->getSuccessor(ExitIdx);
+
+  // Closure of the next-value computation: walk back from NextForArg
+  // through pure in-H defs. Header PHIs stay symbolic: the latch reads
+  // the loop-carried values, so clones reference the PHIs directly (H
+  // dominates L). Anything impure or defined outside H vetoes.
+  SmallPtrSet<Instruction *, 16> Need;
+  SmallVector<Value *, 16> Work(NextForArg.begin(), NextForArg.end());
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      continue;
+    if (I->getParent() != H)
+      return false;
+    if (isa<PHINode>(I))
+      continue;
+    if (!Need.insert(I).second)
+      continue;
+    if (!isPureForLatch(*I))
+      return false;
+    for (Value *Op : I->operands())
+      Work.push_back(Op);
+  }
+  if (Need.empty())
+    return false;
+
+  // Values the exit needs that live in the header body but are NOT part
+  // of the latch computation must stay in H; the latch clones only Need.
+  // Cloning (not moving) keeps H's exit path intact: H keeps its body and
+  // its exit edge, L computes the taken-path values independently.
+  BasicBlock *L =
+      BasicBlock::Create(F.getContext(), H->getName() + ".untail", &F);
+  // Clone in domination order (iterate H in order, clone members of Need).
+  DenseMap<Instruction *, Value *> CloneOf;
+  for (Instruction &I : *H) {
+    if (!Need.count(&I))
+      continue;
+    Instruction *C = I.clone();
+    C->setName(I.getName() + ".ut");
+    C->insertInto(L, L->end());
+    CloneOf[&I] = C;
+  }
+  // Remap clone operands: cloned defs -> clones; header PHIs stay as-is
+  // (H dominates L, the latch reads the loop-carried values).
+  for (auto &KV : CloneOf) {
+    Instruction *C = cast<Instruction>(KV.second);
+    for (unsigned o = 0, e = C->getNumOperands(); o != e; ++o) {
+      Value *V = C->getOperand(o);
+      auto ItC = CloneOf.find(dyn_cast<Instruction>(V));
+      if (ItC != CloneOf.end())
+        C->setOperand(o, ItC->second);
+    }
+    if (MDNode *MD = KV.first->getMetadata("revenant.va"))
+      C->setMetadata("revenant.va", MD);
+  }
+  // Next-values as computed in L.
+  for (unsigned k = 0; k != NumArgs; ++k) {
+    Value *V = NextForArg[k];
+    auto ItC = CloneOf.find(dyn_cast<Instruction>(V));
+    if (ItC != CloneOf.end())
+      NextForArg[k] = ItC->second;
+  }
+  BranchInst::Create(H, L);
+
+  // H's backedge now goes to L (taken path), the other edge keeps the
+  // exit. Update the branch FIRST, then the phis: between the two steps
+  // the IR is transiently invalid, but both complete before any verify.
+  Term->setSuccessor(BackIdx, L);
+  for (unsigned k = 0; k != NumArgs; ++k) {
+    PHINode *PN = PhiForArg[k];
+    for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
+      if (PN->getIncomingBlock(i) == H)
+        PN->setIncomingBlock(i, L);
+  }
+  (void)ExitIdx;
+  (void)Exit;
+  return true;
+}
+
 bool rewrite(Function &F, const LoopShape &S) {
   // The latch block becomes the recursive call block: move the needed
   // header body defs first, then append `r = call @self(next...); ret r`
@@ -296,13 +433,14 @@ bool rewrite(Function &F, const LoopShape &S) {
 
   SmallVector<Value *, 4> Args(S.NextForArg.begin(), S.NextForArg.end());
   Type *RetTy = F.getReturnType();
-
-  // Collect the header body defs the call transitively needs, plus every
-  // header value the latch code reads: the latch stays in L, so its
-  // header-phi operands must be rewritten to entry values as well. Header
-  // PHIs are replaced by their entry values (the loop is entered once).
   SmallPtrSet<Instruction *, 16> Moved;
+  // Defs already in L (e.g. splitSelfLoop clones) dominate already and
+  // must not move; mark them so the walk below skips them but still
+  // rewrites their header-phi operands via the latch seed.
+  for (Instruction &LI : *L)
+    Moved.insert(&LI);
   SmallVector<Value *, 16> Work(Args.begin(), Args.end());
+  // Seed with the latch's own operands so header values the latch reads
   for (Instruction &LI : *L)
     for (Value *Op : LI.operands())
       Work.push_back(Op);
@@ -324,11 +462,19 @@ bool rewrite(Function &F, const LoopShape &S) {
     for (Value *Op : I->operands())
       Work.push_back(Op);
   }
-  // Insert moved defs before the first non-phi of L (keep L's own order).
-  Instruction *Anchor = L->getFirstNonPHI();
-  for (Instruction *I : llvm::reverse(ToMove))
-    I->moveBefore(*L, Anchor->getIterator());
-  // Rewrite moved operands: header phis -> entry values.
+  // Header order is already topological. A reverse worklist order is not:
+  // shared dependencies can be visited before another user is discovered.
+  // Do not infer clone identity from instruction names, which are optional.
+  // Needed originals dominate the existing latch clones when inserted first.
+  SmallPtrSet<Instruction *, 16> Needed(ToMove.begin(), ToMove.end());
+  SmallVector<Instruction *, 16> Ordered;
+  for (Instruction &I : *H)
+    if (Needed.contains(&I))
+      Ordered.push_back(&I);
+  BasicBlock::iterator At = L->getFirstNonPHIIt();
+  for (Instruction *I : Ordered)
+    I->moveBefore(*L, At);
+  // Rewrite header PHIs to the values supplied by the entry edge.
   SmallVector<Instruction *, 16> Fix;
   for (Instruction &FI : *L)
     Fix.push_back(&FI);
@@ -355,11 +501,16 @@ bool rewrite(Function &F, const LoopShape &S) {
   else
     BC.CreateRet(Call);
 
-  // Route the entry guard's header edge to the call block.
+  // Route the entry guard's header edge to the call block. The header
+  // PHIs lose their entry incoming accordingly (the loop is entered once,
+  // through L now); drop it before erasing so predecessor lists match.
   auto *Guard = cast<BranchInst>(S.Entry->getTerminator());
   for (unsigned i = 0; i < 2; ++i)
     if (Guard->getSuccessor(i) == H)
       Guard->setSuccessor(i, L);
+  for (PHINode *PN : S.PhiForArg)
+    if (PN->getBasicBlockIndex(S.Entry) >= 0)
+      PN->removeIncomingValue(S.Entry);
 
   // Every remaining use of a header-defined value outside L reads the
   // recursion result: the call returns exactly what the loop would have
@@ -391,18 +542,36 @@ bool rewrite(Function &F, const LoopShape &S) {
       U->set(Call);
   }
 
-  // Fix PHIs in other blocks (exits) that reference the header block.
-  for (BasicBlock &BB : F)
-    for (PHINode &PN : BB.phis()) {
-      bool HasH = false;
-      for (unsigned i = 0, e = PN.getNumIncomingValues(); i != e; ++i)
-        if (PN.getIncomingBlock(i) == H)
-          HasH = true;
-      if (HasH)
-        PN.replaceIncomingBlockWith(H, L);
-    }
+  // Fix PHIs in other blocks (exits) that reference the header block: the
+  // loop path now returns through the call in L, so exits are only
+  // reachable from elsewhere (entry). Drop the header incoming instead of
+  // retargeting it to L: L ends in `ret` and never branches to the exit,
+  // so an L incoming would reference a non-predecessor.
+  for (BasicBlock &BB : F) {
+    if (&BB == H || &BB == L)
+      continue;
+    for (PHINode &PN : BB.phis())
+      while (PN.getBasicBlockIndex(H) >= 0)
+        PN.removeIncomingValue(H, /*DeletePHIIfEmpty=*/false);
+  }
 
-  // The header is now unreachable: drop its references and erase it.
+  // The header is now unreachable: erase it unconditionally. Any
+  // still-needing users (exit rets/ PHIs of values the loop computed) read
+  // the recursion result instead: retarget them to the call (or undef for
+  // void), including users inside H itself, then drop and erase.
+  for (Instruction &I : *H) {
+    if (I.getType()->isVoidTy())
+      continue;
+    SmallVector<Use *, 8> All;
+    for (Use &U : I.uses())
+      All.push_back(&U);
+    for (Use *U : All) {
+      if (RetTy->isVoidTy())
+        U->set(llvm::UndefValue::get(I.getType()));
+      else
+        U->set(Call);
+    }
+  }
   H->dropAllReferences();
   H->eraseFromParent();
 

@@ -49,7 +49,6 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
   Prec P = Prec::Add;
   bool NonAssocRight = false;
   bool IsShift = false;
-  bool IsBitwise = false;
   switch (Op) {
   case llvm::Instruction::Add:
     BOp = BO_Add;
@@ -92,17 +91,14 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
   case llvm::Instruction::And:
     BOp = BO_And;
     P = Prec::And;
-    IsBitwise = true;
     break;
   case llvm::Instruction::Or:
     BOp = BO_Or;
     P = Prec::Or;
-    IsBitwise = true;
     break;
   case llvm::Instruction::Xor:
     BOp = BO_Xor;
     P = Prec::Xor;
-    IsBitwise = true;
     break;
   case llvm::Instruction::FAdd:
     BOp = BO_Add;
@@ -150,35 +146,6 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
     }
   }
 
-  // Hex for bitwise/shift mask constants (emit-c `fmt` closure): rebuild
-  // a constant operand as an explicitly hex literal of the operand type.
-  // The AST holds the same value; the printer chooses hex by width, so
-  // force the spelling through a matching-width literal: values that fit
-  // print through clang::IntegerLiteral normally, and large masks (> int64)
-  // print hex with ULL suffix under clang-cl's printer. Because Clang's
-  // printer always picks decimal for small values, emulate emit-c by
-  // widening small mask constants to their unsigned type — the value is
-  // identical, only the printed form changes.
-  auto Hexify = [&](llvm::Value *V, Expr *E) -> Expr * {
-    if (!IsBitwise && !IsShift)
-      return E;
-    auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V);
-    if (!CI)
-      return E;
-    uint64_t U = CI->getValue().getZExtValue();
-    // Small values that emit-c would print hex: keep the value, the
-    // printer spells small ints decimal, so leave them; only constants
-    // that *need* hex (wide masks) change form. Values >= 10 with a
-    // high bit set in a 32-bit mask read far better hex, but emit-c
-    // hexes *every* bitwise constant, so do the same: rebuild with an
-    // explicit unsigned type so the value survives intact.
-    if (U < 10)
-      return E;
-    (void)U;
-    return E;
-  };
-  L = Hexify(LHS, L);
-  R = Hexify(RHS, R);
 
   // Shift amount and division by unsigned values: keep operand types;
   // the result type comes from the IR type via TypeBuilder.
@@ -491,6 +458,52 @@ Expr *ExprBuilderImpl::cond(llvm::Value *Cond, ExprScope &Scope) {
     }
   }
   return truthTest(C);
+}
+
+Expr *ExprBuilderImpl::inverted(llvm::Value *Cond, ExprScope &Scope) {
+  assert(AST && "beginFunction must run before inverted()");
+  // Canonical negation: predicate flip on comparisons, else `!x`.
+  Expr *C = cond(Cond, Scope);
+  if (auto *B = llvm::dyn_cast<clang::BinaryOperator>(C)) {
+    BinaryOperatorKind Flip = BO_EQ;
+    bool Flippable = true;
+    switch (B->getOpcode()) {
+    case BO_EQ:
+      Flip = BO_NE;
+      break;
+    case BO_NE:
+      Flip = BO_EQ;
+      break;
+    case BO_LT:
+      Flip = BO_GE;
+      break;
+    case BO_LE:
+      Flip = BO_GT;
+      break;
+    case BO_GT:
+      Flip = BO_LE;
+      break;
+    case BO_GE:
+      Flip = BO_LT;
+      break;
+    default:
+      Flippable = false;
+      break;
+    }
+    if (Flippable) {
+      return BinaryOperator::Create(*AST, B->getLHS(), B->getRHS(), Flip,
+                                    B->getType(), VK_PRValue, OK_Ordinary,
+                                    SourceLocation(), FPOptionsOverride());
+    }
+  }
+  // `!!x` folds back to a truth test instead of stacking negations.
+  if (auto *UO = llvm::dyn_cast<clang::UnaryOperator>(C)) {
+    if (UO->getOpcode() == UO_LNot)
+      return truthTest(UO->getSubExpr());
+  }
+  return UnaryOperator::Create(*AST, parenIfNeeded(C, Prec::Unary), UO_LNot,
+                               AST->BoolTy, VK_PRValue, OK_Ordinary,
+                               SourceLocation(), false, FPOptionsOverride());
 }
 
 } // namespace revenant::clangx

@@ -81,8 +81,27 @@ Expected<Disasm> Disasm::create(const Image &Img) {
 // instruction; the decoder reports Size).
 static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
                                      const MCInstrAnalysis &MIA,
+                                     const MCInstrInfo &MII,
                                      const MCSubtargetInfo &STI, Va Addr,
                                      ArrayRef<uint8_t> Bytes) {
+  // LLVM's X86 decoder can surface an F0 LOCK prefix as its own one-byte
+  // pseudo-instruction even when the following instruction is lockable.
+  // Fold it into the following atomic memory operation to preserve hardware
+  // instruction boundaries and MCInstPrinter's lock-prefix rendering.
+  if (!Bytes.empty() && Bytes.front() == 0xF0 && Bytes.size() > 1) {
+    if (auto Locked = decodeAt(Dis, MIA, MII, STI, Addr.wrappingAdd(1),
+                               Bytes.drop_front())) {
+      const MCInstrDesc &Desc = MII.get(Locked->Inst.getOpcode());
+      int MemOp = X86II::getMemoryOperandNo(Desc.TSFlags);
+      if (Locked->Size < 15 && MemOp >= 0 && Desc.mayLoad() &&
+          Desc.mayStore()) {
+        Locked->Addr = Addr;
+        ++Locked->Size;
+        Locked->Inst.setFlags(Locked->Inst.getFlags() | X86::IP_HAS_LOCK);
+        return Locked;
+      }
+    }
+  }
   if (Bytes.empty())
     return std::nullopt;
   MCInst Inst;
@@ -121,6 +140,12 @@ static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
     Out.HasMemTarget = true;
     Out.MemTarget = Va(*MemAddr);
   }
+  // A `3E` prefix on an indirect call/jmp is CET `notrack`; the decoder
+  // keeps it as a segment override that the printer then drops.
+  if (Bytes[0] == 0x3E &&
+      (Out.Flow == FlowKind::IndirectBranch ||
+       (Out.Flow == FlowKind::Call && !Out.HasTarget)))
+    Out.Inst.setFlags(Out.Inst.getFlags() | X86::IP_HAS_NOTRACK);
   return Out;
 }
 
@@ -131,7 +156,7 @@ static std::optional<Instr>
 decodeWithPrefixes(const MCDisassembler &Dis, const MCInstrAnalysis &MIA,
                    const MCInstrInfo &MII, const MCSubtargetInfo &STI,
                    Va Addr, ArrayRef<uint8_t> Bytes) {
-  std::optional<Instr> Prefix = decodeAt(Dis, MIA, STI, Addr, Bytes);
+  std::optional<Instr> Prefix = decodeAt(Dis, MIA, MII, STI, Addr, Bytes);
   if (!Prefix)
     return std::nullopt;
 
@@ -153,8 +178,10 @@ decodeWithPrefixes(const MCDisassembler &Dis, const MCInstrAnalysis &MIA,
   auto Body = decodeWithPrefixes(Dis, MIA, MII, STI,
                                  Addr.wrappingAdd(Prefix->Size),
                                  Bytes.drop_front(Prefix->Size));
+  // A prefix whose body does not decode is an invalid instruction (iced
+  // reports `Code::INVALID`), never a standalone prefix instruction.
   if (!Body)
-    return Prefix;
+    return std::nullopt;
   Body->Addr = Addr;
   Body->Size += Prefix->Size;
   Body->Inst.setFlags(Body->Inst.getFlags() | Flag);

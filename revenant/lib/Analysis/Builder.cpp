@@ -758,7 +758,10 @@ struct Builder {
     const std::vector<Range> Ranges = ownCodeRanges();
     if (Ranges.empty())
       return;
-    for (unsigned Pass = 0; Pass < 32; ++Pass) {
+    // Each pass roots one candidate per uncovered gap, so a jump slide of N
+    // `jmp` stubs needs N passes. The loop ends when a pass adds nothing;
+    // the bound only guards against a pathological non-terminating decode.
+    for (unsigned Pass = 0; Pass < 4096; ++Pass) {
       std::vector<Range> Covered;
       for (const BasicBlock &B : F.Blocks)
         Covered.emplace_back(B.Start, B.End);

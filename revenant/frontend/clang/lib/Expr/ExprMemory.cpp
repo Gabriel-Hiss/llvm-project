@@ -45,11 +45,21 @@ Expr *ExprBuilderImpl::decayToPointer(Expr *E, QualType Pointee) {
   if (!T->isPointerType())
     return makeCStyleCast(AST->getPointerType(Pointee),
                           CK_IntegralToPointer, E);
+  QualType WantPtr = AST->getPointerType(Pointee);
+  if (T != WantPtr)
+    return makeCStyleCast(WantPtr, CK_BitCast, E);
   return E;
 }
 
 Expr *ExprBuilderImpl::derefPointer(Expr *Ptr, QualType Pointee) {
   Expr *P = decayToPointer(Ptr, Pointee);
+  // A byte-array global read as i64 decays to `unsigned char *`: view it as a
+  // pointer to the accessed type instead of reading one element.
+  if (const auto *PT = P->getType()->getAs<clang::PointerType>())
+    if (!Pointee->isVoidType() &&
+        AST->getCanonicalType(PT->getPointeeType().getUnqualifiedType()) !=
+            AST->getCanonicalType(Pointee.getUnqualifiedType()))
+      P = makeCStyleCast(AST->getPointerType(Pointee), CK_BitCast, P);
   // Clang's printer does not parenthesize unary operands itself
   // (Sema normally inserts ParenExpr); wrap anything below postfix so
   // `*(p + k)` does not print as `*p + k`.
@@ -125,18 +135,17 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
     Dst = Ptr;
   else
     Dst = derefPointer(Ptr, Pointee);
-  // llvm::Value needs the destination type; insert a llvm::cast when they differ
-  // (avoids `-Wincompatible-pointer-types`-style breakage).
-  if (Val->getType() != Pointee && !Pointee.isNull()) {
-    if (Val->getType()->isIntegerType() && Pointee->isIntegerType())
-      Val = makeCStyleCast(Pointee, CK_IntegralCast, Val);
-    else if (Val->getType()->isPointerType() && Pointee->isPointerType())
-      Val = makeCStyleCast(Pointee, CK_BitCast, Val);
+  QualType DestType = Dst->getType();
+  if (Val->getType() != DestType && !DestType.isNull()) {
+    if (Val->getType()->isIntegerType() && DestType->isIntegerType())
+      Val = makeCStyleCast(DestType, CK_IntegralCast, Val);
+    else if (Val->getType()->isPointerType() && DestType->isPointerType())
+      Val = makeCStyleCast(DestType, CK_BitCast, Val);
     else if (Val->getType()->isFloatingType() &&
-             Pointee->isFloatingType())
-      Val = makeCStyleCast(Pointee, CK_FloatingCast, Val);
-    else if (Val->getType()->isIntegerType() && Pointee->isPointerType())
-      Val = makeCStyleCast(Pointee, CK_IntegralToPointer, Val);
+             DestType->isFloatingType())
+      Val = makeCStyleCast(DestType, CK_FloatingCast, Val);
+    else if (Val->getType()->isIntegerType() && DestType->isPointerType())
+      Val = makeCStyleCast(DestType, CK_IntegralToPointer, Val);
   }
   clang::BinaryOperator *Assign = BinaryOperator::Create(
       *AST, Dst, Val, BO_Assign, Dst->getType(), VK_PRValue, OK_Ordinary,

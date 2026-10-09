@@ -196,6 +196,9 @@ bool ExprBuilderImpl::isSignedIntValue(const llvm::Value *V) const {
 QualType ExprBuilderImpl::exprTypeOf(llvm::Value *V) {
   const llvm::DIType *DI = debugTypeOf(V);
   QualType T = Types.typeOf(V->getType(), DI);
+  if (CurFD && V->getType() == CurF->getReturnType() &&
+      (V->getType()->isStructTy() || V->getType()->isArrayTy()))
+    T = CurFD->getReturnType();
   assert(!T.isNull() && "TypeBuilder must never return null");
   return T;
 }
@@ -228,7 +231,25 @@ Expr *ExprBuilderImpl::parenIfNeeded(Expr *E, Prec Parent,
   return E;
 }
 
+/// Clang asserts that any cast to bool carries a *ToBoolean kind (or NoOp
+/// from bool): pick it from the operand's type.
+static CastKind boolDestKind(QualType T, CastKind K, const Expr *Op) {
+  if (!T->isBooleanType())
+    return K;
+  QualType S = Op->getType();
+  if (S->isBooleanType())
+    return CK_NoOp;
+  if (S->isPointerType())
+    return CK_PointerToBoolean;
+  if (S->isFloatingType())
+    return CK_FloatingToBoolean;
+  return CK_IntegralToBoolean;
+}
+
 Expr *ExprBuilderImpl::makeCStyleCast(QualType T, CastKind K, Expr *Op) {
+  // `(T)a + b` casts only `a`: a binary operand needs its own parentheses.
+  Op = parenIfNeeded(Op, Prec::Unary);
+  K = boolDestKind(T, K, Op);
   TypeSourceInfo *TSI = AST->getTrivialTypeSourceInfo(T);
   clang::CStyleCastExpr *C =
       CStyleCastExpr::Create(*AST, T, VK_PRValue, K, Op, nullptr,
@@ -271,7 +292,8 @@ bool ExprBuilderImpl::isStoredVar(llvm::Value *PtrOp, const clang::Expr *Ptr) {
   if (!llvm::isa<llvm::AllocaInst>(PtrOp) &&
       !llvm::isa<llvm::GlobalVariable>(PtrOp))
     return false;
-  return llvm::isa<clang::DeclRefExpr>(Ptr);
+  // An array designator is not assignable: access it through a pointer.
+  return llvm::isa<clang::DeclRefExpr>(Ptr) && !Ptr->getType()->isArrayType();
 }
 
 // ---- literals -------------------------------------------------------------
@@ -283,12 +305,42 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
   // the type width first, preserving the value under the type's own
   // signedness. Non-integer types fall back to `uintptr_t`.
   QualType T = Ty->isIntegerType() ? Ty : uintptrTy();
-  // Bool context: 0/1 become `false`/`true` in C++ mode.
-  if (T->isBooleanType() && Ctx.isCPlusPlus()) {
-    return CXXBoolLiteralExpr::Create(*AST, !V.isZero(), T,
-                                      SourceLocation());
+  // Bool context: 0/1 become `false`/`true` in C++ mode. IntegerLiteral
+  // cannot carry a bool type, so C prints a plain `0`/`1`.
+  if (T->isBooleanType()) {
+    if (Ctx.isCPlusPlus())
+      return CXXBoolLiteralExpr::Create(*AST, !V.isZero(), T,
+                                        SourceLocation());
+    T = AST->IntTy;
   }
   unsigned W = (unsigned)AST->getIntWidth(T);
+  // No C/C++ spelling exists for a >64-bit decimal literal: Clang's
+  // printer emits the raw digits and clang-cl rejects them ("integer
+  // literal is too large"). Split the value into two 64-bit halves
+  // joined by a shift+or, which folds to the same constant.
+  if (W > 64 && !V.isZero()) {
+    uint64_t Lo = V.trunc(64).getZExtValue();
+    uint64_t Hi = V.lshr(64).trunc(64).getZExtValue();
+    Expr *LoE = IntegerLiteral::Create(
+        *AST, llvm::APInt(64, Lo), AST->UnsignedLongLongTy, SourceLocation());
+    Expr *HiE = IntegerLiteral::Create(
+        *AST, llvm::APInt(64, Hi), AST->UnsignedLongLongTy, SourceLocation());
+    Expr *ShiftAmt = IntegerLiteral::Create(
+        *AST, llvm::APInt(32, 64), AST->IntTy, SourceLocation());
+    Expr *Shift = BinaryOperator::Create(*AST, HiE, ShiftAmt, BO_Shl,
+                                         AST->UnsignedLongLongTy, VK_PRValue,
+                                         OK_Ordinary, SourceLocation(),
+                                         FPOptionsOverride());
+    QualType U128 = T->isSignedIntegerType() ? AST->Int128Ty
+                                             : AST->UnsignedInt128Ty;
+    Expr *Or = BinaryOperator::Create(
+        *AST, makeCStyleCast(U128, CK_IntegralCast, Shift),
+        makeCStyleCast(U128, CK_IntegralCast, LoE), BO_Or, U128, VK_PRValue,
+        OK_Ordinary, SourceLocation(), FPOptionsOverride());
+    if (U128 != T)
+      return Or;
+    return makeCStyleCast(T, CK_IntegralCast, Or);
+  }
   llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative())
                         ? V.sextOrTrunc(W)
                         : V.zextOrTrunc(W);
@@ -379,8 +431,7 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
       return declRef(D);
     // Forward reference: ask Core to materialize a declaration-only
     // FunctionDecl so the call still prints by name.
-    FunctionDecl *FD = Ctx.functionDecl(
-        *F, [&](llvm::Type *Ty, const llvm::DIType *DI) { return Types.typeOf(Ty, DI); });
+    FunctionDecl *FD = Ctx.functionDecl(*F, Types);
     if (FD)
       return declRef(FD);
     return IntegerLiteral::Create(*AST, llvm::APInt(64, 0u), uintptrTy(),
@@ -404,6 +455,10 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
       return makeCStyleCast(exprTypeOf(C), CK_IntegralToPointer,
                             value(CE->getOperand(0), Scope));
     case llvm::Instruction::PtrToInt:
+      // The operand may be an array or function designator: the cast makes
+      // the decay and the integer result explicit.
+      return makeCStyleCast(exprTypeOf(C), CK_PointerToIntegral,
+                            value(CE->getOperand(0), Scope));
     case llvm::Instruction::BitCast:
       return value(CE->getOperand(0), Scope);
     default:
@@ -424,15 +479,10 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
 Expr *ExprBuilderImpl::tempFor(llvm::Instruction *I, ExprScope &Scope) {
   if (ValueDecl *D = Ctx.lookupDecl(I))
     return declRef(D);
-  // Not yet materialized: StmtBuilder emits the VarDecl when it reaches
-  // the instruction (it walks PendingTemps). Record it now so repeat
-  // uses share one temporary.
+  // Record this value so Core can declare its temporary in the function
+  // prologue. Bind it now so later uses share the same VarDecl.
   if (Materialized.insert(I).second)
     Scope.PendingTemps.push_back(I);
-  // Synthesize a placeholder VarDecl so inline uses before emission still
-  // resolve; StmtBuilder replaces it with the real one. In practice
-  // StmtBuilder always emits temps before their uses (dominance order),
-  // so this path only fires for irreducible CFG edges.
   std::string Name = "v" + std::to_string(TempCounter++);
   IdentifierInfo *Id = Ctx.ident(Name);
   QualType T = exprTypeOf(I);
@@ -445,13 +495,9 @@ Expr *ExprBuilderImpl::tempFor(llvm::Instruction *I, ExprScope &Scope) {
 
 Expr *ExprBuilderImpl::ensureTemp(llvm::Instruction *I, ExprScope &Scope,
                                   clang::Expr *Inline) {
-  // Single-use (or still-useless) instructions fold into their use site,
-  // mirroring how emit-c prints expressions inline. Only values that
-  // already have several uses get a `v<N>` temporary; StmtBuilder emits
-  // the DeclStmt from PendingTemps. PHIs have no inline spelling and
-  // always materialize. Calls fold like anything else when they have a
-  // single use; instr() on a multi-use value-call binds the temp exactly
-  // once, and StmtBuilder emits it.
+  // Values with multiple uses need a local. Core emits the declaration;
+  // instr() emits the cached initializer at this instruction's position.
+  // PHIs have no inline spelling and remain declaration-only here.
   bool NeedsTemp = !I->hasOneUse() && !I->use_empty();
   if (I->getOpcode() == llvm::Instruction::PHI)
     NeedsTemp = true;
@@ -470,6 +516,7 @@ Expr *ExprBuilderImpl::ensureTemp(llvm::Instruction *I, ExprScope &Scope,
                                   Inline->getType(), TSI, SC_None);
     Ctx.bindTemp(I, VD);
   }
+  Scope.PendingInitializers[I] = Inline;
   return declRef(llvm::cast<ValueDecl>(Ctx.lookupDecl(I)));
 }
 
@@ -483,6 +530,7 @@ void ExprBuilderImpl::beginFunction(llvm::Function &F, FunctionDecl *FD,
   Materialized.clear();
   DebugTypes.clear();
   Scope.PendingTemps.clear();
+  Scope.PendingInitializers.clear();
   TempCounter = 0;
   ThisRecord = nullptr;
   ThisArgIndex = 0;
@@ -618,36 +666,39 @@ Stmt *ExprBuilderImpl::instr(llvm::Instruction &I, ExprScope &Scope) {
   if (llvm::isa<llvm::DbgInfoIntrinsic>(I))
     return nullptr;
   assert(AST && "beginFunction must run before instr()");
+  auto EmitTemp = [&]() -> Stmt * {
+    auto It = Scope.PendingInitializers.find(&I);
+    auto *D = llvm::dyn_cast_or_null<ValueDecl>(Ctx.lookupDecl(&I));
+    if (It == Scope.PendingInitializers.end() || !D)
+      return nullptr;
+    Expr *Init = It->second;
+    Scope.PendingInitializers.erase(It);
+    Expr *LHS = declRef(D);
+    return BinaryOperator::Create(*AST, LHS, Init, BO_Assign, D->getType(),
+                                  VK_PRValue, OK_Ordinary, SourceLocation(),
+                                  FPOptionsOverride());
+  };
   switch (I.getOpcode()) {
   case llvm::Instruction::Store:
     return buildStore(llvm::cast<llvm::StoreInst>(I), Scope);
   case llvm::Instruction::Call:
-    return buildCallStmt(llvm::cast<llvm::CallInst>(I), Scope);
+    if (Stmt *S = buildCallStmt(llvm::cast<llvm::CallInst>(I), Scope))
+      return S;
+    return EmitTemp();
   case llvm::Instruction::Alloca:
   case llvm::Instruction::PHI:
-    // Declarations / edge copies are emitted by StmtBuilder from
-    // PendingTemps and predecessor edges; nothing inline.
+    // Alloca declarations and PHI edge copies are handled separately.
     (void)value(&I, Scope);
     return nullptr;
-  case llvm::Instruction::Fence: {
-    // `llvm.dbg.*` intrinsics (old form) lower to nothing.
+  case llvm::Instruction::Fence:
     return nullptr;
-  }
-  default: {
-    if (I.mayHaveSideEffects()) {
-      // Atomicrmw / cmpxchg / volatile ops: keep a temp binding so the
-      // effect is sequenced; StmtBuilder emits `vN = <op>;`.
-      (void)value(&I, Scope);
-      return nullptr;
-    }
-    // Pure instructions fold into uses; if a temp was bound (multi-use),
-    // StmtBuilder emits it from PendingTemps. No statement here.
+  default:
     if (!I.getType()->isVoidTy())
       (void)value(&I, Scope);
-    return nullptr;
-  }
+    return EmitTemp();
   }
 }
+
 
 Expr *ExprBuilderImpl::retVal(llvm::Value *V, ExprScope &Scope) {
   assert(AST && "beginFunction must run before retVal()");

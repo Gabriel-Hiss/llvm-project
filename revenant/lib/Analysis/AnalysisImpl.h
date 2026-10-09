@@ -37,12 +37,12 @@ BuildResult buildFunction(
     llvm::ArrayRef<std::pair<Va, Va>> Bound = {});
 
 
+/// End of the run of pointer-shaped qwords (absolute executable VAs, zero or
+/// all-ones) that `V` falls in, if it holds at least three slots.
+std::optional<Va> pointerTableEnd(const Image &Img, Va V);
+
 std::set<Va> collectStrongStarts(const PeFile &Pe, const Image &Img);
 std::set<Va> collectInitialWeakCandidates(const PeFile &Pe);
-bool rejectWeakCandidate(const Image &Img, const Disasm &Dis,
-                         const TargetHooks &Hooks,
-                         const std::map<Va, std::pair<Va, Va>> &Pdata,
-                         llvm::ArrayRef<std::pair<Va, Va>> Claimed, Va Candidate);
 bool rejectWeakFunction(const Image &Img, const TargetHooks &Hooks,
                         const Function &F);
 

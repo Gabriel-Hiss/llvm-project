@@ -13,23 +13,32 @@ integrator after each merge loop.
 | IR contract | RevenantIR, revenant-ir-verify | builds |
 | Structure | RevenantStructure, rv-structure-tool | builds |
 | Target/X86 | RevenantTargetX86 | builds |
-| Transforms | SsaOut, Unrotate (plugin DLLs), Devectorize, TypeRecovery (static libs) | builds; Devectorize lit test needs the standalone plugin or revenant-opt |
-| Frontend clang | RevenantClangCore, revenant-clang | builds |
+| Transforms | SsaOut, Unrotate, Devectorize, TypeRecovery, and newly merged deopt passes | integrated build blocked in Analysis; SsaOut and Unrotate superbuild targets are STATIC, standalone plugins remain MODULEs |
+| Frontend clang | RevenantClangCore, revenant-clang | merged ClangAccept fixes, integrated rebuild pending |
 | Driver | tools/revenant | builds |
 
 ## Tests
 
 | Suite | Result |
 |---|---|
-| RevenantObjectTests (gtest) | 5/5 pass |
-| RevenantDisasmTests (gtest) | 3/3 pass |
-| RevenantClangTypeTests + TypeSmoke (gtest) | 4/4 pass; TypeSmoke needs an .ll arg (no default) |
-| StructuredStmtBuilderTests (gtest) | compile-fixed by integrator; all tests abort at `CreateCondBr` on i32 condition (i1 required) — owner: Swe2ClangStmt/LunaClangStmt |
-| test/ir-contract (revenant-ir-verify) | 10/10 valid accepted, 10/10 invalid rejected |
-| test/Structure (lit-style) | 5/5 pass |
-| test/Transforms/Unrotate + SsaOut (opt plugin) | 12/12 pass |
-| test/Transforms/Devectorize, TypeRecovery | not runnable: no revenant-opt / plugin DLL in superbuild — owner: MuseTxPipeline |
-| revenant-clang on ir-contract modules | 3/10 emit (for, if-else, while); crashes on call-import, cpp-method, leaf-locals, opaque-asm, rust-result, struct-di, switch — owners: Swe2ClangCore/MuseClangCpp; emitted .c fails clang-cl /c (undeclared v0/v2/v3 temporaries, missing labels) |
+| RevenantObjectTests | 5/5 pass |
+| RevenantDisasmTests | 4/4 pass |
+| RevenantAnalysisTests | last built set 16/16 pass; new Candidates, Overlaps, StackPtr, Signatures, and Orphan coverage not rebuilt |
+| RevenantClangTypeTests | 4/4 pass before latest ClangAccept merge |
+| StructuredStmtBuilderTests | pre-fix binary 5/7 pass; latest ClangAccept branch reports IfThen and Switch fixes, pending integrated rerun |
+| test/ir-contract (revenant-ir-verify) | last run 10/10 valid accepted, 10/10 invalid rejected |
+| test/Structure (RUN lines via CMD) | last run 5/5 pass |
+| test/Transforms/Unrotate (RUN lines via CMD) | last run 7/7 pass; Unrotate owner reports 8/8 on standalone plugin |
+| TypeSmoke | aborts on `for.ll` because expected vtable global is missing |
+| test/Transforms/Devectorize, TypeRecovery | not run after merging newer transforms; `revenant-opt` superbuild target still needs a successful link |
+| revenant-clang on ir-contract modules | prior integrated run emitted 4/10 and clang-cl rejected every emitted file; ClangAccept reports 10/10 references and 5 structure shapes now compile, pending integrated rerun |
+
+## Latest integration loop
+
+- Merged new commits from MuseXrefs, Discovery, CompilerProfile, DeoptAbi/Licm/Noreturn/StackPtr/Select/HotCold/Inline/TailDup/EH, LiftSystem/LiftFunction/LiftGen2, TxDevec/TxPipeline/TxUnrotate, JumpTables, Sigs, and ClangAccept. Resolved Analysis, X86, and TableGen CMake conflicts by retaining all distinct sources, tests, and target links.
+- Registered new Candidates, Overlaps, StackPtr, Signatures, and Orphan sources/tests. SsaOut now builds STATIC in the superbuild and keeps its standalone MODULE. UnrotatePlugin.cpp is standalone-only; its static superbuild target omits that plugin entry.
+- CMake configuration succeeds after registering all committed sources. The full build then fails because Candidates.cpp and Overlaps.cpp include `AnalysisImpl.h`, still untracked in LunaDiscovery's worktree. Orphan.cpp also calls TargetHooks methods/types absent from the current Core interface; LunaSkeleton was asked to reconcile the contract.
+- `ctest --test-dir build-rv` has no registered tests. Direct gtests and RUN lines above describe the last fully built integration state; the latest merged changes still need a clean integrated build and test run.
 
 ## Integration fixes applied (on revenant, not slice branches)
 

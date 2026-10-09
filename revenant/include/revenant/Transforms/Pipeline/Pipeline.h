@@ -8,9 +8,11 @@
 // revenant/include/revenant/Transforms/<Name>/.
 //
 // Every Revenant pass is a FunctionPassManager pass registered under
-// `revenant-<name>` via registerPipelineParsingCallback (see Register.cpp).
-// revenant-opt links all RevenantTransform* libs statically, so
-// `revenant-opt -passes=revenant-<name> in.ll` works with no plugin flags.
+// `revenant-<name>` via registerPipelineParsingCallback (see Register.cpp),
+// except `revenant-unabi`, which rewrites function signatures and runs as
+// a ModulePassManager pass. revenant-opt links all RevenantTransform*
+// libs statically, so `revenant-opt -passes=revenant-<name> in.ll` works
+// with no plugin flags.
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,27 +31,26 @@ class TargetMachine;
 
 namespace revenant {
 
-/// The cleanup pipeline, ported from `crates/lift/src/pipeline.rs`
-/// (`CLEANUP_PASSES`). Stock LLVM passes only. `simplifycfg` options keep
-/// the CFG close to the original asm: no switch-to-lookup tables, no
-/// hoisting/sinking of common instructions, no block speculation. `dse` +
-/// a late `sroa,instcombine` round remove frames whose slots are never read
-/// or address-taken.
+/// Normalize machine-state IR before deoptimization. Stack splitting happens
+/// before promotion; address and width recovery repeats after promotion so
+/// register stores no longer hide the pointer and integer expression trees.
+/// Keep CFG cleanup conservative to preserve vector epilogues and loop tiers.
 inline constexpr llvm::StringLiteral CleanupPipeline =
-    "sroa,mem2reg,early-cse,"
-    "instcombine<no-verify-fixpoint>,"
+    "revenant-lift-normalize,sroa,mem2reg,"
+    "revenant-lift-normalize,instcombine<no-verify-fixpoint>,"
     "simplifycfg<no-switch-to-lookup;no-hoist-common-insts;"
     "no-sink-common-insts;no-speculate-blocks>,"
-    "gvn,dse,dce,sroa,"
-    "instcombine<no-verify-fixpoint>";
+    "early-cse,sroa,instcombine<no-verify-fixpoint>,"
+    "gvn,dse,dce,sroa,instcombine<no-verify-fixpoint>,"
+    "revenant-lift-normalize";
 
 /// The unopt stage in pipeline order, ported from
-/// `crates/unopt/src/lib.rs` (`passes()`). `lane0` exposes scalar low-lane
-/// accumulators so `devectorize` sees plain scalar loops; `devectorize`
+/// `crates/unopt/src/lib.rs` (`passes()`). `revenant-devectorize` runs the
+/// lane-0 scalarization first (exposing scalar low-lane accumulators), then
 /// produces the canonical one-element-per-iteration form that `reroll`
 /// compacts further; `unrotate`/`untailrec` normalize loop structure.
 inline constexpr llvm::StringLiteral UnoptPipeline =
-    "revenant-lane0,revenant-devectorize,revenant-reroll,revenant-unrotate,"
+    "revenant-devectorize,revenant-reroll,revenant-unrotate,"
     "revenant-untailrec";
 
 /// The IR-level idiom stage, ported from `crates/idioms/src/lib.rs`
@@ -66,7 +67,7 @@ inline constexpr llvm::StringLiteral IdiomsPipeline = "revenant-idioms";
 /// and then runs this text with revenant-opt/opt.
 LLVM_ABI std::string defaultPipeline(bool withPatterns = false);
 
-/// Run the cleanup pipeline (`CleanupPipeline`, stock LLVM passes only) over
+/// Run the cleanup pipeline (`CleanupPipeline`) over
 /// M in-process, exactly as the lifter does after lifting and before
 /// deoptimization. Returns true on success, false + ErrMsg on parse/run
 /// failure. TM may be null (cleanup passes do not need a TargetMachine).

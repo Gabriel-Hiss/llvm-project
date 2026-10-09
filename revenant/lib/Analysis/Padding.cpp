@@ -81,6 +81,11 @@ std::string upperRegName(llvm::MCRegister R) {
 // nop. The reference only names `ax,ax` (`66 90`); accepting `eax`/`rax`
 // too covers however MC spells the single-byte `90` form.
 bool isAxXchg(const Instr &I) {
+  // `xchg eax,[mem]` carries the tied register as a second operand; only the
+  // register-register spellings are fillers.
+  llvm::StringRef Name = opcodeName(I);
+  if (Name.ends_with("rm") || Name.ends_with("mr"))
+    return false;
   if (I.Inst.getNumOperands() < 2 || !I.Inst.getOperand(0).isReg() ||
       !I.Inst.getOperand(1).isReg())
     return false;
