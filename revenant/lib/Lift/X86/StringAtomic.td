@@ -10,13 +10,10 @@
 // the `include "StringAtomic.td"` line to RevenantX86.td on integration
 // (never on this branch: his build would break on a missing include).
 //
-// Family op declarations (single source of truth for these names; the
-// emitter dispatches by op name globally. All other ops this file's
-// bodies use (rv_seq/set/reg/immw/add/sub/mul/select/load/fcmp, rv_df,
-// rv_hasrep, rv_prefix) are declared in X86Lift.td; this file declares
-// only the two its string bodies need and nothing else):
-def rv_memmove : RVOp;    // (rv_memmove dst_i64, src_i64, len_i64)
-def rv_memset : RVOp;     // (rv_memset dst_i64, val_i8, len_i64)
+// This file declares no family ops: every op its bodies use (shared ops,
+// rv_df/rv_hasrep, rv_memmove/rv_memset, rv_atomicrmw/rv_cmpxchg,
+// rv_cmpxchg8b/rv_cmpxchg16b) is declared in X86Lift.td, which needs them
+// for its own defs. Single source of truth, no duplicate declarations.
 //
 // Opcode census (RvLiftGen/opcount-out, 249 PEs, 51.4M decoded instr):
 //   string (plain forms; rep arrives as separate prefix MCInsts, see below):
@@ -272,5 +269,64 @@ def : RVLift {
     (rv_set (rv_reg "RSI"), (rv_select (rv_df),
       (rv_sub (rv_reg "RSI"), (rv_immw 64, 8)),
       (rv_add (rv_reg "RSI"), (rv_immw 64, 8)))));
+}
+
+// ---- XCHG rm: spelled-out atomicrmw "xchg" + reg write ----------------------
+// xchg is implicitly locked on hardware; keeping the RMW visible preserves
+// the ordering in the IR. rr/ar reg forms live in X86Lift.td; the mem
+// forms below are exclusively mine (no double coverage either way).
+
+foreach I = [XCHG8rm, XCHG16rm, XCHG32rm, XCHG64rm] in
+def : RVLift {
+  let Insn = I;
+  dag Body = (rv_set $dst, (rv_atomicrmw "xchg", (rv_addr $ptr), $val));
+}
+
+// ---- XADD rm: old -> reg, flags of (old + val) ------------------------------
+// $dst holds old after the write, so rv_fadd($dst, $val) sets exactly the
+// add flags with no second atomic. rr forms live in X86Lift.td.
+
+foreach I = [XADD8rm, XADD16rm, XADD32rm, XADD64rm] in
+def : RVLift {
+  let Insn = I;
+  dag Body = (rv_seq
+    (rv_set $dst, (rv_atomicrmw "add", (rv_addr $ptr), $val)),
+    (rv_fadd $dst, $val));
+}
+
+// ---- CMPXCHG rm: hook returns old and writes ZF, body writes acc ------------
+// rr forms live in X86Lift.td (rv_cmpxchgr). Storing old into the
+// accumulator is correct on both paths (success keeps acc).
+
+def : RVLift {
+  let Insn = CMPXCHG8rm;
+  dag Body = (rv_set (rv_reg "AL"),
+    (rv_cmpxchg (rv_addr $dst), (rv_reg "AL"), $src));
+}
+def : RVLift {
+  let Insn = CMPXCHG16rm;
+  dag Body = (rv_set (rv_reg "AX"),
+    (rv_cmpxchg (rv_addr $dst), (rv_reg "AX"), $src));
+}
+def : RVLift {
+  let Insn = CMPXCHG32rm;
+  dag Body = (rv_set (rv_reg "EAX"),
+    (rv_cmpxchg (rv_addr $dst), (rv_reg "EAX"), $src));
+}
+def : RVLift {
+  let Insn = CMPXCHG64rm;
+  dag Body = (rv_set (rv_reg "RAX"),
+    (rv_cmpxchg (rv_addr $dst), (rv_reg "RAX"), $src));
+}
+
+// ---- CMPXCHG8B/16B: hook owns the register pairs and ZF ---------------------
+
+def : RVLift {
+  let Insn = CMPXCHG8B;
+  dag Body = (rv_cmpxchg8b (rv_addr $dst));
+}
+def : RVLift {
+  let Insn = CMPXCHG16B;
+  dag Body = (rv_cmpxchg16b (rv_addr $dst));
 }
 
