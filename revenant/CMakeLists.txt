@@ -21,8 +21,12 @@ find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}: ${LLVM_DIR}")
 # Clang is only needed by frontend/clang and slices that link it; it may
 # not be in the build tree yet, so keep it optional.
+if(DEFINED Clang_DIR AND NOT Clang_DIR STREQUAL "Clang_DIR-NOTFOUND")
+  list(APPEND CMAKE_MODULE_PATH "${Clang_DIR}")
+endif()
 find_package(Clang CONFIG QUIET)
 if(Clang_FOUND)
+  include(AddClang)
   message(STATUS "Found Clang: ${Clang_DIR}")
 else()
   message(STATUS "Clang not found; clang-dependent targets are skipped")
