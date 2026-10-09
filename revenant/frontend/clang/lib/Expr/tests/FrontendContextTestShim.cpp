@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Clang/FrontendContext.h"
+#include "revenant/Clang/TypeBuilder.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
@@ -29,18 +30,17 @@ IdentifierInfo *FrontendContext::ident(llvm::StringRef Name) {
   return II;
 }
 
-FunctionDecl *FrontendContext::functionDecl(
-    llvm::Function &F,
-    llvm::function_ref<QualType(llvm::Type *, const llvm::DIType *)> typeOf) {
+FunctionDecl *FrontendContext::functionDecl(llvm::Function &F,
+                                            TypeBuilder &Types) {
   if (ValueDecl *D = lookupDecl(&F))
     return cast<FunctionDecl>(D);
   // Build a declaration-only prototype from the IR signature.
   ASTContext &A = ast();
   SmallVector<QualType, 8> Params;
   for (llvm::Argument &Arg : F.args())
-    Params.push_back(typeOf(Arg.getType(), nullptr));
+    Params.push_back(Types.typeOf(Arg.getType(), nullptr));
   llvm::FunctionType *FT = F.getFunctionType();
-  QualType Ret = typeOf(FT->getReturnType(), nullptr);
+  QualType Ret = Types.typeOf(FT->getReturnType(), nullptr);
   FunctionProtoType::ExtProtoInfo EPI;
   QualType FQT = A.getFunctionType(Ret, Params, EPI);
   IdentifierInfo *Id = ident(F.getName());
@@ -66,13 +66,12 @@ FunctionDecl *FrontendContext::functionDecl(
   return FD;
 }
 
-VarDecl *FrontendContext::globalDecl(
-    llvm::GlobalVariable &GV,
-    llvm::function_ref<QualType(llvm::Type *, const llvm::DIType *)> typeOf) {
+VarDecl *FrontendContext::globalDecl(llvm::GlobalVariable &GV,
+                                     TypeBuilder &Types) {
   if (ValueDecl *D = lookupDecl(&GV))
     return cast<VarDecl>(D);
   ASTContext &A = ast();
-  QualType T = typeOf(GV.getValueType(), nullptr);
+  QualType T = Types.typeOf(GV.getValueType(), nullptr);
   VarDecl *VD = VarDecl::Create(A, A.getTranslationUnitDecl(),
                                 SourceLocation(), SourceLocation(),
                                 ident(GV.getName()), T,
