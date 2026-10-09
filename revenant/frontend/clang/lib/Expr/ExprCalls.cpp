@@ -222,7 +222,9 @@ Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
       QualType Want = Types.typeOf(FTy->getParamType(A), nullptr);
       QualType Have = E->getType();
       if (Have != Want) {
-        if (Have->isPointerType() && Want->isPointerType())
+        if (Have->isArrayType() && Want->isPointerType())
+          E = makeCStyleCast(Want, CK_BitCast, E);
+        else if (Have->isPointerType() && Want->isPointerType())
           E = makeCStyleCast(Want, CK_BitCast, E);
         else if (Have->isPointerType() && Want->isIntegerType())
           E = makeCStyleCast(Want, CK_PointerToIntegral, E);
@@ -264,6 +266,26 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
           SourceLocation(), parenIfNeeded(R, Prec::Ternary), ResTy,
           VK_PRValue, OK_Ordinary);
       return ensureTemp(&I, Scope, Q);
+    }
+    if (N == "llvm.x86.int" && I.arg_size() == 1) {
+      auto *Vector = llvm::dyn_cast<llvm::ConstantInt>(I.getArgOperand(0));
+      if (Vector && Vector->getZExtValue() == 0x29) {
+        IdentifierInfo *Id = Ctx.ident("__fastfail");
+        QualType FT =
+            AST->getFunctionType(AST->VoidTy, {AST->UnsignedIntTy}, {});
+        FunctionDecl *FD = FunctionDecl::Create(
+            *AST, AST->getTranslationUnitDecl(), SourceLocation(),
+            SourceLocation(), Id, FT, AST->getTrivialTypeSourceInfo(FT),
+            SC_Extern);
+        Expr *Ref = declRef(FD);
+        Expr *Arg = value(I.getArgOperand(0), Scope);
+        if (Arg->getType() != AST->UnsignedIntTy)
+          Arg = makeCStyleCast(AST->UnsignedIntTy, CK_IntegralCast, Arg);
+        clang::CallExpr *Call =
+            CallExpr::Create(*AST, Ref, {Arg}, AST->VoidTy, VK_PRValue,
+                             SourceLocation(), FPOptionsOverride());
+        return Call;
+      }
     }
     if (N == "llvm.trap") {
       // `__debugbreak()` in MSVC terms; call it so the output compiles.
