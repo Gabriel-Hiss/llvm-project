@@ -2342,6 +2342,244 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
   }
   if (!HeadFromReduce || !Exit || Exit == Head)
     return false;
+  // Chain head: the index and accumulator phis, started at 0 on the
+  // guard's small arm and resumed from the reduction on the vector arm.
+  unsigned HeadPhis = 0;
+  for (PHINode &P : Head->phis())
+    (void)P, ++HeadPhis;
+  if (HeadPhis != 2)
+    return false;
+  PHINode *IdxPhi = nullptr;
+  PHINode *AccTail = nullptr;
+  for (PHINode &P : Head->phis()) {
+    if (P.getType()->isIntegerTy(64) && !IdxPhi)
+      IdxPhi = &P;
+    else if (P.getType() == ElemTy && !AccTail)
+      AccTail = &P;
+  }
+  if (!IdxPhi || !AccTail)
+    return false;
+  BasicBlock *SmallEntry = PR.SmallRelays.empty() ? D : PR.SmallRelays.back();
+  if (IdxPhi->getNumIncomingValues() != 2 ||
+      AccTail->getNumIncomingValues() != 2)
+    return false;
+  auto *IdxZero = dyn_cast<ConstantInt>(IdxPhi->getIncomingValueForBlock(SmallEntry));
+  auto *AccZeroStart =
+      dyn_cast<ConstantInt>(AccTail->getIncomingValueForBlock(SmallEntry));
+  if (!IdxZero || !IdxZero->isZero() || !AccZeroStart || !AccZeroStart->isZero())
+    return false;
+  if (IdxPhi->getIncomingValueForBlock(Reduce) != StartIdx)
+    return false;
+  if (AccTail->getIncomingValueForBlock(Reduce) != Fold)
+    return false;
+  if (predCount(Head) != 2)
+    return false;
+
+  // Walk the unrolled remainder: one guarded element per block, the
+  // last one unconditional, all addressing relative to the head's
+  // index phi, all accumulation chained from the head's accumulator.
+  PHINode *IP = IdxPhi;
+  Value *Acc = AccTail;
+  SmallVector<BasicBlock *, 4> Chain;
+  SmallVector<Value *, 4> ChainAcc;
+  DenseSet<BasicBlock *> DeadSet;
+  DeadSet.insert(Pre);
+  DeadSet.insert(Body);
+  DeadSet.insert(Reduce);
+  for (BasicBlock *BB : PR.SmallRelays)
+    DeadSet.insert(BB);
+  for (BasicBlock *BB : PR.VecRelays)
+    DeadSet.insert(BB);
+  BasicBlock *Prev = Head;
+  for (unsigned Lane = 0;; ++Lane) {
+    if (Lane != 0 && !Prev->phis().empty())
+      return false;
+    LoadInst *Ld = nullptr;
+    GetElementPtrInst *Gep = nullptr;
+    BinaryOperator *Add = nullptr;
+    ICmpInst *Guard = nullptr;
+    for (Instruction &I : *Prev) {
+      if (isa<PHINode>(&I) || I.isTerminator())
+        continue;
+      if (auto *L = dyn_cast<LoadInst>(&I)) {
+        if (Ld || L->isVolatile() || L->isAtomic() || L->getType() != ElemTy)
+          return false;
+        Ld = L;
+        continue;
+      }
+      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+        // The accumulator update is the only element-typed add;
+        // index derivations (or, shl, add) pass through as pure value
+        // arithmetic.
+        if (BO->getOpcode() == Instruction::Add && BO->getType() == ElemTy) {
+          if (Add)
+            return false;
+          Add = BO;
+        }
+        continue;
+      }
+      if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+        // Several GEPs may build one address; the offset walk below
+        // validates the whole chain back to the base pointer.
+        if (!Gep)
+          Gep = G;
+        continue;
+      }
+      if (auto *IC = dyn_cast<ICmpInst>(&I)) {
+        if (Guard)
+          return false;
+        Guard = IC;
+        continue;
+      }
+      if (isa<CallBase>(&I) || isa<StoreInst>(&I) || I.mayHaveSideEffects() ||
+          I.getMetadata("revenant.opaque"))
+        return false;
+    }
+    if (!Ld || !Add || !Gep)
+      return false;
+    if (!((Add->getOperand(0) == Acc && Add->getOperand(1) == Ld) ||
+          (Add->getOperand(1) == Acc && Add->getOperand(0) == Ld)))
+      return false;
+    if (cast<OverflowingBinaryOperator>(Add)->hasNoSignedWrap() ||
+        cast<OverflowingBinaryOperator>(Add)->hasNoUnsignedWrap())
+      return false;
+    int64_t ElemOff = 0;
+    if (!matchChainElemOffset(Ld->getPointerOperand(), PtrArg, IP, DL, ElemBytes,
+                              ElemOff) ||
+        ElemOff != static_cast<int64_t>(Lane))
+      return false;
+    if (Lane == 0) {
+      // Provenance donors for the synthesized loop.
+      PR.VAGep = Gep;
+      PR.VALoad = Ld;
+      PR.VAAdd = Add;
+    }
+    Acc = Add;
+    auto *Term = dyn_cast<BranchInst>(Prev->getTerminator());
+    if (!Term)
+      return false;
+    if (Term->isUnconditional()) {
+      if (Term->getSuccessor(0) != Exit)
+        return false;
+      Chain.push_back(Prev);
+      ChainAcc.push_back(Acc);
+      DeadSet.insert(Prev);
+      break;
+    }
+    if (Lane + 1 >= VF)
+      return false;
+    if (!Guard || Guard->getPredicate() != ICmpInst::ICMP_SLT)
+      return false;
+    // Exactly one side is the count N32; the other is the index
+    // derivation (index + Lane + 1).
+    Value *Count = nullptr;
+    if (Guard->getOperand(0) == N32 && Guard->getOperand(1) != N32)
+      Count = Guard->getOperand(1);
+    else if (Guard->getOperand(1) == N32 && Guard->getOperand(0) != N32)
+      Count = Guard->getOperand(0);
+    if (!Count)
+      return false;
+    int64_t GuardOff = 0;
+    if (!matchIndexPlus(Count, IP, GuardOff) || GuardOff != Lane + 1)
+      return false;
+    // One successor is the exit merge, the other continues the chain.
+    BasicBlock *Next = nullptr;
+    if (Term->getSuccessor(0) == Exit && Term->getSuccessor(1) != Exit)
+      Next = Term->getSuccessor(1);
+    else if (Term->getSuccessor(1) == Exit && Term->getSuccessor(0) != Exit)
+      Next = Term->getSuccessor(0);
+    if (!Next || Next == Prev || Next == Head)
+      return false;
+    if (Lane == 0 && predCount(Head) != 2)
+      return false;
+    if (Lane != 0 && predCount(Prev) != 1)
+      return false;
+    Chain.push_back(Prev);
+    ChainAcc.push_back(Acc);
+    DeadSet.insert(Prev);
+    Prev = Next;
+  }
+  if (Chain.empty() || Chain.size() + 1 < VF)
+    return false;
+  // Exit merge: the accumulated value on every erased edge.
+  if (Exit->getTerminator()->getNumSuccessors() != 1)
+    return false;
+  PHINode *ExitPhi = nullptr;
+  for (PHINode &P : Exit->phis()) {
+    if (P.getType() != ElemTy)
+      continue;
+    if (P.getIncomingValueForBlock(Reduce) != Fold)
+      continue;
+    ExitPhi = &P;
+  }
+  if (!ExitPhi)
+    return false;
+  for (unsigned I = 0; I < ExitPhi->getNumIncomingValues(); ++I) {
+    BasicBlock *IB = ExitPhi->getIncomingBlock(I);
+    if (IB != Reduce && !DeadSet.count(IB))
+      return false;
+  }
+  if (ExitPhi->getNumIncomingValues() != Chain.size() + 1)
+    return false;
+  for (unsigned I = 0; I < Chain.size(); ++I)
+    if (ExitPhi->getIncomingValueForBlock(Chain[I]) != ChainAcc[I])
+      return false;
+  // No kept block may branch into the region except through D.
+  for (BasicBlock &BB : F) {
+    if (DeadSet.count(&BB))
+      continue;
+    for (BasicBlock *Su : successors(&BB))
+      if (DeadSet.count(Su) && Su != Small && Su != Vec)
+        return false;
+  }
+  // Region blocks: branches only, and every outside edge lands on the
+  // exit merge (the guard's own targets are the region entries).
+  for (BasicBlock *BB : DeadSet)
+    for (BasicBlock *Su : successors(BB))
+      if (!DeadSet.count(Su) && Su != Exit)
+        return false;
+  // Values that must outlive the erased region.
+  if (auto *PI = dyn_cast<Instruction>(PtrArg))
+    if (DeadSet.count(PI->getParent()))
+      return false;
+  if (auto *NI = dyn_cast<Instruction>(N64))
+    if (DeadSet.count(NI->getParent()))
+      return false;
+  // No kept instruction may use a value defined inside the region:
+  // only the exit merge phi (rewired by the fold) may.
+  for (BasicBlock *BB : DeadSet)
+    for (Instruction &I : *BB) {
+      for (User *U : I.users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI)
+          return false;
+        if (DeadSet.count(UI->getParent()))
+          continue;
+        if (isa<PHINode>(UI) && UI->getParent() == Exit)
+          continue;
+        return false;
+      }
+    }
+
+  PR.D = D;
+  PR.Pre = Pre;
+  PR.Body = Body;
+  PR.Reduce = Reduce;
+  PR.Exit = Exit;
+  PR.Chain = std::move(Chain);
+  PR.ExitPhi = ExitPhi;
+  PR.IdxPhi = IdxPhi;
+  PR.N32 = N32;
+  PR.PtrArg = PtrArg;
+  PR.ElemTy = ElemTy;
+  PR.VF = VF;
+  PR.LogVF = LogVF;
+  PR.VAStep = cast<Instruction>(SL.IV->getIncomingValueForBlock(Body));
+  PR.VABound = dyn_cast<ICmpInst>(
+      cast<BranchInst>(Body->getTerminator())->getCondition());
+  PR.VATerm = Body->getTerminator();
+  return true;
+}
 // Counted loops can lower wide copies to i128 load/store pairs, or repeated
 // fills to vector splats. Split only these proven memory shapes. Keep all
 // copy loads before their stores so each chunk retains read-before-write
