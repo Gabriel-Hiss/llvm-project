@@ -7,16 +7,14 @@
 //===----------------------------------------------------------------------===//
 //
 // Single registration site for every Revenant transform pass. Each pass is
-// a FunctionPassManager pass named `revenant-<name>`, declared in its own
+// a FunctionPassManager pass named `revenant-<name>` — except
+// `revenant-unabi`, which rewrites function signatures and must run as a
+// ModulePassManager pass (erasing a Function while the FPM iterates the
+// module is a use-after-free; LLVM's own ArgPromotion/DeadArgElim are
+// module passes for the same reason). Each pass is declared in its own
 // header under revenant/include/revenant/Transforms/<Name>/ and defined in
 // its own library RevenantTransform<Name> (both owned by the pass agent).
 // This file only wires names to classes so agents never conflict.
-//
-// A pass directory that does not exist yet (its agent has not landed) is
-// skipped: the corresponding __has_include guard leaves the name
-// unregistered, and revenant-opt reports the stock "unknown function pass"
-// error for it. Landing the pass library + rebuilding revenant-opt is all
-// it takes to enable the name; nothing here changes.
 //
 //===----------------------------------------------------------------------===//
 
@@ -53,6 +51,15 @@
 #endif
 #if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
 #include "revenant/Transforms/SsaOut/SsaOut.h"
+#endif
+#if __has_include("revenant/Transforms/Unabi/Unabi.h")
+#include "revenant/Transforms/Unabi/Unabi.h"
+#endif
+#if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
+#include "revenant/Transforms/Unhoist/Unhoist.h"
+#endif
+#if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
+#include "revenant/Transforms/UnloopVec/UnloopVec.h"
 #endif
 
 using namespace llvm;
@@ -118,6 +125,33 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
         if (Name == "revenant-ssaout") {
           FPM.addPass(SsaOutPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
+        if (Name == "revenant-unhoist") {
+          FPM.addPass(UnhoistPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
+        if (Name == "revenant-unloopvec") {
+          FPM.addPass(UnloopVecPass());
+          return true;
+        }
+#endif
+        return false;
+      });
+  // Module passes: only passes that must erase/replace Function objects
+  // (today just revenant-unabi, which rewrites signatures). Registered on
+  // the Module pipeline so top-level `-passes=revenant-unabi` resolves
+  // without the function adaptor.
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, ModulePassManager &MPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+#if __has_include("revenant/Transforms/Unabi/Unabi.h")
+        if (Name == "revenant-unabi") {
+          MPM.addPass(UnabiPass());
           return true;
         }
 #endif

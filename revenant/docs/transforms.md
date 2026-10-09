@@ -98,8 +98,9 @@ conditions with safe `continue` behavior.
 **revenant-untailrec (owner: MuseTxUnrotate).** Expects unrotated IR.
 Undoes TailCallElim/loop-to-recursive-call: turns the recursive-call form
 back into the loop it came from (toward IR 1:1 with the compiler's ir-pre).
-Guarantees vetoes on any existing self-call, impure latch, or non-covering
-phis; anything vetoed stays as-is.
+Self-loop headers get a dedicated latch split out first, then the same
+rewrite. Guarantees vetoes on any existing self-call, impure latch, or
+non-covering phis; anything vetoed stays as-is.
 
 **revenant-patterns (owner: MuseTxPatterns, opt-in).** Expects unopt
 output. Matches oracle-generated library-idiom patterns (anchor-seeded
@@ -127,3 +128,15 @@ Guarantees region annotations and provenance survive; types only refine.
 **revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
 structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the
 frontends. Guarantees stable `bb_<va>` names and intact annotations.
+
+**revenant-unabi (owner: MuseDeoptAbi).** Module pass (not function): rewrites
+function signatures, snapshotting the function list first so erasure is safe.
+Runs explicitly via `-passes=revenant-unabi`, not in the default pipeline.
+Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
+22 parseable output.
+
+**revenant-unloopvec (owner: MuseDeoptVecLoops).** Expects devectorize output
+(or raw vectorizer skeletons). Collapses vector body + scalar remainder +
+runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
+leaving the CFG untouched when unsure. Runs explicitly, not in the default
+pipeline.
