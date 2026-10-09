@@ -14,6 +14,8 @@
 
 #include "revenant/Transforms/Devectorize/Devectorize.h"
 
+#include "Lane0.h"
+
 #include "llvm/IR/Function.h"
 
 using namespace llvm;
@@ -21,11 +23,11 @@ using namespace llvm;
 namespace revenant {
 
 PreservedAnalyses DevectorizePass::run(Function &F, FunctionAnalysisManager &) {
-  // Skeleton: the lane-0, loop and straight-line phases land in the next
-  // commits. Today this is a registered no-op so the lit harness and the
-  // pipeline wiring land first.
-  (void)F;
-  return PreservedAnalyses::all();
+  if (F.isDeclaration() || F.hasOptNone())
+    return PreservedAnalyses::all();
+  if (lane0::propagate(F) == 0)
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
 
 } // namespace revenant
