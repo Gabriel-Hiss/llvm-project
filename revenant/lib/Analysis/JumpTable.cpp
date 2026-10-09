@@ -528,6 +528,11 @@ setupInWindow(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
       AddI = I;
       break;
     }
+    // Any other write to the jump register ends the search: a virtual-call
+    // tail (`mov rax,[rax+18h]; jmp rax`) must not borrow the table setup
+    // of an earlier switch that left its value in the same register.
+    if (Ins.Op0 == JtOpKind::Reg && full(Ops, Ins.Reg0) == JmpReg)
+      return std::nullopt;
   }
   if (!AddI)
     return std::nullopt;
@@ -653,7 +658,10 @@ describeTable(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
   for (const BasicBlock &B : Blocks) {
     if (B.Start == Block.Start)
       continue;
-    bool Reaches = B.End == Block.Start;
+    // Address adjacency only counts when the block actually falls through:
+    // a block ending in its own `jmp reg` does not run into its neighbour.
+    bool Reaches =
+        B.End == Block.Start && B.EndKind == BlockEnd::Fallthrough;
     if (!Reaches)
       for (const Edge &E : B.Edges)
         if (E.To == Block.Start &&

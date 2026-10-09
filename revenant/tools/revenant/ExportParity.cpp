@@ -21,6 +21,7 @@
 #include "revenant/Target/TargetHooks.h"
 
 #include "revenant/Analysis/Analysis.h"
+#include "revenant/Analysis/StackPtr.h"
 
 #include <cstdint>
 #include <string>
@@ -99,7 +100,8 @@ static int writeFuncDump(const Program &Prog, StringRef OutDir) {
     errs() << "revenant: " << Path << ": " << Ec.message() << "\n";
     return 1;
   }
-  Os << "start\tpdata\torphan\tinstrs\tblocks\tunresolved\tchunks\tname\n";
+  Os << "start\tpdata\torphan\tinstrs\tblocks\tunresolved\tchunks\tname\tstack\n";
+  auto Hooks = createX86TargetHooks();
   for (const auto &[Start, F] : Prog.Functions) {
     Os << Twine::utohexstr(Start.Value - Prog.Img->Base.Value) << "\t"
        << (F.HasPdata ? 1 : 0) << "\t" << (F.Orphan ? 1 : 0) << "\t"
@@ -113,7 +115,14 @@ static int writeFuncDump(const Program &Prog, StringRef OutDir) {
       Os << Twine::utohexstr(A.Value - Prog.Img->Base.Value) << "-"
          << Twine::utohexstr(B.Value - Prog.Img->Base.Value);
     }
-    Os << "\t" << F.Name << "\n";
+    // Stack-pointer model result: "ok" or the analyzeStack error message.
+    std::string Stack = "ok";
+    if (auto Fat = revenant::function(Prog, Start)) {
+      auto Info = revenant::analyzeStack(Prog, *Fat, *Hooks);
+      if (!Info)
+        Stack = toString(Info.takeError());
+    }
+    Os << "\t" << F.Name << "\t" << Stack << "\n";
   }
   // One row per block: function, block range, end kind and outgoing edges.
   SmallString<256> BlockPath(OutDir);
