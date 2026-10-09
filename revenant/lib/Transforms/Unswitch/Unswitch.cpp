@@ -149,14 +149,18 @@ OffsetSplit splitOffset(Value *V) {
   return OffsetSplit();
 }
 
-// Match `icmp ult Base(+Off), Size` or `icmp ult Base, Size` (plain range
-// check). On success fills Base (the switch condition value), Min (the
-// absolute case minimum) and Size.
+// Match `icmp ult Base(+Off), Size` or `icmp ugt Base(+Off), Size-1` (a
+// plain range check). On success fills Base (the switch condition value),
+// Min (the absolute case minimum), Size, and Negated: false when the true
+// edge is in range (ult), true when the false edge is in range (ugt, the
+// spelling lifted MSVC/clang guard code prefers).
 bool matchRangeCheck(Value *Cond, Value *&OutBase, APInt &OutMin,
-                     uint64_t &OutSize) {
+                     uint64_t &OutSize, bool &Negated) {
   auto *Cmp = dyn_cast<ICmpInst>(Cond);
-  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+  if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_ULT &&
+               Cmp->getPredicate() != ICmpInst::ICMP_UGT))
     return false;
+  Negated = Cmp->getPredicate() == ICmpInst::ICMP_UGT;
   auto *SizeC = dyn_cast<ConstantInt>(Cmp->getOperand(1));
   if (!SizeC || SizeC->isZero())
     return false;
@@ -170,27 +174,63 @@ bool matchRangeCheck(Value *Cond, Value *&OutBase, APInt &OutMin,
     OutBase = Sub;
     OutMin = APInt(SizeC->getValue().getBitWidth(), 0);
   }
-  OutSize = SizeC->getValue().getLimitedValue();
+  if (Negated) {
+    // ugt Base(+Off), Max: in range is [Min, Min + Max]; size = Max + 1.
+    if (SizeC->isMaxValue(false))
+      return false;
+    OutSize = SizeC->getValue().getLimitedValue() + 1;
+  } else {
+    OutSize = SizeC->getValue().getLimitedValue();
+  }
   return OutSize > 0 && OutSize <= 1000000;
 }
 
 // Collect constant entries of a `@switch.table.*` global. Returns the
 // element constants in order, or nullopt when the global is unsuitable
-// (non-constant initializer, wrong size, poison/undef entries).
+// (non-constant initializer, wrong size, poison/undef entries). For lifted
+// IR the compiler's lookup table survives as a constant byte array the
+// load indexes by element (`getelementptr i32` on `[N*4 x i8]`); in that
+// mode ElemTy is the loaded element type and the bytes are decoded
+// little-endian (x86-64).
 std::optional<std::vector<Constant *>>
-readTable(GlobalVariable *GV, uint64_t ExpectSize) {
+readTable(GlobalVariable *GV, uint64_t ExpectSize, IntegerType *ElemTy) {
   if (!GV || !GV->isConstant() || !GV->hasInitializer())
     return std::nullopt;
   auto *Init = GV->getInitializer();
   auto *ArrayTy = dyn_cast<ArrayType>(Init->getType());
-  if (!ArrayTy || ArrayTy->getNumElements() != ExpectSize)
+  if (!ArrayTy)
+    return std::nullopt;
+  std::vector<Constant *> Elems;
+  Elems.reserve((size_t)ExpectSize);
+  auto *Bytes = dyn_cast<ConstantDataSequential>(Init);
+  if (Bytes && ArrayTy->getElementType()->isIntegerTy(8) && ElemTy) {
+    // Lifted byte table: ExpectSize elements of ElemTy, little-endian.
+    unsigned EW = ElemTy->getBitWidth();
+    if (EW == 0 || EW % 8 || EW > 64)
+      return std::nullopt;
+    uint64_t EBytes = EW / 8;
+    uint64_t Off0 = 0;
+    if (ArrayTy->getNumElements() < ExpectSize * EBytes)
+      return std::nullopt;
+    for (uint64_t I = 0; I < ExpectSize; ++I) {
+      APInt V(EW, 0);
+      for (uint64_t B = 0; B < EBytes; ++B) {
+        auto *C = dyn_cast<ConstantInt>(
+            Bytes->getElementAsConstant((unsigned)(Off0 + I * EBytes + B)));
+        if (!C)
+          return std::nullopt;
+        V |= C->getValue().zext(EW) << (B * 8);
+      }
+      Elems.push_back(ConstantInt::get(ElemTy->getContext(), V));
+    }
+    return Elems;
+  }
+  if (ArrayTy->getNumElements() != ExpectSize)
     return std::nullopt;
   auto *Data = dyn_cast<ConstantDataSequential>(Init);
   auto *Array = dyn_cast<ConstantArray>(Init);
   if (!Data && !Array)
     return std::nullopt;
-  std::vector<Constant *> Elems;
-  Elems.reserve((size_t)ExpectSize);
   for (uint64_t I = 0; I < ExpectSize; ++I) {
     Constant *C = Data ? Data->getElementAsConstant((unsigned)I)
                        : cast<Constant>(Array->getOperand((unsigned)I));
@@ -202,10 +242,19 @@ readTable(GlobalVariable *GV, uint64_t ExpectSize) {
 }
 
 // Convention check: only rebuild switches from globals SimplifyCFG itself
-// created (`switch.table.<func>`), so hand-written constant arrays the
-// program indexes for other reasons are never mistaken for switches.
+// created (`switch.table.<func>`), or from lifted constant byte arrays
+// whose contents came straight from the binary's read-only data (the
+// `g_<va>` / section-array globals the lifter emits).
 bool isSwitchTable(GlobalVariable *GV) {
-  return GV && GV->getName().starts_with("switch.table.");
+  if (!GV)
+    return false;
+  if (GV->getName().starts_with("switch.table."))
+    return true;
+  if (!GV->isConstant() || !GV->hasInitializer())
+    return false;
+  auto *Init = dyn_cast<ConstantDataSequential>(GV->getInitializer());
+  auto *ArrayTy = Init ? dyn_cast<ArrayType>(Init->getType()) : nullptr;
+  return ArrayTy && ArrayTy->getElementType()->isIntegerTy(8);
 }
 
 //===----------------------------------------------------------------------===//
@@ -232,6 +281,7 @@ struct LookupShape {
   PHINode *Phi = nullptr;
   Constant *DefaultVal = nullptr;
   ICmpInst *RangeCheck = nullptr;
+  IntegerType *ElemTy = nullptr; // byte-table element type (lifted IR)
 };
 
 std::optional<LookupShape> matchLookup(BasicBlock *Head) {
@@ -244,11 +294,13 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
   Value *Base = nullptr;
   APInt Min(32, 0);
   uint64_t Size = 0;
-  if (!matchRangeCheck(Cmp, Base, Min, Size))
+  bool Negated = false;
+  if (!matchRangeCheck(Cmp, Base, Min, Size, Negated))
     return std::nullopt;
 
-  BasicBlock *Lookup = BI->getSuccessor(0);
-  BasicBlock *Default = BI->getSuccessor(1);
+  // ult: the true edge is in range (the lookup). ugt: the false edge is.
+  BasicBlock *Lookup = BI->getSuccessor(Negated ? 1 : 0);
+  BasicBlock *Default = BI->getSuccessor(Negated ? 0 : 1);
   if (Lookup->getSinglePredecessor() != Head)
     return std::nullopt;
   auto *LookupBr = dyn_cast<BranchInst>(Lookup->getTerminator());
@@ -261,6 +313,7 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
   // Join has a phi fed by the lookup load plus at least the default edge.
   PHINode *Phi = nullptr;
   LoadInst *Ld = nullptr;
+  IntegerType *ElemTy = nullptr;
   for (PHINode &PN : Join->phis()) {
     Value *FromLookup = PN.getIncomingValueForBlock(Lookup);
     if (!FromLookup)
@@ -275,6 +328,14 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
         GEP->getPointerOperand()->stripPointerCasts());
     if (!isSwitchTable(GV))
       continue;
+    // Lifted byte tables are addressed with the element type on the GEP;
+    // require it to match the load type so byte offsets decode right.
+    if (!GV->getName().starts_with("switch.table.")) {
+      auto *ET = dyn_cast<IntegerType>(Load->getType());
+      if (!ET || GEP->getSourceElementType() != ET)
+        continue;
+      ElemTy = ET;
+    }
     Phi = &PN;
     Ld = Load;
     break;
@@ -330,11 +391,12 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
   S.Phi = Phi;
   S.DefaultVal = Def;
   S.RangeCheck = Cmp;
+  S.ElemTy = ElemTy;
   return S;
 }
 
 bool buildSwitchFromTable(LookupShape &S) {
-  auto Elems = readTable(S.Table, S.TableSize);
+  auto Elems = readTable(S.Table, S.TableSize, S.ElemTy);
   if (!Elems)
     return false;
   if (!regionIsPure({S.Lookup}))
@@ -453,7 +515,10 @@ bool tryLinearMap(Function &F, BasicBlock &BB) {
       continue;
     APInt Min = (-OS.Off).sextOrTrunc(CW);
 
-    // True value: add(mul(sub, K), B).
+    // True value: add(mul(sub-or-cond, K), B). The compiler emits
+    // mul((cond-min), K)+B; the lifter may instead fold the offset into
+    // the multiply and compute mul(cond, K) directly (same in-range
+    // values, the index base is -Min).
     Value *T = Sel->getTrueValue();
     // Allow an intcast around the arithmetic (SimplifyCFG inserts
     // switch.idx.cast when index width differs).
@@ -463,23 +528,42 @@ bool tryLinearMap(Function &F, BasicBlock &BB) {
     ConstantInt *K = nullptr;
     ConstantInt *Bc = nullptr;
     Value *AddOp0 = nullptr;
+    bool MulOnCond = false; // mul uses Cond, not Sub
     auto *ResTy = dyn_cast<IntegerType>(Sel->getType());
     if (!ResTy)
       continue;
+    auto mulBase = [&](Value *M) -> Value * {
+      auto *BO = dyn_cast<BinaryOperator>(M);
+      if (!BO || BO->getOpcode() != Instruction::Mul)
+        return nullptr;
+      auto *KC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!KC)
+        return nullptr;
+      return BO->getOperand(0);
+    };
     if (match(T, m_Add(m_Value(AddOp0), m_ConstantInt(Bc)))) {
-      if (match(AddOp0, m_Mul(m_Value(), m_ConstantInt(K)))) {
-        Value *MulOp = cast<BinaryOperator>(AddOp0)->getOperand(0);
-        if (MulOp != Sub)
+      Value *MulOp = mulBase(AddOp0);
+      if (MulOp) {
+        K = dyn_cast<ConstantInt>(cast<BinaryOperator>(AddOp0)->getOperand(1));
+        if (MulOp == Sub) {
+        } else if (MulOp == Cond) {
+          MulOnCond = true;
+        } else {
           continue;
+        }
       } else if (AddOp0 == Sub) {
         K = ConstantInt::get(F.getContext(), APInt(CW, 1));
       } else {
         continue;
       }
-    } else if (match(T, m_Mul(m_Value(), m_ConstantInt(K)))) {
-      Value *MulOp = cast<BinaryOperator>(T)->getOperand(0);
-      if (MulOp != Sub)
+    } else if (Value *MulOp = mulBase(T)) {
+      K = dyn_cast<ConstantInt>(cast<BinaryOperator>(T)->getOperand(1));
+      if (MulOp == Sub) {
+      } else if (MulOp == Cond) {
+        MulOnCond = true;
+      } else {
         continue;
+      }
       Bc = ConstantInt::get(F.getContext(), APInt(CW, 0));
     } else if (T == Sub) {
       K = ConstantInt::get(F.getContext(), APInt(CW, 1));
@@ -506,9 +590,12 @@ bool tryLinearMap(Function &F, BasicBlock &BB) {
     if (!FeedsEnd)
       continue;
 
-    // Verify each case value exactly: res(i) = B + K*i.
+    // Verify each case value exactly: res(i) = B + K*i when the mul runs
+    // on the offset, or B + K*(min+i) when it runs on the condition.
     APInt Kv = K->getValue().sextOrTrunc(64);
     APInt Bv = Bc->getValue().sextOrTrunc(64);
+    if (MulOnCond)
+      Bv += Kv * Min.sextOrTrunc(64);
     unsigned RW = ResTy->getBitWidth();
     LLVMContext &Ctx = F.getContext();
     std::vector<Constant *> CaseVals;
@@ -645,9 +732,10 @@ bool tryBitmap(Function &F, BasicBlock &BB) {
     Value *Base = nullptr;
     APInt Min(32, 0);
     uint64_t Sz = 0;
-    if (!matchRangeCheck(Cmp, Base, Min, Sz))
+    bool Neg = false;
+    if (!matchRangeCheck(Cmp, Base, Min, Sz, Neg))
       continue;
-    if (Sz != N)
+    if (Neg || Sz != N)
       continue;
     auto *BaseTy = dyn_cast<IntegerType>(Base->getType());
     if (!BaseTy || BaseTy->getBitWidth() > 64)
@@ -754,7 +842,8 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
   Value *Base = nullptr;
   APInt Min(32, 0);
   uint64_t Size = 0;
-  if (!matchRangeCheck(Cmp, Base, Min, Size))
+  bool Negated = false;
+  if (!matchRangeCheck(Cmp, Base, Min, Size, Negated))
     return false;
   if (!Base->getType()->isIntegerTy())
     return false;
@@ -778,8 +867,14 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
       break; // only inspect the first instruction
     }
   }
-  BasicBlock *Dest = BI->getSuccessor(0);
-  BasicBlock *Other = BI->getSuccessor(1);
+  // In-range destination first: ult's true edge, ugt's false edge.
+  BasicBlock *Dest = BI->getSuccessor(Negated ? 1 : 0);
+  BasicBlock *Other = BI->getSuccessor(Negated ? 0 : 1);
+  // A range check guarding another dispatch (jump-table switch, select
+  // chain) is structural, not a folded switch: expanding it would stack a
+  // duplicate switch in front of the real one.
+  if (isa<SwitchInst>(Dest->getTerminator()))
+    return false;
   // Small ranges are indistinguishable from source-level interval checks.
   // Only expand ranges large enough to plausibly be folded switch cases.
   if (Size < 4 || Size > 64)
@@ -1021,6 +1116,45 @@ bool trySelectToSwitch(Function &F, BasicBlock &BB) {
       }
     }
   }
+  // Lifted diamonds: a range pre-check in BB branches to a chain block
+  // holding the selects, which falls into the join. The selects sit in
+  // the single-predecessor successor rather than BB itself.
+  for (BasicBlock *Succ : successors(&BB)) {
+    if (Succ->getSinglePredecessor() != &BB)
+      continue;
+    auto *SuccBr = dyn_cast<BranchInst>(Succ->getTerminator());
+    if (!SuccBr)
+      continue;
+    for (Instruction &I : *Succ) {
+      auto *S = dyn_cast<SelectInst>(&I);
+      if (!S)
+        continue;
+      if (SuccBr->isConditional())
+        break; // chain block must fall through to the join
+      BasicBlock *Join = SuccBr->getSuccessor(0);
+      for (PHINode &PN : Join->phis()) {
+        for (unsigned K = 0, E = PN.getNumIncomingValues(); K < E; ++K) {
+          if (PN.getIncomingBlock(K) == Succ &&
+              PN.getIncomingValue(K) == S) {
+            Root R;
+            R.Sel = S;
+            R.Join = Join;
+            R.Phi = &PN;
+            Roots.push_back(R);
+          }
+        }
+      }
+      if (auto *RI = dyn_cast<ReturnInst>(Succ->getTerminator()))
+        if (RI->getNumOperands() && RI->getOperand(0) == S) {
+          Root R;
+          R.Sel = S;
+          R.Join = Succ;
+          R.Ret = RI;
+          Roots.push_back(R);
+        }
+      break; // one root per chain block is enough; chain walk finds rest
+    }
+  }
   for (Root R : Roots) {
     std::vector<SelectCase> Rows;
     Constant *Def = nullptr;
@@ -1029,17 +1163,19 @@ bool trySelectToSwitch(Function &F, BasicBlock &BB) {
       continue;
     if (!Cond->getType()->isIntegerTy())
       continue;
-    // All compares and selects must live in BB (single-block chain, the
-    // shape foldSwitchToSelect produces).
-    bool AllInBB = true;
-    for (auto &Row : Rows) {
-      if (Row.Cmp->getParent() != &BB) {
-        AllInBB = false;
-        break;
-      }
+  // All compares and selects must live in BB (single-block chain, the
+  // shape foldSwitchToSelect produces) or in the chain block holding the
+  // root select (lifted diamond: range pre-check in BB, selects next).
+  BasicBlock *ChainBB = R.Sel->getParent();
+  bool AllInBB = true;
+  for (auto &Row : Rows) {
+    if (Row.Cmp->getParent() != &BB && Row.Cmp->getParent() != ChainBB) {
+      AllInBB = false;
+      break;
     }
-    if (!AllInBB)
-      continue;
+  }
+  if (!AllInBB)
+    continue;
     // At least two eq rows, or a mask row (foldSwitchToSelect needs >= 2
     // cases or a mask row; a lone eq+select is InstCombine's, not a
     // switch).
@@ -1168,9 +1304,10 @@ bool trySelectToSwitch(Function &F, BasicBlock &BB) {
     }
     if (R.Phi) {
       BasicBlock *Join = R.Join;
+      BasicBlock *Chain = R.Sel->getParent();
       int Slot = -1;
       for (unsigned K = 0; K < R.Phi->getNumIncomingValues(); ++K)
-        if (R.Phi->getIncomingBlock(K) == &BB &&
+        if (R.Phi->getIncomingBlock(K) == Chain &&
             R.Phi->getIncomingValue(K) == R.Sel) {
           Slot = (int)K;
           break;
@@ -1185,7 +1322,13 @@ bool trySelectToSwitch(Function &F, BasicBlock &BB) {
       if (HasMask)
         continue;
       R.Phi->setIncomingValue((unsigned)Slot, Def);
-      Instruction *HeadTerm = BB.getTerminator();
+      // Lifted diamond: the switch replaces the chain block's fallthrough
+      // once the pre-check proves BB == Chain's only predecessor; the
+      // range check in BB already routes out-of-range inputs to the join,
+      // so every value reaching here is in range and the default edge
+      // (Join) only carries the chain's own default.
+      BasicBlock *SwitchBB = (Chain != &BB) ? Chain : &BB;
+      Instruction *HeadTerm = SwitchBB->getTerminator();
       IRBuilder<> B(HeadTerm);
       auto *SI = B.CreateSwitch(Cond, Join, (unsigned)Rows.size());
       copyProvenance(SI, R.Sel);
