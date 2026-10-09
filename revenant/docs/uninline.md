@@ -32,9 +32,9 @@ rather than treating a recompile as evidence about a different corpus module.
 With verified records the denominator is exact: 36,249 compiler-reported
 inline events across 39 translation units (15 clang TUs in the main index
 plus the 16 re-captured library TUs whose recipes the corpus generator had
-overwritten, plus rust-o3). Current recovery: 105 full (all with the callee
-definition retained), 0 partial, 36,144 none. The pass makes atomic, proved
-rewrites, so partial never fires. Examples of recovered sites: miniz
+overwritten, plus rust-o3). Exact-match recovery: 105 full (all with the
+callee definition retained), 0 partial, 36,144 none. The pass makes atomic,
+proved rewrites, so partial never fires. Examples of recovered sites: miniz
 `mz_compress2 -> mz_deflateInit`, tinyxml2 `XMLElement::Attribute ->
 XMLAttribute::Value`, pugixml `eval_node_set -> xpath_variable::get_node_set`.
 Unrecovered events are dominated by callees whose bodies the later optimizer
@@ -44,6 +44,25 @@ under the supplied output and scratch paths. They are machine-local
 measurement artifacts, not test fixtures. There is no prebuilt rustc O2 IR
 pair in this corpus. Rust O3 is the available optimized reference; do not
 invent O2 results.
+
+`reinline.py` replays each verified event faithfully to separate
+specialization from unrecoverable shapes: it strips the record-mode debug
+info from ir-pre, runs the same `default<On>` pipeline the corpus recipe
+ran, and compares the optimized caller against the ir-post caller up to
+value numbering, predecessor order and debug attachments. Full means the
+round trip reproduces the corpus caller exactly. Results on the same
+denominator: 182 full, 0 partial, 36,067 none, broken down as clang-cl O2
+0/16,795, O3 91/9,689, LTO 91/9,689, rustc O3 0/76. Of the 36,067 non-full,
+36,044 are callees deleted from ir-post (nothing to outline back to, per
+the assignment skipped), 19 lose the caller under the replay (large
+C++ TUs where the whole-module replay diverges), and only 4 reproduce
+with a different specialization. The 164 round-trip-only sites beyond the
+exact-match set are the specialization dividend: multi-block callees such
+as miniz `mz_zip_reader_end_internal` (9 sites) and
+`mz_zip_array_ensure_capacity` (8 sites) whose inlined bodies the later
+passes rewrote past exact matching but whose outline-plus-reinline still
+reproduces ir-post. The pass itself still recovers only the exact-match
+subset; the round trip is measurement, not a rewrite rule.
 
 Example, from the assigned worktree:
 
