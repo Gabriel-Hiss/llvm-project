@@ -59,19 +59,20 @@ std::string intTypeName(unsigned Bits, bool Unsigned) {
   return (Unsigned ? "uint" : "int") + utostr(Bits) + "_t";
 }
 
-DIType *intDIType(ir::DIBuilder &DIB, unsigned Bits, bool Unsigned) {
+DIType *intDIType(DIBuilder &DIB, unsigned Bits, bool Unsigned) {
   unsigned Encoding =
       Bits == 1 ? dwarf::DW_ATE_boolean
                 : Unsigned ? dwarf::DW_ATE_unsigned : dwarf::DW_ATE_signed;
-  return ir::createBasicType(intTypeName(Bits, Unsigned), Bits, Encoding);
+  return ir::createBasicType(DIB, intTypeName(Bits, Unsigned), Bits,
+                             Encoding);
 }
 
-DIType *floatDIType(ir::DIBuilder &DIB, unsigned Bits) {
-  return ir::createBasicType(Bits == 32 ? "float" : "double", Bits,
+DIType *floatDIType(DIBuilder &DIB, unsigned Bits) {
+  return ir::createBasicType(DIB, Bits == 32 ? "float" : "double", Bits,
                              dwarf::DW_ATE_float);
 }
 
-DIType *diTypeForInteger(ir::DIBuilder &DIB, TypeInference &TI,
+DIType *diTypeForInteger(DIBuilder &DIB, TypeInference &TI,
                          const Value *V, unsigned DefaultBits) {
   unsigned Bits = TI.intBits(V, DefaultBits);
   if (Bits == 0)
@@ -86,7 +87,7 @@ DIType *diTypeForInteger(ir::DIBuilder &DIB, TypeInference &TI,
 // Build the pointee for a pointer base: a struct when two or more distinct
 // field offsets were observed, else the scalar access type (or an opaque
 // byte when nothing was observed).
-DIType *pointeeForBase(ir::DIBuilder &DIB, DIScope *Scope, DIFile *File,
+DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
                        Function &F, TypeInference &TI, const Value *Base,
                        const TypeInference::FieldAccess *FA) {
   if (!FA || FA->Fields.empty()) {
@@ -176,8 +177,8 @@ DIType *pointeeForBase(ir::DIBuilder &DIB, DIScope *Scope, DIFile *File,
     }
     DIType *FieldTy = intDIType(DIB, Bits, Unsigned);
     std::string Name = "field_" + utostr(OffBits / 8);
-    DIDerivedType *M =
-        ir::createMemberType(DIB, Scope, Name, File, Bits, OffBits, FieldTy);
+    DIDerivedType *M = DIB.createMemberType(
+        Scope, Name, File, 1, Bits, Bits, OffBits, DINode::FlagZero, FieldTy);
     Members.push_back(M);
   }
   std::string StructName;
@@ -190,7 +191,10 @@ DIType *pointeeForBase(ir::DIBuilder &DIB, DIScope *Scope, DIFile *File,
       OS << "anon";
   }
   uint64_t SizeBits = FA->MaxEndBits;
-  return ir::createStructType(DIB, Scope, StructName, SizeBits, Members);
+  SmallVector<Metadata *, 8> Elems;
+  for (DIDerivedType *M : Members)
+    Elems.push_back(M);
+  return ir::createStructType(DIB, Scope, StructName, SizeBits, Elems);
 }
 
 } // namespace
@@ -208,10 +212,12 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   TypeInference TI(F);
   TI.collect();
 
-  ir::DIBuilder &DIB = ir::getDIBuilder(*M);
+  // CU plumbing lives in RevenantIR: one shared compile unit per module.
+  DIBuilder DIB(*M);
+  DICompileUnit &CU = ir::getOrCreateCompileUnit(*M, DIB, "revenant.ll");
   DISubprogram *SP = F.getSubprogram();
   if (!SP)
-    SP = ir::createSubprogramFor(F, DIB);
+    SP = ir::createSubprogramFor(F, DIB, CU);
   DIFile *File = SP->getFile();
   DIScope *Scope = SP;
 
@@ -227,9 +233,9 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
     if (AT->isPointerTy()) {
       const TypeInference::FieldAccess *FA = TI.fieldsFor(&A);
       DIType *Pointee = pointeeForBase(DIB, Scope, File, F, TI, &A, FA);
-      Ty = ir::createPointerType(Pointee);
+      Ty = ir::createPointerType(DIB, Pointee);
     } else if (AT->isIntegerTy()) {
-      Ty = diTypeForInteger(TI, &A, AT->getIntegerBitWidth());
+      Ty = diTypeForInteger(DIB, TI, &A, AT->getIntegerBitWidth());
     } else if (AT->isFloatTy()) {
       Ty = floatDIType(DIB, AT->getPrimitiveSizeInBits());
     } else {
@@ -246,7 +252,7 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
           // Heuristic: `name.addr` spills `name`.
           if (AI->hasName() &&
               displayName(AI->getName()) == Name + ".addr") {
-            ir::attachLocalVariable(F, *AI, Var);
+            ir::declareLocal(F, *AI, Name, Ty, DIB, CU);
             Attached = true;
             Changed = true;
             break;
@@ -257,9 +263,16 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
         break;
     }
     if (!Attached) {
-      // No spill slot: declare the argument at the entry so the name
-      // survives even without a home alloca.
-      ir::declareLocal(DIB, F, &A, Var);
+      // No spill slot for this argument: create the parameter variable so
+      // the name survives, and point it at the argument with a dbg.value
+      // at the entry block.
+      const DILocation *DL = nullptr;
+      if (Instruction *Pos = F.getEntryBlock().getFirstNonPHI())
+        DL = Pos->getDebugLoc().get();
+      if (!DL)
+        DL = DILocation::get(M->getContext(), 1, 1, Scope);
+      DIB.insertDbgValueIntrinsic(&A, Var, DIB.createExpression(), DL,
+                                  &F.getEntryBlock());
       Changed = true;
     }
     ++ArgNo;
@@ -291,14 +304,14 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
                                        : ("v" + utostr(BB.getNumber()));
       Type *AllocTy = AI->getAllocatedType();
       DIType *Ty = nullptr;
-      if (AllocTy->isIntegerTy())
-        Ty = diTypeForInteger(TI, AI, AllocTy->getIntegerBitWidth());
+      if (AllocTy->isIntegerTy()) {
+        Ty = diTypeForInteger(DIB, TI, AI, AllocTy->getIntegerBitWidth());
       } else if (AllocTy->isFloatTy()) {
         Ty = floatDIType(DIB, AllocTy->getPrimitiveSizeInBits());
       } else if (AllocTy->isPointerTy()) {
         const TypeInference::FieldAccess *FA = TI.fieldsFor(AI);
         DIType *Pointee = pointeeForBase(DIB, Scope, File, F, TI, AI, FA);
-        Ty = ir::createPointerType(Pointee);
+        Ty = ir::createPointerType(DIB, Pointee);
       } else if (AllocTy->isArrayTy()) {
         // Fixed-size buffer: describe element type, keep the count in the
         // name comment via the variable (DI has no direct alloca array
@@ -311,22 +324,21 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
         else if (ET->isFloatTy())
           Elem = floatDIType(DIB, ET->getPrimitiveSizeInBits());
         else if (ET->isPointerTy())
-          Elem = ir::createPointerType(intDIType(DIB, 8, true));
+          Elem = ir::createPointerType(DIB, intDIType(DIB, 8, true));
         else
           Elem = intDIType(DIB, 8, true);
-        Ty = ir::createPointerType(Elem);
+        Ty = ir::createPointerType(DIB, Elem);
       } else if (AllocTy->isStructTy()) {
         // Source-level struct alloca (rare in lifted code): describe each
         // element access through field inference when present, else keep
         // the struct shape with byte members.
         const TypeInference::FieldAccess *FA = TI.fieldsFor(AI);
         DIType *Pointee = pointeeForBase(DIB, Scope, File, F, TI, AI, FA);
-        Ty = ir::createPointerType(Pointee);
+        Ty = ir::createPointerType(DIB, Pointee);
       } else {
         continue;
       }
-      DILocalVariable *Var = ir::createLocalVariable(DIB, Scope, Name, Ty);
-      ir::attachLocalVariable(F, *AI, Var);
+      ir::declareLocal(F, *AI, Name, Ty, DIB, CU);
       Changed = true;
     }
   }
@@ -336,14 +348,14 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   // can name field accesses. No variable to attach; the type is reachable
   // through the alloca/argument that roots the base.
   for (const auto &KV : TI.bases()) {
-    Value *Base = KV.first;
+    const Value *Base = KV.first;
     if (isa<AllocaInst>(Base) || isa<Argument>(Base))
       continue; // Already described above.
     if (KV.second.Fields.size() < 2)
       continue;
     DIType *Pointee =
         pointeeForBase(DIB, Scope, File, F, TI, Base, &KV.second);
-    DIType *Ptr = ir::createPointerType(Pointee);
+    DIType *Ptr = ir::createPointerType(DIB, Pointee);
     DIB.retainType(Ptr);
     Changed = true;
   }
@@ -352,6 +364,7 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
     return PreservedAnalyses::all();
   // Only debug metadata changed; code, CFG, and all revenant.* metadata
   // (`!revenant.region`, `!revenant.va`, `!revenant.opaque`) are untouched.
+  DIB.finalize();
   return PreservedAnalyses::none();
 }
 

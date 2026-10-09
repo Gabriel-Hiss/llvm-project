@@ -379,6 +379,14 @@ void TypeInference::collect() {
       }
       if (isa<CallInst>(&I) || isa<InvokeInst>(&I)) {
         const auto *CB = cast<CallBase>(&I);
+        // Opaque asm stubs (`revenant.asm.*`, marked `!revenant.opaque` by
+        // the lifter) carry no type evidence; voting on their operands
+        // would launder integers into pointers and vice versa.
+        if (const Function *Callee = CB->getCalledFunction()) {
+          if (Callee->getName().starts_with("revenant.asm.") ||
+              Callee->getName().starts_with("llvm.dbg."))
+            continue;
+        }
         // Address-taken operands (byval/byref/nocapture-readonly pointer
         // args, or any pointer passed where the callee may load) vote
         // pointer; integer args vote int.
