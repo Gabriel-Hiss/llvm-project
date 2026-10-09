@@ -154,6 +154,31 @@ pdbParameterCounts(NativeSession &Session) {
   return Counts;
 }
 
+/// Shape tag for mismatch triage: how the function body looks.
+static const char *shapeTag(const Function &F) {
+  if (F.Instrs.empty())
+    return "empty";
+  if (F.Instrs.size() == 1) {
+    const Instr &I = F.Instrs[0];
+    if (I.Flow == FlowKind::Branch)
+      return "jmp1";
+    if (I.Flow == FlowKind::IndirectBranch)
+      return "ijmp1";
+    if (I.Flow == FlowKind::Return)
+      return "ret1";
+    return "other1";
+  }
+  if (F.Instrs.size() == 2 && F.Instrs[1].Flow == FlowKind::Return &&
+      F.Instrs[0].Flow == FlowKind::None)
+    return "movret";
+  const Instr &Last = F.Instrs.back();
+  if ((Last.Flow == FlowKind::Branch ||
+       Last.Flow == FlowKind::IndirectBranch) &&
+      !(Last.HasTarget && F.contains(Last.Target)))
+    return "tailjmp";
+  return "body";
+}
+
 int main(int Argc, char **Argv) {
   cl::ParseCommandLineOptions(Argc, Argv,
                               "Compare inferred signatures with PDB truth.\n");
@@ -192,7 +217,7 @@ int main(int Argc, char **Argv) {
     errs() << "cannot open " << CsvPath << ": " << EC.message() << '\n';
     return 1;
   }
-  CSV << "function_va,param_count,return_kind,pdb_param_count\n";
+  CSV << "function_va,param_count,return_kind,pdb_param_count,callers,min_prefix,max_prefix,shape,ninstrs\n";
   uint64_t Compared = 0, Matched = 0, MissingPdb = 0;
   for (const auto &[VA, Sig] : Sigs.Funcs) {
     auto RVA = VA.offsetFrom(PE.Img->Base);
@@ -204,12 +229,37 @@ int main(int Argc, char **Argv) {
     const char *ReturnKind = !Sig.HasRet ? "none"
                              : Sig.Ret.Float ? "float"
                                              : "integer";
+    unsigned NCallers = 0, MinPrefix = UINT32_MAX, MaxPrefix = 0;
+    for (const auto &[Site, N] : Sigs.CallsiteArgs) {
+      auto CallIns = Dis.decodeOne(Site);
+      if (!CallIns || !CallIns->HasTarget || CallIns->Target != VA)
+        continue;
+      ++NCallers;
+      MinPrefix = std::min(MinPrefix, N);
+      MaxPrefix = std::max(MaxPrefix, N);
+    }
+    std::string Shape = "?";
+    size_t NInstrs = 0;
+    if (auto F = revenant::function(P, VA)) {
+      Shape = shapeTag(*F);
+      NInstrs = F->Instrs.size();
+    }
     CSV << format_hex_no_prefix(VA.Value, 0, true) << ',' << Sig.Params.size()
         << ',' << ReturnKind << ',';
     if (PdbCount == UINT32_MAX)
-      CSV << '\n';
+      CSV << ',';
     else
-      CSV << PdbCount << '\n';
+      CSV << PdbCount << ',';
+    CSV << NCallers << ',';
+    if (NCallers == 0)
+      CSV << ',';
+    else
+      CSV << MinPrefix << ',';
+    if (NCallers == 0)
+      CSV << ',';
+    else
+      CSV << MaxPrefix << ',';
+    CSV << Shape << ',' << NInstrs << '\n';
     if (PdbCount == UINT32_MAX) {
       ++MissingPdb;
       continue;
