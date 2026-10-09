@@ -15,13 +15,7 @@
 
 #include "revenant/Engine/Session.h"
 
-#include "revenant/Analysis/LibMatch.h"
-#include "revenant/Core/Instr.h"
-#include "revenant/Object/PeFile.h"
 #include <optional>
-#include <queue>
-#include <set>
-#include <tuple>
 #include <string>
 #include <vector>
 
@@ -38,93 +32,6 @@
 using namespace llvm;
 using namespace revenant;
 
-static std::optional<Va>
-findUserEntry(const Session &S, Lang Out,
-              const std::set<Va> &LibraryStarts,
-              const std::map<Va, std::string> &LibraryNames) {
-  const Program &P = S.program();
-  if (Out != Lang::Rust) {
-    for (const auto &[Start, Rec] : P.Functions)
-      if (Rec.Name == "main" || Rec.Name == "wmain" ||
-          Rec.Name == "WinMain" || Rec.Name == "wWinMain")
-        return Start;
-  }
-  if (Out != Lang::Rust) {
-    for (const auto &[At, Name] : LibraryNames) {
-      if (Name != "invoke_main" &&
-          Name.find("__tmainCRTStartup") == std::string::npos)
-        continue;
-      auto Invoke = S.materialize(At);
-      if (!Invoke) {
-        consumeError(Invoke.takeError());
-        continue;
-      }
-      for (const Instr &I : Invoke->Instrs)
-        if (I.Flow == FlowKind::Branch && I.HasTarget &&
-            P.Functions.count(I.Target) && !LibraryStarts.count(I.Target))
-          return I.Target;
-    }
-  }
-
-  auto Entry = P.Functions.upper_bound(S.pe().EntryPoint);
-  if (Entry == P.Functions.begin())
-    return std::nullopt;
-  --Entry;
-
-  auto FOrErr = S.materialize(Entry->first);
-  if (!FOrErr) {
-    consumeError(FOrErr.takeError());
-    return std::nullopt;
-  }
-  std::queue<std::pair<Va, unsigned>> Pending;
-  std::set<Va> Seen;
-  std::optional<std::pair<size_t, Va>> PointerEntry;
-  std::optional<std::tuple<unsigned, size_t, Va>> TailEntry;
-  Pending.push({Entry->first, 0});
-  while (!Pending.empty()) {
-    auto [At, Depth] = Pending.front();
-    Pending.pop();
-    if (!Seen.insert(At).second || Depth > 6)
-      continue;
-    auto FunctionOrErr = S.materialize(At);
-    if (!FunctionOrErr) {
-      consumeError(FunctionOrErr.takeError());
-      continue;
-    }
-    std::optional<Va> PendingCodePointer;
-    for (const Instr &I : FunctionOrErr->Instrs) {
-      if (I.HasMemTarget && P.Functions.count(I.MemTarget))
-        PendingCodePointer = I.MemTarget;
-      if (!I.HasTarget || !P.Functions.count(I.Target))
-        continue;
-      if (Out == Lang::Rust && I.Flow == FlowKind::Call &&
-          PendingCodePointer && !LibraryStarts.count(*PendingCodePointer)) {
-        const size_t Size = P.Functions.find(*PendingCodePointer)->second.InstrRvas.size();
-        if (!PointerEntry || Size > PointerEntry->first)
-          PointerEntry = {Size, *PendingCodePointer};
-        PendingCodePointer.reset();
-      }
-      if (I.Flow == FlowKind::Branch && I.Target != At &&
-          !LibraryStarts.count(I.Target)) {
-        auto Candidate = P.Functions.find(I.Target);
-        if (Candidate != P.Functions.end() &&
-            (!TailEntry || Depth > std::get<0>(*TailEntry) ||
-             (Depth == std::get<0>(*TailEntry) &&
-              Candidate->second.InstrRvas.size() > std::get<1>(*TailEntry))))
-          TailEntry = {Depth, Candidate->second.InstrRvas.size(), I.Target};
-        if (Depth < 6)
-          Pending.push({I.Target, Depth + 1});
-      }
-      if (I.Flow == FlowKind::Call)
-        Pending.push({I.Target, Depth + 1});
-    }
-  }
-  if (PointerEntry)
-    return PointerEntry->second;
-  if (TailEntry)
-    return std::get<2>(*TailEntry);
-  return std::nullopt;
-}
 
 
 static cl::opt<std::string> Input(cl::Positional, cl::desc("<pe>"),
@@ -253,104 +160,41 @@ int main(int Argc, char **Argv) {
     return 2;
   }
   if (ListFuncs) {
-    std::set<Va> LibraryStarts;
-    std::map<Va, std::string> LibraryNames;
-    std::optional<Va> UserEntry;
-    std::set<Va> Startup;
-    std::set<Va> UserReachable;
+    FunctionClassification Classification;
     if (ClassifyFuncs) {
-      auto DBOrErr = LibraryDatabase::load(LibraryDBPath);
-      if (!DBOrErr) {
+      auto ClassificationOrErr =
+          S->classifyFunctions(Out, LibraryDBPath);
+      if (!ClassificationOrErr) {
         errs() << "revenant-decompile: "
-               << toString(DBOrErr.takeError()) << "\n";
+               << toString(ClassificationOrErr.takeError()) << "\n";
         return 2;
       }
-      auto Matches = matchLibraryFunctions(S->program(), *DBOrErr);
-      for (const LibraryMatch &Match : Matches) {
-        LibraryStarts.insert(Match.Start);
-        if (Match.FunctionIndex < DBOrErr->Functions.size())
-          LibraryNames[Match.Start] =
-              DBOrErr->Functions[Match.FunctionIndex].Name;
-      }
-      UserEntry = findUserEntry(*S, Out, LibraryStarts, LibraryNames);
-      if (!UserEntry) {
+      Classification = std::move(*ClassificationOrErr);
+      if (!Classification.UserEntry) {
         errs() << "revenant-decompile: unable to trace user entry from PE startup\n";
         return 2;
       }
-      auto Entry = S->program().Functions.upper_bound(S->pe().EntryPoint);
-      if (Entry != S->program().Functions.begin()) {
-        --Entry;
-        std::queue<Va> Pending;
-        Pending.push(Entry->first);
-        while (!Pending.empty()) {
-          Va At = Pending.front();
-          Pending.pop();
-          if (At == *UserEntry || !Startup.insert(At).second)
-            continue;
-          auto FOrErr = S->materialize(At);
-          if (!FOrErr) {
-            consumeError(FOrErr.takeError());
-            continue;
-          }
-          for (const Instr &I : FOrErr->Instrs) {
-            if (!I.HasTarget || !S->program().Functions.count(I.Target))
-              continue;
-            if (I.Target != *UserEntry &&
-                (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
-              Pending.push(I.Target);
-          }
-        }
-      }
-      std::queue<Va> UserPending;
-      UserPending.push(*UserEntry);
-      while (!UserPending.empty()) {
-        Va At = UserPending.front();
-        UserPending.pop();
-        if (LibraryStarts.count(At) || !UserReachable.insert(At).second)
-          continue;
-        auto FOrErr = S->materialize(At);
-        if (!FOrErr) {
-          consumeError(FOrErr.takeError());
-          continue;
-        }
-        for (const Instr &I : FOrErr->Instrs) {
-          if (I.HasTarget && S->program().Functions.count(I.Target) &&
-              (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
-            UserPending.push(I.Target);
-          // LEA-based function pointers are not call edges, but still make
-          // the target part of the user program's reachable code.
-          if (I.HasMemTarget &&
-              S->program().Functions.count(I.MemTarget))
-            UserPending.push(I.MemTarget);
-
-          // Address-taken functions in hand-written dispatch tables may only
-          // appear as absolute immediates, not direct call edges.
-          for (unsigned OpIdx = 0; OpIdx < I.Inst.getNumOperands(); ++OpIdx) {
-            const llvm::MCOperand &Operand = I.Inst.getOperand(OpIdx);
-            if (!Operand.isImm() || Operand.getImm() < 0)
-              continue;
-            Va Target(static_cast<uint64_t>(Operand.getImm()));
-            if (S->program().Functions.count(Target))
-              UserPending.push(Target);
-          }
-        }
-      }
-      outs() << "user-entry\t" << format_hex(UserEntry->Value, 0) << "\n";
+      outs() << "user-entry\t"
+             << format_hex(Classification.UserEntry->Value, 0) << "\n";
     }
     for (const auto &[Start, Rec] : S->program().Functions) {
       StringRef Name = Rec.Name;
-      auto Lib = LibraryNames.find(Start);
-      if (Lib != LibraryNames.end())
+      auto Lib = Classification.LibraryNames.find(Start);
+      if (Lib != Classification.LibraryNames.end())
         Name = Lib->second;
       outs() << format_hex(Start.Value, 0) << "\t" << Name << "\t";
       if (!ClassifyFuncs)
         outs() << Rec.InstrRvas.size() << " instrs\n";
-      else if (UserReachable.count(Start))
+      else if (Classification.UserReachable.count(Start))
         outs() << "user\n";
-      else if (Startup.count(Start))
-        outs() << "startup\n";
-      else
+      else if (Classification.LibraryStarts.count(Start))
         outs() << "library\n";
+      else if (Classification.Startup.count(Start))
+        outs() << "startup\n";
+      else if (Classification.HasLibraryDB)
+        outs() << "library\n";
+      else
+        outs() << "unclassified\n";
     }
     return 0;
   }
