@@ -2011,6 +2011,25 @@ class RevenantLiftEmitter {
       OS << "    LC.memWriteAddr(" << Addr << ", " << Value << ");\n";
       return true;
     }
+    if (Name == "rv_mxcsr" && Body.getNumArgs() == 2) {
+      const auto *Dir = dyn_cast<StringInit>(Body.getArg(0));
+      auto N = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Dir || !N)
+        return false;
+      OS << "    LC." << (Dir->getValue() == "ld" ? "ldmxcsrOp"
+                                                    : "stmxcsrOp")
+         << "(MI, " << *N << ");\n";
+      return true;
+    }
+    if (Name == "rv_rng" && Body.getNumArgs() == 2) {
+      const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
+      auto Dst = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Kind || !Dst)
+        return false;
+      OS << "    LC.writeOp(MI, " << *Dst << ", LC.rngOp(\""
+         << Kind->getValue() << "\", " << Width << "));\n";
+      return true;
+    }
     // (rv_int N | (rv_op K) | $op): the imm8 interrupt vector, a literal or
     // the instruction's immediate operand.
     if (Name == "rv_int" && Body.getNumArgs() == 1) {

@@ -38,20 +38,15 @@
 // lift_extend) and crates/lift/src/opaque.rs (lift_opaque) in the
 // h-merge tree. Port is 1:1 first, per wave-2 rules.
 //
-// Emitter hooks this file uses (all implemented):
-//   rv_bls               BLSR/BLSMSK/BLSI with polarity-correct CF
-//   rv_bextr             BMI1 field extract with ZF/CF/OF
-//   rv_bzhi              BMI2 zero-high-bits with CF-on-overflow
-//   rv_shiftx            SHLX/SHRX/SARX with masked count, flags untouched
-//   rv_rorx              RORX with masked imm8, flags untouched
-//   rv_mulx              MULX full multiply, flags untouched
-//   rv_adcx/rv_adox      ADCX/ADOX split carry chains (CF-only / OF-only)
-//   rv_opaque            force emitOpaque for one def (name defaults to the
-//                        lowercased mnemonic)
-// Still unimplemented (opaque by omission):
-//   rv_pdep/rv_pext      parallel deposit/extract (no ISD equivalent)
-//   rv_rdrand/rv_rdseed  flag contract for the hardware RNG
-//   BLSIC*/BEXTRI*       TBM forms (not in scope)
+// Emitter hooks this file uses:
+//   rv_bls/rv_bextr/rv_bzhi/rv_shiftx/rv_rorx/rv_mulx: BMI/BMI2 arithmetic
+//   rv_adcx/rv_adox: split carry chains (CF-only / OF-only)
+//   rv_rng: RDRAND/RDSEED result plus the success flag
+//   rv_mxcsr: LDMXCSR/STMXCSR target memory intrinsics
+//   rv_int: software interrupt intrinsic, including the noreturn fast-fail case
+//   rv_opaque: force emitOpaque for one def.
+// Still opaque: PDEP/PEXT; CRC32; privileged/system instructions without
+// modeled semantics; BLSIC*/BEXTRI* TBM forms (not in scope).
 //
 //===----------------------------------------------------------------------===//
 
@@ -358,13 +353,25 @@ def : RVMatch {
   dag Body = (rv_set $dst, (rv_adox $src1, $src2));
 }
 
-// ---- RDRAND/RDSEED: X86rdrand/X86rdseed nodes, need flag detail ------------
-// RDRAND32r: (outs GR32:$dst), (ins), Defs [EFLAGS]. CF = success,
-// OF/SF/ZF/AF/PF = 0. The raw intrinsic call inverts from the pattern,
-// but the flag writes (CF live, rest cleared) need a hook to beat the
-// reference opaque fallback's undef-flags.
-// NEEDS-HOOK rv_rdrand / rv_rdseed writing $dst with the flag contract.
-// Until then these correctly fall back to emitOpaque (see opaque section).
+// ---- RNG: intrinsic result plus the architectural carry-success flag --------
+def : RVMatch {
+  let Glob = "RDRAND*r";
+  dag Body = (rv_rng "rdrand", $dst);
+}
+def : RVMatch {
+  let Glob = "RDSEED*r";
+  dag Body = (rv_rng "rdseed", $dst);
+}
+
+// MXCSR accesses use the target intrinsics; both operations have memory effects.
+def : RVMatch {
+  let Glob = "LDMXCSR";
+  dag Body = (rv_mxcsr "ld", $src);
+}
+def : RVMatch {
+  let Glob = "STMXCSR";
+  dag Body = (rv_mxcsr "st", $dst);
+}
 
 // ---- CRC32/MOVBE: patterns invert, nothing to write ------------------------
 // CRC32r32r32: (outs GR32:$dst), (ins GR32:$src1, GR32:$src2) with
