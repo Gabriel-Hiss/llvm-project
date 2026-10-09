@@ -1,6 +1,7 @@
 add_library(RevenantLiftGenerated
   LiftContext.cpp
   X86/X86LiftContext.cpp
+  X86/X86LiftIntrinsics.cpp
   X86/X86LiftVector.cpp
   RevenantLift.cpp)
 add_dependencies(RevenantLiftGenerated revenant-lift-gen)

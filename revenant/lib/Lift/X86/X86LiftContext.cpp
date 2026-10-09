@@ -6,6 +6,7 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsX86.h"
 #include "llvm/IR/Module.h"
 
 using namespace llvm;
@@ -917,6 +918,37 @@ static Type *vecTyOf(X86LiftContext::BuilderTy &, Type *IntTy,
                               W / EltBits);
 }
 
+Value *X86LiftContext::fmaOp(Value *A, Value *Bv, Value *C, Value *Merge,
+                             bool NegProduct, bool NegAddend,
+                             unsigned EltBits, bool Scalar) {
+  Type *IntTy = A->getType();
+  Type *EltTy = EltBits == 64 ? Type::getDoubleTy(Ctx)
+                              : Type::getFloatTy(Ctx);
+  auto *VT = FixedVectorType::get(
+      EltTy, IntTy->getIntegerBitWidth() / EltBits);
+  Value *MV = B.CreateBitCast(Merge, VT);
+  Value *AV = B.CreateBitCast(A, VT);
+  Value *BV = B.CreateBitCast(Bv, VT);
+  Value *CV = B.CreateBitCast(C, VT);
+  if (Scalar) {
+    Value *X = B.CreateExtractElement(AV, uint64_t(0));
+    Value *Y = B.CreateExtractElement(BV, uint64_t(0));
+    Value *Z = B.CreateExtractElement(CV, uint64_t(0));
+    if (NegProduct)
+      X = B.CreateFNeg(X);
+    if (NegAddend)
+      Z = B.CreateFNeg(Z);
+    Value *R = B.CreateIntrinsic(Intrinsic::fma, {EltTy}, {X, Y, Z});
+    return B.CreateBitCast(B.CreateInsertElement(MV, R, uint64_t(0)), IntTy);
+  }
+  if (NegProduct)
+    AV = B.CreateFNeg(AV);
+  if (NegAddend)
+    CV = B.CreateFNeg(CV);
+  return B.CreateBitCast(
+      B.CreateIntrinsic(Intrinsic::fma, {VT}, {AV, BV, CV}), IntTy);
+}
+
 Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
                            int64_t Imm) {
   Type *F32 = Type::getFloatTy(Ctx);
@@ -964,10 +996,13 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     return B.CreateBitCast(
         B.CreateInsertElement(Vec, S, uint64_t(0)), iN(128));
   }
-  if (Name == "sitofpf32")
-    return B.CreateSIToFP(toInt(A, 64), F32);
-  if (Name == "sitofpf64")
-    return B.CreateSIToFP(toInt(A, 64), F64);
+  if (Name == "sitofpf32" || Name == "sitofpf64") {
+    // cvtsi2s* reads a signed 32- or 64-bit GPR/memory cell: convert from
+    // the operand's own width so a narrow negative stays negative (the
+    // old toInt(A, 64) zero-extended i32 negatives into huge positives).
+    unsigned W = A->getType()->getPrimitiveSizeInBits();
+    return B.CreateSIToFP(toInt(A, W), Name.ends_with("f32") ? F32 : F64);
+  }
   if (Name == "fminnum")
     return B.CreateBinaryIntrinsic(Intrinsic::minnum, A, Bv);
   if (Name == "fmaxnum")
@@ -1329,6 +1364,18 @@ Value *X86LiftContext::atomicRMW(StringRef Name, Value *Addr, Value *Val) {
 
 void X86LiftContext::emitFence() {
   B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+}
+
+void X86LiftContext::intTrap(uint64_t Imm8) {
+  // llvm.x86.int is the interrupt-vector intrinsic the fork ships for
+  // __int2c/__fastfail lowering; the C frontend maps vector numbers back
+  // to __debugbreak/__fastfail/__int2c. int 0x29 (__fastfail) never
+  // returns; every other vector can.
+  Function *Int =
+      Intrinsic::getOrInsertDeclaration(&Mod, Intrinsic::x86_int);
+  CallInst *C = B.CreateCall(Int, {constI(Imm8 & 0xff, 8)});
+  if ((Imm8 & 0xff) == 0x29)
+    C->setDoesNotReturn();
 }
 
 // ---- bulk memory -----------------------------------------------------------------------

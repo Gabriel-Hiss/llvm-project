@@ -36,8 +36,11 @@ rolled back. Function-pass adaptors still retain per-function isolation.
 ```text
 revenant-decompile <pe> [--func <va|name>]... [--lang c|cpp|rust]
                         [--meta none|embedded|pdb]
+revenant-decompile <pe> [--func <va|name>]... [--func-file <path>]
+                        [--lang c|cpp|rust]
                         [--emit asm|ir-raw|ir-clean|ir-final|source]
-                        [-o <base>] [--patterns] [--list] [--time]
+                        [-o <base>] [--patterns] [--list [--classify]]
+                        [--libdb <path>] [--time]
 ```
 
 
@@ -50,6 +53,16 @@ strings, and RTTI class/vtable data to IR as `!rev.source`, `!rev.panic`,
 `!rev.eh.types`, `!rev.class`, `!rev.strings`, and `!rev.types`. `none` drops
 embedded names and metadata, but retains data bytes and import names.
 
+`--list --classify --libdb=<path>` prints `user-entry<TAB><va>` followed by
+one row per function with its name and `user`, `library`, or `startup`
+classification. It traces the PE entry through CRT startup to the user entry
+(including MinGW's startup call convention), follows direct calls and
+address-taken function pointers from user code, and stops at library matches.
+When the user's first call reaches an unmatched MinGW constructor-list
+dispatcher, that hook and code reachable only through it are treated as
+runtime. An adjacent `libdb.json` is optional by default; an explicitly
+supplied missing database is an error. `--func-file=<path>` reads one selector
+per line.
 
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
@@ -65,7 +78,8 @@ and their names are used in the listing. The IR pipeline adds
 metadata mode. C++ deoptimization uses these attributes to keep runtime and
 startup functions out of user-code transformations.
 Without `--func` every discovered function is decompiled; a Windows command
-line holds a few hundred `--func` arguments, so chunk large sets.
+line holds a few hundred `--func` arguments, so chunk large sets or use
+`--func-file`.
 
 `test/meta-mode/invariant.py` samples 300 functions per release binary with
 seed 211009, normalizes identifiers and type names, then compares final IR

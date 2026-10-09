@@ -35,15 +35,8 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
   unsigned Op = I.getOpcode();
   llvm::Value *LHS = I.getOperand(0);
   llvm::Value *RHS = I.getOperand(1);
-  bool Signed = isSignedIntValue(&I);
-  // Signedness follows the operands' DI when present (either side may
-  // carry it after SROA renames).
-  if (!isSignedIntValue(LHS) || !isSignedIntValue(RHS))
-    Signed = isSignedIntValue(LHS) && isSignedIntValue(RHS);
-  // True when either operand is unsigned: C arithmetic then works on the
-  // unsigned type.
-  bool Unsigned = !isSignedIntValue(LHS) || !isSignedIntValue(RHS);
-  (void)Signed;
+  // DI signedness describes the source variable, not the operation selected
+  // by LLVM. Signed and unsigned opcodes below define arithmetic semantics.
 
   BinaryOperatorKind BOp = BO_Add;
   Prec P = Prec::Add;
@@ -147,23 +140,25 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
   }
 
 
-  // Shift amount and division by unsigned values: keep operand types;
-  // the result type comes from the IR type via TypeBuilder.
   QualType ResTy = exprTypeOf(&I);
-  // Arithmetic shift right on a signed value is `>>` on the signed type
-  // (implementation-defined but what every x86 compiler emits); unsigned
-  // values shift `>>` on the unsigned type. Nothing to rewrite.
-  if (Unsigned && ResTy->isSignedIntegerType()) {
-    // C would perform signed arithmetic; the IR said unsigned. Cast the
-    // operands to the unsigned type so the printed code computes the
-    // same value.
-    QualType U = AST->getCorrespondingUnsignedType(ResTy);
-    if (!U.isNull()) {
-      if (L->getType() != U)
-        L = makeCStyleCast(U, CK_IntegralCast, L);
-      if (!IsShift && R->getType() != U)
-        R = makeCStyleCast(U, CK_IntegralCast, R);
-      ResTy = U;
+  bool SignedOp = Op == llvm::Instruction::SDiv ||
+                  Op == llvm::Instruction::SRem ||
+                  Op == llvm::Instruction::AShr;
+  bool UnsignedOp = Op == llvm::Instruction::UDiv ||
+                    Op == llvm::Instruction::URem ||
+                    Op == llvm::Instruction::LShr;
+  if ((SignedOp || UnsignedOp) && L->getType()->isIntegerType()) {
+    QualType OperandTy = L->getType();
+    if (SignedOp && !OperandTy->isSignedIntegerType())
+      OperandTy = AST->getCorrespondingSignedType(OperandTy);
+    else if (UnsignedOp && !OperandTy->isUnsignedIntegerType())
+      OperandTy = AST->getCorrespondingUnsignedType(OperandTy);
+    if (!OperandTy.isNull()) {
+      if (L->getType() != OperandTy)
+        L = makeCStyleCast(OperandTy, CK_IntegralCast, L);
+      if (!IsShift && R->getType() != OperandTy)
+        R = makeCStyleCast(OperandTy, CK_IntegralCast, R);
+      ResTy = OperandTy;
     }
   }
 
@@ -219,17 +214,21 @@ Expr *ExprBuilderImpl::buildCmp(llvm::CmpInst &I, ExprScope &Scope) {
     default:
       break;
     }
-    // Unsigned comparison on a signed-typed operand: llvm::cast to unsigned
-    // first so the printed comparison computes the same result.
-    if (!Signed) {
-      QualType LT = L->getType();
-      if (LT->isSignedIntegerType()) {
-        QualType U = AST->getCorrespondingUnsignedType(LT);
-        if (!U.isNull()) {
-          L = makeCStyleCast(U, CK_IntegralCast, L);
-          if (R->getType() != U)
-            R = makeCStyleCast(U, CK_IntegralCast, R);
-        }
+    // C's usual arithmetic conversions can erase LLVM's signed predicate.
+    // Cast both operands to the predicate's signedness before comparison.
+    bool IsRelational = BOp == BO_GT || BOp == BO_GE || BOp == BO_LT ||
+                       BOp == BO_LE;
+    if (IsRelational && L->getType()->isIntegerType()) {
+      QualType OperandTy = L->getType();
+      if (Signed && !OperandTy->isSignedIntegerType())
+        OperandTy = AST->getCorrespondingSignedType(OperandTy);
+      else if (!Signed && !OperandTy->isUnsignedIntegerType())
+        OperandTy = AST->getCorrespondingUnsignedType(OperandTy);
+      if (!OperandTy.isNull()) {
+        if (L->getType() != OperandTy)
+          L = makeCStyleCast(OperandTy, CK_IntegralCast, L);
+        if (R->getType() != OperandTy)
+          R = makeCStyleCast(OperandTy, CK_IntegralCast, R);
       }
     }
   } else if (auto *FC = llvm::dyn_cast<llvm::FCmpInst>(&I)) {

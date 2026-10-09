@@ -88,6 +88,7 @@ def rv_ffadd   : RVOp;
 def rv_ffsub   : RVOp;
 def rv_ffmul   : RVOp;
 def rv_ffdiv   : RVOp;
+def rv_fma : RVOp;
 def rv_fneg    : RVOp;
 def rv_fminnum : RVOp;
 def rv_fmaxnum : RVOp;
@@ -133,6 +134,7 @@ def rv_pop   : RVOp;  // (rv_pop W) -> popped value of W bits
 def rv_pushf : RVOp;
 def rv_popf  : RVOp;
 def rv_leave : RVOp;
+def rv_int   : RVOp;  // (rv_int imm | $op): software interrupt vector -> llvm.x86.int
 // read-modify-write, locks, fences
 def rv_frmw  : RVOp;  // (rv_frmw "add|sub|and|or|xor|inc|dec|neg|not", $mem, $src)
                       // statement: load+op+flags+store; atomicrmw when lock
@@ -870,7 +872,7 @@ def : RVMatch { let Glob = "SFENCE*";   dag Body = (rv_nop); }
 def : RVMatch { let Glob = "MFENCE*";   dag Body = (rv_fence); }
 // ENDBR landing pads have no data effect.
 def : RVMatch { let Glob = "ENDBR*"; dag Body = (rv_nop); }
-def : RVLift { let Insn = INT3; dag Body = (rv_nop); }
+def : RVLift { let Insn = INT3; dag Body = (rv_int 3); }
 def : RVLift { let Insn = VZEROUPPER; dag Body = (rv_nop); }
 def : RVLift { let Insn = VZEROALL;   dag Body = (rv_nop); }
 // Traps and serializing/system instructions stay opaque escapes.

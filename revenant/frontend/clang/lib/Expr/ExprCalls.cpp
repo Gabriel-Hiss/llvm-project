@@ -218,9 +218,24 @@ Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
   llvm::FunctionType *FTy = I.getFunctionType();
   for (unsigned A = 0; A < I.arg_size(); ++A) {
     Expr *E = value(I.getArgOperand(A), Scope);
-    // Cast variadic extras and mismatched params to the declared type
-    // so the output compiles under clang-cl's checking.
-    (void)FTy;
+    if (A < FTy->getNumParams()) {
+      QualType Want = Types.typeOf(FTy->getParamType(A), nullptr);
+      QualType Have = E->getType();
+      if (Have != Want) {
+        if (Have->isArrayType() && Want->isPointerType())
+          E = makeCStyleCast(Want, CK_BitCast, E);
+        else if (Have->isPointerType() && Want->isPointerType())
+          E = makeCStyleCast(Want, CK_BitCast, E);
+        else if (Have->isPointerType() && Want->isIntegerType())
+          E = makeCStyleCast(Want, CK_PointerToIntegral, E);
+        else if (Have->isIntegerType() && Want->isPointerType())
+          E = makeCStyleCast(Want, CK_IntegralToPointer, E);
+        else if (Have->isIntegerType() && Want->isIntegerType())
+          E = makeCStyleCast(Want, CK_IntegralCast, E);
+        else if (Have->isFloatingType() && Want->isFloatingType())
+          E = makeCStyleCast(Want, CK_FloatingCast, E);
+      }
+    }
     Args.push_back(E);
   }
   clang::CallExpr *Call =
@@ -251,6 +266,26 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
           SourceLocation(), parenIfNeeded(R, Prec::Ternary), ResTy,
           VK_PRValue, OK_Ordinary);
       return ensureTemp(&I, Scope, Q);
+    }
+    if (N == "llvm.x86.int" && I.arg_size() == 1) {
+      auto *Vector = llvm::dyn_cast<llvm::ConstantInt>(I.getArgOperand(0));
+      if (Vector && Vector->getZExtValue() == 0x29) {
+        IdentifierInfo *Id = Ctx.ident("__fastfail");
+        QualType FT =
+            AST->getFunctionType(AST->VoidTy, {AST->UnsignedIntTy}, {});
+        FunctionDecl *FD = FunctionDecl::Create(
+            *AST, AST->getTranslationUnitDecl(), SourceLocation(),
+            SourceLocation(), Id, FT, AST->getTrivialTypeSourceInfo(FT),
+            SC_Extern);
+        Expr *Ref = declRef(FD);
+        Expr *Arg = value(I.getArgOperand(0), Scope);
+        if (Arg->getType() != AST->UnsignedIntTy)
+          Arg = makeCStyleCast(AST->UnsignedIntTy, CK_IntegralCast, Arg);
+        clang::CallExpr *Call =
+            CallExpr::Create(*AST, Ref, {Arg}, AST->VoidTy, VK_PRValue,
+                             SourceLocation(), FPOptionsOverride());
+        return Call;
+      }
     }
     if (N == "llvm.trap") {
       // `__debugbreak()` in MSVC terms; call it so the output compiles.

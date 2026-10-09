@@ -445,6 +445,21 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
             IRBuilder<> B(&F.getEntryBlock(), F.getEntryBlock().begin());
             Spill = B.CreateAlloca(Dst->getAllocatedType(), nullptr,
                                    "v_spill");
+            DIType *SpillTy = nullptr;
+            if (Dst->getAllocatedType()->isFloatingPointTy())
+              SpillTy = DIB.createBasicType("double", 64, dwarf::DW_ATE_float);
+            else if (Dst->getAllocatedType()->isIntegerTy(1))
+              SpillTy = DIB.createBasicType("bool", 1, dwarf::DW_ATE_boolean);
+            else if (Dst->getAllocatedType()->isIntegerTy())
+              SpillTy = DIB.createBasicType("long",
+                                           Dst->getAllocatedType()->getIntegerBitWidth(),
+                                           dwarf::DW_ATE_signed);
+            else
+              SpillTy = DIB.createBasicType("ptr", 64, dwarf::DW_ATE_address);
+            DILocalVariable *SpillVar =
+                DIB.createAutoVariable(SP, Spill->getName(), File, 1, SpillTy);
+            DIB.insertDeclare(Spill, SpillVar, DIB.createExpression(),
+                              DILocation::get(Ctx, 1, 0, SP), Spill->getNextNode());
           }
           SpilledVal = Dst;
           Ordered.push_back({Spill, Pending[0].second});

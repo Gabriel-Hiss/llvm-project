@@ -130,6 +130,9 @@ public:
   /// packed shifts. Imm is -1 when unused. Returns nullptr for void ops.
   Value *vop(StringRef Name, Value *A, Value *Bv = nullptr,
              int64_t Imm = -1);
+  /// FMA3 arithmetic, preserving scalar upper lanes and vector element widths.
+  Value *fmaOp(Value *A, Value *Bv, Value *C, Value *Merge,
+               bool NegProduct, bool NegAddend, unsigned EltBits, bool Scalar);
   // ---- typed vectors (generated from the backend's vector patterns) --------
   Type *vecTy(Type *Elt, unsigned N);
   /// Bit-preserving conversion between any two integer, float and vector
@@ -170,6 +173,7 @@ public:
   /// hardware.
   void mulxOp(const MCInst &MI, unsigned DstHi, unsigned DstLo,
               unsigned Src, unsigned Width);
+
   // ---- mul/div families ----------------------------------------------------
   /// Unsigned one-operand mul: rax*src -> rdx:rax, CF=OF=(high!=0).
   void mulPair(Value *Src, unsigned W, bool Signed);
@@ -195,6 +199,34 @@ public:
   // ---- atomics ---------------------------------------------------------------
   Value *atomicRMW(StringRef Name, Value *Addr, Value *Val);
   void emitFence();
+  /// `int imm8`: a call to llvm.x86.int (the fork carries the intrinsic;
+  /// 0x29 is __fastfail, 0x2c is __int2c, 3 is __debugbreak in C terms).
+  /// The 0x29 call site is noreturn; other vectors can return.
+  void intTrap(uint64_t Imm8);
+  // ---- intrinsic-backed families --------------------------------------------
+  /// Masked vector load/store (VMASKMOV*, *MASKMOVDQU). Mask lanes are
+  /// selected by the sign bit of each EltBits element.
+  Value *maskLoad(Value *Mask, Value *AddrI64, unsigned W, unsigned EltBits);
+  void maskStore(Value *Mask, Value *V, Value *AddrI64, unsigned W,
+                 unsigned EltBits);
+  /// AES-NI operation kind: enc|enclast|dec|declast|imc|keygen.
+  Value *aesOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  Value *pclmulOp(Value *A, Value *Bv, int64_t Imm);
+  Value *sha1Op(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  Value *sha256Op(StringRef Kind, Value *A, Value *Bv);
+  Value *fmaScalar(StringRef Kind, unsigned Form, Value *MergeOrMul1,
+                   Value *Mul2OrAdd, Value *AddOrMul2, bool NegMul,
+                   bool NegAdd);
+  Value *cmpScalar(bool IsSD, Value *Merge, Value *A, Value *Bv, int64_t Imm);
+  void pcmpXstrOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  Value *rotCarryOp(bool IsLeft, Value *V, Value *Count);
+  Value *rngOp(StringRef Name, unsigned W);
+  void cpuidOp();
+  void xgetbvOp();
+  void ldmxcsrOp(const MCInst &MI, unsigned MIOpNo);
+  void stmxcsrOp(const MCInst &MI, unsigned MIOpNo);
+  void pauseOp();
+  void enterOp(uint64_t Frame, uint64_t Level);
 
   // ---- bulk memory -----------------------------------------------------------
   void memMove(Value *Dst, Value *Src, Value *Len);

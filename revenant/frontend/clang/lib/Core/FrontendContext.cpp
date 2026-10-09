@@ -111,6 +111,17 @@ FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
   if (auto *D = llvm::dyn_cast_or_null<clang::FunctionDecl>(lookupDecl(&F)))
     return D;
   clang::QualType FT = Types.functionType(F);
+  // Normalize main/wmain signature for MSVC/clang-cl compatibility.
+  if (F.getName() == "main" || F.getName() == "wmain") {
+    clang::ASTContext &A = AST;
+    clang::QualType IntTy = A.IntTy;
+    clang::QualType CharPtrTy = A.getPointerType(A.CharTy);
+    clang::QualType CharPtrPtrTy = A.getPointerType(CharPtrTy);
+    llvm::SmallVector<clang::QualType, 2> Params;
+    Params.push_back(IntTy);
+    Params.push_back(CharPtrPtrTy);
+    FT = A.getFunctionType(IntTy, Params, clang::FunctionProtoType::ExtProtoInfo());
+  }
   auto *FD = clang::FunctionDecl::Create(
       AST, AST.getTranslationUnitDecl(), clang::SourceLocation(),
       clang::SourceLocation(),
