@@ -389,6 +389,7 @@ TEST(StructuredStmtBuilderTest, SehTryExcept) {
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("__try"), std::string::npos);
   EXPECT_NE(S.find("__except"), std::string::npos);
+  EXPECT_NE(S.find("__except (1)"), std::string::npos);
 }
 
 } // namespace
