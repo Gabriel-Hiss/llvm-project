@@ -24,6 +24,7 @@
 #include "revenant/Core/Va.h"
 
 #include <cstdint>
+#include <string>
 #include <map>
 #include <vector>
 
@@ -69,6 +70,9 @@ struct Param {
   uint32_t Bits = 0;
   /// Lives in an xmm register.
   bool Float = false;
+  /// Original parameter spelling when recovered from a library prototype.
+  std::string Name;
+  std::string Type;
 };
 
 struct RetLoc {
@@ -85,12 +89,12 @@ struct Signature {
   /// Set when the function spills all four Win64 register arguments to
   /// their home slots before consuming a variadic argument list.
   bool VarArgs = false;
-  /// Rust `sigs::SigSource`.
   enum class Source : uint8_t {
-    /// Signature came from debug info. Never produced by this port;
-    /// kept so lifter-side code shared with Rust still compiles.
+    /// Signature came from debug info.
     Pdb,
     Inferred,
+    /// Signature came from the static-library function database.
+    Library,
     /// Nothing proven; conservative default (4 int regs, i64 ret).
     Default,
   } SigSource = Source::Inferred;

@@ -266,8 +266,8 @@ TEST(StructuredStmtBuilderTest, ExternalGotoToRegionHeaderHasLabel) {
   B.CreateRet(X);
   tagRegion(Header->getTerminator(), "if", {indexOf(*F, Follow)});
   std::string S = printFunction(M, *F);
-  EXPECT_NE(S.find("goto L_bb_8010"), std::string::npos);
-  EXPECT_NE(S.find("L_bb_8010:"), std::string::npos);
+  EXPECT_NE(S.find("goto f_region_entry_L_bb_8010"), std::string::npos);
+  EXPECT_NE(S.find("f_region_entry_L_bb_8010:"), std::string::npos);
 }
 TEST(StructuredStmtBuilderTest, SanitizedLabelsStayUnique) {
   LLVMContext &C = ctx();

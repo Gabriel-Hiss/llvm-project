@@ -17,6 +17,7 @@
 
 #include "revenant/Engine/Session.h"
 
+#include "revenant/Analysis/LibMatch.h"
 #include "revenant/Analysis/EHTables.h"
 #include "revenant/Analysis/Signatures.h"
 #include "revenant/Clang/ClangFrontend.h"
@@ -28,6 +29,7 @@
 #include "revenant/Lift/LiftFunction.h"
 #include "revenant/Object/PeFile.h"
 #include "revenant/Transforms/Pipeline/Pipeline.h"
+#include "revenant/Transforms/Uncxx/Uncxx.h"
 
 #include <chrono>
 #include <numeric>
@@ -58,6 +60,18 @@ using namespace llvm;
 
 namespace revenant {
 namespace {
+
+CxxFlavor uncxxFlavor(Compiler Producer) {
+  switch (Producer) {
+  case Compiler::Msvc:
+  case Compiler::ClangCl:
+    return CxxFlavor::Msvc;
+  case Compiler::MinGwGcc:
+    return CxxFlavor::Gnu;
+  default:
+    return CxxFlavor::Auto;
+  }
+}
 
 // Store references only; format diagnostics when a crash actually occurs.
 class FunctionStageTrace final : public PrettyStackTraceEntry {
@@ -151,6 +165,8 @@ lift::Signature convertSig(const revenant::Signature &S) {
                              : lift::ParamLoc::reg(llvm::MCRegister(P.Loc.Reg));
     LP.Bits = P.Bits;
     LP.Float = P.Float;
+    if (!P.Name.empty())
+      LP.Name = P.Name;
     Out.Params.push_back(std::move(LP));
   }
   if (S.HasRet)
@@ -163,6 +179,9 @@ lift::Signature convertSig(const revenant::Signature &S) {
   case revenant::Signature::Source::Inferred:
     Out.Source = lift::SigSource::Inferred;
     break;
+  case revenant::Signature::Source::Library:
+    Out.Source = lift::SigSource::Library;
+    break;
   case revenant::Signature::Source::Default:
     Out.Source = lift::SigSource::Default;
     break;
@@ -170,9 +189,16 @@ lift::Signature convertSig(const revenant::Signature &S) {
   return Out;
 }
 
-std::shared_ptr<const lift::Signatures> recoverSignatures(const Program &Prog,
-                                                          const Disasm &Dis) {
+Expected<std::shared_ptr<const lift::Signatures>>
+recoverSignatures(Program &Prog, const Disasm &Dis, StringRef LibraryDBPath) {
   revenant::Signatures A = revenant::analyzeSignatures(Prog, Dis);
+  if (!LibraryDBPath.empty()) {
+    auto DB = LibraryDatabase::load(LibraryDBPath);
+    if (!DB)
+      return DB.takeError();
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DB);
+    applyLibraryMatches(Prog, A, Matches, *DB);
+  }
   auto Out = std::make_shared<lift::Signatures>();
   for (const auto &[At, S] : A.Funcs)
     Out->Funcs.emplace(At, convertSig(S));
@@ -182,7 +208,7 @@ std::shared_ptr<const lift::Signatures> recoverSignatures(const Program &Prog,
     Out->IndirectArgs.emplace(At, N);
   for (const auto &[At, N] : A.CallsiteArgs)
     Out->CallsiteArgs.emplace(At, N);
-  return Out;
+  return std::shared_ptr<const lift::Signatures>(std::move(Out));
 }
 
 //==--------------------------------------------------------------------==//
@@ -205,7 +231,8 @@ SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
-                          std::vector<StageReport> &Reports) {
+                          std::vector<StageReport> &Reports,
+                          CxxFlavor Flavor) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -223,7 +250,9 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   auto Passes = pipelineElements(Pipeline);
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
-    if (Error E = PB.parsePassPipeline(FPM, Pass))
+    if (Pass == "revenant-uncxx")
+      FPM.addPass(UncxxPass(Flavor));
+    else if (Error E = PB.parsePassPipeline(FPM, Pass))
       return createStringError("pipeline '" + Pass.str() +
                                "': " + toString(std::move(E)));
     SmallVector<llvm::Function *, 32> Functions;
@@ -301,7 +330,8 @@ Error runModulePass(Module &M, StringRef Pass) {
 }
 
 Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
-                      StringRef Pipeline, std::vector<StageReport> &Reports) {
+                      StringRef Pipeline, std::vector<StageReport> &Reports,
+                      CxxFlavor Flavor = CxxFlavor::Auto) {
   // Validate the whole pipeline first: unknown pass names are configuration
   // errors, not recoverable failures of a particular function or module.
   PassBuilder PB;
@@ -311,7 +341,8 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
     return E;
   for (StringRef Element : pipelineElements(Pipeline)) {
     if (Element.starts_with("function(")) {
-      if (Error E = runFunctionPipeline(Stage, *M, Element, Reports))
+      if (Error E =
+              runFunctionPipeline(Stage, *M, Element, Reports, Flavor))
         return E;
       continue;
     }
@@ -349,10 +380,11 @@ std::string cleanPipeline(bool EnableStructDI) {
 }
 
 /// ir-final: deoptimization, structuring, type recovery, SSA-out.
-std::string finalPipeline(bool Patterns) {
-  return formatv("function({0}{1},revenant-structure,revenant-types,"
+std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
+  return formatv("function({0}{1}{2},revenant-structure,revenant-types,"
                  "revenant-ssaout)",
-                 UnoptPipeline, Patterns ? ",revenant-patterns" : "")
+                 IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
+                 Patterns ? ",revenant-patterns" : "")
       .str();
 }
 
@@ -494,8 +526,19 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       break;
     // ---- signatures ------------------------------------------------------
     // Interprocedural over the whole program, so it runs once per session.
-    if (!Sigs)
-      Sigs = recoverSignatures(Prog, *Dis);
+    if (!Sigs) {
+      auto Recovered =
+          recoverSignatures(Prog, *Dis, Opts.LibraryDBPath);
+      if (!Recovered)
+        return Recovered.takeError();
+      Sigs = std::move(*Recovered);
+    }
+    auto ClassificationOrErr =
+        classifyFunctions(Out, Opts.LibraryDBPath);
+    if (!ClassificationOrErr)
+      return ClassificationOrErr.takeError();
+    FunctionClassification Classification =
+        std::move(*ClassificationOrErr);
     record(R.Stages, "sigs", "ok",
            formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
                    Sigs->Externs.size())
@@ -588,6 +631,17 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         continue;
       }
       OpaqueSites += L->AsmFallbacks.size();
+    }
+    for (llvm::Function &F : *M) {
+      auto FunctionVA = ir::getFunctionVA(F);
+      if (!FunctionVA)
+        continue;
+      Va Start(*FunctionVA);
+      if (Classification.UserReachable.count(Start))
+        F.addFnAttr("revenant.user", "true");
+      auto Library = Classification.LibraryNames.find(Start);
+      if (Library != Classification.LibraryNames.end())
+        F.addFnAttr("revenant.lib", Library->second);
     }
     // MSVC catch funclets return their continuation VA in rax.
     auto continuationVA = [](const llvm::Function &F)
@@ -749,10 +803,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- ir-final ----------------------------------------------------------
     if (auto E =
-            runPipelineText("ir-final", M, finalPipeline(Opts.Patterns),
-                            R.Stages))
+            runPipelineText("ir-final", M,
+                            finalPipeline(Opts.Patterns, Out == Lang::Cpp),
+                            R.Stages, uncxxFlavor(Compiler.Producer)))
       return std::move(E);
-    record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");
+    record(R.Stages, "ir-final", "ok",
+           "Uncxx (C++ only) + unopt + structure + types + ssaout");
     FinalText = moduleText(*M);
     if (Opts.Emit == EmitKind::IrFinal) {
       R.Text = FinalText;

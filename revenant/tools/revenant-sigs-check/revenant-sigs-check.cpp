@@ -1,4 +1,5 @@
 #include "revenant/Analysis/Analysis.h"
+#include "revenant/Analysis/LibMatch.h"
 #include "revenant/Analysis/Signatures.h"
 #include "revenant/Core/Program.h"
 #include "revenant/Disasm/Disasm.h"
@@ -40,6 +41,8 @@ static cl::opt<std::string> PdbPath(cl::Positional, cl::Required,
                                     cl::desc("matching PDB file"));
 static cl::opt<std::string> CsvPath(cl::Positional, cl::Required,
                                     cl::desc("recovered signatures CSV"));
+static cl::opt<std::string> LibraryDBPath(
+    "libdb", cl::desc("optional static library match database"));
 
 
 static std::optional<std::pair<unsigned, bool>>
@@ -207,6 +210,16 @@ int main(int Argc, char **Argv) {
   }
   Disasm Dis = std::move(*DisOrErr);
   Signatures Sigs = analyzeSignatures(P, Dis);
+  if (!LibraryDBPath.empty()) {
+    auto DB = LibraryDatabase::load(LibraryDBPath);
+    if (!DB) {
+      logAllUnhandledErrors(DB.takeError(), errs(),
+                           "library database load failed: ");
+      return 1;
+    }
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(P, *DB);
+    applyLibraryMatches(P, Sigs, Matches, *DB);
+  }
 
   std::unique_ptr<IPDBSession> Session;
   if (Error E = NativeSession::createFromPdbPath(PdbPath, Session)) {

@@ -54,6 +54,16 @@ embedded names and metadata, but retains data bytes and import names.
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
 (only the stages that ran). `--time` prints the elapsed time of each stage.
+
+`--list --classify` uses `Session::classifyFunctions`. It traces the user
+entry and reachability from the PE entry even without a library database;
+without a database, functions outside those reachable sets are reported as
+`unclassified`. With a database, matched functions are reported as `library`
+and their names are used in the listing. The IR pipeline adds
+`"revenant.user"="true"` to user-reachable definitions and
+`"revenant.lib"="<name>"` to matched library definitions, independent of
+metadata mode. C++ deoptimization uses these attributes to keep runtime and
+startup functions out of user-code transformations.
 Without `--func` every discovered function is decompiled; a Windows command
 line holds a few hundred `--func` arguments, so chunk large sets.
 

@@ -76,7 +76,7 @@ struct RetLoc {
   uint32_t Bits = 64;
 };
 
-enum class SigSource { Pdb, Inferred, Default };
+enum class SigSource { Pdb, Inferred, Library, Default };
 
 struct Signature {
   std::vector<Param> Params;

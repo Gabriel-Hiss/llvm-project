@@ -29,6 +29,8 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/Error.h"
+#include <unordered_set>
+
 
 using llvm::APInt;
 using llvm::ArrayRef;
@@ -59,7 +61,8 @@ createASTContext(llvm::Module &M, const ClangFrontendOptions &Opts) {
   LO.CPlusPlus = Lang == SourceLang::CPlusPlus;
   LO.CPlusPlus11 = LO.CPlusPlus14 = LO.CPlusPlus17 = LO.CPlusPlus;
   LO.Bool = true;
-  LO.MicrosoftExt = LO.MSVCCompat = true;
+  // The emitted text must also compile with GCC/Clang, not just MSVC.
+  LO.MicrosoftExt = LO.MSVCCompat = false;
   LO.DeclSpecKeyword = true;
   LO.WChar = true;
 
@@ -208,7 +211,9 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = Types.typeOf(AI->getAllocatedType(), DI);
+        c::QualType LT = AI->getAllocatedType()->isArrayTy()
+                             ? Types.typeOf(AI->getAllocatedType(), nullptr)
+                             : Types.typeOf(AI->getAllocatedType(), DI);
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
@@ -261,6 +266,25 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
     buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
 }
 
+
+static c::FunctionDecl *prototypeFor(c::FunctionDecl *Definition,
+                                     c::ASTContext &AST) {
+  auto *Prototype = c::FunctionDecl::Create(
+      AST, AST.getTranslationUnitDecl(), c::SourceLocation(),
+      c::SourceLocation(), Definition->getDeclName(), Definition->getType(),
+      Definition->getTypeSourceInfo(), Definition->getStorageClass(),
+      Definition->UsesFPIntrin(), Definition->isInlineSpecified());
+  SmallVector<c::ParmVarDecl *, 8> Parameters;
+  for (c::ParmVarDecl *Parameter : Definition->parameters()) {
+    Parameters.push_back(c::ParmVarDecl::Create(
+        AST, Prototype, c::SourceLocation(), c::SourceLocation(),
+        Parameter->getIdentifier(), Parameter->getType(), nullptr,
+        c::SC_None, nullptr));
+  }
+  Prototype->setParams(Parameters);
+  return Prototype;
+}
+
 void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
                           ArrayRef<StringRef> Includes) {
   c::PrintingPolicy Policy = TU->getASTContext().getPrintingPolicy();
@@ -268,30 +292,41 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
-  for (unsigned Pass = 0; Pass != 3; ++Pass)
+  std::unordered_set<std::string> PrintedRecords;
+  for (unsigned Pass = 0; Pass != 3; ++Pass) {
     for (c::Decl *D : TU->decls()) {
       if (D->isImplicit())
         continue;
       auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
+      auto *Record = llvm::dyn_cast<c::RecordDecl>(D);
+      bool IsRecord = Record != nullptr;
       bool IsNamespace = llvm::isa<c::NamespaceDecl>(D);
-      bool IsRecord = llvm::isa<c::RecordDecl>(D);
       bool IsRecordContainer = IsRecord || IsNamespace;
       bool IsPrototype = FD && !FD->doesThisDeclarationHaveABody();
+      bool HasBody = FD && FD->doesThisDeclarationHaveABody();
       if ((Pass == 0 && !IsRecordContainer) || (Pass == 1 && !FD) ||
           (Pass == 2 && (IsRecordContainer || IsPrototype)))
         continue;
-      c::Stmt *SavedBody = nullptr;
-      if (Pass == 1 && FD && !IsPrototype) {
-        SavedBody = FD->getBody();
-        FD->setBody(nullptr);
+      if (Pass == 0 && Record && Record->isCompleteDefinition() &&
+          !Record->getName().empty()) {
+        std::string Key =
+            (Record->isUnion() ? "union " : "struct ") +
+            Record->getNameAsString();
+        if (!PrintedRecords.insert(std::move(Key)).second)
+          continue;
+      }
+      if (Pass == 1 && HasBody) {
+        prototypeFor(FD, TU->getASTContext())
+            ->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
+        OS << ";\n";
+        continue;
       }
       D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
-      if (SavedBody)
-        FD->setBody(SavedBody);
       if (!FD || IsPrototype || Pass == 1)
         OS << ";";
       OS << "\n";
     }
+  }
 }
 
 } // namespace revenant::clangx

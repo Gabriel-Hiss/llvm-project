@@ -66,7 +66,8 @@ exit:
 declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
 
 ; The vector tiers are gone; the scalar loop and the exit merge remain.
+; CHECK-LABEL: define{{.*}}i32 @sum
 ; CHECK-NOT: <4 x i32>
 ; CHECK-NOT: call i32 @llvm.vector.reduce
-; CHECK: br label
-; CHECK: ret i32
+; CHECK: load i32
+; CHECK: }

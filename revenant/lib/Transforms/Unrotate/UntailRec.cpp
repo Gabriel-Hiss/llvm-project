@@ -55,6 +55,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/CFG.h"
 
 using namespace llvm;
 
@@ -136,6 +137,21 @@ bool isPureForLatch(const Instruction &I) {
   }
 }
 
+bool canReach(BasicBlock *From, BasicBlock *Target) {
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  SmallVector<BasicBlock *, 16> Work{From};
+  while (!Work.empty()) {
+    BasicBlock *BB = Work.pop_back_val();
+    if (BB == Target)
+      return true;
+    if (!Seen.insert(BB).second)
+      continue;
+    for (BasicBlock *Succ : successors(BB))
+      Work.push_back(Succ);
+  }
+  return false;
+}
+
 // Splits a self-loop header H (Latch == H) into a header plus a dedicated
 // latch block, in place; defined after matchLoop.
 static bool splitSelfLoop(Function &F, BasicBlock *H,
@@ -158,6 +174,12 @@ bool matchLoop(Function &F, LoopShape &S) {
   for (unsigned h = 0; h < 2; ++h) {
     BasicBlock *H = Guard->getSuccessor(h);
     if (H == &E)
+      continue;
+    // TailCallElim's alternate entry edge is the base-case exit, never a
+    // path back into the loop. Ordinary loops can have the same argument
+    // PHIs and pure latch computations while their other entry edge also
+    // reaches the header, so leave those loops intact.
+    if (canReach(Guard->getSuccessor(1 - h), H))
       continue;
 
     // Header PHIs must cover every argument exactly once.

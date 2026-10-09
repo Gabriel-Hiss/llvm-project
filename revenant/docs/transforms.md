@@ -205,23 +205,39 @@ not evidence used by structural matching. New calls preserve instruction
 metadata and VA provenance. Structural matching rejects opaque instructions
 and region annotations rather than discarding them during normalization.
 
-Measured with the standalone plugin and `revenant-unipo,verify` on stripped
-raw lifted modules:
+Measured with the standalone plugin and `revenant-unipo,verify` on fresh
+normalized GCC lifts:
 
-| Target | Definitions | Oracle `.constprop`/`.isra` entries | Clone merges | Clone signature restorations | All extended signatures |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| c-gcc-o2 | 151 | 0 | 0 | 0 | 8 |
-| c-gcc-o3 | 151 | 0 | 0 | 0 | 6 |
-| cpp-gcc-o2 | 916 | 9 | 0 | 0 | 5 |
-| cpp-gcc-o3 | 916 | 9 | 0 | 0 | 5 |
-| c-clang-o2lto | 3401 | 0 | 0 | 0 | 0 |
+| Target | Oracle clone entries | Recovered / 9 | Named clone entries merged/restored | Cold partitions |
+| --- | ---: | ---: | --- | --- |
+| cpp-gcc-o2 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
+| cpp-gcc-o3 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
 
-Oracle instruction owners were grouped by symbol and their first RVA mapped
-to lifted `sub_<image-base+RVA>` definitions for scoring only. All nine GCC C++
-entries were present, including two `.cold` partitions. None met the structural
-or unanimous extra-register evidence requirements. These are missed cases,
-not successful IPO inversions. Extended non-oracle signatures demonstrate the
-ABI evidence rule, not recovery of an oracle-proven specialization.
+The pool constprop clones regain their folded pool-object formal by rebinding
+the equivalent internal constant global. Their remaining arguments stay
+site-specific, so callers retain distinct allocation sizes rather than
+requiring a unanimous constant. The `_S_construct.isra` pair folds only when
+the body match proves equivalent initialized string data and equivalent
+trap-only `sub_0x` callees; pooled data is treated as equal only when constant
+initializers match and its address is not compared. Four named entries remain:
+`_M_construct.isra` at VA `0x14001bca0` (O2) / `0x14001bf40` (O3), whose body
+CFG/opcode shapes differ from unspecialized `_M_construct` at `0x14001bbf0` /
+`0x14001be90`; `d_demangle_callback.constprop` at `0x14000aa20` / `0x14000ac30`
+(no equivalent general body survived; its two callers pass different callback
+values); `next_is_type_qual.isra` at `0x140002430` / `0x140002640` (no matching
+general body/call evidence); and `is_designated_init.part.0.isra` at
+`0x1400023f0` / `0x140002600` (an outlined `.part.0` region, intentionally
+excluded). The outlined `.part.0` owners `d_encoding` and
+`d_index_template_argument` are likewise left intact. No oracle/PDB data is
+consulted by the pass.
+
+On fresh normalized `c-clang-o2lto` IR, the statically linked
+`revenant-opt -passes=revenant-unipo,verify` run succeeds: definitions change
+from 3,401 to 3,358 (43 duplicate bodies folded), with 260 surviving
+definitions changing return or parameter types. This is not a GCC named-clone
+oracle corpus, so it is reported separately, not added to the 9-entry GCC
+recovery score. The earlier plugin-DLL run failed because of cross-LLVMContext
+constant/attribute state; the static run avoids that plugin boundary.
 
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`

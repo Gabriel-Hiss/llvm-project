@@ -21,8 +21,10 @@ exit:
   ret void
 }
 
+; CHECK-LABEL: define{{.*}}void @copy_vec
 ; CHECK-NOT: load i128
 ; CHECK-NOT: store i128
 ; CHECK-COUNT-2: load i64
+; CHECK-NOT: store i128
 ; CHECK-COUNT-2: store i64
 ; CHECK: ret void
