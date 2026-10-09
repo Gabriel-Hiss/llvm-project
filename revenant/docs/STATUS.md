@@ -13,8 +13,8 @@ integrator after each merge loop.
 | IR contract | RevenantIR, revenant-ir-verify | builds |
 | Structure | RevenantStructure, rv-structure-tool | builds |
 | Target/X86 | RevenantTargetX86 | builds |
-| Transforms | SsaOut, Unrotate (plugin DLLs), Devectorize, TypeRecovery (static libs) | builds; Devectorize lit test needs the standalone plugin or revenant-opt |
-| Frontend clang | RevenantClangCore, revenant-clang | builds |
+| Transforms | SsaOut, Unrotate, Devectorize, TypeRecovery | prior integrated build passed; current full build fails compiling untracked Unswitch checkout changes |
+| Frontend clang | RevenantClangCore, revenant-clang | prior integrated build passed; current full build fails compiling new Expr slice |
 | Driver | tools/revenant | builds |
 
 ## Tests
@@ -30,6 +30,12 @@ integrator after each merge loop.
 | test/Transforms/Unrotate + SsaOut (opt plugin) | 12/12 pass |
 | test/Transforms/Devectorize, TypeRecovery | not runnable: no revenant-opt / plugin DLL in superbuild — owner: MuseTxPipeline |
 | revenant-clang on ir-contract modules | 3/10 emit (for, if-else, while); crashes on call-import, cpp-method, leaf-locals, opaque-asm, rust-result, struct-di, switch — owners: Swe2ClangCore/MuseClangCpp; emitted .c fails clang-cl /c (undeclared v0/v2/v3 temporaries, missing labels) |
+
+## Latest integration loop
+
+- Merged new commits from MuseLiftSse, MuseNoreturn, MuseClangExpr, and RvSkeleton into `revenant`. The analysis CMake merge retains both Padding and Noreturn sources and tests; unit-test registration retains Compiler and ClangFrontend.
+- `rv-int-build.cmd` reconfigured `build-rv` against the existing `build-revenant`, then failed compiling `ExprCore.cpp` (`ExprBuilderImpl::inverted` missing; `functionDecl` called with a lambda instead of `TypeBuilder&`) and the pre-existing untracked Unswitch source (LLVM API incompatibilities). Expr owner was notified. MuseTxPipeline confirmed Unswitch is not its work and exists only as untracked changes in the integration checkout; its owner is unknown.
+- `ctest --test-dir build-rv --output-on-failure` found no tests. The build stopped before linking the current gtest executables or completing tool targets, so integration tests were not rerun this loop.
 
 ## Integration fixes applied (on revenant, not slice branches)
 
