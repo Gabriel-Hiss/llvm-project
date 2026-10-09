@@ -86,6 +86,22 @@ Value *X86LiftContext::aesOp(StringRef Kind, Value *A, Value *Bv,
       B.CreateIntrinsic(x86Intrinsic(N), ArrayRef<Type *>(), {X, Y}), W);
 }
 
+Value *X86LiftContext::crc32Op(Value *Acc, Value *Data, unsigned AccBits,
+                               unsigned DataBits) {
+  StringRef Name = AccBits == 64
+                       ? "x86.sse42.crc32.64.64"
+                       : DataBits == 8   ? "x86.sse42.crc32.32.8"
+                         : DataBits == 16 ? "x86.sse42.crc32.32.16"
+                         : DataBits == 32 ? "x86.sse42.crc32.32.32"
+                                          : "";
+  if (Name.empty())
+    return PoisonValue::get(iN(AccBits));
+  Function *Crc = Intrinsic::getOrInsertDeclaration(&module(),
+                                                   x86Intrinsic(Name));
+  return B.CreateCall(
+      Crc, {vcast(Acc, iN(AccBits)), vcast(Data, iN(DataBits))});
+}
+
 Value *X86LiftContext::pclmulOp(Value *A, Value *Bv, int64_t Imm) {
   unsigned W = A->getType()->getPrimitiveSizeInBits();
   Type *QVT = vecTy(iN(64), W / 64);
@@ -163,6 +179,24 @@ Value *X86LiftContext::fmaScalar(StringRef Kind, unsigned Form,
   return B.CreateBitCast(B.CreateInsertElement(Vec, R, uint64_t(0)), iN(W));
 }
 
+Value *X86LiftContext::fmaAddSubOp(Value *A, Value *Bv, Value *C, unsigned W,
+                                   unsigned EltBits, bool Invert) {
+  Type *FT = EltBits == 64 ? static_cast<Type *>(Type::getDoubleTy(Ctx))
+                           : static_cast<Type *>(Type::getFloatTy(Ctx));
+  Type *VT = vecTy(FT, W / EltBits);
+  Value *X = vcast(A, VT), *Y = vcast(Bv, VT), *Z = vcast(C, VT);
+  if (Invert)
+    Z = B.CreateFNeg(Z);
+  StringRef Name = EltBits == 64
+                       ? W == 256 ? "x86.fma.vfmaddsub.pd.256"
+                                  : "x86.fma.vfmaddsub.pd"
+                       : W == 256 ? "x86.fma.vfmaddsub.ps.256"
+                                  : "x86.fma.vfmaddsub.ps";
+  Function *Fn = Intrinsic::getOrInsertDeclaration(&module(),
+                                                   x86Intrinsic(Name));
+  return toInt(B.CreateCall(Fn, {X, Y, Z}), W);
+}
+
 // ---- scalar compare ---------------------------------------------------------------
 
 Value *X86LiftContext::cmpScalar(bool IsSD, Value *Merge, Value *A,
@@ -197,13 +231,16 @@ void X86LiftContext::pcmpXstrOp(StringRef Kind, Value *A, Value *Bv,
   if (Explicit) {
     Value *La = toInt(regRead(X86::EAX, iN(32)), 32);
     Value *Lb = toInt(regRead(X86::EDX, iN(32)), 32);
-    Res2 = B.CreateIntrinsic(x86Intrinsic("x86.sse42.pcmpestrm128"), {BVT},
-                             {X, La, Y, Lb, constI(Imm, 8)});
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &module(), x86Intrinsic("x86.sse42.pcmpestrm128"));
+    Res2 = B.CreateCall(Fn, {X, La, Y, Lb, constI(Imm, 8)});
   } else {
-    Res2 = B.CreateIntrinsic(x86Intrinsic("x86.sse42.pcmpistrm128"), {BVT},
-                             {X, Y, constI(Imm, 8)});
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &module(), x86Intrinsic("x86.sse42.pcmpistrm128"));
+    Res2 = B.CreateCall(Fn, {X, Y, constI(Imm, 8)});
   }
-  Value *Bits = B.CreateBitCast(Res2, iN(16));
+  Value *MaskInt = B.CreateBitCast(Res2, iN(128));
+  Value *Bits = B.CreateTrunc(MaskInt, iN(16));
   Value *Zero16 = constI(0, 16);
   flagWrite(CF, B.CreateICmpNE(Bits, Zero16));
   flagWrite(OF, B.CreateTrunc(Bits, iN(1)));
@@ -239,15 +276,11 @@ void X86LiftContext::pcmpXstrOp(StringRef Kind, Value *A, Value *Bv,
     regWrite(X86::ECX, B.CreateZExt(Ix, iN(32)));
   } else {
     flagWrite(PF, parityOf(Bits));
-    // xmm0 <- expanded IntRes2: 0xFF/0x00 per bit (byte/word mask) or the
-    // i16 bit index result for bit-mask mode (imm[4]).
-    if (Imm & 0x40) {
-      // Bit-mask mode: the raw IntRes2 in the low i16.
+    // Imm[6] selects the unit-mask form. Otherwise return the low-bit mask.
+    if (Imm & 0x40)
+      regWrite(X86::XMM0, Res2);
+    else
       regWrite(X86::XMM0, B.CreateZExt(Bits, iN(128)));
-    } else {
-      Value *E = B.CreateSExt(B.CreateBitCast(Res2, vecTy(iN(1), 16)), BVT);
-      regWrite(X86::XMM0, B.CreateBitCast(E, iN(128)));
-    }
   }
 }
 

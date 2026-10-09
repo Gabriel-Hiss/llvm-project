@@ -436,3 +436,13 @@ def : RVMatch {
   string Glob = "VFNMSUB231*";
   dag Body = (rv_setz $dst, (rv_fma "nmsub231", $src1, $src2, $src3));
 }
+
+foreach Op = ["VFMADDSUB132", "VFMADDSUB213", "VFMADDSUB231",
+              "VFMSUBADD132", "VFMSUBADD213", "VFMSUBADD231"] in
+  foreach Ty = ["PS", "PD"] in
+    foreach Suffix = ["r", "m", "Yr", "Ym"] in
+      def : RVMatch {
+        string Glob = Op # Ty # Suffix;
+        dag Body = (rv_setz $dst,
+                    (rv_fmaaddsub Op, $src1, $src2, $src3));
+      }

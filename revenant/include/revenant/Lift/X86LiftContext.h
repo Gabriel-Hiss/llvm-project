@@ -182,6 +182,10 @@ public:
   /// AES-NI: Kind enc|enclast|dec|declast|imc|keygen. Imm is the round
   /// constant for keygen. Bv may be null for imc.
   Value *aesOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  Value *crc32Op(Value *Acc, Value *Data, unsigned AccBits,
+                 unsigned DataBits);
+  Value *fmaAddSubOp(Value *A, Value *Bv, Value *C, unsigned W,
+                     unsigned EltBits, bool Invert);
   /// PCLMULQDQ at 128/256/512: Imm picks the qword pair.
   Value *pclmulOp(Value *A, Value *Bv, int64_t Imm);
   /// SHA-1: Kind rnds4|nexte|msg1|msg2. Imm is the round selector for rnds4.
@@ -240,6 +244,7 @@ public:
 
   // ---- atomics ---------------------------------------------------------------
   Value *atomicRMW(StringRef Name, Value *Addr, Value *Val);
+  Value *atomicNeg(Value *Addr, unsigned W);
   void emitFence();
   /// `int imm8`: a call to llvm.x86.int (the fork carries the intrinsic;
   /// 0x29 is __fastfail, 0x2c is __int2c, 3 is __debugbreak in C terms).

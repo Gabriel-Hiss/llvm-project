@@ -832,6 +832,28 @@ class RevenantLiftEmitter {
           return "LC.lahfVal()";
       }
 
+      if (Name == "rv_crc32" && D->getNumArgs() == 2) {
+        std::string A =
+            expression(D->getArg(0), Inst, Width, D->getArgNameStr(0));
+        std::string B =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        if (A.empty() || B.empty())
+          return {};
+        StringRef Opcode = Inst.TheDef->getName();
+        size_t Suffix = Opcode.find('_');
+        if (Suffix != StringRef::npos)
+          Opcode = Opcode.take_front(Suffix);
+        unsigned DataBits = Opcode.ends_with("r8") || Opcode.ends_with("m8")
+                                ? 8
+                            : Opcode.ends_with("r16") || Opcode.ends_with("m16")
+                                ? 16
+                            : Opcode.ends_with("r32") || Opcode.ends_with("m32")
+                                ? 32
+                                : 64;
+        return (Twine("LC.crc32Op(") + A + ", " + B + ", " +
+                Twine(Width) + ", " + Twine(DataBits) + ")")
+            .str();
+      }
       if ((Name == "rv_aes" || Name == "rv_pclmul") &&
           D->getNumArgs() == 4) {
         const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
@@ -889,6 +911,37 @@ class RevenantLiftEmitter {
                 (NegProduct ? "true" : "false") + ", " +
                 (NegAddend ? "true" : "false") + ", " +
                 Twine(EltBits) + ", " + (Scalar ? "true" : "false") + ")")
+            .str();
+      }
+      if (Name == "rv_fmaaddsub" && D->getNumArgs() == 4) {
+        if (Width != 128 && Width != 256)
+          return {};
+        const auto *Mode = dyn_cast<StringInit>(D->getArg(0));
+        if (!Mode)
+          return {};
+        std::string A =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        std::string B =
+            expression(D->getArg(2), Inst, Width, D->getArgNameStr(2));
+        std::string C =
+            expression(D->getArg(3), Inst, Width, D->getArgNameStr(3));
+        if (A.empty() || B.empty() || C.empty())
+          return {};
+        StringRef Form = Mode->getValue();
+        if (Form.ends_with("132") || Form.ends_with("213"))
+          std::swap(B, C);
+        else if (Form.ends_with("231")) {
+          std::string First = B;
+          B = C;
+          C = A;
+          A = std::move(First);
+        }
+        unsigned EltBits =
+            StringRef(Inst.TheDef->getName()).contains("PD") ? 64 : 32;
+        bool Invert = Form.starts_with("VFMSUBADD");
+        return (Twine("LC.fmaAddSubOp(") + A + ", " + B + ", " + C + ", " +
+                Twine(Width) + ", " + Twine(EltBits) + ", " +
+                (Invert ? "true" : "false") + ")")
             .str();
       }
       if (Name == "rv_icmp" && D->getNumArgs() == 3) {
@@ -1887,10 +1940,6 @@ class RevenantLiftEmitter {
       if (!OpName || !Mem || Src.empty())
         return false;
       StringRef OpText = OpName->getValue();
-      if (OpText == "neg") {
-        OS << "    if (LC.hasLock()) { LC.emitOpaque(MI, \""
-           << Inst.TheDef->getName() << "\"); return true; }\n";
-      }
       OS << "    Value *RMWAddr = LC.memAddr(MI, " << *Mem << ");\n";
       OS << "    Value *RMWValue = " << Src << ";\n"
             "    Value *RMWFlagSrc = RMWValue;\n";
@@ -1902,13 +1951,19 @@ class RevenantLiftEmitter {
         OS << "    RMWValue = LC.builder().CreateAdd(RMWValue, "
               "LC.builder().CreateZExt(LC.flagRead(X86LiftContext::CF), "
            << "LC.iN(" << Width << ")));\n";
-      OS << "    Value *RMWOld = LC.hasLock() ? LC.atomicRMW(\""
-         << (OpText == "inc" ? "add" : OpText == "dec" ? "sub"
-               : OpText == "adc" ? "add" : OpText == "sbb" ? "sub"
-               : OpText == "not" ? "xor" : OpText)
-         << "\", RMWAddr, RMWValue) : "
-            "LC.memReadAddr(RMWAddr, LC.iN("
-         << Width << "));\n";
+      if (OpText == "neg") {
+        OS << "    Value *RMWOld = LC.hasLock() ? LC.atomicNeg(RMWAddr, "
+           << Width
+           << ") : LC.memReadAddr(RMWAddr, LC.iN(" << Width << "));\n";
+      } else {
+        OS << "    Value *RMWOld = LC.hasLock() ? LC.atomicRMW(\""
+           << (OpText == "inc" ? "add" : OpText == "dec" ? "sub"
+                 : OpText == "adc" ? "add" : OpText == "sbb" ? "sub"
+                 : OpText == "not" ? "xor" : OpText)
+           << "\", RMWAddr, RMWValue) : "
+              "LC.memReadAddr(RMWAddr, LC.iN("
+           << Width << "));\n";
+      }
       std::string Result = rmwResult(OpText, "RMWOld", "RMWFlagSrc");
       if (Result.empty())
         return false;
@@ -2009,6 +2064,30 @@ class RevenantLiftEmitter {
       if (Addr.empty() || Value.empty())
         return false;
       OS << "    LC.memWriteAddr(" << Addr << ", " << Value << ");\n";
+      return true;
+    }
+    if ((Name == "rv_pcmpextest" || Name == "rv_pcmpistest") &&
+        Body.getNumArgs() == 4) {
+      const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
+      std::string A = expression(Body.getArg(1), Inst, 128,
+                                 Body.getArgNameStr(1));
+      std::string B = expression(Body.getArg(2), Inst, 128,
+                                 Body.getArgNameStr(2));
+      const auto *ImmOp = dyn_cast<DagInit>(Body.getArg(3));
+      const auto *ImmIndex =
+          ImmOp && ImmOp->getNumArgs() == 1
+              ? dyn_cast<IntInit>(ImmOp->getArg(0))
+              : nullptr;
+      std::string Imm;
+      if (ImmOp && opOf(*ImmOp) &&
+          opOf(*ImmOp)->getName() == "rv_op" && ImmIndex) {
+        unsigned N = inputOperandNo(Inst, ImmIndex->getValue());
+        Imm = (Twine("MI.getOperand(") + Twine(N) + ").getImm()").str();
+      }
+      if (!Kind || A.empty() || B.empty() || Imm.empty())
+        return false;
+      OS << "    LC.pcmpXstrOp(\"" << Kind->getValue() << "\", " << A << ", "
+         << B << ", " << Imm << ");\n";
       return true;
     }
     if (Name == "rv_mxcsr" && Body.getNumArgs() == 2) {

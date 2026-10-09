@@ -840,3 +840,9 @@ foreach Op = ["PCLMULQDQrri", "VPCLMULQDQrri", "VPCLMULQDQYrri",
     dag Body = (rv_setz $dst, (rv_pclmul "clmul", $src1, $src2, $src3));
   }
 
+def : RVMatch {
+  string Glob = "CRC32*";
+  dag Body = (rv_set $dst, (rv_crc32 $src1, $src2));
+}
+
+

@@ -416,6 +416,14 @@ std::vector<Case> cases() {
               .xmm(1, 0x4010000000000000ull, 0x2233)
               .xmm(2, 0x4000000000000000ull, 0x3344));
     }
+  add(Case("vfmaddsub packed", "vfmaddsub132ps xmm0, xmm1, xmm2")
+          .xmm(0, 0x400000003f800000ull, 0x4080000040400000ull)
+          .xmm(1, 0x4000000040000000ull, 0x4000000040000000ull)
+          .xmm(2, 0x3f8000003f800000ull, 0x3f8000003f800000ull));
+  add(Case("vfmsubadd packed", "vfmsubadd231pd xmm0, xmm1, xmm2")
+          .xmm(0, 0x4000000000000000ull, 0x4010000000000000ull)
+          .xmm(1, 0x3ff0000000000000ull, 0x4000000000000000ull)
+          .xmm(2, 0x3ff0000000000000ull, 0x3ff0000000000000ull));
   add(Case("vcvtsd2ss m64", "vcvtsd2ss xmm0, xmm1, qword ptr [rsp+0x20]")
           .stack({0x4014000000000000ull})
           .xmm(0, 0, 0)
@@ -428,6 +436,32 @@ std::vector<Case> cases() {
   add(Case("pclmulqdq", "pclmulqdq xmm0, xmm1, 0x11")
           .xmm(0, 0x0123456789abcdefull, 0xfedcba9876543210ull)
           .xmm(1, 0x1111222233334444ull, 0xaaaabbbbccccddddull));
+  add(Case("crc32 register", "crc32 eax, ecx")
+          .r("rax", 0x12345678).r("rcx", 0xdeadbeef).flags(AllFlags));
+  add(Case("pcmpistri equal any", "pcmpistri xmm0, xmm1, 0x00")
+          .xmm(0, 0x00000000636261ull, 0)
+          .xmm(1, 0x00000000636261ull, 0).flags(AllFlags));
+  add(Case("pcmpestri equal any", "pcmpestri xmm0, xmm1, 0x00")
+          .r("rax", 3).r("rdx", 3)
+          .xmm(0, 0x00000000636261ull, 0)
+          .xmm(1, 0x00000000636261ull, 0).flags(AllFlags));
+  add(Case("pcmpestrm memory", "pcmpestrm xmm0, xmmword ptr [rsp+0x20], 0x00")
+          .r("rax", 3).r("rdx", 3)
+          .stack({0x00000000636261ull, 0})
+          .xmm(0, 0x00000000636261ull, 0).flags(AllFlags));
+  add(Case("stmxcsr", "stmxcsr dword ptr [rsp+0x20]")
+          .stack({0}).flags(AllFlags));
+  add(Case("ldmxcsr", "ldmxcsr dword ptr [rsp+0x20]")
+          .stack({0x1f80}).flags(AllFlags));
+  add(Case("locked neg m64", "lock neg qword ptr [rsp+0x20]")
+          .stack({0x123456789abcdef0ull}).flags(AllFlags));
+  add(Case("x87 square root long form",
+           "fld qword ptr [rsp+0x20]\n"
+           "fsqrt\n"
+           "fstp qword ptr [rsp+0x28]")
+          .stack({0x4010000000000000ull, 0}));
+  add(Case("rdrand non-destination state", "rdrand eax").skip("rax"));
+  add(Case("rdseed non-destination state", "rdseed ecx").skip("rcx"));
   return V;
 }
 

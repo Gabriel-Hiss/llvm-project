@@ -1,6 +1,7 @@
 //===- X86LiftContext.cpp - x86-64 lift state -----------------------------===//
 
 #include "revenant/Lift/X86LiftContext.h"
+#include "revenant/IR/Contract.h"
 #include "X86MCTargetDesc.h"
 #include "X86BaseInfo.h"
 #include "llvm/ADT/APFloat.h"
@@ -1360,6 +1361,42 @@ Value *X86LiftContext::atomicRMW(StringRef Name, Value *Addr, Value *Val) {
   return B.CreateAtomicRMW(Op, B.CreateIntToPtr(Addr, ptrTy()), Val,
                            MaybeAlign(),
                            AtomicOrdering::SequentiallyConsistent);
+}
+
+Value *X86LiftContext::atomicNeg(Value *Addr, unsigned W) {
+  Type *Ty = iN(W);
+  FunctionType *FT = FunctionType::get(Ty, {ptrTy()}, false);
+  std::string Name = (Twine("__revenant_atomic_neg_i") + Twine(W)).str();
+  Function *Helper = module().getFunction(Name);
+  if (!Helper) {
+    Helper = Function::Create(FT, Function::InternalLinkage, Name, module());
+    Value *Ptr = Helper->getArg(0);
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Helper);
+    BasicBlock *Loop = BasicBlock::Create(Ctx, "retry", Helper);
+    BasicBlock *Done = BasicBlock::Create(Ctx, "done", Helper);
+    IRBuilder<> HB(Entry);
+    HB.CreateBr(Loop);
+    HB.SetInsertPoint(Loop);
+    auto *Old = HB.CreateLoad(Ty, Ptr);
+    Old->setAtomic(AtomicOrdering::SequentiallyConsistent);
+    Value *New = HB.CreateNeg(Old);
+    auto *Pair = HB.CreateAtomicCmpXchg(
+        Ptr, Old, New, MaybeAlign(), AtomicOrdering::SequentiallyConsistent,
+        AtomicOrdering::SequentiallyConsistent);
+    Value *Succeeded = HB.CreateExtractValue(Pair, 1);
+    HB.CreateCondBr(Succeeded, Done, Loop);
+    HB.SetInsertPoint(Done);
+    auto *Result = HB.CreatePHI(Ty, 1);
+    Result->addIncoming(Old, Loop);
+    HB.CreateRet(Result);
+    for (BasicBlock &BB : *Helper)
+      for (Instruction &I : BB)
+        ::revenant::ir::setInstructionVA(I, curVA());
+  }
+  CallInst *Call = B.CreateCall(Helper, {B.CreateIntToPtr(Addr, ptrTy())});
+  Helper->setCallingConv(CallingConv::Win64);
+  Call->setCallingConv(CallingConv::Win64);
+  return Call;
 }
 
 void X86LiftContext::emitFence() {
