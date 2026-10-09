@@ -371,6 +371,97 @@ std::vector<Case> cases() {
   add(Case("cvttsd2si", "cvttsd2si eax, xmm0").xmm(0, 0x4014000000000000ull, 0));
   add(Case("comisd", "comisd xmm0, xmm1").xmm(0, 0x3ff0000000000000ull, 0)
           .xmm(1, 0x4000000000000000ull, 0).flags(CF | ZF | PF));
+  // Conversion memory forms: the scalar cell loads at its natural width,
+  // then the register form's semantics apply. Overflow/NaN produce the
+  // x86 indefinite 0x8000..0, which fptosi in the JIT reproduces.
+  add(Case("cvtsi2sd m64", "cvtsi2sd xmm0, qword ptr [rsp+0x20]")
+          .stack({0xfffffffffffffff0ull}).xmm(0, 0, 0));
+  add(Case("cvtsi2ss m32 neg", "cvtsi2ss xmm0, dword ptr [rsp+0x20]")
+          .stack({0xaaaaaaaafffffffeull}).xmm(0, 0, 0));
+  add(Case("cvttsd2si m64", "cvttsd2si eax, qword ptr [rsp+0x20]")
+          .stack({0x4014000000000000ull}));
+  add(Case("cvttsd2si m64 inf", "cvttsd2si eax, qword ptr [rsp+0x20]")
+          .stack({0x7ff0000000000000ull}));
+  add(Case("cvttsd2si m64 nan", "cvttsd2si rax, qword ptr [rsp+0x20]")
+          .stack({0x7ff8000000000001ull}));
+  add(Case("cvttss2si m32", "cvttss2si ecx, dword ptr [rsp+0x20]")
+          .stack({0xbbbbbbbb40a00000ull}));
+  add(Case("cvtsd2si64 m64", "cvtsd2si rax, qword ptr [rsp+0x20]")
+          .stack({0x4014000000000000ull}));
+  add(Case("cvtsi642sd m64", "cvtsi2sd xmm0, qword ptr [rsp+0x20]")
+          .stack({0xffffffffffffff9cull}).xmm(0, 0x7777, 0x8888));
+  add(Case("vcvtsi2sd m64", "vcvtsi2sd xmm0, xmm1, qword ptr [rsp+0x20]")
+          .stack({0xffffffffffffff9cull})
+          .xmm(0, 0, 0)
+          .xmm(1, 0x1111, 0x2222));
+  add(Case("vcvtsi642ss m64", "vcvtsi2ss xmm0, xmm1, qword ptr [rsp+0x20]")
+          .stack({0x0000000100000001ull})
+          .xmm(0, 0, 0)
+          .xmm(1, 0x1111, 0x2222));
+  add(Case("vcvttsd2si m64", "vcvttsd2si eax, qword ptr [rsp+0x20]")
+          .stack({0x4014000000000000ull}));
+  add(Case("vcvttss2si64 m32", "vcvttss2si rax, dword ptr [rsp+0x20]")
+          .stack({0xbbbbbbbbbf800000ull}));
+  add(Case("vcvtsd2si m64", "vcvtsd2si ecx, qword ptr [rsp+0x20]")
+          .stack({0x4014000000000000ull}));
+  add(Case("vcvtss2sd m32", "vcvtss2sd xmm0, xmm1, dword ptr [rsp+0x20]")
+          .stack({0xcccccccc40a00000ull})
+          .xmm(0, 0, 0)
+          .xmm(1, 0x1111, 0x2222));
+  for (const char *Prefix : {"vfmadd", "vfmsub", "vfnmadd", "vfnmsub"})
+    for (const char *Form : {"132sd", "213sd", "231sd"}) {
+      std::string Op = std::string(Prefix) + Form;
+      add(Case(Op, Op + " xmm0, xmm1, xmm2")
+              .xmm(0, 0x4008000000000000ull, 0x1122)
+              .xmm(1, 0x4010000000000000ull, 0x2233)
+              .xmm(2, 0x4000000000000000ull, 0x3344));
+    }
+  add(Case("vfmaddsub packed", "vfmaddsub132ps xmm0, xmm1, xmm2")
+          .xmm(0, 0x400000003f800000ull, 0x4080000040400000ull)
+          .xmm(1, 0x4000000040000000ull, 0x4000000040000000ull)
+          .xmm(2, 0x3f8000003f800000ull, 0x3f8000003f800000ull));
+  add(Case("vfmsubadd packed", "vfmsubadd231pd xmm0, xmm1, xmm2")
+          .xmm(0, 0x4000000000000000ull, 0x4010000000000000ull)
+          .xmm(1, 0x3ff0000000000000ull, 0x4000000000000000ull)
+          .xmm(2, 0x3ff0000000000000ull, 0x3ff0000000000000ull));
+  add(Case("vcvtsd2ss m64", "vcvtsd2ss xmm0, xmm1, qword ptr [rsp+0x20]")
+          .stack({0x4014000000000000ull})
+          .xmm(0, 0, 0)
+          .xmm(1, 0x1111, 0x2222));
+  add(Case("aesenc", "aesenc xmm0, xmm1")
+          .xmm(0, 0x0011223344556677ull, 0x8899aabbccddeeffull)
+          .xmm(1, 0x0f1e2d3c4b5a6978ull, 0x8796a5b4c3d2e1f0ull));
+  add(Case("aeskeygenassist", "aeskeygenassist xmm0, xmm1, 0x1b")
+          .xmm(1, 0x0011223344556677ull, 0x8899aabbccddeeffull));
+  add(Case("pclmulqdq", "pclmulqdq xmm0, xmm1, 0x11")
+          .xmm(0, 0x0123456789abcdefull, 0xfedcba9876543210ull)
+          .xmm(1, 0x1111222233334444ull, 0xaaaabbbbccccddddull));
+  add(Case("crc32 register", "crc32 eax, ecx")
+          .r("rax", 0x12345678).r("rcx", 0xdeadbeef).flags(AllFlags));
+  add(Case("pcmpistri equal any", "pcmpistri xmm0, xmm1, 0x00")
+          .xmm(0, 0x00000000636261ull, 0)
+          .xmm(1, 0x00000000636261ull, 0).flags(AllFlags));
+  add(Case("pcmpestri equal any", "pcmpestri xmm0, xmm1, 0x00")
+          .r("rax", 3).r("rdx", 3)
+          .xmm(0, 0x00000000636261ull, 0)
+          .xmm(1, 0x00000000636261ull, 0).flags(AllFlags));
+  add(Case("pcmpestrm memory", "pcmpestrm xmm0, xmmword ptr [rsp+0x20], 0x00")
+          .r("rax", 3).r("rdx", 3)
+          .stack({0x00000000636261ull, 0})
+          .xmm(0, 0x00000000636261ull, 0).flags(AllFlags));
+  add(Case("stmxcsr", "stmxcsr dword ptr [rsp+0x20]")
+          .stack({0}).flags(AllFlags));
+  add(Case("ldmxcsr", "ldmxcsr dword ptr [rsp+0x20]")
+          .stack({0x1f80}).flags(AllFlags));
+  add(Case("locked neg m64", "lock neg qword ptr [rsp+0x20]")
+          .stack({0x123456789abcdef0ull}).flags(AllFlags));
+  add(Case("x87 square root long form",
+           "fld qword ptr [rsp+0x20]\n"
+           "fsqrt\n"
+           "fstp qword ptr [rsp+0x28]")
+          .stack({0x4010000000000000ull, 0}));
+  add(Case("rdrand non-destination state", "rdrand eax").skip("rax"));
+  add(Case("rdseed non-destination state", "rdseed ecx").skip("rcx"));
   return V;
 }
 

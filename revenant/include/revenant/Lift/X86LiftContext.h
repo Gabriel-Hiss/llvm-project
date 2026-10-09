@@ -130,6 +130,9 @@ public:
   /// packed shifts. Imm is -1 when unused. Returns nullptr for void ops.
   Value *vop(StringRef Name, Value *A, Value *Bv = nullptr,
              int64_t Imm = -1);
+  /// FMA3 arithmetic, preserving scalar upper lanes and vector element widths.
+  Value *fmaOp(Value *A, Value *Bv, Value *C, Value *Merge,
+               bool NegProduct, bool NegAddend, unsigned EltBits, bool Scalar);
   // ---- typed vectors (generated from the backend's vector patterns) --------
   Type *vecTy(Type *Elt, unsigned N);
   /// Bit-preserving conversion between any two integer, float and vector
@@ -170,6 +173,53 @@ public:
   /// hardware.
   void mulxOp(const MCInst &MI, unsigned DstHi, unsigned DstLo,
               unsigned Src, unsigned Width);
+  // ---- intrinsic-backed families --------------------------------------------
+  /// Masked vector load/store (VMASKMOV*, *MASKMOVDQU, gather-free forms).
+  /// Mask lanes selected by the sign bit of each EltBits element.
+  Value *maskLoad(Value *Mask, Value *AddrI64, unsigned W, unsigned EltBits);
+  void maskStore(Value *Mask, Value *V, Value *AddrI64, unsigned W,
+                 unsigned EltBits);
+  /// AES-NI: Kind enc|enclast|dec|declast|imc|keygen. Imm is the round
+  /// constant for keygen. Bv may be null for imc.
+  Value *aesOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  Value *crc32Op(Value *Acc, Value *Data, unsigned AccBits,
+                 unsigned DataBits);
+  Value *fmaAddSubOp(Value *A, Value *Bv, Value *C, unsigned W,
+                     unsigned EltBits, bool Invert);
+  /// PCLMULQDQ at 128/256/512: Imm picks the qword pair.
+  Value *pclmulOp(Value *A, Value *Bv, int64_t Imm);
+  /// SHA-1: Kind rnds4|nexte|msg1|msg2. Imm is the round selector for rnds4.
+  Value *sha1Op(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  /// SHA-256: Kind rnds2|msg1|msg2. rnds2 reads XMM0 implicitly.
+  Value *sha256Op(StringRef Kind, Value *A, Value *Bv);
+  /// Scalar FMA: Kind "sd"|"ss"; Form 132/213/231 chooses the multiplicand
+  /// and addend among the three operands, which arrive in operand order
+  /// (tied merge first). Upper lanes merge from operand 0.
+  Value *fmaScalar(StringRef Kind, unsigned Form, Value *MergeOrMul1,
+                   Value *Mul2OrAdd, Value *AddOrMul2, bool NegMul,
+                   bool NegAdd);
+  /// Scalar CMPSS/CMPSD: lane-0 predicate result merged into Merge's upper
+  /// lanes (VEX semantics; SSE merges too because the sources are tied).
+  Value *cmpScalar(bool IsSD, Value *Merge, Value *A, Value *Bv, int64_t Imm);
+  /// PCMPxSTRx string ops: Kind estri|estrm|istri|istrm. Writes ECX or XMM0
+  /// plus the full flag set. Imm is the u8 control operand.
+  void pcmpXstrOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
+  /// RCL/RCR through CF. Count masking and CF update per SDM; OF modeled for
+  /// count 1 and preserved otherwise.
+  Value *rotCarryOp(bool IsLeft, Value *V, Value *Count);
+  /// RDRAND/RDSEED: returns the random value and writes CF (success), other
+  /// flags cleared. Name "rdrand"|"rdseed", W = 16|32|64.
+  Value *rngOp(StringRef Name, unsigned W);
+  /// CPUID via inline asm; reads EAX/ECX, writes EAX..EDX.
+  void cpuidOp();
+  /// XGETBV (llvm.x86.xgetbv): EDX:EAX = XCR[ECX].
+  void xgetbvOp();
+  /// LDMXCSR/STMXCSR through llvm.x86.sse.ldmxcsr/stmxcsr.
+  void ldmxcsrOp(const MCInst &MI, unsigned MIOpNo);
+  void stmxcsrOp(const MCInst &MI, unsigned MIOpNo);
+  void pauseOp();
+  /// ENTER imm16, imm8: push rbp, copy nesting-level frame pointers, reserve.
+  void enterOp(uint64_t Frame, uint64_t Level);
   // ---- mul/div families ----------------------------------------------------
   /// Unsigned one-operand mul: rax*src -> rdx:rax, CF=OF=(high!=0).
   void mulPair(Value *Src, unsigned W, bool Signed);
@@ -194,7 +244,12 @@ public:
 
   // ---- atomics ---------------------------------------------------------------
   Value *atomicRMW(StringRef Name, Value *Addr, Value *Val);
+  Value *atomicNeg(Value *Addr, unsigned W);
   void emitFence();
+  /// `int imm8`: a call to llvm.x86.int (the fork carries the intrinsic;
+  /// 0x29 is __fastfail, 0x2c is __int2c, 3 is __debugbreak in C terms).
+  /// The 0x29 call site is noreturn; other vectors can return.
+  void intTrap(uint64_t Imm8);
 
   // ---- bulk memory -----------------------------------------------------------
   void memMove(Value *Dst, Value *Src, Value *Len);

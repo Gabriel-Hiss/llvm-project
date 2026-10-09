@@ -198,6 +198,61 @@ def : RVMatch {
   dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
     (rv_fptrunc (rv_floadf64 (rv_addr $src2)))));
 }
+def : RVMatch {
+  string Glob = "VCVTSI2SSrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_sitofpf32 (rv_load 32, (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VCVTSI642SSrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_sitofpf32 (rv_load 64, (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VCVTSI2SDrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_sitofpf64 (rv_load 32, (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VCVTSI642SDrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_sitofpf64 (rv_load 64, (rv_addr $src2)))));
+}
+// Memory-source float-to-int: the memory cell is the scalar element width,
+// so readOp loads the same bits the register lane carries and the register
+// body applies verbatim (0x80..0 indefinite on out-of-range/NaN).
+def : RVMatch {
+  string Glob = "VCVTTSS2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTTSS2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTTSD2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTTSD2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTSS2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTSS2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTSD2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "VCVTSD2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
+}
 
 // ---- VEX-128 scalar compares (flags only) ------------------------------------------
 def : RVMatch {
@@ -331,3 +386,63 @@ foreach M = ["VMOVDQU", "VMOVDQA", "VMOVAPS", "VMOVAPD", "VMOVUPS", "VMOVUPD"] i
 foreach M = ["VMOVNTDQ", "VMOVNTPS", "VMOVNTPD"] in
   foreach W = ["", "Y"] in
     def : RVMatch { string Glob = M # W # "mr"; dag Body = (rv_store (rv_addr $dst), (rv_op 1)); }
+
+// FMA3's three encodings permute the tied destination and source operands.
+def : RVMatch {
+  string Glob = "VFMADD213*";
+  dag Body = (rv_setz $dst, (rv_fma "madd", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFMSUB213*";
+  dag Body = (rv_setz $dst, (rv_fma "msub", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFNMADD213*";
+  dag Body = (rv_setz $dst, (rv_fma "nmadd", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFNMSUB213*";
+  dag Body = (rv_setz $dst, (rv_fma "nmsub", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFMADD132*";
+  dag Body = (rv_setz $dst, (rv_fma "madd132", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFMADD231*";
+  dag Body = (rv_setz $dst, (rv_fma "madd231", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFMSUB132*";
+  dag Body = (rv_setz $dst, (rv_fma "msub132", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFMSUB231*";
+  dag Body = (rv_setz $dst, (rv_fma "msub231", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFNMADD132*";
+  dag Body = (rv_setz $dst, (rv_fma "nmadd132", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFNMADD231*";
+  dag Body = (rv_setz $dst, (rv_fma "nmadd231", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFNMSUB132*";
+  dag Body = (rv_setz $dst, (rv_fma "nmsub132", $src1, $src2, $src3));
+}
+def : RVMatch {
+  string Glob = "VFNMSUB231*";
+  dag Body = (rv_setz $dst, (rv_fma "nmsub231", $src1, $src2, $src3));
+}
+
+foreach Op = ["VFMADDSUB132", "VFMADDSUB213", "VFMADDSUB231",
+              "VFMSUBADD132", "VFMSUBADD213", "VFMSUBADD231"] in
+  foreach Ty = ["PS", "PD"] in
+    foreach Suffix = ["r", "m", "Yr", "Ym"] in
+      def : RVMatch {
+        string Glob = Op # Ty # Suffix;
+        dag Body = (rv_setz $dst,
+                    (rv_fmaaddsub Op, $src1, $src2, $src3));
+      }

@@ -1,16 +1,26 @@
 # Corpus-weighted opaque lift gaps
 
-The census covers all 274 PE builds listed in `target/parity`. Across those builds, the static instruction counts sum to 66,461,721. Opaque fallback handles 537,456 instructions, or 0.81%. The other 65,924,265 instructions, or 99.19%, hit a generated DSL case or a supported direct-pattern case.
+This remeasurement covers the 199 PE artifacts (`.exe` and `.dll`) present
+under `target/parity/*/artifacts/`. The 274 target directories do not all have
+a PE artifact, so these figures are not directly comparable to the prior
+274-build census. The measured artifacts contain 41,466,153 decoded static
+instructions across 1,622 distinct opcodes; the counter reported 40,730
+decode failures.
 
-The CFG-aware function lifter handles control-flow instructions at block terminators, so the headline opaque rate excludes the control-flow opcode families listed at the end. The remaining non-control instructions total 52,255,347; 55,402 hit an opaque fallback (0.11%, down from the 2.84% baseline measured before the RMW-memory, shift-by-CL, BMI/BMI2 and XADD forms were lifted), and 52,199,945 use generated semantics (99.89%).
+The generated dispatcher marks 336,499 occurrences opaque (0.81%). Using the
+same mnemonic-prefix grouping for control flow as the previous census,
+8,960,412 instructions are control flow, including 305,583 opaque indirect
+branches/calls, traps and far returns. Excluding those instructions leaves
+32,505,741 non-control instructions, of which 30,916 are opaque (0.095%); the
+other 32,474,825 (99.905%) use a DSL or supported direct-pattern case.
 
-Control-flow opcodes excluded from the headline rate account for 14,206,374 static occurrences. The generated table now lifts direct branches, calls and returns (brOp/brccOp/callToOp/retOp); the remaining 482,054 control occurrences (indirect `JMP64r`/`CALL64r`/`CALL64m`, `TRAP`, `INT` and far returns) still dispatch through an opaque case when they occur outside a block terminator.
+The current `NEG8m`/`NEG16m`/`NEG32m`/`NEG64m` locked forms use an internal
+sequentially consistent compare-exchange loop. The differential suite checks
+the memory result and condition flags for locked 64-bit NEG.
 
-The census marks opcodes whose generated case starts with an opaque call. It cannot identify runtime-conditional opaque branches from per-opcode counts alone; the only conditional ones left are `NEG8m`/`NEG16m`/`NEG32m`/`NEG64m` (locked memory NEG), 898 static occurrences included in the opaque total above.
-
-These are weighted static instruction occurrences, not distinct opcodes. Several parity binaries share a filename, so the census tool's original per-filename CSVs overwrote each other. Duplicate-name PEs were re-censused into separate directories and aggregated with the rest.
-
-The table lists the 200 most common non-control opaque opcodes across the corpus. Family labels use mnemonic-prefix rules. Top-200 family entries: SSE/AVX 133, system 39, ALU/flags 10, other 11, x87 7. Distinct non-control opaque opcode names: 302 (down from ~798); occurrences below rank 200 total 204.
+The table below is the prior 274-build census, retained for historical
+comparison. Its opcode counts and family totals do not describe this
+remeasurement.
 
 | Family | Opcode | Static count |
 |---|---|---:|

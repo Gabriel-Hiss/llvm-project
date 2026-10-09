@@ -454,6 +454,43 @@ def : RVMatch {
   dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
 }
 
+// Memory-source forms of the float-to-int conversions: the memory cell is
+// exactly the scalar element width, so readOp loads the same bits the
+// register lane carries and the register body applies verbatim (x86
+// out-of-range/NaN results are the hardware's 0x80..0 indefinite).
+def : RVMatch {
+  string Glob = "CVTTSS2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTTSS2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTTSD2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTTSD2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSD2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSD2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSS2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSS2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+
 // ---- scalar float compares (flags only) --------------------------------------
 def : RVMatch {
   string Glob = "COMISSrr";
@@ -767,3 +804,45 @@ def : RVMatch {
   string Glob = "PCMPISTRMrri";
   dag Body = (rv_pcmpistest "istrm", (rv_op 0), (rv_op 1), (rv_op 2));
 }
+
+// AES and carry-less multiply are represented by the same target intrinsics
+// used by clang's x86 builtins.
+def : RVMatch {
+  string Glob = "AESENCrr*";
+  dag Body = (rv_set $dst, (rv_aes "enc", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESENCLASTrr*";
+  dag Body = (rv_set $dst, (rv_aes "enclast", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESDECrr*";
+  dag Body = (rv_set $dst, (rv_aes "dec", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESDECLASTrr*";
+  dag Body = (rv_set $dst, (rv_aes "declast", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESIMCrr";
+  dag Body = (rv_set $dst, (rv_aes "imc", $src1, (rv_imm 0), 0));
+}
+def : RVMatch {
+  string Glob = "AESKEYGENASSISTrri";
+  dag Body = (rv_set $dst,
+    (rv_aes "keygen", $src1, (rv_imm 0), $src2));
+}
+foreach Op = ["PCLMULQDQrri", "VPCLMULQDQrri", "VPCLMULQDQYrri",
+              "VPCLMULQDQZrri", "VPCLMULQDQZ128rri",
+              "VPCLMULQDQZ256rri"] in
+  def : RVMatch {
+    string Glob = Op;
+    dag Body = (rv_setz $dst, (rv_pclmul "clmul", $src1, $src2, $src3));
+  }
+
+def : RVMatch {
+  string Glob = "CRC32*";
+  dag Body = (rv_set $dst, (rv_crc32 $src1, $src2));
+}
+
+
