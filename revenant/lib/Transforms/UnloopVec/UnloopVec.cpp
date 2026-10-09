@@ -517,8 +517,18 @@ uint64_t matchScaledVecBound(Value *VecBound, Value *N, uint64_t ElemBytes,
 // n.vec is a multiple of 2^K below N, so the erased vector loop ran
 // whole steps and the tail restarted at 0 covers the full range.
 uint64_t matchVecBound(Value *VecBound, Value *N, uint64_t &StepOut) {
-  Value *RootN = stripCountDerivation(N, *cast<Instruction>(VecBound)->getParent()->getParent());
-  if (auto *And = dyn_cast<BinaryOperator>(VecBound)) {
+  const Function &F =
+      *cast<Instruction>(VecBound)->getParent()->getParent();
+  Value *RootN = stripCountDerivation(N, F);
+  Value *Shape = VecBound;
+  while (auto *Cast = dyn_cast<CastInst>(Shape)) {
+    if (Cast->getOpcode() != Instruction::ZExt &&
+        Cast->getOpcode() != Instruction::SExt &&
+        Cast->getOpcode() != Instruction::Trunc)
+      break;
+    Shape = Cast->getOperand(0);
+  }
+  if (auto *And = dyn_cast<BinaryOperator>(Shape)) {
     if (And->getOpcode() == Instruction::And) {
       if (auto *C = dyn_cast<ConstantInt>(And->getOperand(1))) {
         unsigned Width = C->getBitWidth();
