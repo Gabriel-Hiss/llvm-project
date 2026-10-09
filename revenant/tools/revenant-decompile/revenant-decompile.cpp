@@ -64,6 +64,7 @@ static std::optional<MetaMode> metaMode(StringRef S) {
       .Default(std::nullopt);
 }
 
+static cl::opt<std::string>
     LibraryDB("libdb",
               cl::desc("static-library database (default: libdb.json next to "
                        "the executable)"),
