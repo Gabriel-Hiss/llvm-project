@@ -218,9 +218,22 @@ Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
   llvm::FunctionType *FTy = I.getFunctionType();
   for (unsigned A = 0; A < I.arg_size(); ++A) {
     Expr *E = value(I.getArgOperand(A), Scope);
-    // Cast variadic extras and mismatched params to the declared type
-    // so the output compiles under clang-cl's checking.
-    (void)FTy;
+    if (A < FTy->getNumParams()) {
+      QualType Want = Types.typeOf(FTy->getParamType(A), nullptr);
+      QualType Have = E->getType();
+      if (Have != Want) {
+        if (Have->isPointerType() && Want->isPointerType())
+          E = makeCStyleCast(Want, CK_BitCast, E);
+        else if (Have->isPointerType() && Want->isIntegerType())
+          E = makeCStyleCast(Want, CK_PointerToIntegral, E);
+        else if (Have->isIntegerType() && Want->isPointerType())
+          E = makeCStyleCast(Want, CK_IntegralToPointer, E);
+        else if (Have->isIntegerType() && Want->isIntegerType())
+          E = makeCStyleCast(Want, CK_IntegralCast, E);
+        else if (Have->isFloatingType() && Want->isFloatingType())
+          E = makeCStyleCast(Want, CK_FloatingCast, E);
+      }
+    }
     Args.push_back(E);
   }
   clang::CallExpr *Call =
