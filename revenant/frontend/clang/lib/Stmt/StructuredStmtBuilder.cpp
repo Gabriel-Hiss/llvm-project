@@ -1220,7 +1220,7 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
   // For non-MSVC targets (gcc/MinGW), never emit SEH.
   bool IsSEH = false;
   if (Fn && Fn->hasPersonalityFn()) {
-    llvm::StringRef Triple = Fn->getParent()->getTargetTriple();
+    llvm::StringRef Triple = Fn->getParent()->getTargetTriple().str();
     if (Triple.contains("msvc")) {
       if (const auto *GV = dyn_cast<GlobalValue>(
               Fn->getPersonalityFn()->stripPointerCasts()))
