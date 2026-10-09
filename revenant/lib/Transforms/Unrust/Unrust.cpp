@@ -921,58 +921,61 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
 // loop header compares a phi against a length with `ult` but the
 // function holds no 16-byte iter frame, add one and seed it from the
 // loop's pointer/length. Dead until stored; cleanup removes it.
+//
+// Lifted IR materializes every local in one big frame alloca, so the
+// iter struct is already inside `%frame`: a function that still holds an
+// alloca keeps its frames and gets no dead duplicate. And a bare `ult`
+// compare (bounds checks, magic division, `n <= 1` base cases) is not a
+// range loop: the compare must test the induction phi, and the phi's
+// loop-carried update must be a constant step (Range::next). Functions
+// with no alloca at all (the compiler post shape, SROA'd) still fire.
 bool rebuildIterFrame(Function &F, unsigned &Changed) {
   bool HasIter = false;
-  bool HasUltLoop = false;
-  for (BasicBlock &BB : F) {
+  bool HasAlloca = false;
+  for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
-      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        Type *AT = AI->getAllocatedType();
-        if (AT->isArrayTy() && AT->getArrayNumElements() == 16)
-          HasIter = true;
-      }
+      auto *AI = dyn_cast<AllocaInst>(&I);
+      if (!AI)
+        continue;
+      HasAlloca = true;
+      Type *AT = AI->getAllocatedType();
+      if (AT->isArrayTy() && AT->getArrayNumElements() == 16)
+        HasIter = true;
     }
-    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!BI || !BI->isConditional())
-      continue;
-    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-    if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
-      continue;
-    // Loop shape: an ult-guarded branch inside a function that still
-    // carries a loop phi (SROA evidence: at -O0 the iter struct is
-    // intact and no phi exists, so a bare ult loop is not enough).
-    for (BasicBlock &B2 : F)
-      for (Instruction &SI : B2)
-        if (isa<PHINode>(&SI))
-          HasUltLoop = true;
-  }
-  if (HasIter || !HasUltLoop)
+  if (HasIter || HasAlloca)
     return false;
-  // The ult compare must feed the loop through a phi: one operand must
-  // be a phi node (induction) or flow into one. A plain ult branch
-  // over straight-line code (o0 bounds checks) is not an iter loop.
-  bool UltFeedsPhi = false;
+  // Range-loop evidence: an `ult` compare on the induction phi whose
+  // loop-carried value is `add/sub phi, C`.
+  bool IsRangeLoop = false;
   for (BasicBlock &BB : F) {
     auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
     if (!BI || !BI->isConditional())
       continue;
     auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-    if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    if (!Cmp || hasOpaqueMarker(*Cmp) || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
       continue;
     for (Value *Op : Cmp->operands()) {
-      if (isa<PHINode>(Op))
-        UltFeedsPhi = true;
-      if (auto *I = dyn_cast<Instruction>(Op))
-        for (User *U : I->users())
-          if (isa<PHINode>(U))
-            UltFeedsPhi = true;
+      auto *PN = dyn_cast<PHINode>(Op);
+      if (!PN)
+        continue;
+      for (unsigned K = 0; K < PN->getNumIncomingValues(); ++K) {
+        auto *Step = dyn_cast<BinaryOperator>(PN->getIncomingValue(K));
+        if (!Step)
+          continue;
+        if (Step->getOpcode() != Instruction::Add &&
+            Step->getOpcode() != Instruction::Sub)
+          continue;
+        if (Step->getOperand(0) != PN && Step->getOperand(1) != PN)
+          continue;
+        bool ConstStep =
+            isa<ConstantInt>(Step->getOperand(0)) ||
+            isa<ConstantInt>(Step->getOperand(1));
+        if (ConstStep)
+          IsRangeLoop = true;
+      }
     }
-    for (BasicBlock *Succ : BI->successors())
-      for (Instruction &SI : *Succ)
-        if (isa<PHINode>(&SI))
-          UltFeedsPhi = true;
   }
-  if (!UltFeedsPhi)
+  if (!IsRangeLoop)
     return false;
   BasicBlock &Entry = F.getEntryBlock();
   if (Entry.empty())
