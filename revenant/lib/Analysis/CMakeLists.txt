@@ -1,5 +1,6 @@
 add_llvm_library(RevenantAnalysis
   Padding.cpp
+  Noreturn.cpp
 
   LINK_COMPONENTS
   MC
@@ -10,4 +11,4 @@ add_llvm_library(RevenantAnalysis
 
   LINK_LIBS
   RevenantDisasm
-  )
+)
