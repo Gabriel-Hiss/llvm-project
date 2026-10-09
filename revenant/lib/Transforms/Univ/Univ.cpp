@@ -142,7 +142,7 @@ static bool isLoopInvariant(Value *V, BasicBlock *Header, BasicBlock *Latch) {
 // value defined outside the loop (vector-tail remainders start at the
 // main loop's end count).
 static Instruction *matchStep(PHINode *Phi, BasicBlock *Header,
-                              BasicBlock *Latch, uint64_t &StepC,
+                              BasicBlock *Latch, int64_t &StepC,
                               Value *&StartV) {
   if (Phi->getNumIncomingValues() != 2)
     return nullptr;
@@ -179,7 +179,7 @@ static Instruction *matchStep(PHINode *Phi, BasicBlock *Header,
   auto *C = Other ? dyn_cast<ConstantInt>(Other) : nullptr;
   if (!C)
     return nullptr;
-  StepC = C->getZExtValue();
+  StepC = C->getValue().getSExtValue();
   StartV = Start;
   return Step;
 }
@@ -210,6 +210,9 @@ struct LoopShape {
   Value *Bound = nullptr; // narrow `%n` (integer) or trip `%rem` (ptr)
   ICmpInst *ExitCmp = nullptr;
   Value *IVStart = nullptr; // entry value of the integer IV (0 or invariant)
+  PHINode *Count = nullptr; // optional countdown PHI for a lifted remainder
+  Instruction *CountStep = nullptr;
+  Value *CountStart = nullptr;
   bool IsPtr = false;
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> PtrSteps;
@@ -230,7 +233,7 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       break;
     if (!PN->getType()->isIntegerTy())
       continue;
-    uint64_t StepC = 0;
+    int64_t StepC = 0;
     Value *StartV = nullptr;
     Instruction *St = matchStep(PN, Header, Latch, StepC, StartV);
     if (!St || StepC != 1)
@@ -250,7 +253,7 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     if (!PN)
       break;
     if (PN != IV && PN->getType()->isIntegerTy()) {
-      uint64_t StepC = 0;
+      int64_t StepC = 0;
       Value *Dummy = nullptr;
       if (matchStep(PN, Header, Latch, StepC, Dummy))
         return false;
@@ -363,12 +366,11 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (GEPs.empty())
     return false;
-  // One base, one element type across all touches.
-  Value *Base = GEPs[0]->getPointerOperand();
+  // Every touch has its own invariant base; copies commonly read one array
+  // and write another. All touches still use the same indexed element type.
   Type *ElemTy = GEPs[0]->getSourceElementType();
   for (auto *GI : GEPs) {
-    if (GI->getPointerOperand() != Base ||
-        GI->getSourceElementType() != ElemTy)
+    if (GI->getSourceElementType() != ElemTy)
       return false;
     // Address users must be loads/stores in the loop.
     for (User *U : GI->users()) {
@@ -453,7 +455,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       break;
     if (!PN->getType()->isIntegerTy(32))
       continue;
-    uint64_t StepC = 0;
+    int64_t StepC = 0;
     Value *StartV = nullptr;
     Instruction *St = matchStep(PN, Header, Latch, StepC, StartV);
     if (!St || StepC != 1)
