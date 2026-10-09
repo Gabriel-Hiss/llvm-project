@@ -54,6 +54,9 @@
 #if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
 #include "revenant/Transforms/SsaOut/SsaOut.h"
 #endif
+#if __has_include("revenant/Transforms/Unabi/Unabi.h")
+#include "revenant/Transforms/Unabi/Unabi.h"
+#endif
 
 using namespace llvm;
 
@@ -118,6 +121,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
         if (Name == "revenant-ssaout") {
           FPM.addPass(SsaOutPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unabi/Unabi.h")
+        if (Name == "revenant-unabi") {
+          FPM.addPass(UnabiPass());
           return true;
         }
 #endif

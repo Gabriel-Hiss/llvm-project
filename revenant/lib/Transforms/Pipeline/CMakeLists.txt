@@ -25,4 +25,5 @@ add_llvm_library(RevenantTransformPipeline
   $<$<TARGET_EXISTS:RevenantTransformStructure>:RevenantTransformStructure>
   $<$<TARGET_EXISTS:RevenantTransformTypeRecovery>:RevenantTransformTypeRecovery>
   $<$<TARGET_EXISTS:RevenantTransformSsaOut>:RevenantTransformSsaOut>
+  $<$<TARGET_EXISTS:RevenantTransformUnabi>:RevenantTransformUnabi>
   )
