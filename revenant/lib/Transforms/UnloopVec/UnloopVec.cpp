@@ -2059,6 +2059,289 @@ static Value *matchLaneFold(Value *V, unsigned VF, unsigned ElemBits,
     return nullptr;
   return EE;
 }
+// Match the whole packed-reduction arm behind one small-N guard D and
+// prove it computes sum(a[0..N)) for the i32 count N:
+//   D:      br ult i32 N, K  (true -> remainder chain, false -> vector)
+//   relays: empty unconditional-branch blocks
+//   Pre:    byte bound = (N << log2VF) & (((1<<31) - VF) << log2VF),
+//           i.e. exactly VF * (N & ~(VF-1)) bytes from the base, plus
+//           the unconditional branch into the loop
+//   Body:   acc = phi [0, Pre], [acc + load, Body]; ptr walks VF*E
+//           bytes; exit when the byte counter hits the bound
+//   Reduce: lane fold of acc; remainder index = N & ((1<<31) - VF);
+//           branch to the chain or straight to the exit merge
+//   Chain:  VF-1 blocks, each adds one element, guarded by
+//           index + k + 1 < N (or falling through on the last one)
+//   Exit:   acc merge (Reduce's fold or the chain's last add)
+// The vector loop covers [0, N & ~(VF-1)) elements, the chain covers
+// [N & ~(VF-1), N), so the arm reads a[0..N) exactly once and the
+// wrapping lane fold equals the sequential sum. Everything the
+// synthesized loop needs is recorded in PR.
+static bool matchPackedReduction(BasicBlock *D, Function &F,
+                                 PackedReduction &PR) {
+  auto *Br = dyn_cast<BranchInst>(D->getTerminator());
+  if (!Br || !Br->isConditional())
+    return false;
+  auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    return false;
+  auto *K = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+  if (!K || K->getZExtValue() < 2 || K->getValue().getActiveBits() > 16)
+    return false;
+  Value *N32 = Cmp->getOperand(0);
+  if (!N32->getType()->isIntegerTy(32))
+    return false;
+  // The count is the low half of a wider parameter: every mask below is
+  // expressed on that 64-bit value, like the machine code's 32-bit ops.
+  auto *Tr = dyn_cast<TruncInst>(N32);
+  if (!Tr)
+    return false;
+  Value *N64 = Tr->getOperand(0);
+  if (!N64->getType()->isIntegerTy(64))
+    return false;
+  BasicBlock *Small = Br->getSuccessor(0);
+  BasicBlock *Vec = Br->getSuccessor(1);
+  if (Small == Vec)
+    return false;
+  for (BasicBlock *Su : successors(D))
+    if (Su == D)
+      return false;
+
+  // Relay blocks: plain unconditional branch and nothing else. Both
+  // arms may sit behind one; they are erased with the region. Each is
+  // entered only from the guard (or the previous relay).
+  auto StripRelays = [&](BasicBlock *From,
+                         SmallVectorImpl<BasicBlock *> &Out) -> BasicBlock * {
+    BasicBlock *BB = From;
+    BasicBlock *Pred = D;
+    for (unsigned I = 0; I != 8; ++I) {
+      auto *B = dyn_cast<BranchInst>(BB->getTerminator());
+      if (!B || B->isConditional() || BB->size() != 1)
+        return BB;
+      if (BB->getSinglePredecessor() != Pred)
+        return nullptr;
+      BasicBlock *Next = B->getSuccessor(0);
+      if (Next == D || Next == From)
+        return nullptr;
+      Out.push_back(BB);
+      Pred = BB;
+      BB = Next;
+    }
+    return nullptr;
+  };
+  BasicBlock *Head = StripRelays(Small, PR.SmallRelays);
+  if (!Head)
+    return false;
+  BasicBlock *Pre = StripRelays(Vec, PR.VecRelays);
+  if (!Pre)
+    return false;
+  auto *PreTerm = dyn_cast<BranchInst>(Pre->getTerminator());
+  if (!PreTerm || PreTerm->isConditional() || PreTerm->getSuccessor(0) == Pre)
+    return false;
+  BasicBlock *PrePred = Pre->getSinglePredecessor();
+  BasicBlock *PreEntry = PR.VecRelays.empty() ? D : PR.VecRelays.back();
+  if (!PrePred || PrePred != PreEntry)
+    return false;
+  BasicBlock *Body = PreTerm->getSuccessor(0);
+
+  // Body: a counted single-block loop with a packed accumulator, a
+  // pointer walk and a byte counter.
+  ScalarLoopInfo SL;
+  if (!matchScalarLoop(Body, SL))
+    return false;
+  PHINode *AccPhi = nullptr;
+  PHINode *PtrPhi = nullptr;
+  for (PHINode &P : Body->phis()) {
+    if (P.getType()->isVectorTy()) {
+      if (AccPhi)
+        return false;
+      AccPhi = &P;
+    } else if (P.getType()->isPointerTy()) {
+      if (PtrPhi)
+        return false;
+      PtrPhi = &P;
+    }
+  }
+  if (!AccPhi || !PtrPhi)
+    return false;
+  auto *VT = dyn_cast<FixedVectorType>(AccPhi->getType());
+  if (!VT)
+    return false;
+  unsigned VF = VT->getNumElements();
+  unsigned LogVF = 0;
+  while ((1u << LogVF) < VF)
+    ++LogVF;
+  if ((1u << LogVF) != VF || VF < 2 || LogVF > 4)
+    return false;
+  Type *ElemTy = VT->getElementType();
+  unsigned ElemBits = ElemTy->getScalarSizeInBits();
+  if (!ElemTy->isIntegerTy() || ElemBits < 8 || ElemBits % 8 != 0 ||
+      VT->getNumElements() * ElemBits > 512)
+    return false;
+  if (K->getZExtValue() > VF)
+    return false;
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  uint64_t ElemBytes = DL.getTypeStoreSize(ElemTy).getFixedValue();
+  if (SL.Step->getZExtValue() != VF * ElemBytes)
+    return false;
+
+  LoadInst *VecLoad = nullptr;
+  BinaryOperator *VecAdd = nullptr;
+  GetElementPtrInst *PtrStep = nullptr;
+  for (Instruction &I : *Body) {
+    if (isa<PHINode>(&I) || I.isTerminator())
+      continue;
+    if (isa<StoreInst>(&I) || isa<CallBase>(&I) || I.isVolatile() ||
+        isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I) ||
+        isa<FenceInst>(&I) || I.getMetadata("revenant.opaque"))
+      return false;
+    if (auto *L = dyn_cast<LoadInst>(&I)) {
+      if (VecLoad || L->getType() != VT)
+        return false;
+      VecLoad = L;
+      continue;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (BO->getOpcode() == Instruction::Add && BO->getType() == VT) {
+        if (VecAdd)
+          return false;
+        VecAdd = BO;
+      }
+      continue;
+    }
+    if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+      if (PtrStep)
+        return false;
+      PtrStep = G;
+      continue;
+    }
+    // The byte-counter step and the exit compare are plain value
+    // arithmetic; anything else (casts, selects) stays allowed but
+    // unidentified.
+  }
+  if (!VecLoad || !VecAdd || !PtrStep)
+    return false;
+  if (VecLoad->getPointerOperand() != PtrPhi)
+    return false;
+  if (!((VecAdd->getOperand(0) == AccPhi && VecAdd->getOperand(1) == VecLoad) ||
+        (VecAdd->getOperand(1) == AccPhi && VecAdd->getOperand(0) == VecLoad)))
+    return false;
+  if (cast<OverflowingBinaryOperator>(VecAdd)->hasNoSignedWrap() ||
+      cast<OverflowingBinaryOperator>(VecAdd)->hasNoUnsignedWrap())
+    return false;
+  // Accumulator and pointer start values (the loop's non-latch
+  // incomings, both fed from the preheader).
+  Value *AccStart = AccPhi->getIncomingValueForBlock(Pre);
+  Value *PtrStart = PtrPhi->getIncomingValueForBlock(Pre);
+  Value *ByteStart = SL.IV->getIncomingValueForBlock(Pre);
+  if (!AccStart || !PtrStart || !ByteStart)
+    return false;
+  auto *AccZero = dyn_cast<Constant>(AccStart);
+  if (!AccZero || !AccZero->isZeroValue())
+    return false;
+  if (PtrStep->getPointerOperand() != PtrPhi)
+    return false;
+  APInt PtrOff(DL.getIndexTypeSizeInBits(PtrStep->getType()), 0);
+  if (!PtrStep->accumulateConstantOffset(DL, PtrOff) ||
+      PtrOff.getZExtValue() != VF * ElemBytes)
+    return false;
+  if (Body->getTerminator()->getNumSuccessors() != 2)
+    return false;
+  BasicBlock *Reduce = nullptr;
+  for (BasicBlock *Su : successors(Body))
+    if (Su != Body)
+      Reduce = Su;
+  if (!Reduce || Reduce == Body)
+    return false;
+
+  // Byte bound: base + (N << log2VF) & (((1<<31) - VF) << log2VF). The
+  // mask is the 32-bit element mask ~(VF-1) scaled by the lane width,
+  // so the loop covers exactly N & ~(VF-1) elements.
+  Value *Bound = loopBound(SL);
+  if (!Bound)
+    return false;
+  auto *BAdd = dyn_cast<BinaryOperator>(Bound);
+  if (!BAdd || BAdd->getOpcode() != Instruction::Add)
+    return false;
+  Value *BaseV = nullptr;
+  Value *MaskV = nullptr;
+  if (BAdd->getOperand(0) == ByteStart) {
+    BaseV = BAdd->getOperand(0);
+    MaskV = BAdd->getOperand(1);
+  } else if (BAdd->getOperand(1) == ByteStart) {
+    BaseV = BAdd->getOperand(1);
+    MaskV = BAdd->getOperand(0);
+  } else {
+    return false;
+  }
+  auto *P2I = dyn_cast<PtrToIntInst>(BaseV);
+  if (!P2I)
+    return false;
+  Value *PtrArg = P2I->getPointerOperand();
+  if (PtrPhi->getIncomingValueForBlock(Pre) != PtrArg)
+    return false;
+  auto *MaskAnd = dyn_cast<BinaryOperator>(MaskV);
+  if (!MaskAnd || MaskAnd->getOpcode() != Instruction::And)
+    return false;
+  auto *MaskC = dyn_cast<ConstantInt>(MaskAnd->getOperand(1));
+  if (!MaskC)
+    return false;
+  uint64_t ExpMask = ((1ull << 31) - VF) << LogVF;
+  if (MaskC->getValue().getZExtValue() != ExpMask)
+    return false;
+  auto *Shl = dyn_cast<BinaryOperator>(MaskAnd->getOperand(0));
+  if (!Shl || Shl->getOpcode() != Instruction::Shl)
+    return false;
+  auto *ShlC = dyn_cast<ConstantInt>(Shl->getOperand(1));
+  if (!ShlC || ShlC->getZExtValue() != LogVF)
+    return false;
+  if (stripCountDerivation(Shl->getOperand(0), F) !=
+      stripCountDerivation(N32, F))
+    return false;
+
+  // Reduce: lane fold, remainder start index, branch into the chain or
+  // straight to the exit merge.
+  if (Reduce->getSinglePredecessor() != Body)
+    return false;
+  for (Instruction &I : *Reduce) {
+    if (isa<PHINode>(&I) || I.isTerminator())
+      continue;
+    if (isa<StoreInst>(&I) || isa<CallBase>(&I) || I.isVolatile() ||
+        isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I) ||
+        isa<FenceInst>(&I) || I.getMetadata("revenant.opaque"))
+      return false;
+  }
+  Value *Fold = matchLaneFold(VecAdd, VF, ElemBits, Reduce);
+  if (!Fold)
+    return false;
+  Value *StartIdx = nullptr;
+  for (Instruction &I : *Reduce) {
+    auto *BO = dyn_cast<BinaryOperator>(&I);
+    if (!BO || BO->getOpcode() != Instruction::And)
+      continue;
+    auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (!C || !C->getType()->isIntegerTy(64) ||
+        C->getValue().getZExtValue() != ((1ull << 31) - VF))
+      continue;
+    if (stripCountDerivation(BO->getOperand(0), F) !=
+        stripCountDerivation(N32, F))
+      continue;
+    StartIdx = &I;
+  }
+  if (!StartIdx)
+    return false;
+  BasicBlock *Exit = nullptr;
+  BasicBlock *HeadFromReduce = nullptr;
+  for (BasicBlock *Su : successors(Reduce)) {
+    if (Su == Head)
+      HeadFromReduce = Su;
+    else if (!Exit)
+      Exit = Su;
+    else
+      return false;
+  }
+  if (!HeadFromReduce || !Exit || Exit == Head)
+    return false;
 // Counted loops can lower wide copies to i128 load/store pairs, or repeated
 // fills to vector splats. Split only these proven memory shapes. Keep all
 // copy loads before their stores so each chunk retains read-before-write
