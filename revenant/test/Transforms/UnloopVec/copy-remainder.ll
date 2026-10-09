@@ -128,10 +128,11 @@ define dso_local i32 @copy_bytes(ptr noundef %0, ptr noundef readonly captures(n
 ; Function Attrs: mustprogress nofree noinline norecurse nosync nounwind sspstrong willreturn memory(none) uwtable
 
 ; The vector tiers are gone; the scalar remainder and epilogue remain.
+; CHECK-LABEL: define{{.*}}i32 @copy_bytes
 ; CHECK-NOT: <16 x i8>
 ; CHECK-NOT: llvm.vector.reduce
-; CHECK: br label
-; CHECK: ret i32
+; CHECK: store i8
+; CHECK: }
 
 !10 = distinct !{!10}
 !12 = distinct !{!12}

@@ -21,6 +21,7 @@ exit:
   ret void
 }
 
+; CHECK-LABEL: define{{.*}}void @fill_vec
 ; CHECK-NOT: store <4 x i32>
 ; CHECK-COUNT-4: store i32 %value
 ; CHECK: ret void

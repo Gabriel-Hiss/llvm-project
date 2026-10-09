@@ -78,7 +78,8 @@ exit:
 declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
 
 ; The predicated vector body and the middle reduce are gone.
+; CHECK-LABEL: define{{.*}}i32 @condsum
 ; CHECK-NOT: <4 x i32>
 ; CHECK-NOT: call i32 @llvm.vector.reduce
-; CHECK: br label
-; CHECK: ret i32
+; CHECK: load i32
+; CHECK: }
