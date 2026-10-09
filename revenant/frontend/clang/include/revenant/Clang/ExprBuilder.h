@@ -18,6 +18,8 @@
 
 #include "clang/AST/Expr.h"
 #include "clang/AST/Stmt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
@@ -30,11 +32,12 @@ class TypeBuilder;
 /// Per-function state ExprBuilder accumulates while building. Created by
 /// StmtBuilder::buildBody, passed back through the ExprBuilder methods.
 struct ExprScope {
-  /// Instruction results that must be introduced as `v<N>` temporaries
-  /// before use; StmtBuilder emits the VarDecl+init statement when it
-  /// reaches the instruction, ExprBuilder resolves later uses to the
-  /// VarDecl via FrontendContext::lookupDecl.
+  /// Instruction results that need local `v<N>` variables. Core emits their
+  /// declarations in the function prologue after the body has been built.
   llvm::SmallVector<llvm::Instruction *, 16> PendingTemps;
+  /// Expressions computed for materialized results. instr() emits the
+  /// initializer assignment at the defining instruction when applicable.
+  llvm::DenseMap<llvm::Instruction *, clang::Expr *> PendingInitializers;
 };
 
 class ExprBuilder {

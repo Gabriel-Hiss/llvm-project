@@ -73,6 +73,17 @@ TEST_F(TypeFixture, IntWidthsFollowSignedness) {
   EXPECT_EQ(Types->typeOf(Type::getInt1Ty(Ctx), nullptr),
             Clang->getASTContext().BoolTy);
 }
+TEST_F(TypeFixture, DebugTypeMustMatchIRCategory) {
+  DIBuilder B(*M);
+  DIBasicType *S64 = B.createBasicType("long long", 64, dwarf::DW_ATE_signed);
+  DIDerivedType *Pointer = B.createPointerType(S64, 64);
+  clang::ASTContext &AST = Clang->getASTContext();
+  EXPECT_EQ(Types->typeOf(Type::getInt64Ty(Ctx), Pointer),
+            AST.UnsignedLongLongTy);
+  EXPECT_TRUE(Types->typeOf(PointerType::get(Ctx, 0), S64)
+                  ->isPointerType());
+}
+
 
 TEST_F(TypeFixture, PointersArraysFunctions) {
   // ptr -> void*.

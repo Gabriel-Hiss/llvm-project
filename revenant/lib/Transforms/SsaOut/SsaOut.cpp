@@ -8,12 +8,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "SsaOut.h"
-
+#include "revenant/Transforms/SsaOut/SsaOut.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
@@ -123,7 +123,10 @@ bool inlineableByKind(Instruction *I, unsigned Uses) {
 // instruction. Opaque markers (`!revenant.opaque`) live on the original
 // call and are never moved; new stores/loads need no marker.
 void copyProvenance(const Instruction *Src, Instruction *Dst) {
-  Dst->copyMetadata(*Src);
+  // Copy only revenant.va and dbg; nonnull/noundef on the source describe
+  // the original pointer/value and are invalid on a fresh alloca or store.
+  if (MDNode *VA = Src->getMetadata("revenant.va"))
+    Dst->setMetadata("revenant.va", VA);
   Dst->setDebugLoc(Src->getDebugLoc());
 }
 
@@ -139,6 +142,31 @@ std::string sanitize(StringRef N) {
   if (S.empty())
     S = "tmp";
   return S;
+}
+
+// DILocation stores its line in 32 bits; use the low 32 bits of the
+// instruction VA as a stable location, or zero when provenance is absent.
+unsigned debugLineFromVA(const Instruction &I) {
+  MDNode *VA = I.getMetadata("revenant.va");
+  if (!VA || VA->getNumOperands() == 0)
+    return 0;
+  auto *CAM = dyn_cast<ConstantAsMetadata>(VA->getOperand(0));
+  auto *CI = CAM ? dyn_cast<ConstantInt>(CAM->getValue()) : nullptr;
+  return CI ? static_cast<unsigned>(CI->getZExtValue()) : 0;
+}
+
+bool attachMissingCallLocations(Function &F, DISubprogram &SP) {
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (!isa<CallBase>(I) || I.getDebugLoc())
+        continue;
+      I.setDebugLoc(DILocation::get(F.getContext(), debugLineFromVA(I), 0,
+                                    &SP));
+      Changed = true;
+    }
+  }
+  return Changed;
 }
 
 } // namespace
@@ -158,6 +186,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   DICompileUnit *CU = nullptr;
   DIFile *File = nullptr;
   DISubprogram *SP = F.getSubprogram();
+  bool Changed = false;
   if (NamedMDNode *CUs = M->getNamedMetadata("llvm.dbg.cu")) {
     if (CUs->getNumOperands() > 0)
       CU = dyn_cast<DICompileUnit>(CUs->getOperand(0));
@@ -206,7 +235,12 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
                             DISubprogram::SPFlagDefinition |
                                 DISubprogram::SPFlagOptimized);
     F.setSubprogram(SP);
+    Changed = true;
   }
+  // SSA-out can introduce the first !dbg scope, notably when replaying the
+  // pipeline with revenant-types disabled. Give every call a location now;
+  // otherwise LLVM rejects inlinable calls in this debug-info function.
+  Changed |= attachMissingCallLocations(F, *SP);
 
   // One local per phi web + per materialized def. Keyed by canonical
   // name so web members share the slot.
@@ -214,7 +248,6 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   std::map<std::string, AllocaInst *> LocalByName;
   DenseMap<AllocaInst *, DILocalVariable *> LocalVar;
   unsigned TmpN = 0;
-  bool Changed = false;
 
   auto getOrCreateLocal = [&](std::string Key, Type *Ty,
                               const Instruction *Provenance) -> AllocaInst * {
@@ -247,6 +280,18 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     Changed = true;
     return AI;
   };
+  // Web key: the canonical name, qualified by type when the same web name
+  // already holds a slot of another type (`rax.0` i64 next to `rax.1` i32
+  // must not share one alloca).
+  auto keyFor = [&](StringRef Name, Type *Ty) -> std::string {
+    std::string Base = Webs.canon(Name);
+    auto It = LocalByName.find(Base);
+    if (It == LocalByName.end() || It->second->getAllocatedType() == Ty)
+      return Base;
+    std::string TS;
+    raw_string_ostream(TS) << *Ty;
+    return Base + "." + TS;
+  };
   // Demote materialized defs: every non-inlineable instruction with
   // uses gets a local; its def becomes `store`, each use a `load`.
   // Phis always demote (their web's local).
@@ -264,7 +309,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
       continue; // stays inline for the frontend
     std::string Key;
     if (I->hasName())
-      Key = Webs.canon(I->getName());
+      Key = keyFor(I->getName(), I->getType());
     else
       Key = "tmp" + std::to_string(TmpN++);
     AllocaInst *AI = getOrCreateLocal(Key, I->getType(), I);
@@ -274,7 +319,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   // Phi webs always get a local, even before uses are rewritten.
   for (BasicBlock &BB : F) {
     for (PHINode &PN : BB.phis()) {
-      std::string Key = Webs.canon(PN.getName());
+      std::string Key = keyFor(PN.getName(), PN.getType());
       AllocaInst *AI = getOrCreateLocal(Key, PN.getType(), &PN);
       Materialized[&PN] = AI;
     }
@@ -307,7 +352,21 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
           U.set(LD);
       }
     }
-    IRBuilder<> B(I->getNextNode());
+    Instruction *InsertBefore = I->getNextNode();
+    if (auto *II = dyn_cast<InvokeInst>(I)) {
+      BasicBlock *NormalDest = II->getNormalDest();
+      if (pred_size(NormalDest) > 1) {
+        if (BasicBlock *Edge =
+                SplitCriticalEdge(II->getParent(), NormalDest)) {
+          // `!revenant.region` operands use block-list indices.
+          Edge->moveAfter(&F.back());
+          NormalDest = Edge;
+          Changed = true;
+        }
+      }
+      InsertBefore = NormalDest->getFirstNonPHI();
+    }
+    IRBuilder<> B(InsertBefore);
     B.SetCurrentDebugLocation(I->getDebugLoc());
     StoreInst *ST = B.CreateStore(I, AI);
     copyProvenance(I, ST);
@@ -357,13 +416,22 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   // its own edge. Region annotations ride along to the new terminator.
   for (BasicBlock &BB : F) {
     SmallVector<BasicBlock *, 4> Succs(succ_begin(&BB), succ_end(&BB));
-    if (Succs.size() < 2)
+    Instruction *PredTerm = BB.getTerminator();
+    if (Succs.size() < 2 || BB.isEHPad() ||
+        isa<CatchSwitchInst>(PredTerm) || isa<CatchReturnInst>(PredTerm) ||
+        isa<CleanupReturnInst>(PredTerm))
       continue;
     for (BasicBlock *Succ : Succs) {
-      if (Succ->phis().empty())
+      if (Succ->phis().empty() || Succ->isEHPad())
         continue;
-      if (SplitCriticalEdge(&BB, Succ))
+      if (BasicBlock *EdgeBB = SplitCriticalEdge(&BB, Succ)) {
+        // `!revenant.region` operands are block-list indices; inserting
+        // the split block mid-list would shift every later index and
+        // mis-decode annotations written before this pass. Keep the new
+        // block at the end so existing indices stay valid.
+        EdgeBB->moveAfter(&F.back());
         Changed = true;
+      }
     }
   }
 
@@ -379,7 +447,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     std::map<BasicBlock *, SmallVector<std::pair<AllocaInst *, Value *>, 4>>
         EdgeCopies;
     for (PHINode &PN : Succ.phis()) {
-      std::string Key = Webs.canon(PN.getName());
+      std::string Key = keyFor(PN.getName(), PN.getType());
       auto LIt = LocalByName.find(Key);
       if (LIt == LocalByName.end())
         continue;
@@ -428,6 +496,21 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
             IRBuilder<> B(&F.getEntryBlock(), F.getEntryBlock().begin());
             Spill = B.CreateAlloca(Dst->getAllocatedType(), nullptr,
                                    "v_spill");
+            DIType *SpillTy = nullptr;
+            if (Dst->getAllocatedType()->isFloatingPointTy())
+              SpillTy = DIB.createBasicType("double", 64, dwarf::DW_ATE_float);
+            else if (Dst->getAllocatedType()->isIntegerTy(1))
+              SpillTy = DIB.createBasicType("bool", 1, dwarf::DW_ATE_boolean);
+            else if (Dst->getAllocatedType()->isIntegerTy())
+              SpillTy = DIB.createBasicType("long",
+                                           Dst->getAllocatedType()->getIntegerBitWidth(),
+                                           dwarf::DW_ATE_signed);
+            else
+              SpillTy = DIB.createBasicType("ptr", 64, dwarf::DW_ATE_address);
+            DILocalVariable *SpillVar =
+                DIB.createAutoVariable(SP, Spill->getName(), File, 1, SpillTy);
+            DIB.insertDeclare(Spill, SpillVar, DIB.createExpression(),
+                              DILocation::get(Ctx, 1, 0, SP), Spill->getNextNode());
           }
           SpilledVal = Dst;
           Ordered.push_back({Spill, Pending[0].second});
@@ -441,7 +524,20 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         }
       }
       Instruction *Term = Pred->getTerminator();
-      IRBuilder<> B(Term);
+      // A catchswitch must be the first non-PHI instruction in its block.
+      // Its handler choice also makes a pre-switch copy incorrect for all
+      // but one handler. The handler pad has a single catchswitch predecessor,
+      // so materialize its phi copies immediately after the pad instead.
+      Instruction *InsertBefore = Term;
+      if (Succ.isEHPad() && isa<CatchSwitchInst>(Term)) {
+        Instruction *Pad = Succ.getFirstNonPHI();
+        if (!Pad)
+          continue;
+        InsertBefore = Pad->getNextNode();
+        if (!InsertBefore)
+          continue;
+      }
+      IRBuilder<> B(InsertBefore);
       for (auto &C : Ordered) {
         Value *V = C.second;
         // An incoming value that was itself materialized (non-phi def)
@@ -457,7 +553,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         // phi-to-phi edge reads the source web's slot.
         if (Instruction *PI = dyn_cast<Instruction>(V)) {
           if (PHINode *PPN = dyn_cast<PHINode>(PI)) {
-            std::string SKey = Webs.canon(PPN->getName());
+            std::string SKey = keyFor(PPN->getName(), PPN->getType());
             auto SLIt = LocalByName.find(SKey);
             if (SLIt != LocalByName.end() && SLIt->second != C.first) {
               B.SetCurrentDebugLocation(PPN->getDebugLoc());
@@ -477,7 +573,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         } else {
           // Fall back to the phi's own provenance.
           for (PHINode &PN : Succ.phis()) {
-            std::string K = Webs.canon(PN.getName());
+            std::string K = keyFor(PN.getName(), PN.getType());
             auto LIt = LocalByName.find(K);
             if (LIt != LocalByName.end() && LIt->second == C.first) {
               copyProvenance(&PN, ST);

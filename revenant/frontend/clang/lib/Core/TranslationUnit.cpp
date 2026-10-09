@@ -24,13 +24,16 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TargetOptions.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/Error.h"
+#include <unordered_set>
 
-using llvm::ArrayRef;
+
 using llvm::APInt;
+using llvm::ArrayRef;
 using llvm::DenseMap;
 using llvm::SmallVector;
 using llvm::StringRef;
@@ -58,7 +61,8 @@ createASTContext(llvm::Module &M, const ClangFrontendOptions &Opts) {
   LO.CPlusPlus = Lang == SourceLang::CPlusPlus;
   LO.CPlusPlus11 = LO.CPlusPlus14 = LO.CPlusPlus17 = LO.CPlusPlus;
   LO.Bool = true;
-  LO.MicrosoftExt = LO.MSVCCompat = true;
+  // The emitted text must also compile with GCC/Clang, not just MSVC.
+  LO.MicrosoftExt = LO.MSVCCompat = false;
   LO.DeclSpecKeyword = true;
   LO.WChar = true;
 
@@ -77,15 +81,13 @@ createASTContext(llvm::Module &M, const ClangFrontendOptions &Opts) {
   if (TripleStr.empty())
     TripleStr = "x86_64-pc-windows-msvc";
   TargetOpts->Triple = TripleStr;
-  T->Target.reset(
-      c::TargetInfo::CreateTargetInfo(*T->Diags, *TargetOpts));
+  T->Target.reset(c::TargetInfo::CreateTargetInfo(*T->Diags, *TargetOpts));
 
   T->Idents = std::make_unique<c::IdentifierTable>(LO);
   T->Selectors = std::make_unique<c::SelectorTable>();
   T->Builtins = std::make_unique<c::Builtin::Context>();
-  T->AST = std::make_unique<c::ASTContext>(LO, *T->Sources, *T->Idents,
-                                           *T->Selectors, *T->Builtins,
-                                           c::TU_Complete);
+  T->AST = std::make_unique<c::ASTContext>(
+      LO, *T->Sources, *T->Idents, *T->Selectors, *T->Builtins, c::TU_Complete);
   if (T->Target)
     T->AST->InitBuiltinTypes(*T->Target);
   T->Builtins->initializeBuiltins(*T->Idents, LO);
@@ -119,28 +121,41 @@ paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
   return Out;
 }
 
+static StringRef vtableClassName(StringRef Name) {
+  if (!Name.starts_with("??_7"))
+    return {};
+  return Name.drop_front(4).split("@@").first;
+}
+
 static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
                          TypeBuilder &Types) {
   c::ASTContext &AST = FCtx.ast();
   for (llvm::GlobalVariable &GV : M.globals()) {
+    StringRef Name = GV.getName();
+    StringRef Class = vtableClassName(Name);
+    if (!Class.empty())
+      Types.addVTable(Class, &GV);
     c::VarDecl *VD = FCtx.globalDecl(GV, Types);
     if (GV.isDeclaration())
       continue;
     llvm::Constant *Init = GV.getInitializer();
     c::SourceLocation L;
-    auto *CDS =
-        llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(Init);
+    auto *CDS = llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(Init);
     if (!CDS)
       continue;
-    if (CDS->isString()) {
+    // C allows a string literal that exactly fills the array; C++ always
+    // counts the terminator, so there only a NUL-terminated array prints as a
+    // literal (without its last byte) and the rest as a byte list.
+    if (CDS->isString() && (!FCtx.isCPlusPlus() || CDS->isCString())) {
       StringRef S = CDS->getRawDataValues();
       c::QualType ArrTy = AST.getConstantArrayType(
           AST.CharTy, APInt(64, S.size()), nullptr,
           c::ArraySizeModifier::Normal, 0);
+      if (FCtx.isCPlusPlus())
+        S = S.drop_back();
       VD->setType(ArrTy);
-      VD->setInit(c::StringLiteral::Create(AST, S,
-                                           c::StringLiteralKind::Ordinary,
-                                           false, ArrTy, L));
+      VD->setInit(c::StringLiteral::Create(
+          AST, S, c::StringLiteralKind::Ordinary, false, ArrTy, L));
       VD->setInitStyle(c::VarDecl::CInit);
     } else if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
       SmallVector<c::Expr *, 64> Elems;
@@ -157,13 +172,13 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
   }
 }
 
+
 static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
                           TypeBuilder &Types, StmtBuilder &Stmts,
                           ExprBuilder &Exprs) {
   c::ASTContext &AST = FCtx.ast();
   c::FunctionDecl *FD = FCtx.functionDecl(F, Types);
-  if (F.isDeclaration())
-    return;
+  // Declarations still need ParmVarDecls for Clang's printer, but have no body.
 
   // Parameters: DI arg names when present, else a1..aN.
   DenseMap<unsigned, const llvm::DILocalVariable *> PV;
@@ -178,50 +193,67 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       II = FCtx.ident(V->getName());
     if (!II)
       II = FCtx.ident(("a" + Twine(Idx)).str());
-    c::ParmVarDecl *PD = c::ParmVarDecl::Create(
-        AST, FD, c::SourceLocation(), c::SourceLocation(), II, PT, nullptr,
-        c::SC_None, nullptr);
+    c::ParmVarDecl *PD = c::ParmVarDecl::Create(AST, FD, c::SourceLocation(),
+                                                c::SourceLocation(), II, PT,
+                                                nullptr, c::SC_None, nullptr);
     FCtx.bindDecl(&A, PD);
     Params.push_back(PD);
     ++Idx;
   }
   FD->setParams(Params);
 
+  if (F.isDeclaration())
+    return;
   // Locals: one VarDecl per alloca, DI names/types when available.
+  SmallVector<c::Stmt *, 16> LocalDecls;
   for (llvm::BasicBlock &BB : F)
     for (llvm::Instruction &I : BB)
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = DI ? Types.typeOfDI(DI)
-                            : Types.typeOf(AI->getAllocatedType(), nullptr);
-        c::IdentifierInfo *II = FCtx.ident(
-            V ? V->getName()
-              : (AI->getName().empty()
-                     ? Twine("v_").concat(Twine((uintptr_t)AI)).str()
-                     : AI->getName().str()));
-        c::VarDecl *VD =
-            c::VarDecl::Create(AST, FD, c::SourceLocation(),
-                               c::SourceLocation(), II, LT, nullptr,
-                               c::SC_None);
+        c::QualType LT = AI->getAllocatedType()->isArrayTy()
+                             ? Types.typeOf(AI->getAllocatedType(), nullptr)
+                             : Types.typeOf(AI->getAllocatedType(), DI);
+        c::IdentifierInfo *II =
+            FCtx.ident(V ? V->getName()
+                         : (AI->getName().empty()
+                                ? Twine("v_").concat(Twine((uintptr_t)AI)).str()
+                                : AI->getName().str()));
+        c::VarDecl *VD = c::VarDecl::Create(AST, FD, c::SourceLocation(),
+                                            c::SourceLocation(), II, LT,
+                                            nullptr, c::SC_None);
         FCtx.bindDecl(AI, VD);
+        LocalDecls.push_back(new (AST) c::DeclStmt(
+            c::DeclGroupRef(VD), c::SourceLocation(), c::SourceLocation()));
       }
 
   ExprScope Scope;
   c::CompoundStmt *Body = Stmts.buildBody(F, FD, Exprs, Scope);
-  c::QualType RT =
-      FD->getType()->castAs<c::FunctionType>()->getReturnType();
+  SmallVector<llvm::Instruction *, 16> Temps(Scope.PendingTemps.begin(),
+                                             Scope.PendingTemps.end());
+  for (llvm::Instruction *I : Temps) {
+    auto *VD = llvm::dyn_cast_or_null<c::VarDecl>(FCtx.lookupDecl(I));
+    if (!VD)
+      continue;
+    LocalDecls.push_back(new (AST) c::DeclStmt(
+        c::DeclGroupRef(VD), c::SourceLocation(), c::SourceLocation()));
+  }
+  if (!LocalDecls.empty()) {
+    SmallVector<c::Stmt *, 32> WithLocals(LocalDecls.begin(), LocalDecls.end());
+    WithLocals.push_back(Body);
+    Body = c::CompoundStmt::Create(AST, WithLocals, c::FPOptionsOverride(),
+                                   c::SourceLocation(), c::SourceLocation());
+  }
+
+  c::QualType RT = FD->getType()->castAs<c::FunctionType>()->getReturnType();
   if (!RT->isVoidType()) {
     SmallVector<c::Stmt *, 2> Tail;
     Tail.push_back(Body);
+    llvm::Constant *Zero = llvm::Constant::getNullValue(F.getReturnType());
     Tail.push_back(c::ReturnStmt::Create(
-        AST, c::SourceLocation(),
-        c::IntegerLiteral::Create(
-            AST, APInt(AST.getIntWidth(RT), 0), RT, c::SourceLocation()),
-        nullptr));
+        AST, c::SourceLocation(), Exprs.retVal(Zero, Scope), nullptr));
     Body = c::CompoundStmt::Create(AST, Tail, c::FPOptionsOverride(),
-                                   c::SourceLocation(),
-                                   c::SourceLocation());
+                                   c::SourceLocation(), c::SourceLocation());
   }
   FD->setBody(Body);
 }
@@ -234,6 +266,25 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
     buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
 }
 
+
+static c::FunctionDecl *prototypeFor(c::FunctionDecl *Definition,
+                                     c::ASTContext &AST) {
+  auto *Prototype = c::FunctionDecl::Create(
+      AST, AST.getTranslationUnitDecl(), c::SourceLocation(),
+      c::SourceLocation(), Definition->getDeclName(), Definition->getType(),
+      Definition->getTypeSourceInfo(), Definition->getStorageClass(),
+      Definition->UsesFPIntrin(), Definition->isInlineSpecified());
+  SmallVector<c::ParmVarDecl *, 8> Parameters;
+  for (c::ParmVarDecl *Parameter : Definition->parameters()) {
+    Parameters.push_back(c::ParmVarDecl::Create(
+        AST, Prototype, c::SourceLocation(), c::SourceLocation(),
+        Parameter->getIdentifier(), Parameter->getType(), nullptr,
+        c::SC_None, nullptr));
+  }
+  Prototype->setParams(Parameters);
+  return Prototype;
+}
+
 void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
                           ArrayRef<StringRef> Includes) {
   c::PrintingPolicy Policy = TU->getASTContext().getPrintingPolicy();
@@ -241,11 +292,90 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
-  for (c::Decl *D : TU->decls()) {
-    if (D->isImplicit())
-      continue;
-    D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
-    OS << "\n";
+  llvm::StringRef Triple = TU->getASTContext().getTargetInfo().getTriple().str();
+  if (Triple.contains("msvc")) {
+    OS << "#include <intrin.h>\n\n";
+    OS << "struct rv_u128 { unsigned __int64 lo, hi; };\n";
+    OS << "static struct rv_u128 rv_add128(struct rv_u128 a, struct rv_u128 b) {\n";
+    OS << "  struct rv_u128 r; unsigned __int64 carry = 0;\n";
+    OS << "  r.lo = a.lo + b.lo; carry = (r.lo < a.lo) ? 1 : 0;\n";
+    OS << "  r.hi = a.hi + b.hi + carry; return r;\n";
+    OS << "}\n";
+    OS << "static struct rv_u128 rv_sub128(struct rv_u128 a, struct rv_u128 b) {\n";
+    OS << "  struct rv_u128 r; unsigned __int64 borrow = 0;\n";
+    OS << "  r.lo = a.lo - b.lo; borrow = (a.lo < b.lo) ? 1 : 0;\n";
+    OS << "  r.hi = a.hi - b.hi - borrow; return r;\n";
+    OS << "}\n";
+    OS << "static struct rv_u128 rv_mul128(struct rv_u128 a, struct rv_u128 b) {\n";
+    OS << "  struct rv_u128 r; unsigned __int64 lo = _umul128(a.lo, b.lo, &r.hi);\n";
+    OS << "  r.hi += a.hi * b.lo + a.lo * b.hi; r.lo = lo; return r;\n";
+    OS << "}\n";
+    OS << "static struct rv_u128 rv_shl128(struct rv_u128 a, unsigned c) {\n";
+    OS << "  struct rv_u128 r; c &= 127;\n";
+    OS << "  if (c == 0) return a;\n";
+    OS << "  if (c < 64) { r.lo = a.lo << c; r.hi = (a.hi << c) | (a.lo >> (64 - c)); }\n";
+    OS << "  else { r.lo = 0; r.hi = a.lo << (c - 64); } return r;\n";
+    OS << "}\n";
+    OS << "static struct rv_u128 rv_lshr128(struct rv_u128 a, unsigned c) {\n";
+    OS << "  struct rv_u128 r; c &= 127;\n";
+    OS << "  if (c == 0) return a;\n";
+    OS << "  if (c < 64) { r.hi = a.hi >> c; r.lo = (a.lo >> c) | (a.hi << (64 - c)); }\n";
+    OS << "  else { r.hi = 0; r.lo = a.hi >> (c - 64); } return r;\n";
+    OS << "}\n";
+    OS << "static struct rv_u128 rv_ashr128(struct rv_u128 a, unsigned c) {\n";
+    OS << "  struct rv_u128 r; c &= 127;\n";
+    OS << "  if (c == 0) return a;\n";
+    OS << "  if (c < 64) { r.hi = (long long)a.hi >> c; r.lo = (a.lo >> c) | (a.hi << (64 - c)); }\n";
+    OS << "  else { r.hi = (long long)a.hi >> 63; r.lo = (long long)a.hi >> (c - 64); } return r;\n";
+    OS << "}\n";
+    OS << "static int rv_cmp128(struct rv_u128 a, struct rv_u128 b) {\n";
+    OS << "  if (a.hi < b.hi) return -1; if (a.hi > b.hi) return 1;\n";
+    OS << "  if (a.lo < b.lo) return -1; if (a.lo > b.lo) return 1; return 0;\n";
+    OS << "}\n";
+    OS << "static unsigned __int64 rv_trunc128(struct rv_u128 a) { return a.lo; }\n";
+    OS << "static struct rv_u128 rv_zext128(unsigned __int64 v) {\n";
+    OS << "  struct rv_u128 r; r.lo = v; r.hi = 0; return r;\n";
+    OS << "}\n";
+    OS << "static struct rv_u128 rv_sext128(__int64 v) {\n";
+    OS << "  struct rv_u128 r; r.lo = (unsigned __int64)v; r.hi = (v < 0) ? ~0ULL : 0; return r;\n";
+    OS << "}\n\n";
+  }
+  std::unordered_set<std::string> PrintedRecords;
+  for (unsigned Pass = 0; Pass != 3; ++Pass) {
+    for (c::Decl *D : TU->decls()) {
+      if (D->isImplicit())
+        continue;
+      auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
+      auto *Record = llvm::dyn_cast<c::RecordDecl>(D);
+      bool IsRecord = Record != nullptr;
+      bool IsNamespace = llvm::isa<c::NamespaceDecl>(D);
+      bool IsRecordContainer = IsRecord || IsNamespace;
+      bool IsPrototype = FD && !FD->doesThisDeclarationHaveABody();
+      bool HasBody = FD && FD->doesThisDeclarationHaveABody();
+      if ((Pass == 0 && !IsRecordContainer) || (Pass == 1 && !FD) ||
+          (Pass == 2 && (IsRecordContainer || IsPrototype)))
+        continue;
+      if (Pass == 0 && Record && Record->isCompleteDefinition() &&
+          !Record->getName().empty()) {
+        std::string Key =
+            (Record->isUnion() ? "union " : "struct ") +
+            Record->getNameAsString();
+        if (Key == "struct rv_u128")
+          continue; // defined in the MSVC helper block above
+        if (!PrintedRecords.insert(std::move(Key)).second)
+          continue;
+      }
+      if (Pass == 1 && HasBody) {
+        prototypeFor(FD, TU->getASTContext())
+            ->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
+        OS << ";\n";
+        continue;
+      }
+      D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
+      if (!FD || IsPrototype || Pass == 1)
+        OS << ";";
+      OS << "\n";
+    }
   }
 }
 

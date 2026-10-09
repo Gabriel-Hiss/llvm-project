@@ -1,7 +1,7 @@
 ; Critical edge into a phi block is split: the copy for the cond->merge
 ; edge runs only on that edge (in the split block), and the region
 ; annotation survives on a terminator.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-ssaout -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-ssaout -S %s | %FileCheck %s
 
 ; CHECK: br i1 %c, label %left, label %entry.merge_crit_edge, !revenant.va !{{[0-9]+}}, !revenant.region !{{[0-9]+}}
 ; CHECK: entry.merge_crit_edge:

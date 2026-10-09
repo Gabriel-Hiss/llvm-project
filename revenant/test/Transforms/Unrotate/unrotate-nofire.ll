@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-unrotate -S %s | FileCheck %s --allow-unused-prefixes
+; RUN: %revenant-opt -passes=revenant-unrotate -S %s | %FileCheck %s --allow-unused-prefixes
 
 ; Guard/latch mismatch: no rewrite, CFG unchanged.
 define void @nomatch(i32 %x, i32 %n, i32 %m) {

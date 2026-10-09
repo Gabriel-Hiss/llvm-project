@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Disasm/Disasm.h"
+#include "X86BaseInfo.h"
 
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
@@ -80,8 +81,27 @@ Expected<Disasm> Disasm::create(const Image &Img) {
 // instruction; the decoder reports Size).
 static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
                                      const MCInstrAnalysis &MIA,
+                                     const MCInstrInfo &MII,
                                      const MCSubtargetInfo &STI, Va Addr,
                                      ArrayRef<uint8_t> Bytes) {
+  // LLVM's X86 decoder can surface an F0 LOCK prefix as its own one-byte
+  // pseudo-instruction even when the following instruction is lockable.
+  // Fold it into the following atomic memory operation to preserve hardware
+  // instruction boundaries and MCInstPrinter's lock-prefix rendering.
+  if (!Bytes.empty() && Bytes.front() == 0xF0 && Bytes.size() > 1) {
+    if (auto Locked = decodeAt(Dis, MIA, MII, STI, Addr.wrappingAdd(1),
+                               Bytes.drop_front())) {
+      const MCInstrDesc &Desc = MII.get(Locked->Inst.getOpcode());
+      int MemOp = X86II::getMemoryOperandNo(Desc.TSFlags);
+      if (Locked->Size < 15 && MemOp >= 0 && Desc.mayLoad() &&
+          Desc.mayStore()) {
+        Locked->Addr = Addr;
+        ++Locked->Size;
+        Locked->Inst.setFlags(Locked->Inst.getFlags() | X86::IP_HAS_LOCK);
+        return Locked;
+      }
+    }
+  }
   if (Bytes.empty())
     return std::nullopt;
   MCInst Inst;
@@ -120,12 +140,56 @@ static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
     Out.HasMemTarget = true;
     Out.MemTarget = Va(*MemAddr);
   }
+  // A `3E` prefix on an indirect call/jmp is CET `notrack`; the decoder
+  // keeps it as a segment override that the printer then drops.
+  if (Bytes[0] == 0x3E &&
+      (Out.Flow == FlowKind::IndirectBranch ||
+       (Out.Flow == FlowKind::Call && !Out.HasTarget)))
+    Out.Inst.setFlags(Out.Inst.getFlags() | X86::IP_HAS_NOTRACK);
   return Out;
 }
 
+/// LLVM's X86 decoder exposes a few legacy prefix bytes as standalone
+/// MCInsts. Fold them into the following instruction so the reported
+/// address/size and Intel printer output match the encoded instruction.
+static std::optional<Instr>
+decodeWithPrefixes(const MCDisassembler &Dis, const MCInstrAnalysis &MIA,
+                   const MCInstrInfo &MII, const MCSubtargetInfo &STI,
+                   Va Addr, ArrayRef<uint8_t> Bytes) {
+  std::optional<Instr> Prefix = decodeAt(Dis, MIA, MII, STI, Addr, Bytes);
+  if (!Prefix)
+    return std::nullopt;
+
+  unsigned Flag = 0;
+  StringRef Name = MII.getName(Prefix->Inst.getOpcode());
+  if (Name == "LOCK_PREFIX")
+    Flag = X86::IP_HAS_LOCK;
+  else if (Name == "REP_PREFIX")
+    Flag = X86::IP_HAS_REPEAT;
+  else if (Name == "REPNE_PREFIX")
+    Flag = X86::IP_HAS_REPEAT_NE;
+  else if (Name == "DATA16_PREFIX")
+    Flag = X86::IP_HAS_OP_SIZE;
+  else if (Name == "REX64_PREFIX")
+    Flag = X86::IP_USE_REX;
+  if (Flag == 0 || Prefix->Size >= Bytes.size())
+    return Prefix;
+
+  auto Body = decodeWithPrefixes(Dis, MIA, MII, STI,
+                                 Addr.wrappingAdd(Prefix->Size),
+                                 Bytes.drop_front(Prefix->Size));
+  // A prefix whose body does not decode is an invalid instruction (iced
+  // reports `Code::INVALID`), never a standalone prefix instruction.
+  if (!Body)
+    return std::nullopt;
+  Body->Addr = Addr;
+  Body->Size += Prefix->Size;
+  Body->Inst.setFlags(Body->Inst.getFlags() | Flag);
+  return Body;
+}
 std::optional<Instr> Disasm::decodeOne(Va Addr) const {
   ArrayRef<uint8_t> Bytes = Img->dataAt(Addr, 16);
-  return decodeAt(*Dis, *MIA, *STI, Addr, Bytes);
+  return decodeWithPrefixes(*Dis, *MIA, *MII, *STI, Addr, Bytes);
 }
 
 std::vector<Instr> Disasm::decodeRange(Va Start, Va End) const {
@@ -138,7 +202,7 @@ std::vector<Instr> Disasm::decodeRange(Va Start, Va End) const {
   size_t Off = 0;
   while (Off < Bytes.size() && Ip < End) {
     auto One =
-        decodeAt(*Dis, *MIA, *STI, Ip, Bytes.drop_front(Off));
+        decodeWithPrefixes(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
     if (!One)
       break;
     Off += One->Size;
@@ -155,7 +219,7 @@ std::vector<Instr> Disasm::decodeSlice(Va Addr,
   size_t Off = 0;
   while (Off < Bytes.size()) {
     auto One =
-        decodeAt(*Dis, *MIA, *STI, Ip, Bytes.drop_front(Off));
+        decodeWithPrefixes(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
     if (!One)
       break;
     Off += One->Size;
@@ -168,8 +232,15 @@ std::vector<Instr> Disasm::decodeSlice(Va Addr,
 std::string Disasm::format(const Instr &I, const SharedNames &Names) const {
   std::string Out;
   raw_string_ostream OS(Out);
-  IP->printInst(&I.Inst, I.Addr.Value, "", *STI, OS);
-  return OS.str();
+  IP->printInst(&I.Inst, I.nextVa().Value, "", *STI, OS);
+  OS.flush();
+  if (Names)
+    return Names->decorateLine(I, Out, refs(I));
+  return Out;
+}
+
+bool Disasm::isStore(const Instr &I) const {
+  return MII->get(I.Inst.getOpcode()).mayStore();
 }
 
 std::vector<std::string> Disasm::formatAll(ArrayRef<Instr> Instrs,

@@ -211,8 +211,25 @@ public:
 
   clang::QualType typeOf(Type *Ty, const DIType *DI) override {
     if (DI) {
-      if (clang::QualType Q = typeOfDI(DI); !Q.isNull())
-        return Q;
+      clang::QualType Q = typeOfDI(DI);
+      if (!Q.isNull()) {
+        bool KnownIRCategory = Ty &&
+                               (Ty->isIntegerTy() || Ty->isFloatingPointTy() ||
+                                Ty->isPointerTy() || Ty->isStructTy() ||
+                                Ty->isArrayTy() || Ty->isVoidTy() ||
+                                Ty->isVectorTy());
+        bool Compatible =
+            !KnownIRCategory ||
+            (Ty->isIntegerTy() && Q->isIntegerType()) ||
+            (Ty->isFloatingPointTy() && Q->isFloatingType()) ||
+            (Ty->isPointerTy() && Q->isPointerType()) ||
+            (Ty->isStructTy() && Q->isRecordType()) ||
+            (Ty->isArrayTy() && Q->isArrayType()) ||
+            (Ty->isVoidTy() && Q->isVoidType()) ||
+            (Ty->isVectorTy() && Q->isVectorType());
+        if (Compatible)
+          return Q;
+      }
     }
     return typeOfIR(Ty);
   }
@@ -227,21 +244,35 @@ public:
 
   clang::QualType functionType(Function &F) override {
     // Prefer DISubprogram element types over the IR signature (interface
-    // contract: recovered signature lives in DI).
+    // contract: recovered signature lives in DI). Arity still comes from
+    // the IR: callers create one ParmVarDecl per Argument, so the proto
+    // must have F.arg_size() params. DI lists [ret, p1..pN] and may be
+    // shorter (partial recovery) or longer (elements beyond params).
+    unsigned IRArity = F.arg_size();
     if (DISubprogram *SP = F.getSubprogram()) {
       if (const auto *Sig = dyn_cast_or_null<DISubroutineType>(SP->getType())) {
-        clang::QualType Ret = voidTy();
+        clang::QualType Ret = typeOfIR(F.getReturnType());
         SmallVector<clang::QualType, 8> Params;
         bool First = true;
         for (DIType *T : Sig->getTypeArray()) {
           if (First) {
+            First = false;
             if (T)
               Ret = mapDIOrFallback(T);
             continue;
           }
+          if (Params.size() >= IRArity)
+            break;
           Params.push_back(T ? mapDIOrFallback(T) : uintptrT());
         }
-        return buildFunctionType(Ret, Params, /*Variadic=*/false);
+        // Partial or missing DI params: fill from the IR signature.
+        unsigned P = 0;
+        for (Type *PT : F.getFunctionType()->params()) {
+          if (P++ < Params.size())
+            continue;
+          Params.push_back(typeOfIR(PT));
+        }
+        return buildFunctionType(Ret, Params, F.getFunctionType()->isVarArg());
       }
     }
     clang::QualType Ret = typeOfIR(F.getReturnType());
@@ -366,8 +397,44 @@ private:
       return Signed ? A.IntTy : A.UnsignedIntTy;
     case 64:
       return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
-    case 128:
-      return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
+    case 128: {
+      // MSVC does not support __int128. Use target-conditional:
+      // gcc/clang targets get unsigned __int128; MSVC gets struct rv_u128
+      // with per-TU helpers (see TranslationUnit.cpp).
+      clang::ASTContext &A = Ctx.ast();
+      llvm::StringRef Triple = Ctx.module().getTargetTriple().str();
+      bool IsMSVC = Triple.contains("msvc");
+      if (!IsMSVC) {
+        return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
+      }
+      // MSVC: struct rv_u128 { unsigned __int64 lo, hi; }
+      clang::IdentifierInfo &II = A.Idents.get("rv_u128");
+      clang::TagDecl *TD = nullptr;
+      for (clang::NamedDecl *D : A.getTranslationUnitDecl()->lookup(&II))
+        if (auto *T = llvm::dyn_cast<clang::TagDecl>(D))
+          TD = T;
+      if (!TD) {
+        TD = clang::RecordDecl::Create(A, clang::TagTypeKind::Struct,
+                                       A.getTranslationUnitDecl(),
+                                       clang::SourceLocation(),
+                                       clang::SourceLocation(), &II);
+        TD->setImplicit(false);
+        A.getTranslationUnitDecl()->addDecl(TD);
+        clang::QualType U64Ty = A.UnsignedLongLongTy;
+        clang::IdentifierInfo &LoII = A.Idents.get("lo");
+        clang::FieldDecl *LoFD = clang::FieldDecl::Create(A, TD,
+            clang::SourceLocation(), clang::SourceLocation(), &LoII,
+            U64Ty, nullptr, nullptr, false, clang::ICIS_NoInit);
+        TD->addDecl(LoFD);
+        clang::IdentifierInfo &HiII = A.Idents.get("hi");
+        clang::FieldDecl *HiFD = clang::FieldDecl::Create(A, TD,
+            clang::SourceLocation(), clang::SourceLocation(), &HiII,
+            U64Ty, nullptr, nullptr, false, clang::ICIS_NoInit);
+        TD->addDecl(HiFD);
+        llvm::cast<clang::RecordDecl>(TD)->completeDefinition();
+      }
+      return A.getCanonicalTagType(TD);
+    }
     default:
       return uintptrT();
     }
@@ -412,6 +479,12 @@ private:
                                     nullptr, clang::ArraySizeModifier::Normal,
                                     0);
     }
+    if (auto *VT = dyn_cast<FixedVectorType>(Ty)) {
+      TypeSize Size = Ctx.module().getDataLayout().getTypeSizeInBits(VT);
+      if (!Size.isScalable())
+        return intOf(static_cast<unsigned>(Size.getFixedValue()),
+                     /*Signed=*/false);
+    }
     if (auto *ST = dyn_cast<StructType>(Ty)) {
       if (ST->isOpaque())
         return voidPtr();
@@ -434,6 +507,14 @@ private:
   clang::QualType buildFunctionType(clang::QualType Ret,
                                     ArrayRef<clang::QualType> Params,
                                     bool Variadic) {
+    // C and C++ cannot return arrays. Lifted aggregate-array returns decay
+    // to pointers in the emitted source signature.
+    if (const auto *AT = Ret->getAsArrayTypeUnsafe())
+      Ret = Ctx.ast().getPointerType(AT->getElementType());
+    // C has no `f(...)` without a named parameter before C23; the opaque
+    // revenant.asm.* declarations are unprototyped there instead.
+    if (Variadic && Params.empty() && !Ctx.isCPlusPlus())
+      return Ctx.ast().getFunctionNoProtoType(Ret);
     clang::FunctionProtoType::ExtProtoInfo EPI;
     EPI.Variadic = Variadic;
     return Ctx.ast().getFunctionType(Ret, Params, EPI);
@@ -541,6 +622,8 @@ private:
     if (const auto *B = dyn_cast<DIBasicType>(DI)) {
       uint64_t Bits = B->getSizeInBits();
       switch (B->getEncoding()) {
+      case dwarf::DW_ATE_address:
+        return Ctx.ast().getPointerType(voidTy());
       case dwarf::DW_ATE_boolean:
         return Ctx.ast().BoolTy;
       case dwarf::DW_ATE_float:

@@ -2,7 +2,7 @@
 ; tier restarts its IV inside the erased region, so it matches as a
 ; secondary body (same trip count, R-defined start). Corpus shape:
 ; c-clang-o2avx2 fill_vec.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define dso_local void @fill_vec(ptr noundef writeonly captures(none) %0, i32 noundef %1, i32 noundef %2) local_unnamed_addr #12 {
   %4 = icmp sgt i32 %2, 0

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-unrotate -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrotate -S %s | %FileCheck %s
 
 ; Mirrors unopt's unrotate_do_while: if (x < n) { do { i++ } while (i < n) }.
 define void @t(i32 %x, i32 %n) {

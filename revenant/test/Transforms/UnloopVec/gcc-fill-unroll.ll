@@ -1,7 +1,7 @@
 ; Lifted source shape: c-gcc-o3 fill_vec in corpus/src/c/main.c:205-207.
 ; The x86 lifter expands an eight-element store group into scalar stores.
 ; Revenant must undo the group stride as well as the vector splat.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
 define void @fill_unrolled(ptr %dst, i32 %value, i64 %limit) {
 entry:

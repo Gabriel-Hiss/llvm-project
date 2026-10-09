@@ -87,6 +87,15 @@ DIType *diTypeForInteger(DIBuilder &DIB, TypeInference &TI,
 DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
                        Function &F, TypeInference &TI, const Value *Base,
                        const TypeInference::FieldAccess *FA) {
+  // Module normalization shares one layout across direct callers. Keep its
+  // named LLVM struct and DI schema together instead of creating a second,
+  // function-local layout from the subset of fields observed here.
+  for (const User *U : Base->users())
+    if (const auto *G = dyn_cast<GetElementPtrInst>(U))
+      if (MDNode *MD = G->getMetadata("revenant.pointee"))
+        if (MD->getNumOperands() == 1)
+          if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
+            return Ty;
   if (!FA || FA->Fields.empty()) {
     // No field evidence: opaque byte pointee (reference Unknown(8)).
     DIType *Byte = intDIType(DIB, 8, /*Unsigned=*/true);
@@ -184,6 +193,8 @@ DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
     OS << "rv_struct_" << F.getName() << "_";
     if (Base->hasName())
       OS << displayName(Base->getName());
+    else if (const auto *A = dyn_cast<Argument>(Base))
+      OS << "arg" << A->getArgNo();
     else
       OS << "anon";
   }
@@ -209,8 +220,13 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   TypeInference TI(F);
   TI.collect();
 
-  // CU plumbing lives in RevenantIR: one shared compile unit per module.
-  DIBuilder DIB(*M);
+  // CU plumbing lives in RevenantIR: one shared compile unit per module. The
+  // builder starts over the module's existing CU so finalize() has one.
+  DICompileUnit *ExistingCU = nullptr;
+  if (NamedMDNode *CUs = M->getNamedMetadata("llvm.dbg.cu"))
+    if (CUs->getNumOperands() > 0)
+      ExistingCU = dyn_cast<DICompileUnit>(CUs->getOperand(0));
+  DIBuilder DIB(*M, /*AllowUnresolved=*/true, ExistingCU);
   DICompileUnit &CU = ir::getOrCreateCompileUnit(*M, DIB, "revenant.ll");
   DISubprogram *SP = F.getSubprogram();
   if (!SP)
@@ -357,6 +373,16 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
     DIB.retainType(Ptr);
     Changed = true;
   }
+
+  // The verifier wants a !dbg location on every call in a function that has a
+  // DISubprogram; lifted calls only carry !revenant.va.
+  DILocation *CallLoc = DILocation::get(F.getContext(), 1, 1, SP);
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (isa<CallBase>(I) && !I.getDebugLoc()) {
+        I.setDebugLoc(CallLoc);
+        Changed = true;
+      }
 
   if (!Changed)
     return PreservedAnalyses::all();

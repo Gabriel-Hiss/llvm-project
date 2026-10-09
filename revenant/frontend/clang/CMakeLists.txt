@@ -80,3 +80,8 @@ clang_target_link_libraries(revenant-clang PRIVATE
   clangAST
   clangBasic
   )
+
+if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/unittests AND
+   EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unittests/CMakeLists.txt)
+  add_subdirectory(unittests)
+endif()

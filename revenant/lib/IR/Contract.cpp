@@ -336,7 +336,8 @@ bool revenant::ir::isOpaqueAsmCall(const Instruction &I) {
 Function *revenant::ir::getOrCreateOpaqueAsmFn(Module &M, StringRef Mnemonic,
                                              Type *RetTy,
                                              ArrayRef<Type *> ArgTys) {
-  FunctionType *FT = FunctionType::get(RetTy, ArgTys, /*isVarArg=*/false);
+  FunctionType *FT = FunctionType::get(RetTy, {}, /*isVarArg=*/true);
+  (void)ArgTys;
   return cast<Function>(
       M.getOrInsertFunction((OpaqueAsmPrefix + Mnemonic.lower()).str(), FT)
           .getCallee());
@@ -380,6 +381,11 @@ DICompileUnit &revenant::ir::getOrCreateCompileUnit(Module &M, DIBuilder &DIB,
   DIFile *F = DIB.createFile(
       SourceFileName.empty() ? StringRef("f_recovered") : SourceFileName,
       "revenant");
+  // The verifier and other readers treat DI without this flag as version 0
+  // and drop it.
+  if (!M.getModuleFlag("Debug Info Version"))
+    M.addModuleFlag(Module::Warning, "Debug Info Version",
+                    DEBUG_METADATA_VERSION);
   return *DIB.createCompileUnit(dwLangFor(M), F, "revenant",
                                 /*isOptimized=*/true, /*Flags=*/"",
                                 /*RV=*/0, /*SplitName=*/"",

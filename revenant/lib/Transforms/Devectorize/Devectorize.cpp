@@ -14,6 +14,10 @@
 
 #include "revenant/Transforms/Devectorize/Devectorize.h"
 
+#include "Lane0.h"
+#include "LoopDevec.h"
+#include "StraightDevec.h"
+
 #include "llvm/IR/Function.h"
 
 using namespace llvm;
@@ -21,15 +25,21 @@ using namespace llvm;
 namespace revenant {
 
 PreservedAnalyses DevectorizePass::run(Function &F, FunctionAnalysisManager &) {
-  // Skeleton: the lane-0, loop and straight-line phases land in the next
-  // commits. Today this is a registered no-op so the lit harness and the
-  // pipeline wiring land first.
-  (void)F;
-  return PreservedAnalyses::all();
+  if (F.isDeclaration() || F.hasOptNone())
+    return PreservedAnalyses::all();
+  // Phase 1: lane-0 scalarization exposes scalar low-lane accumulators.
+  unsigned Changed = lane0::propagate(F);
+  // Phase 2: single-block integer reduction loops explode into scalar
+  // acc chains. Phase 3: straight-line SLP webs explode in place.
+  // No CFG change in any phase.
+  Changed += loopdevec::devectorizeLoops(F);
+  Changed += straight::explodeStraight(F);
+  if (Changed == 0)
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
 
 } // namespace revenant
-
 // Plugin entry for `opt -load-pass-plugin`. The `revenant-opt` superbuild
 // (owner: MuseTxPipeline) links this library statically and registers the
 // `revenant-devectorize` name in Pipeline/Register.cpp, so the entry point

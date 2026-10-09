@@ -3,7 +3,7 @@
 ; the middle.block edge. The escape rule lets R-edge incomings drop when
 ; the merge keeps its scalar-loop edge. Corpus shape: probe built from
 ; the clang vectorizer skeleton (scalar tail %loop, i32 N).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define i32 @sum(ptr noundef %p, i32 noundef %n) {
 entry:

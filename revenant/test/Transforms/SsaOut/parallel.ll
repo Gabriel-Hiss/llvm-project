@@ -1,7 +1,7 @@
 ; Independent webs on one backedge: each phi's incoming value lives on
 ; the latch edge, so the loop-carried values survive in distinct locals
 ; with stores on the backedge and loads where they are read.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-ssaout -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-ssaout -S %s | %FileCheck %s
 
 ; CHECK-NOT: phi i32
 ; CHECK: alloca i32

@@ -72,14 +72,57 @@ c::CompoundStmt *GotoStmtBuilder::buildBody(llvm::Function &F,
             gotoTo(BI->getSuccessor(1)));
     } else if (auto *SI = llvm::dyn_cast<llvm::SwitchInst>(T)) {
       c::Expr *Cond = Exprs.cond(SI->getCondition(), Scope);
+      c::QualType CT = Cond ? Cond->getType() : AST.IntTy;
+      if (!CT->isIntegerType()) {
+        unsigned Bits =
+            SI->getCondition()->getType()->getIntegerBitWidth();
+        CT = AST.getIntTypeForBitwidth(Bits, false);
+        c::CastKind K = Cond->getType()->isPointerType()
+                            ? c::CK_PointerToIntegral
+                            : c::CK_IntegralCast;
+        Cond = c::CStyleCastExpr::Create(
+            AST, CT, c::VK_PRValue, K, Cond, nullptr, c::FPOptionsOverride(),
+            AST.getTrivialTypeSourceInfo(CT), c::SourceLocation(),
+            c::SourceLocation());
+      }
+      // The checker types the switch by the PRINTED condition: an
+      // ImplicitCast (lvalue-to-rvalue) prints as its operand, so the
+      // declared variable type governs, not the load's type. Widen to
+      // unsigned when that printed type is signed and any case needs
+      // the high bit; dispatch compares the same bit patterns.
+      c::Expr *Stripped = Cond;
+      while (auto *IC = llvm::dyn_cast<c::ImplicitCastExpr>(Stripped))
+        Stripped = IC->getSubExpr();
+      c::QualType Printed = Stripped ? Stripped->getType() : CT;
+      bool NeedUnsigned = Printed->isSignedIntegerType();
+      if (NeedUnsigned) {
+        NeedUnsigned = false;
+        for (auto &Case : SI->cases())
+          NeedUnsigned |= Case.getCaseValue()->getValue().isNegative();
+      }
+      if (NeedUnsigned) {
+        c::QualType U = AST.getCorrespondingUnsignedType(
+            Printed->isSignedIntegerType() ? Printed : CT);
+        if (!U.isNull()) {
+          c::TypeSourceInfo *TSI = AST.getTrivialTypeSourceInfo(U);
+          Cond = c::CStyleCastExpr::Create(AST, U, c::VK_PRValue,
+                                           c::CK_IntegralCast, Cond, nullptr,
+                                           c::FPOptionsOverride(), TSI,
+                                           c::SourceLocation(),
+                                           c::SourceLocation());
+          CT = U;
+        }
+      }
       c::SwitchStmt *SW =
           c::SwitchStmt::Create(AST, nullptr, nullptr, Cond,
                                 c::SourceLocation(), c::SourceLocation());
       SmallVector<c::Stmt *, 8> Cases;
       for (auto &Case : SI->cases()) {
-        c::QualType CT = Cond ? Cond->getType() : AST.IntTy;
-        llvm::APInt CaseValue =
-            Case.getCaseValue()->getValue().sextOrTrunc(AST.getIntWidth(CT));
+        llvm::APInt CaseValue = Case.getCaseValue()->getValue();
+        if (CT->isSignedIntegerType())
+          CaseValue = CaseValue.sextOrTrunc(AST.getIntWidth(CT));
+        else if (CaseValue.getBitWidth() != (unsigned)AST.getIntWidth(CT))
+          CaseValue = CaseValue.zextOrTrunc(AST.getIntWidth(CT));
         c::Expr *LH = c::IntegerLiteral::Create(
             AST, CaseValue, CT, c::SourceLocation());
         c::CaseStmt *CS = c::CaseStmt::Create(
