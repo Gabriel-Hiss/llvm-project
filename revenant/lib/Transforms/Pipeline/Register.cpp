@@ -7,12 +7,13 @@
 //===----------------------------------------------------------------------===//
 //
 // Single registration site for every Revenant transform pass. Each pass is
-// a FunctionPassManager pass named `revenant-<name>` — except
-// `revenant-unabi`, which rewrites function signatures and must run as a
-// ModulePassManager pass (erasing a Function while the FPM iterates the
-// module is a use-after-free; LLVM's own ArgPromotion/DeadArgElim are
-// module passes for the same reason). Each pass is declared in its own
-// header under revenant/include/revenant/Transforms/<Name>/ and defined in
+// a FunctionPassManager pass named `revenant-<name>` — except the
+// signature-rewriting module passes (`revenant-unabi`, `revenant-uninline`,
+// `revenant-unipo`), which must run as ModulePassManager passes (erasing a
+// Function while the FPM iterates the module is a use-after-free; LLVM's
+// own ArgPromotion/DeadArgElim are module passes for the same reason).
+// Each pass is declared in its own header under
+// revenant/include/revenant/Transforms/<Name>/ and defined in
 // its own library RevenantTransform<Name> (both owned by the pass agent).
 // This file only wires names to classes so agents never conflict.
 //
@@ -70,6 +71,9 @@
 #if __has_include("revenant/Transforms/Uneh/Uneh.h")
 #include "revenant/Transforms/Uneh/Uneh.h"
 #endif
+#if __has_include("revenant/Transforms/Unipo/Unipo.h")
+#include "revenant/Transforms/Unipo/Unipo.h"
+#endif
 #if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
 #include "revenant/Transforms/UnloopVec/UnloopVec.h"
 #endif
@@ -79,7 +83,6 @@
 #if __has_include("revenant/Transforms/Unrust/Unrust.h")
 #include "revenant/Transforms/Unrust/Unrust.h"
 #endif
-
 using namespace llvm;
 
 namespace revenant {
@@ -191,9 +194,9 @@ void registerRevenantPasses(PassBuilder &PB) {
         return false;
       });
   // Module passes: only passes that must erase/replace Function objects
-  // (today just revenant-unabi, which rewrites signatures). Registered on
-  // the Module pipeline so top-level `-passes=revenant-unabi` resolves
-  // without the function adaptor.
+  // (revenant-unabi/uninline/unipo, which rewrite signatures or outline
+  // regions). Registered on the Module pipeline so top-level
+  // `-passes=revenant-<name>` resolves without the function adaptor.
   PB.registerPipelineParsingCallback(
       [](StringRef Name, ModulePassManager &MPM,
          ArrayRef<PassBuilder::PipelineElement>) {
@@ -206,6 +209,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Uninline/Uninline.h")
         if (Name == "revenant-uninline") {
           MPM.addPass(UninlinePass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unipo/Unipo.h")
+        if (Name == "revenant-unipo") {
+          MPM.addPass(UnipoPass());
           return true;
         }
 #endif
