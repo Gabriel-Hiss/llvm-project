@@ -603,7 +603,8 @@ bool matchEmpty(const DataLayout &DL, ICmpInst *Cmp, CxxFlavor Fl,
   // A loop-exit comparison such as `it != end` is not vector.empty().
   auto *LA = dyn_cast<LoadInst>(stripPtr(A));
   auto *LB = dyn_cast<LoadInst>(stripPtr(B));
-  if (!LA || !LB)
+  if (!LA || !LB || !LA->getType()->isPointerTy() ||
+      !LB->getType()->isPointerTy())
     return false;
   auto RA = rootOff(DL, LA->getPointerOperand());
   auto RB = rootOff(DL, LB->getPointerOperand());

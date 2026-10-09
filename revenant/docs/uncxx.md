@@ -16,7 +16,7 @@ For MSVC, a string-size candidate at +16 is accepted only when the same object a
 
 ## Regression coverage
 
-`test/Transforms/Uncxx/field-disambiguation.ll` checks a genuine first/last empty comparison and rejects iterator-versus-end comparisons, vector end-field `string.size` misclassification, and a null-data fallback being mistaken for an SSO selector. It also checks vector `back` recovery with a last-pointer-minus-one load.
+`test/Transforms/Uncxx/field-disambiguation.ll` checks a genuine first/last empty comparison and rejects iterator-versus-end comparisons, vector end-field `string.size` misclassification, a null-data fallback mistaken for an SSO selector, and C integer fields at offsets 0 and 8 mistaken for vector pointers. It also checks `vector.back` recovery with typed and byte-offset last-element addresses.
 
 ## Corpus coverage
 
@@ -33,6 +33,11 @@ remarks compare with 2 `vector.back` helper calls; the 672 string-destructor
 remarks compare with 10 `string_dtor` calls. The other ranked comparisons are
 140 vector-empty remarks vs 19 recovered calls and 323 string-size remarks vs
 452 helper calls.
+
+On normalized C IR, the integer-field guard prevents the false `vector.empty`
+rewrite. `c-o2` and `c-clang-o2` then produce no Uncxx helper calls. The
+module currently lacks compiler-language metadata, so whole-pass C++ gating
+still depends on language detection being available in the pipeline.
 
 The existing `revenant-decompile` accepts `--emit ir-raw|ir-clean|ir-final`,
 not `--emit ir`. On `cpp-o2.exe`, `--emit ir-final` succeeded, but applying

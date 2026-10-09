@@ -110,3 +110,15 @@ entry:
   %result = select i1 %keep.shape, i64 %field, i64 0
   ret i64 %result
 }
+; CHECK-LABEL: define i1 @integer_fields_equal
+; CHECK-NOT: revenant.cxx.vector.empty
+; CHECK: icmp eq i32 %first, %last
+
+define i1 @integer_fields_equal(ptr %record) {
+entry:
+  %first = load i32, ptr %record, align 4
+  %last.addr = getelementptr i8, ptr %record, i64 8
+  %last = load i32, ptr %last.addr, align 4
+  %equal = icmp eq i32 %first, %last
+  ret i1 %equal
+}
