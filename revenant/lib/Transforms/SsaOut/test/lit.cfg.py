@@ -2,7 +2,7 @@ import os
 import lit.formats
 
 # Standalone lit config for the SsaOut slice. Run from the slice build:
-#   <build-revenant>/bin/llvm-lit -v <worktree>/revenant/test/Transforms/SsaOut
+#   <build-revenant>/bin/llvm-lit -v <worktree>/revenant/lib/Transforms/SsaOut/test
 # The plugin DLL path comes from the environment (set by the build), else it
 # defaults to <worktree>/build-rv-ssaout/RevenantTransformSsaOut.dll.
 config.name = "RevenantSsaOut"
@@ -14,7 +14,7 @@ bindir = r"C:\Users\User\RustroverProjects\llvm-project\build-revenant\bin"
 plugin = os.environ.get("REVENANT_SSAOUT_PLUGIN", "")
 if not plugin:
     plugin = os.path.normpath(os.path.join(
-        config.test_source_root, "..", "..", "..", "..",
+        config.test_source_root, "..", "..", "..", "..", "..",
         "build-rv-ssaout", "RevenantTransformSsaOut.dll"))
 
 config.substitutions.append(("%opt", bindir + r"\opt.exe"))
