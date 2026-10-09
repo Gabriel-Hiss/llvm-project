@@ -33,6 +33,8 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Metadata.h"
+
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include <algorithm>
@@ -330,6 +332,64 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     Fn = llvm::cast<llvm::Function>(M.getOrInsertFunction(Name, FT).getCallee());
   }
   ir::setFunctionVA(*Fn, F.Start.Value);
+  if (auto It = P.Embedded.find(F.Start); It != P.Embedded.end()) {
+    const EmbeddedFunctionMetadata &Meta = It->second;
+    if (!Meta.SourceFile.empty()) {
+      llvm::Metadata *Location[] = {
+          llvm::MDString::get(M.getContext(), Meta.SourceFile),
+          llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt32Ty(M.getContext()), Meta.Line)),
+          llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt32Ty(M.getContext()), Meta.Column))};
+      Fn->setMetadata("rev.source", llvm::MDNode::get(M.getContext(), Location));
+    }
+    if (!Meta.PanicMessages.empty()) {
+      std::vector<llvm::Metadata *> Messages;
+      Messages.reserve(Meta.PanicMessages.size());
+      for (const std::string &Message : Meta.PanicMessages)
+        Messages.push_back(llvm::MDString::get(M.getContext(), Message));
+      Fn->setMetadata("rev.panic", llvm::MDNode::get(M.getContext(), Messages));
+    }
+    if (!Meta.ExceptionTypes.empty()) {
+      std::vector<llvm::Metadata *> Types;
+      Types.reserve(Meta.ExceptionTypes.size());
+      for (const std::string &Type : Meta.ExceptionTypes)
+        Types.push_back(llvm::MDString::get(M.getContext(), Type));
+      Fn->setMetadata("rev.eh.types", llvm::MDNode::get(M.getContext(), Types));
+    }
+    if (!Meta.ClassNames.empty()) {
+      std::vector<llvm::Metadata *> Classes;
+      Classes.reserve(Meta.ClassNames.size());
+      for (const std::string &Class : Meta.ClassNames)
+        Classes.push_back(llvm::MDString::get(M.getContext(), Class));
+      Fn->setMetadata("rev.class", llvm::MDNode::get(M.getContext(), Classes));
+    }
+    if (!Meta.MetadataStrings.empty()) {
+      std::vector<llvm::Metadata *> Strings;
+      Strings.reserve(Meta.MetadataStrings.size());
+      for (const std::string &String : Meta.MetadataStrings)
+        Strings.push_back(llvm::MDString::get(M.getContext(), String));
+      Fn->setMetadata("rev.strings", llvm::MDNode::get(M.getContext(), Strings));
+    }
+  }
+  if (!P.EmbeddedTypes.empty()) {
+    llvm::NamedMDNode *Types = M.getOrInsertNamedMetadata("rev.types");
+    if (Types->getNumOperands() == 0) {
+      for (const EmbeddedTypeMetadata &Type : P.EmbeddedTypes) {
+        std::vector<llvm::Metadata *> Fields{
+            llvm::MDString::get(M.getContext(), Type.Name),
+            llvm::MDString::get(M.getContext(), Type.DecoratedName),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt64Ty(M.getContext()), Type.VTable.Value))};
+        for (const std::string &Base : Type.BaseClasses)
+          Fields.push_back(llvm::MDString::get(M.getContext(), Base));
+        for (Va Target : Type.VirtualFunctions)
+          Fields.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt64Ty(M.getContext()), Target.Value)));
+        Types->addOperand(llvm::MDNode::get(M.getContext(), Fields));
+      }
+    }
+  }
   if (Sig && Sig->NoReturn)
     Fn->addFnAttr(llvm::Attribute::NoReturn);
 
