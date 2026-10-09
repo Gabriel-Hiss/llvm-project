@@ -3,13 +3,15 @@
 // suffix. All other blocks, edges, PHIs and operations must match exactly.
 struct CFGBody {
   Function *Fn;
-  const ReturnInst *Ret = nullptr;
+  SmallVector<const ReturnInst *, 4> Returns;
   bool Valid = false;
 };
 
 CFGBody analyzeCFG(Function &F) {
   CFGBody B{&F};
   if (F.isDeclaration() || F.isIntrinsic() || F.hasAddressTaken() ||
+      F.isInterposable() || F.hasFnAttribute(Attribute::ReturnsTwice) ||
+      F.hasFnAttribute(Attribute::Convergent) ||
       F.isVarArg() || F.size() < 2 || F.size() > 32 ||
       F.arg_size() > MaxOperands || !F.front().phis().empty())
     return B;
@@ -19,14 +21,14 @@ CFGBody analyzeCFG(Function &F) {
       ReturnAttrs.hasAttribute(Attribute::ZExt) ||
       ReturnAttrs.hasAttribute(Attribute::InReg))
     return B;
-  bool SawCall = false;
   for (const Argument &A : F.args()) {
     if (!A.getType()->isFirstClassType() || A.getType()->isTokenTy() ||
         A.hasByValAttr() || A.hasStructRetAttr() || A.hasInAllocaAttr() ||
         A.hasPreallocatedAttr() || A.hasAttribute(Attribute::SExt) ||
         A.hasAttribute(Attribute::ZExt) || A.hasAttribute(Attribute::InReg) ||
         A.hasAttribute(Attribute::Nest) || A.hasAttribute(Attribute::SwiftSelf) ||
-        A.hasAttribute(Attribute::SwiftError))
+        A.hasAttribute(Attribute::SwiftError) ||
+        A.hasAttribute(Attribute::NoAlias))
       return B;
   }
   for (const BasicBlock &BB : F) {
@@ -38,18 +40,23 @@ CFGBody analyzeCFG(Function &F) {
           I.isAtomic() || isSkippableMarker(I))
         return B;
       if (const auto *Ret = dyn_cast<ReturnInst>(&I)) {
-        if (B.Ret)
-          return B;
-        B.Ret = Ret;
+        B.Returns.push_back(Ret);
       } else if (I.isTerminator()) {
         if (!isa<BranchInst>(I) && !isa<SwitchInst>(I))
           return B;
-      } else if (!isPureForMatch(I, SawCall)) {
+      } else if (const auto *Call = dyn_cast<CallInst>(&I)) {
+        if (!Call->getCalledFunction() || Call->isInlineAsm() ||
+            Call->getCalledFunction()->isIntrinsic() ||
+            Call->isConvergent() || Call->cannotDuplicate() ||
+            Call->isMustTailCall() || Call->hasOperandBundles() ||
+            Call->hasFnAttr(Attribute::ReturnsTwice))
+          return B;
+      } else if (I.isVolatile() || isa<VAArgInst>(I) || isa<FenceInst>(I)) {
         return B;
       }
     }
   }
-  B.Valid = B.Ret != nullptr;
+  B.Valid = !B.Returns.empty();
   return B;
 }
 
@@ -60,6 +67,10 @@ struct CFGRegion {
   Instruction *Start = nullptr;
   Instruction *After = nullptr;
   Value *Escape = nullptr;
+  BasicBlock *Follow = nullptr;
+  DenseMap<BasicBlock *, Value *> ReturnValues;
+  // A null replacement denotes the reconstructed call result.
+  SmallVector<std::pair<PHINode *, Value *>, 4> ExitValues;
 };
 
 bool matchCFG(const CFGBody &B, Instruction &Start, CFGRegion &R) {
@@ -67,6 +78,12 @@ bool matchCFG(const CFGBody &B, Instruction &Start, CFGRegion &R) {
   Function &Caller = *Start.getFunction();
   if (&Callee == &Caller)
     return false;
+  if (Callee.hasFnAttribute(Attribute::NullPointerIsValid) !=
+      Caller.hasFnAttribute(Attribute::NullPointerIsValid))
+    return false;
+  for (StringRef Name : {"denormal-fp-math", "denormal-fp-math-f32"})
+    if (Callee.getFnAttribute(Name) != Caller.getFnAttribute(Name))
+      return false;
   DenseMap<const BasicBlock *, BasicBlock *> Blocks;
   SmallPtrSet<BasicBlock *, 32> Seen;
   SmallVector<const BasicBlock *, 16> Queue{&Callee.front()};
@@ -126,7 +143,20 @@ bool matchCFG(const CFGBody &B, Instruction &Start, CFGRegion &R) {
       if (isa<ReturnInst>(CI)) {
         if (TI == T->end())
           return false;
-        R.After = &*TI;
+        if (B.Returns.size() == 1) {
+          R.After = &*TI;
+        } else {
+          auto *Branch = dyn_cast<BranchInst>(&*TI++);
+          if (!Branch || !Branch->isUnconditional() ||
+              Branch->hasMetadata("revenant.opaque") ||
+              Branch->hasMetadata("revenant.region"))
+            return false;
+          BasicBlock *Follow = Branch->getSuccessor(0);
+          if (R.Follow && R.Follow != Follow)
+            return false;
+          R.Follow = Follow;
+          R.Insts.push_back(Branch);
+        }
         break;
       }
       if (TI == T->end())
@@ -137,16 +167,35 @@ bool matchCFG(const CFGBody &B, Instruction &Start, CFGRegion &R) {
           !CI.isSameOperationAs(RI) ||
           !CI.hasSameSubclassOptionalData(RI))
         return false;
+      for (StringRef Name : {"range", "nonnull", "align", "dereferenceable",
+                             "dereferenceable_or_null", "noundef",
+                             "invariant.load", "invariant.group", "alias.scope",
+                             "noalias", "fpmath", "nofpclass"})
+        if (CI.getMetadata(Name) != RI->getMetadata(Name))
+          return false;
       M.bindLocal(&CI, RI);
       Pairs.push_back({&CI, RI});
       R.Insts.push_back(RI);
     }
-    if (C != B.Ret->getParent() && TI != T->end())
+    if ((B.Returns.size() > 1 || !isa<ReturnInst>(C->getTerminator())) &&
+        TI != T->end())
       return false;
   }
   // Prebinding makes loop-carried PHIs and forward block references legal.
   // PHI incoming order is irrelevant; incoming edge identity is not.
   for (auto Pair : Pairs) {
+    if (const auto *CC = dyn_cast<CallInst>(Pair.first)) {
+      const auto *TC = cast<CallInst>(Pair.second);
+      if (CC->getAttributes() != TC->getAttributes() ||
+          CC->getTailCallKind() != TC->getTailCallKind())
+        return false;
+    }
+    if (const auto *Load = dyn_cast<LoadInst>(Pair.first))
+      if (Load->getAlign() != cast<LoadInst>(Pair.second)->getAlign())
+        return false;
+    if (const auto *Store = dyn_cast<StoreInst>(Pair.first))
+      if (Store->getAlign() != cast<StoreInst>(Pair.second)->getAlign())
+        return false;
     if (const auto *CP = dyn_cast<PHINode>(Pair.first)) {
       auto *TP = cast<PHINode>(Pair.second);
       for (unsigned I = 0; I < CP->getNumIncomingValues(); ++I) {
@@ -160,51 +209,132 @@ bool matchCFG(const CFGBody &B, Instruction &Start, CFGRegion &R) {
       return false;
     }
   }
-  auto Locals = M.snapLocals();
-  auto Args = M.args();
-  const Value *Return = B.Ret->getReturnValue();
-  if (Return) {
-    if (isa<Constant>(Return))
-      R.Escape = const_cast<Value *>(Return);
-    else if (const auto *A = dyn_cast<Argument>(Return))
-      R.Escape = Args.lookup(A);
-    else
-      R.Escape = Locals.lookup(Return);
-    if (!R.Escape)
+  for (const ReturnInst *Ret : B.Returns) {
+    Value *V = M.boundValue(Ret->getReturnValue());
+    if (Ret->getReturnValue() && !V)
       return false;
+    if (B.Returns.size() == 1)
+      R.Escape = V;
+    else
+      R.ReturnValues[Blocks.lookup(Ret->getParent())] = V;
   }
   SmallPtrSet<Instruction *, 32> Inside;
   for (Instruction *I : R.Insts)
     Inside.insert(I);
-  // Only the returned definition may escape. The exit suffix remains in
-  // the caller, including its terminator, so its successor PHIs stay intact.
+  if (R.Follow) {
+    if (Seen.contains(R.Follow))
+      return false;
+    for (PHINode &Phi : R.Follow->phis()) {
+      bool IsReturn = !Callee.getReturnType()->isVoidTy();
+      Value *Uniform = nullptr;
+      bool IsUniform = true;
+      for (auto Item : R.ReturnValues) {
+        int Index = Phi.getBasicBlockIndex(Item.first);
+        if (Index < 0)
+          return false;
+        Value *V = Phi.getIncomingValue(Index);
+        IsReturn &= V == Item.second;
+        if (!Uniform)
+          Uniform = V;
+        else
+          IsUniform &= V == Uniform;
+      }
+      if (IsReturn) {
+        R.ExitValues.push_back({&Phi, nullptr});
+      } else {
+        auto *I = dyn_cast<Instruction>(Uniform);
+        if (!IsUniform || (I && Inside.contains(I)))
+          return false;
+        R.ExitValues.push_back({&Phi, Uniform});
+      }
+    }
+  }
+  // Only the return may escape, either directly into the unique exit
+  // suffix or through proved return PHIs at the shared continuation.
   for (Instruction *I : R.Insts)
     for (User *U : I->users()) {
       auto *UI = dyn_cast<Instruction>(U);
-      if (!UI || (!Inside.contains(UI) && I != R.Escape))
+      if (!UI)
+        return false;
+      if (Inside.contains(UI) || (!R.Follow && I == R.Escape))
+        continue;
+      bool ReturnUse = false;
+      for (auto Item : R.ExitValues)
+        ReturnUse |= Item.first == UI && !Item.second;
+      if (!ReturnUse)
         return false;
     }
   DominatorTree DT(Caller);
+  for (Attribute Attr : Callee.getAttributes().getRetAttrs()) {
+    if (!Attr.isEnumAttribute() && !Attr.isConstantRangeAttribute())
+      return false;
+    Attribute::AttrKind Kind = Attr.getKindAsEnum();
+    if (Kind != Attribute::NoUndef && Kind != Attribute::Range)
+      return false;
+    for (const ReturnInst *Ret : B.Returns) {
+      Value *V = M.boundValue(Ret->getReturnValue());
+      Instruction *Context = R.Follow
+                                 ? Blocks.lookup(Ret->getParent())->getTerminator()
+                                 : R.After;
+      if (!V)
+        return false;
+      if (Kind == Attribute::NoUndef &&
+          !isGuaranteedNotToBeUndefOrPoison(V, nullptr, Context, &DT))
+        return false;
+      if (Kind == Attribute::Range &&
+          !Attr.getValueAsConstantRange().contains(
+              computeConstantRange(V, false, true, nullptr, Context, &DT)))
+        return false;
+    }
+  }
+  for (auto Item : R.ExitValues)
+    if (const auto *I = dyn_cast_or_null<Instruction>(Item.second))
+      if (!DT.dominates(I, &Start))
+        return false;
   for (const Argument &A : Callee.args()) {
-    Value *V = Args.lookup(&A);
+    Value *V = M.boundValue(&A);
     if (!V || V->getType() != A.getType())
       return false;
     if (const auto *I = dyn_cast<Instruction>(V))
       if (Inside.contains(I) || !DT.dominates(I, &Start))
         return false;
+    // Inlining can erase argument UB contracts. Reintroducing a call must
+    // not make a formerly defined input undefined. Check noundef directly;
+    // for the other input restrictions require an identical caller contract.
+    if (A.hasAttribute(Attribute::NoUndef) &&
+        !isGuaranteedNotToBeUndefOrPoison(V, nullptr, &Start, &DT))
+      return false;
+    AttributeSet Contracts = Callee.getAttributes().getParamAttrs(A.getArgNo());
+    for (Attribute Attr : Contracts) {
+      if (!Attr.isEnumAttribute() && !Attr.isIntAttribute() &&
+          !Attr.isConstantRangeAttribute())
+        continue;
+      Attribute::AttrKind Kind = Attr.getKindAsEnum();
+      if (Kind != Attribute::NonNull && Kind != Attribute::Alignment &&
+          Kind != Attribute::Dereferenceable &&
+          Kind != Attribute::DereferenceableOrNull && Kind != Attribute::Range &&
+          Kind != Attribute::NoFPClass && Kind != Attribute::NoAlias)
+        continue;
+      const auto *Input = dyn_cast<Argument>(V);
+      if (!Input ||
+          Input->getParent()->getAttributes().getParamAttr(Input->getArgNo(),
+                                                         Kind) != Attr)
+        return false;
+    }
     R.Args.push_back(V);
   }
   // Prefix instructions in the exit must have no successors of their own.
   // A branch/switch only occurs in fully matched non-return blocks. Thus
   // splitting the suffix creates the sole exit and introduces no side exit.
-  return R.After != nullptr && !isa<PHINode>(R.After);
+  return R.Follow || (R.After != nullptr && !isa<PHINode>(R.After));
 }
 
 void outlineCFG(const CFGBody &B, CFGRegion &R) {
   BasicBlock *Entry = R.Start->getParent();
-  BasicBlock *Exit = R.After->getParent();
-  BasicBlock *Follow = Exit->splitBasicBlock(R.After->getIterator(),
-                                           "uninline.cont");
+  BasicBlock *Follow = R.Follow;
+  if (!Follow)
+    Follow = R.After->getParent()->splitBasicBlock(R.After->getIterator(),
+                                                 "uninline.cont");
   CallInst *Call = CallInst::Create(B.Fn->getFunctionType(), B.Fn, R.Args,
                                   "", R.Start->getIterator());
   Call->setCallingConv(B.Fn->getCallingConv());
@@ -213,6 +343,13 @@ void outlineCFG(const CFGBody &B, CFGRegion &R) {
   // ABI-changing parameter attributes are rejected during analysis.
   for (Instruction *I : R.Insts)
     copyVA(I, Call);
+  for (auto Item : R.ExitValues) {
+    PHINode *Phi = Item.first;
+    for (unsigned I = Phi->getNumIncomingValues(); I-- > 0;)
+      if (R.ReturnValues.count(Phi->getIncomingBlock(I)))
+        Phi->removeIncomingValue(I, false);
+    Phi->addIncoming(Item.second ? Item.second : Call, Entry);
+  }
   if (R.Escape && isa<Instruction>(R.Escape)) {
     SmallPtrSet<Instruction *, 32> Inside;
     for (Instruction *I : R.Insts)
@@ -244,7 +381,9 @@ bool tryUninlineCFG(Function &Caller, const CFGBody &B) {
     return false;
   for (BasicBlock &BB : Caller)
     for (Instruction &I : BB) {
-      if (isa<PHINode>(I))
+      if (isa<PHINode>(I) ||
+          !B.Fn->front().front().isSameOperationAs(&I) ||
+          !B.Fn->front().front().hasSameSubclassOptionalData(&I))
         continue;
       CFGRegion R;
       if (!matchCFG(B, I, R))

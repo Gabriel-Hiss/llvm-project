@@ -73,6 +73,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
@@ -301,6 +302,16 @@ public:
   }
 
   void bindLocal(const Value *C, Value *R) { LocalBind[C] = R; }
+
+  Value *boundValue(const Value *V) const {
+    if (!V)
+      return nullptr;
+    if (isa<Constant>(V))
+      return const_cast<Value *>(V);
+    if (const auto *A = dyn_cast<Argument>(V))
+      return ArgBind.lookup(A);
+    return LocalBind.lookup(V);
+  }
 
   // Snapshot/restore for trial matches of candidate regions.
   DenseMap<const Value *, Value *> snapLocals() const { return LocalBind; }

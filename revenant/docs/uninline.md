@@ -74,3 +74,25 @@ repairs successor PHIs. The new call and branch retain available virtual
 addresses and debug locations. Opaque and structured-region annotations cause
 rejection rather than losing their meaning. Allocation, EH, atomics, marker
 intrinsics and ABI-changing attributes are outside the current proof.
+
+Multiple callee returns must branch to one continuation in the caller. Each
+continuation PHI must either merge the corresponding callee return values or
+carry the same outside value on every matched return edge. The rewrite removes
+those incoming edges and adds the entry edge with the call result or the proved
+uniform value. Unrelated outside predecessors stay in place. A second varying
+output, a side exit, or a non-dominating uniform value rejects the whole match.
+
+Stores and direct calls are legal when all operations and their order match.
+Volatile accesses, atomics, convergent calls, operand bundles and frame-sensitive
+intrinsics are rejected. Input and return contracts must also remain valid:
+noundef needs a value-tracking proof, other input restrictions need the same
+caller argument contract, and return ranges need a constant-range proof.
+Semantic instruction metadata must match, while addresses and debug locations
+are carried to the replacement call.
+
+Pass `--remarks meas/remarks/index.json` to `measure.py` for the confirmed
+inline-event denominator. Every row then retains the compiler's source
+location. Deleted callers and deleted callees remain in the denominator as
+none. If repeated identical targets have only some calls restored, their
+individual sites are unresolved rather than arbitrarily assigning successes
+to source locations. These rows are reported separately.
