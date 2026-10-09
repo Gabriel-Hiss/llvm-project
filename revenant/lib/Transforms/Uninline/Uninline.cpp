@@ -222,7 +222,42 @@ CalleeBody analyzeCallee(Function &F) {
       HasCall = true;
   if (B.Insts.size() < 3 && !HasCall)
     return B;
-  B.RetVal = Ret->getReturnValue();
+  // Wrapper disambiguation: a body that only forwards its arguments to
+  // one inner call (`mz_free(p)` = `free(p)`) is indistinguishable from
+  // hand-written calls to the inner function (measured: all 16 `free`
+  // sites in miniz O1 rewritten to `mz_free`, diverging from ir-pre,
+  // which calls `free` directly). Require the wrapper to add evidence
+  // beyond forwarding: a constant operand in the body, or an argument
+  // used zero times or at least twice. `mz_deflateInit(a,b)` passes
+  if (HasCall && B.Insts.size() < 3) {
+    bool Distinctive = false;
+    for (const Instruction *I : B.Insts) {
+      const Value *CalleeOp =
+          isa<CallBase>(I) ? cast<CallBase>(I)->getCalledOperand() : nullptr;
+      for (const Value *V : I->operands()) {
+        if (V == CalleeOp)
+          continue; // the inner target itself is not binding evidence
+        if (isa<Constant>(V) && !V->getType()->isVoidTy() &&
+            !isa<UndefValue>(V))
+          Distinctive = true;
+      }
+    }
+    DenseMap<const Argument *, unsigned> Uses;
+    for (const Argument &A : F.args())
+      Uses[&A] = 0;
+    for (const Instruction *I : B.Insts)
+      for (const Value *V : I->operands())
+        if (const auto *A = dyn_cast<Argument>(V)) {
+          auto It = Uses.find(A);
+          if (It != Uses.end())
+            ++It->second;
+        }
+    for (auto &KV : Uses)
+      if (KV.second != 1)
+        Distinctive = true;
+    if (!Distinctive)
+      return B;
+  }
   if (B.RetVal) {
     // The returned value must be computed by the body or be a bound
     // argument/constant: anything else (e.g. a global) still matches, but
