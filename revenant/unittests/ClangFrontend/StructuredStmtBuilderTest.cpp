@@ -391,5 +391,41 @@ TEST(StructuredStmtBuilderTest, SehTryExcept) {
   EXPECT_NE(S.find("__except"), std::string::npos);
   EXPECT_NE(S.find("__except (1)"), std::string::npos);
 }
+TEST(StructuredStmtBuilderTest, SehTryFinally) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_seh_finally", C);
+  llvm::Type *VoidTy = llvm::Type::getVoidTy(C);
+  llvm::Function *Throw = llvm::Function::Create(
+      llvm::FunctionType::get(VoidTy, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "may_throw_finally", M);
+  llvm::Function *Cleanup = llvm::Function::Create(
+      llvm::FunctionType::get(VoidTy, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "cleanup_finally", M);
+  llvm::Function *Pers = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getInt32Ty(C), true),
+      llvm::GlobalValue::ExternalLinkage, "__C_specific_handler", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(VoidTy, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_seh_finally", M);
+  F->setPersonalityFn(Pers);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_a000", F);
+  llvm::BasicBlock *Normal = BasicBlock::Create(C, "bb_a010", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_a020", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateInvoke(Throw->getFunctionType(), Throw, Normal, Dispatch, {});
+  B.SetInsertPoint(Normal);
+  B.CreateRetVoid();
+  B.SetInsertPoint(Dispatch);
+  auto *Pad = B.CreateCleanupPad(llvm::ConstantTokenNone::get(C), {},
+                                 "finally.pad");
+  Pad->setMetadata("revenant.finally", MDNode::get(C, {}));
+  B.CreateCall(Cleanup);
+  B.CreateCleanupRet(Pad);
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("__try"), std::string::npos);
+  EXPECT_NE(S.find("__finally"), std::string::npos);
+  EXPECT_NE(S.find("cleanup_finally"), std::string::npos);
+}
 
 } // namespace

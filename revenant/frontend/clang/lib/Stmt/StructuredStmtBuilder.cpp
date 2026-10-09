@@ -1140,6 +1140,19 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
     EHClaimed.insert(H);
   EHClaimed.insert(Dispatch);
 
+  if (IsSEH && CP && CP->getMetadata("revenant.finally")) {
+    SmallVector<Stmt *, 4> FinallyBody;
+    emitCatchBlockStmts(Dispatch, FinallyBody);
+    if (FinallyBody.empty())
+      FinallyBody.push_back(new (*AST) NullStmt(SourceLocation(), false));
+    CompoundStmt *TryC = CompoundStmt::Create(
+        *AST, TryBody, FPOptionsOverride(), SourceLocation(), SourceLocation());
+    CompoundStmt *HC = CompoundStmt::Create(
+        *AST, FinallyBody, FPOptionsOverride(), SourceLocation(),
+        SourceLocation());
+    Stmt *Handler = SEHFinallyStmt::Create(*AST, SourceLocation(), HC);
+    return SEHTryStmt::Create(*AST, false, SourceLocation(), TryC, Handler);
+  }
   if (IsSEH) {
     SmallVector<Stmt *, 4> HandlerBody;
     for (BasicBlock *H : Handlers)

@@ -118,6 +118,27 @@ TEST(EHTablesTest, DecodesFuncInfo3CatchHandlerAndTypeName) {
   EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1110));
   EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1120));
 }
+TEST(EHTablesTest, DecodesCleanupOnlyFuncInfo3RangesFromIPStates) {
+  PeFile PE = makePE(true);
+  auto &D = PE.Img->Sections[1].Data;
+  put32(D, 12, 0);
+  put32(D, 16, 0x1280);
+  put32(D, 20, 0);
+  put32(D, 24, 0);
+  put32(D, 28, 4);
+  put32(D, 32, 0x1300);
+  put32(D, 0x280, 0);
+  put32(D, 0x284, 0x1300);
+
+  auto EH = decodeEHTables(PE);
+  ASSERT_EQ(EH.size(), 1u);
+  ASSERT_EQ(EH[0].Cleanups.size(), 1u);
+  ASSERT_EQ(EH[0].TryRegions.size(), 2u);
+  EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1100));
+  EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1110));
+  EXPECT_EQ(EH[0].TryRegions[1].Begin, Va(0x1120));
+  EXPECT_EQ(EH[0].TryRegions[1].End, Va(0x1180));
+}
 
 TEST(EHTablesTest, DecodesSehScopeRangeAndFinally) {
   auto EH = decodeEHTables(makePE(false));

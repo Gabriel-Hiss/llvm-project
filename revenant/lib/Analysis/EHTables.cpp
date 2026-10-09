@@ -154,6 +154,23 @@ void readSEH(const Image &I, FunctionEH &F, Va Data) {
 
 /// Resolve try-state intervals against the ordered MSVC IP-to-state map.
 void resolveTryRanges(FunctionEH &F) {
+  // FuncInfo may have unwind-map states but no catch blocks. Those states
+  // still delimit calls that need cleanuppads for destructors/finally.
+  for (const EHCleanup &Cleanup : F.Cleanups) {
+    bool Covered = std::any_of(
+        F.TryRegions.begin(), F.TryRegions.end(), [&](const EHTryRegion &T) {
+          return Cleanup.State >= T.CatchLow && Cleanup.State <= T.CatchHigh;
+        });
+    if (Covered || Cleanup.State < 0)
+      continue;
+    EHTryRegion T;
+    T.Begin = F.Function;
+    T.End = F.End;
+    T.State = Cleanup.State;
+    T.CatchLow = Cleanup.State;
+    T.CatchHigh = Cleanup.State;
+    F.TryRegions.push_back(std::move(T));
+  }
   std::vector<EHTryRegion> Resolved;
   for (const EHTryRegion &T : F.TryRegions) {
     bool Active = false;

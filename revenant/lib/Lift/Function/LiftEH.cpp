@@ -237,6 +237,8 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
           "revenant.handler",
           MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
                           Type::getInt64Ty(C), HandlerVA))}));
+      if (Handler && Handler->Kind == HandlerKind::Finally)
+        PadI->setMetadata("revenant.finally", MDNode::get(C, {}));
       Pad = PadI;
     } else {
       Normal->eraseFromParent();
