@@ -139,11 +139,29 @@ def _operand_width(text):
 def canon(text, near_branch=False, ip_rel_memory=False,
           symbol_memory=False, memory_index=None, memory_scale=1):
     """Normalize printer-only Intel differences and preserve operand identity."""
-    t = _PAREN.sub("", text).strip().lower()
+    # iced-x86 spells legacy PCLMUL immediate variants as separate
+    # mnemonics; LLVM's printer uses the base mnemonic plus the selector.
+    pclmul_aliases = {
+        "pclmullqlqdq": ("pclmulqdq", 0),
+        "pclmullqhqdq": ("pclmulqdq", 16),
+        "pclmulhqlqdq": ("pclmulqdq", 1),
+        "pclmulhqhqdq": ("pclmulqdq", 17),
+        "vpclmullqlqdq": ("vpclmulqdq", 0),
+        "vpclmullqhqdq": ("vpclmulqdq", 16),
+        "vpclmulhqlqdq": ("vpclmulqdq", 1),
+        "vpclmulhqhqdq": ("vpclmulqdq", 17),
+    }
+    t = re.sub(r"^\s*addr32\s+", "", text.lower()).strip()
+    t = _PAREN.sub("", t).strip().lower()
+    head0 = t.split(None, 1)[0] if t else ""
+    if head0 in pclmul_aliases:
+        mnemonic, selector = pclmul_aliases[head0]
+        operands = t.split(None, 1)[1].split(",")
+        t = mnemonic + " " + ", ".join(operands) + f", {selector}"
     if ip_rel_memory:
         t = _RIPBR.sub("[@]", t)
-        # The oracle may contain an unrelocated object literal; the final
-        # binary decode established that this bracket operand is RIP-relative.
+        # Oracle text can retain unrelocated object literals; decode the
+        # linked PE to identify the corresponding RIP-relative operand.
         t = _BAREABS.sub("[@]", t)
     elif symbol_memory:
         expr = "[@"
@@ -153,6 +171,8 @@ def canon(text, near_branch=False, ip_rel_memory=False,
                 expr += "*" + str(memory_scale)
         expr += "]"
         t = re.sub(r"\[[^\]]*\]", expr, t, count=1)
+    if t.startswith("hint-taken "):
+        t = t[len("hint-taken "):]
     if near_branch:
         mnemonic = t.split(None, 1)[0] if t else ""
         return mnemonic + "@"
@@ -171,6 +191,8 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     head = {"fwait": "wait", "fucompi": "fucomip", "fcompi": "fcomip"}.get(
         head, head)
     operands = [o.strip() for o in rest.split(",")] if rest.strip() else []
+    if head == "sha256rnds2" and operands[-1:] == ["xmm0"]:
+        operands = operands[:-1]
     if head.startswith("f") and head != "fs":
         # x87 implicit operands: the stack top and (for pops/exchange) st(1)
         # print explicitly in one syntax and not in the other.
@@ -196,6 +218,7 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     t = re.sub(r",\s*-(0x[0-9a-f]+|[0-9a-f]+h|\d+)\b",
                mask_negative_immediate, t)
     t = _PTR.sub("", t)
+    t = re.sub(r"\b(?:ds|ss):", "", t)
     t = _SCALE.sub(r"\2*\1", t)
     t = _NUMBER.sub(lambda m: f"#{_number_value(m.group(0))}", t)
     t = _WS.sub("", t)
