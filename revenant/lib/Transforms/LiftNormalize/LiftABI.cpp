@@ -1,14 +1,202 @@
 //===- LiftABI.cpp - pointer signatures and stored addresses -------------===//
 #include "revenant/Transforms/LiftNormalize/LiftNormalize.h"
+#include "revenant/IR/Contract.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/DIBuilder.h"
+#include <algorithm>
+#include <vector>
 using namespace llvm;
 namespace revenant {
 namespace {
+DIType *irDebugType(Type *Ty, DIBuilder &DIB) {
+  if (Ty->isVoidTy())
+    return nullptr;
+  if (Ty->isPointerTy())
+    return DIB.createPointerType(nullptr, 64);
+  if (Ty->isIntegerTy())
+    return DIB.createBasicType("integer", Ty->getIntegerBitWidth(),
+                               dwarf::DW_ATE_signed);
+  if (Ty->isFloatingPointTy())
+    return DIB.createBasicType("float", Ty->getPrimitiveSizeInBits(),
+                               dwarf::DW_ATE_float);
+  return nullptr;
+}
+
+void updateSubprogramType(Function &F, DIBuilder &DIB,
+                          ArrayRef<DIType *> PointerArgs,
+                          bool PointerReturn) {
+  DISubprogram *SP = F.getSubprogram();
+  if (!SP || !SP->isDistinct())
+    return;
+  auto *OldType = SP->getType();
+  DITypeRefArray OldTypes =
+      OldType ? OldType->getTypeArray() : DITypeRefArray();
+  SmallVector<Metadata *, 8> Types;
+  if (PointerReturn)
+    Types.push_back(DIB.createPointerType(nullptr, 64));
+  else if (F.getReturnType()->isVoidTy())
+    Types.push_back(nullptr);
+  else
+    Types.push_back(OldTypes.size() && OldTypes[0]
+                        ? OldTypes[0]
+                        : irDebugType(F.getReturnType(), DIB));
+  for (Argument &A : F.args()) {
+    unsigned I = A.getArgNo();
+    if (I < PointerArgs.size() && PointerArgs[I])
+      Types.push_back(PointerArgs[I]);
+    else if (I + 1 < OldTypes.size() && OldTypes[I + 1])
+      Types.push_back(OldTypes[I + 1]);
+    else
+      Types.push_back(irDebugType(A.getType(), DIB));
+  }
+  SP->replaceType(DIB.createSubroutineType(DIB.getOrCreateTypeArray(Types)));
+}
+
+void updateSubprogramType(Function &F, ArrayRef<bool> PointerArgs,
+                          bool PointerReturn) {
+  DISubprogram *SP = F.getSubprogram();
+  if (!SP || !SP->getUnit())
+    return;
+  DIBuilder DIB(*F.getParent(), true, SP->getUnit());
+  SmallVector<DIType *, 8> Types(PointerArgs.size(), nullptr);
+  for (unsigned I = 0; I < PointerArgs.size(); ++I)
+    if (PointerArgs[I])
+      Types[I] = DIB.createPointerType(nullptr, 64);
+  updateSubprogramType(F, DIB, Types, PointerReturn);
+  DIB.finalize();
+}
+
+/// Convert V to Ty for a rebuilt call operand. Returns undef when no
+/// conversion exists; lifted signatures are integer/float/pointer only.
+Value *coerceTo(Value *V, Type *Ty, IRBuilder<> &B) {
+  Type *VT = V->getType();
+  if (VT == Ty)
+    return V;
+  if (VT->isIntegerTy() && Ty->isIntegerTy())
+    return B.CreateZExtOrTrunc(V, Ty, "aco");
+  if (VT->isIntegerTy() && Ty->isPointerTy())
+    return B.CreateIntToPtr(V, Ty, "aco");
+  if (VT->isPointerTy() && Ty->isIntegerTy())
+    return B.CreatePtrToInt(V, Ty, "aco");
+  if (VT->isIntegerTy() && Ty->isFloatingPointTy()) {
+    Value *Wide = B.CreateZExtOrTrunc(
+        V, IntegerType::get(V->getContext(), Ty->getPrimitiveSizeInBits()),
+        "aco");
+    return B.CreateBitCast(Wide, Ty, "aco");
+  }
+  if (VT->isFloatingPointTy() && Ty->isIntegerTy())
+    return B.CreateZExtOrTrunc(
+        B.CreateBitCast(
+            V, IntegerType::get(V->getContext(), VT->getPrimitiveSizeInBits()),
+            "aco"),
+        Ty, "aco");
+  if (VT->isFloatingPointTy() && Ty->isFloatingPointTy())
+    return B.CreateFPCast(V, Ty, "aco");
+  return UndefValue::get(Ty);
+}
+/// Absolute address constants the lifter leaves as `inttoptr` because the
+/// referenced symbol was not materialized for that function yet. Every
+/// lifted object carries its image VA (functions: "revenant.va" attribute,
+/// globals: "revenant.va" metadata; import decls carry the IAT slot VA),
+/// so a constant inttoptr can resolve to the real symbol or a GEP into the
+/// global containing the address.
+struct Absolute {
+  /// Exact function VA -> Function.
+  DenseMap<uint64_t, Function *> Functions;
+  /// Global VA ranges, sorted: [VA, VA + allocated size).
+  std::vector<std::pair<uint64_t, GlobalVariable *>> Globals;
+
+  /// The image-backed object covering V, or nullptr.
+  Constant *forAddress(uint64_t V) const {
+    if (auto It = Functions.find(V); It != Functions.end())
+      return It->second;
+    auto It = std::upper_bound(
+        Globals.begin(), Globals.end(), V,
+        [](uint64_t V, const std::pair<uint64_t, GlobalVariable *> &G) {
+          return V < G.first;
+        });
+    if (It == Globals.begin())
+      return nullptr;
+    --It;
+    GlobalVariable *G = It->second;
+    uint64_t Size =
+        G->getParent()->getDataLayout()
+            .getTypeAllocSize(G->getValueType())
+            .getFixedValue();
+    if (V >= It->first + Size)
+      return nullptr;
+    if (V == It->first)
+      return G;
+    LLVMContext &C = G->getContext();
+    Constant *Idx = ConstantInt::get(Type::getInt64Ty(C), V - It->first);
+    return ConstantExpr::getGetElementPtr(Type::getInt8Ty(C), G, Idx);
+  }
+};
+
+/// `C` with every inttoptr-of-image-VA replaced by its global object.
+Constant *resolveConstant(Constant *C, const Absolute &Abs) {
+  auto *CE = dyn_cast<ConstantExpr>(C);
+  if (!CE)
+    return C;
+  if (CE->getOpcode() == Instruction::IntToPtr)
+    if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+      if (Constant *R = Abs.forAddress(CI->getZExtValue()))
+        return R;
+  SmallVector<Constant *, 8> Ops;
+  bool Any = false;
+  for (unsigned K = 0; K < CE->getNumOperands(); ++K) {
+    auto *Op = cast<Constant>(CE->getOperand(K));
+    Constant *R = resolveConstant(Op, Abs);
+    Ops.push_back(R);
+    Any |= R != Op;
+  }
+  if (!Any)
+    return C;
+  return CE->getWithOperands(Ops, C->getType(), true);
+}
+
+/// Point `CB` at F, rebuilding the call when the site's function type no
+/// longer matches (extra register args are dropped, missing ones become
+/// undef, the result is coerced back). Keeps provenance metadata.
+void retargetCall(CallBase &CB, Function *F) {
+  if (CB.getFunctionType() == F->getFunctionType()) {
+    CB.setCalledFunction(F);
+    return;
+  }
+  FunctionType *FT = F->getFunctionType();
+  SmallVector<Value *, 8> Args;
+  IRBuilder<> B(&CB);
+  for (unsigned K = 0; K < FT->getNumParams(); ++K) {
+    Value *A = K < CB.arg_size()
+                   ? coerceTo(CB.getArgOperand(K), FT->getParamType(K), B)
+                   : UndefValue::get(FT->getParamType(K));
+    Args.push_back(A);
+  }
+  auto *New = B.CreateCall(FT, F, Args);
+  New->setCallingConv(CB.getCallingConv());
+  if (CB.getDebugLoc())
+    New->setDebugLoc(CB.getDebugLoc());
+  else if (DISubprogram *SP = CB.getFunction()->getSubprogram())
+    New->setDebugLoc(DILocation::get(CB.getContext(), 1, 1, SP));
+  New->copyMetadata(CB);
+  if (!CB.getType()->isVoidTy()) {
+    Value *Res;
+    if (New->getType()->isVoidTy())
+      Res = UndefValue::get(CB.getType());
+    else
+      Res = coerceTo(New, CB.getType(), B);
+    CB.replaceAllUsesWith(Res);
+  }
+  CB.eraseFromParent();
+}
 void copyOrigin(Instruction *To, const Instruction &From) {
   for (StringRef Kind : {"revenant.va", "revenant.opaque", "revenant.region"})
     if (MDNode *MD = From.getMetadata(Kind))
@@ -54,6 +242,7 @@ void rewriteSignature(Function &F, Signature &S) {
   M.getFunctionList().insert(F.getIterator(), N);
   N->takeName(&F);
   N->splice(N->end(), &F);
+  updateSubprogramType(*N, ArrayRef<bool>(S.Pointers), S.PointerReturn);
   for (Argument &Old : F.args()) {
     Argument *New = N->getArg(Old.getArgNo());
     New->takeName(&Old);
@@ -126,6 +315,77 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
   const DataLayout &DL = M.getDataLayout();
   if (DL.getPointerSizeInBits() != 64 || DL.isNonIntegralAddressSpace(0))
     return PreservedAnalyses::all();
+  // Absolute addresses the lifter left as integer constants: globals,
+  // strings and IAT slots that this function never materialized, plus
+  // direct calls whose target was lifted as inttoptr code VA. Map them
+  // onto the module's own symbols first so signature evidence below sees
+  // real pointer uses.
+  Absolute Abs;
+  bool Changed = false;
+  for (GlobalVariable &G : M.globals())
+    if (auto VA = ir::getGlobalVA(G))
+      Abs.Globals.push_back({*VA, &G});
+  llvm::sort(Abs.Globals,
+             [](const auto &A, const auto &B) { return A.first < B.first; });
+  for (Function &F : M)
+    if (auto VA = ir::getFunctionVA(F))
+      Abs.Functions.try_emplace(*VA, &F);
+  for (GlobalVariable &G : M.globals())
+    if (G.hasInitializer()) {
+      Constant *R = resolveConstant(G.getInitializer(), Abs);
+      if (R != G.getInitializer()) {
+        G.setInitializer(R);
+        Changed = true;
+      }
+    }
+  for (Function &F : M) {
+    // Calls through a resolved code VA become direct calls.
+    SmallVector<CallBase *, 8> Calls;
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (!isa<CallBrInst>(CB) && !CB->isMustTailCall())
+          Calls.push_back(CB);
+    for (CallBase *CB : Calls)
+      if (auto *CE = dyn_cast<ConstantExpr>(CB->getCalledOperand()))
+        if (CE->getOpcode() == Instruction::IntToPtr)
+          if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+            if (Constant *R = Abs.forAddress(CI->getZExtValue())) {
+              if (auto *Target = dyn_cast<Function>(R))
+                retargetCall(*CB, Target);
+              else
+                CB->setCalledOperand(R);
+              Changed = true;
+            }
+  }
+  // Any other constant inttoptr operand: phi inedges, non-callee call
+  // operands, stores, selects and surviving IntToPtr instructions.
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      for (Use &U : I.operands()) {
+        auto *C = dyn_cast<Constant>(U.get());
+        if (!C || isa<GlobalValue>(C) || isa<ConstantInt>(C))
+          continue;
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (CB->isCallee(&U))
+            continue;
+        Constant *R = resolveConstant(C, Abs);
+        if (R != C) {
+          U.set(R);
+          Changed = true;
+        }
+      }
+  // IntToPtr instructions over image constants never reach the operand
+  // loop above unchanged; fold them to the resolved symbol.
+  for (Function &F : M)
+    for (Instruction &I : make_early_inc_range(instructions(F)))
+      if (auto *P = dyn_cast<IntToPtrInst>(&I))
+        if (auto *CI = dyn_cast<ConstantInt>(P->getOperand(0)))
+          if (Constant *R = Abs.forAddress(CI->getZExtValue())) {
+            P->replaceAllUsesWith(R);
+            P->eraseFromParent();
+            Changed = true;
+          }
+
   DenseMap<Function *, Signature> Signatures;
   SmallPtrSet<Value *, 32> Addresses;
   for (Function &F : M) {
@@ -170,7 +430,6 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
               Progress |= Addresses.insert(R->getReturnValue()).second;
     }
   } while (Progress);
-  bool Changed = false;
   for (auto &KV : Signatures) {
     Signature &S = KV.second;
     if (S.PointerReturn || llvm::is_contained(S.Pointers, true)) {

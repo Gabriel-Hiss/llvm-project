@@ -12,10 +12,15 @@
 #include "revenant/Target/TargetHooks.h"
 
 #include "revenant/Analysis/Analysis.h"
+#include "revenant/Analysis/EmbeddedMeta.h"
+#include "revenant/Analysis/Resolver.h"
+
 #include <algorithm>
 #include <chrono>
 #include <map>
 #include <set>
+
+#include "llvm/ADT/StringExtras.h"
 
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -136,6 +141,7 @@ Error Session::setup() {
 Error Session::analyze() {
   auto Start = std::chrono::steady_clock::now();
   Prog = revenant::analyze(*Pe, *createX86TargetHooks());
+  applyEmbeddedMetadata(Prog, *Pe);
   if (!Prog.Resolver)
     Prog.Resolver = std::make_shared<SessionNames>(Prog);
   SetupStages.push_back(
@@ -144,6 +150,41 @@ Error Session::analyze() {
        "", microsSince(Start)});
   return Error::success();
 }
+
+void Session::setMetaMode(MetaMode Mode) {
+  if (Mode == MetaMode::Embedded) {
+    applyEmbeddedMetadata(Prog, *Pe);
+    return;
+  }
+  Prog.Embedded.clear();
+  Prog.EmbeddedTypes.clear();
+  if (Mode != MetaMode::None)
+    return;
+
+  // Imports are needed to keep external calls linked. Other names are
+  // optional metadata and must not leak into none-mode output.
+  std::map<Va, std::string> AvailableNames;
+  if (Prog.Externs)
+    for (const auto &[Slot, Ext] : *Prog.Externs)
+      AvailableNames.emplace(Slot, Ext.Name);
+  for (auto &[Start, Rec] : Prog.Functions) {
+    Rec.Name = "sub_" + utohexstr(Start.Value);
+    AvailableNames.insert_or_assign(Start, Rec.Name);
+  }
+  if (Prog.Names)
+    *Prog.Names = std::move(AvailableNames);
+  Prog.Resolver = makeResolver(Prog.Names, Prog.Externs, nullptr);
+  SymNames.clear();
+  if (Prog.Externs)
+    for (const auto &[Slot, Ext] : *Prog.Externs) {
+      (void)Slot;
+      SymNames.push_back(Ext.Name);
+    }
+  llvm::sort(SymNames);
+  SymNames.erase(std::unique(SymNames.begin(), SymNames.end()), SymNames.end());
+  Pe->CoffSymbols.clear();
+}
+
 
 std::string Session::nameFor(Va Addr) const {
   if (Prog.Externs)

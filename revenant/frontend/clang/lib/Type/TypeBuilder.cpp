@@ -211,8 +211,25 @@ public:
 
   clang::QualType typeOf(Type *Ty, const DIType *DI) override {
     if (DI) {
-      if (clang::QualType Q = typeOfDI(DI); !Q.isNull())
-        return Q;
+      clang::QualType Q = typeOfDI(DI);
+      if (!Q.isNull()) {
+        bool KnownIRCategory = Ty &&
+                               (Ty->isIntegerTy() || Ty->isFloatingPointTy() ||
+                                Ty->isPointerTy() || Ty->isStructTy() ||
+                                Ty->isArrayTy() || Ty->isVoidTy() ||
+                                Ty->isVectorTy());
+        bool Compatible =
+            !KnownIRCategory ||
+            (Ty->isIntegerTy() && Q->isIntegerType()) ||
+            (Ty->isFloatingPointTy() && Q->isFloatingType()) ||
+            (Ty->isPointerTy() && Q->isPointerType()) ||
+            (Ty->isStructTy() && Q->isRecordType()) ||
+            (Ty->isArrayTy() && Q->isArrayType()) ||
+            (Ty->isVoidTy() && Q->isVoidType()) ||
+            (Ty->isVectorTy() && Q->isVectorType());
+        if (Compatible)
+          return Q;
+      }
     }
     return typeOfIR(Ty);
   }
@@ -425,6 +442,12 @@ private:
       return A.getConstantArrayType(El, llvm::APInt(64, AT->getNumElements()),
                                     nullptr, clang::ArraySizeModifier::Normal,
                                     0);
+    }
+    if (auto *VT = dyn_cast<FixedVectorType>(Ty)) {
+      TypeSize Size = Ctx.module().getDataLayout().getTypeSizeInBits(VT);
+      if (!Size.isScalable())
+        return intOf(static_cast<unsigned>(Size.getFixedValue()),
+                     /*Signed=*/false);
     }
     if (auto *ST = dyn_cast<StructType>(Ty)) {
       if (ST->isOpaque())

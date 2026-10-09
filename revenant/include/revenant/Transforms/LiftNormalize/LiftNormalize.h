@@ -11,5 +11,9 @@ class LiftABIPass : public llvm::PassInfoMixin<LiftABIPass> {
 public:
   llvm::PreservedAnalyses run(llvm::Module &, llvm::ModuleAnalysisManager &);
 };
+class LiftStructsPass : public llvm::PassInfoMixin<LiftStructsPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &, llvm::ModuleAnalysisManager &);
+};
 } // namespace revenant
 #endif

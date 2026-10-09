@@ -9,7 +9,7 @@
 #include "revenant/Object/PeFile.h"
 
 #include <algorithm>
-#include <cstring>
+#include <cstddef>
 #include <set>
 
 #include "llvm/Object/COFF.h"
@@ -441,6 +441,41 @@ static std::vector<RichEntry> readRichHeader(ArrayRef<uint8_t> Bytes) {
   return Out;
 }
 
+static void readCoffSymbols(const COFFObjectFile &Obj, Va Base,
+                            std::vector<CoffSymbol> &Out) {
+  uint32_t Count = Obj.getNumberOfSymbols();
+  for (uint32_t Index = 0; Index < Count;) {
+    auto SymbolOrErr = Obj.getSymbol(Index);
+    if (!SymbolOrErr) {
+      consumeError(SymbolOrErr.takeError());
+      break;
+    }
+    COFFSymbolRef Symbol = *SymbolOrErr;
+    uint32_t Next = Index + 1 + Symbol.getNumberOfAuxSymbols();
+    if (Next <= Index || Next > Count)
+      break;
+
+    int32_t SectionNumber = Symbol.getSectionNumber();
+    if (SectionNumber > 0) {
+      auto SectionOrErr = Obj.getSection(SectionNumber);
+      if (SectionOrErr) {
+        auto NameOrErr = Obj.getSymbolName(Symbol);
+        if (NameOrErr && !NameOrErr->empty()) {
+          const coff_section *Section = *SectionOrErr;
+          Out.push_back({Va(Base.Value + Section->VirtualAddress +
+                            Symbol.getValue()),
+                         NameOrErr->str(), Symbol.isFunctionDefinition()});
+        } else if (!NameOrErr) {
+          consumeError(NameOrErr.takeError());
+        }
+      } else {
+        consumeError(SectionOrErr.takeError());
+      }
+    }
+    Index = Next;
+  }
+}
+
 //==--------------------------------------------------------------------==//
 // PeFile::parse
 //==--------------------------------------------------------------------==//
@@ -480,6 +515,7 @@ Expected<PeFile> PeFile::parse(ArrayRef<uint8_t> Bytes) {
     return std::move(E);
   if (Error E = readExports(*Obj, *Img, Base, Pe.Exports))
     return std::move(E);
+  readCoffSymbols(*Obj, Base, Pe.CoffSymbols);
   readPdata(*Img, Pe.Pdata);
 
   std::vector<VaRange> RelocSlots;
@@ -518,6 +554,27 @@ Expected<PeFile> PeFile::parse(ArrayRef<uint8_t> Bytes) {
       uint64_t End = std::min(Off + Size, Pe.FileSize);
       if (Off < End)
         Pe.Certificate = {Off, End};
+    }
+  }
+
+  // Load config directory: Control Flow Guard function-pointer slots.
+  // `call [GuardCFCheckFunctionPointer]` wraps a real indirect call through
+  // rcx; `call [GuardCFDispatchFunctionPointer]` tail-jumps to rax.
+  if (const data_directory *LC =
+          Obj->getDataDirectory(COFF::LOAD_CONFIG_TABLE)) {
+    constexpr size_t Need = offsetof(coff_load_configuration64,
+                                     GuardCFFunctionCount) +
+                            sizeof(uint64_t);
+    if (auto Raw = Img->read(Va(Base.Value + LC->RelativeVirtualAddress),
+                             Need)) {
+      auto *Cfg =
+          reinterpret_cast<const coff_load_configuration64 *>(Raw->data());
+      if (Cfg->Size >= Need) {
+        if (Cfg->GuardCFCheckFunction)
+          Pe.GuardCFCheckPtr = Va(Cfg->GuardCFCheckFunction);
+        if (Cfg->GuardCFCheckDispatch)
+          Pe.GuardCFDispatchPtr = Va(Cfg->GuardCFCheckDispatch);
+      }
     }
   }
 

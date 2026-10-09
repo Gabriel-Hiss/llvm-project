@@ -24,6 +24,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TargetOptions.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -207,8 +208,7 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = DI ? Types.typeOfDI(DI)
-                            : Types.typeOf(AI->getAllocatedType(), nullptr);
+        c::QualType LT = Types.typeOf(AI->getAllocatedType(), DI);
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
@@ -244,11 +244,9 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
   if (!RT->isVoidType()) {
     SmallVector<c::Stmt *, 2> Tail;
     Tail.push_back(Body);
+    llvm::Constant *Zero = llvm::Constant::getNullValue(F.getReturnType());
     Tail.push_back(c::ReturnStmt::Create(
-        AST, c::SourceLocation(),
-        c::IntegerLiteral::Create(AST, APInt(AST.getIntWidth(RT), 0), RT,
-                                  c::SourceLocation()),
-        nullptr));
+        AST, c::SourceLocation(), Exprs.retVal(Zero, Scope), nullptr));
     Body = c::CompoundStmt::Create(AST, Tail, c::FPOptionsOverride(),
                                    c::SourceLocation(), c::SourceLocation());
   }

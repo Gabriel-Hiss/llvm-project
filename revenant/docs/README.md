@@ -59,6 +59,13 @@ Drop a `CMakeLists.txt` into `lib/<Area>` (use `add_llvm_library`),
 directory; an unknown one needs a one-line `add_subdirectory` in the
 `REVENANT_AREA_DIRS` list.
 
+## Clang frontend
+
+The LLVM type controls the emitted C/C++ expression category. Debug info may
+refine signedness and record layout, but a conflicting pointer/integer type
+must not override the IR type.
+
+
 ## Driver
 
 ```
