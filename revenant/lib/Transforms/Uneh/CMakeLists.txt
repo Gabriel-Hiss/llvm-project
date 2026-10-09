@@ -1,3 +1,4 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 cmake_minimum_required(VERSION 3.20)
 project(RevenantUneh CXX)
 
@@ -30,28 +31,38 @@ else()
   add_compile_options(-fno-exceptions -fno-rtti)
 endif()
 
-add_library(RevenantTransformUneh MODULE
-  Uneh.cpp
-  EHProfile.cpp
-)
-if(WIN32)
-  target_sources(RevenantTransformUneh PRIVATE Uneh.def)
 endif()
-target_compile_definitions(RevenantTransformUneh PRIVATE REVENANT_BUILD_PLUGIN)
-set_target_properties(RevenantTransformUneh PROPERTIES
-  OUTPUT_NAME "RevenantTransformUneh"
-  PREFIX ""
-  SUFFIX ".dll"
-)
-llvm_map_components_to_libnames(LLVM_LIBS
-  Core
-  Support
-  Analysis
-  TransformUtils
-)
-target_link_libraries(RevenantTransformUneh PRIVATE ${LLVM_LIBS})
-target_include_directories(RevenantTransformUneh PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
-)
+if(COMMAND add_llvm_library)
+  add_llvm_library(RevenantTransformUneh STATIC
+    Uneh.cpp
+    EHProfile.cpp
+    LINK_COMPONENTS Core Support Analysis TransformUtils
+    )
+else()
+  add_library(RevenantTransformUneh MODULE
+    Uneh.cpp
+    EHProfile.cpp
+    )
+  if(WIN32)
+    target_sources(RevenantTransformUneh PRIVATE Uneh.def)
+  endif()
+  target_compile_definitions(RevenantTransformUneh PRIVATE
+    REVENANT_BUILD_PLUGIN)
+  set_target_properties(RevenantTransformUneh PROPERTIES
+    OUTPUT_NAME "RevenantTransformUneh"
+    PREFIX ""
+    SUFFIX ".dll"
+    )
+  llvm_map_components_to_libnames(LLVM_LIBS
+    Core
+    Support
+    Analysis
+    TransformUtils
+    )
+  target_link_libraries(RevenantTransformUneh PRIVATE ${LLVM_LIBS})
+  target_include_directories(RevenantTransformUneh PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
+    )
+endif()
 set_property(TARGET RevenantTransformUneh PROPERTY CXX_STANDARD 17)
 set_property(TARGET RevenantTransformUneh PROPERTY CXX_STANDARD_REQUIRED ON)

@@ -72,12 +72,12 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Operator.h"
-
 using namespace llvm;
 
 namespace {
@@ -350,7 +350,17 @@ bool terminatorsMatch(BasicBlock *A, BasicBlock *B, const BlockMatch &M) {
     if (BA->isConditional() &&
         !valuesMatch(BA->getCondition(), BB->getCondition(), M))
       return false;
-    return BA->getNumSuccessors() == BB->getNumSuccessors();
+    if (BA->getNumSuccessors() != BB->getNumSuccessors())
+      return false;
+    // Unconditional branches must target the same block (or the A/B pair
+    // for self-loops): folding B into A re-routes B's predecessors along
+    // A's edge, so divergent targets would silently change control flow.
+    if (!BA->isConditional()) {
+      BasicBlock *SA = BA->getSuccessor(0), *SB = BB->getSuccessor(0);
+      if (!(SA == SB || (SA == A && SB == B) || (SA == B && SB == A)))
+        return false;
+    }
+    return true;
   }
   if (auto *SA = dyn_cast<SwitchInst>(TA)) {
     auto *SB = dyn_cast<SwitchInst>(TB);
@@ -365,28 +375,95 @@ bool terminatorsMatch(BasicBlock *A, BasicBlock *B, const BlockMatch &M) {
 // values (mapped through Match); uses of B's values become A's values.
 bool mergeIdenticalBlocks(BasicBlock *A, BasicBlock *B,
                           const BlockMatch &Match) {
-  Function *F = A->getParent();
-  (void)F;
-  // B must not be the entry block and must have at least one predecessor.
   if (B == &B->getParent()->getEntryBlock())
     return false;
   if (llvm::pred_empty(B))
     return false;
-  // Collect B's predecessors (excluding B itself to avoid self-loop mess).
   SmallVector<BasicBlock *, 4> Preds;
   for (BasicBlock *P : predecessors(B)) {
     if (P == B)
       return false;
     Preds.push_back(P);
   }
-  // A's PHIs gain B's incoming values.
+  // Dominance gates (BEFORE any mutation: a rejection leaves zero trace).
+  // A's matching values replace B's at every outside use, and B's preds
+  // re-route to A, widening A's predecessor set. Compute a fresh
+  // DominatorTree (merges invalidate it, hence recompute per merge).
+  DominatorTree DT(*A->getParent());
+  // (a) Re-routed predecessors: every value flowing out of A along A's
+  // outgoing edges must be live on the new paths: for each successor S of
+  // A, each phi in S with an A incoming (V, A) requires V to dominate every
+  // re-routed P. Otherwise the phi would read V on a path where V never
+  // executes (found live on pugi load_buffer_impl: merging two `br %813`
+  // guards widened %1041's pred set and its successor phi read %855 on a
+  // path not dominated by %854).
+  for (BasicBlock *S : successors(A)) {
+    for (PHINode &P : S->phis()) {
+      for (unsigned i = 0, e = P.getNumIncomingValues(); i != e; ++i) {
+        if (P.getIncomingBlock(i) != A)
+          continue;
+        Value *V = P.getIncomingValue(i);
+        auto *ID = dyn_cast<Instruction>(V);
+        if (!ID)
+          continue;
+        for (BasicBlock *NP : Preds)
+          if (!DT.dominates(ID, NP))
+            return false;
+      }
+    }
+  }
+  // (b) Replaced uses: for every mapped pair (IB in B -> IA in A), IA must
+  // dominate each outside use (phi uses live on their incoming edge).
+  for (auto &KV : Match.B2A) {
+    auto *IB = dyn_cast<Instruction>(KV.first);
+    auto *IA = dyn_cast<Instruction>(KV.second);
+    if (!IB || !IA)
+      continue;
+    for (const User *U : IB->users()) {
+      const auto *UI = dyn_cast<Instruction>(U);
+      if (!UI)
+        return false;
+      if (UI->getParent() == B)
+        continue; // in-B uses die with B
+      if (auto *PN = dyn_cast<PHINode>(UI)) {
+        bool DomEdge = false;
+        for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
+          if (PN->getIncomingValue(i) == IB) {
+            BasicBlock *Edge = PN->getIncomingBlock(i);
+            if (Edge == B || DT.dominates(A, Edge))
+              DomEdge = true;
+            else
+              return false;
+          }
+        if (!DomEdge)
+          return false;
+        continue;
+      }
+      if (!DT.dominates(IA, UI))
+        return false;
+    }
+  }
+  // with B: remap it through the value map to A's matching instruction.
   for (PHINode &PA : A->phis()) {
     const Value *VB = Match.A2B.lookup(&PA);
     if (!VB)
       continue;
     const auto *PB = cast<PHINode>(VB);
-    for (unsigned i = 0, e = PB->getNumIncomingValues(); i != e; ++i)
-      PA.addIncoming(PB->getIncomingValue(i), PB->getIncomingBlock(i));
+    for (unsigned i = 0, e = PB->getNumIncomingValues(); i != e; ++i) {
+      Value *V = PB->getIncomingValue(i);
+      BasicBlock *BB = PB->getIncomingBlock(i);
+      if (auto *ID = dyn_cast<Instruction>(V))
+        if (ID->getParent() == B) {
+          auto It = Match.B2A.find(ID);
+          V = It != Match.B2A.end() ? const_cast<Value *>(It->second)
+                                    : UndefValue::get(ID->getType());
+        }
+      // The incoming BLOCK dies with B when it is B itself (self-edge);
+      // that edge vanishes (predecessors were re-routed), so skip it.
+      if (BB == B)
+        continue;
+      PA.addIncoming(V, BB);
+    }
   }
   // Re-route B's predecessors to A. A conditional branch that now targets
   // A on both edges folds to an unconditional branch.
@@ -417,13 +494,27 @@ bool mergeIdenticalBlocks(BasicBlock *A, BasicBlock *B,
     }
   }
   (void)SuccsA;
-  // Replace uses of B's values with A's values.
+  // Replace uses of B's values with A's values, then scrub any remaining
+  // in-B uses (B's own instructions/terminator/phis referencing B's defs)
+  // so erasing B cannot leave a <badref> behind.
   SmallVector<std::pair<Value *, Value *>, 8> Reps;
   for (auto &KV : Match.B2A)
     Reps.emplace_back(const_cast<Value *>(KV.first),
                       const_cast<Value *>(KV.second));
   for (auto &R : Reps)
     R.first->replaceAllUsesWith(R.second);
+  for (Instruction &I : *B) {
+    for (unsigned o = 0, e = I.getNumOperands(); o != e; ++o) {
+      Value *Op = I.getOperand(o);
+      if (auto *IOp = dyn_cast<Instruction>(Op))
+        if (IOp->getParent() == B) {
+          auto It = Match.B2A.find(IOp);
+          I.setOperand(o, It != Match.B2A.end()
+                              ? const_cast<Value *>(It->second)
+                              : UndefValue::get(IOp->getType()));
+        }
+    }
+  }
   // Preserve region metadata from B's terminator onto A's.
   if (MDNode *MD = TB->getMetadata("revenant.region"))
     if (!A->getTerminator()->getMetadata("revenant.region"))
@@ -672,6 +763,53 @@ bool undoUnswitch(Function &F) {
         if (Instruction *CI = dyn_cast<Instruction>(C))
           if (CI->getParent() == H0 || CI->getParent() == H1)
             continue;
+        // Validate exit PHIs BEFORE mutating: every H1 incoming must have
+        // a live H0 counterpart (else the loops differ: bail, guard intact).
+        bool ExitsOK = true;
+        for (PHINode &XP : X0->phis()) {
+          Value *VH1 = nullptr, *VH0 = nullptr;
+          for (unsigned i = 0, e = XP.getNumIncomingValues(); i != e; ++i) {
+            if (XP.getIncomingBlock(i) == H1)
+              VH1 = XP.getIncomingValue(i);
+            if (XP.getIncomingBlock(i) == H0)
+              VH0 = XP.getIncomingValue(i);
+          }
+          if (VH1 && !VH0) {
+            Value *Mapped = const_cast<Value *>(HM.B2A.lookup(VH1));
+            if (!Mapped)
+              ExitsOK = false;
+            else if (auto *ID = dyn_cast<Instruction>(Mapped))
+              if (ID->getParent() == H1)
+                ExitsOK = false;
+            // Mapped must dominate X: defined outside both loop copies.
+            else if (auto *IM = dyn_cast<Instruction>(Mapped))
+              if (IM->getParent() == H0)
+                ExitsOK = false;
+          }
+        }
+        if (!ExitsOK)
+          continue;
+        // H1's body values must have no uses outside H1/X (else remapping
+        // them to H0's values crosses loop iterations: unsound). Check.
+        for (auto &KV : HM.B2A) {
+          const Instruction *IH1 = dyn_cast<Instruction>(KV.first);
+          if (!IH1 || IH1->getParent() != H1)
+            continue;
+          for (const User *U : IH1->users()) {
+            const auto *UI = dyn_cast<Instruction>(U);
+            if (!UI)
+              continue;
+            const BasicBlock *PB = UI->getParent();
+            if (PB != H1 && PB != X0) {
+              ExitsOK = false;
+              break;
+            }
+          }
+          if (!ExitsOK)
+            break;
+        }
+        if (!ExitsOK)
+          continue;
         // Fold: G jumps to H0; H1 dies; X's H1 incoming remaps to H0.
         BranchInst *Goto = BranchInst::Create(H0, G);
         copyVA(GB, Goto);
@@ -688,7 +826,7 @@ bool undoUnswitch(Function &F) {
             XP.removeIncomingValue(H1, /*KeepOneInputPHIs=*/false);
             if (!VH0) {
               Value *Mapped = const_cast<Value *>(HM.B2A.lookup(VH1));
-              XP.addIncoming(Mapped ? Mapped : VH1, H0);
+              XP.addIncoming(Mapped, H0);
             }
           }
         }
@@ -763,18 +901,7 @@ bool undoPeel(Function &F) {
       }
       if (!Latch)
         continue;
-      // P's body must equal H's body (or the latch body) up to the IV init.
-      // Compare P against H's non-phi, non-terminator prefix.
-      BlockMatch M;
-      // Seed the map: H's header phis <-> P's reaching values. For each phi
-      // in H with incoming from P, map phi -> incoming value.
-      for (PHINode &HP : H->phis()) {
-        for (unsigned i = 0, e = HP.getNumIncomingValues(); i != e; ++i)
-          if (HP.getIncomingBlock(i) == P) {
-            M.A2B[&HP] = HP.getIncomingValue(i);
-            M.B2A[HP.getIncomingValue(i)] = &HP;
-          }
-      }
+      // P's body must equal H's body prefix up to the IV init (see below).
       SmallVector<Instruction *, 8> InstsP, InstsH;
       for (Instruction &I : *P)
         if (!I.isTerminator())
@@ -788,42 +915,83 @@ bool undoPeel(Function &F) {
       }
       if (InstsP.empty() || InstsP.size() > InstsH.size())
         continue;
-      // Peeled first iteration: P holds the first-iteration values (IV init
-      // folded) for a SUFFIX of the loop body's instruction prefix... more
-      // precisely P's sequence must equal the body's sequence with the IV
-      // phi replaced by its P-incoming value. Align at the END: P[i] must
-      // match H[lenH-lenP+i] (the peeled copy runs the same tail of the
-      // body: the GEP/load/add/store plus the IV step).
-      size_t Off = InstsH.size() - InstsP.size();
-      // The peeled block must define the header phi's P-incoming value (it
-      // feeds the second iteration).
-      bool FeedsPhi = false;
-      for (PHINode &HP : H->phis())
-        for (unsigned i = 0, e = HP.getNumIncomingValues(); i != e; ++i)
-          if (HP.getIncomingBlock(i) == P)
-            for (Instruction *IP : InstsP)
-              if (IP == HP.getIncomingValue(i))
-                FeedsPhi = true;
-      if (!FeedsPhi)
-        continue;
+      // Peeled first iteration: P's sequence equals a PREFIX of H's body
+      // with the IV phis replaced by their INIT values (what the phi equals
+      // on first entry: a constant or a G-defined value, NOT the phi's
+      // P-incoming, which is the already-stepped value feeding iteration
+      // 2). Align at the START: P[i] matches H[i]; an H-phi operand matches
+      // a P operand that is loop-invariant (constant or defined outside
+      // P/H), recording InitFor[phi] = P-value. Every use of one phi must
+      // record the same init. P may omit H's latch tail.
+      BlockMatch M;
+      DenseMap<const PHINode *, const Value *> InitFor;
+      auto noteInit = [&](const Value *HOp, const Value *POp) -> bool {
+        const auto *HP = dyn_cast<PHINode>(const_cast<Value *>(HOp));
+        if (!HP || HP->getParent() != H)
+          return HOp == POp;
+        // P-side must be loop-invariant: constant or defined outside P/H.
+        bool Invariant = isa<Constant>(const_cast<Value *>(POp));
+        if (!Invariant)
+          if (auto *ID = dyn_cast<Instruction>(const_cast<Value *>(POp)))
+            Invariant = ID->getParent() != P && ID->getParent() != H;
+          else
+            Invariant = true; // arguments, globals
+        if (!Invariant)
+          return false;
+        auto It = InitFor.find(HP);
+        if (It != InitFor.end())
+          return It->second == POp;
+        InitFor[HP] = POp;
+        return true;
+      };
       bool OK = true;
       for (size_t i = 0; i < InstsP.size() && OK; ++i) {
-        Instruction *IH = InstsH[Off + i];
-        if (isOpaqueCall(*InstsP[i]) || isOpaqueCall(*IH))
+        Instruction *IH = InstsH[i], *IP = InstsP[i];
+        if (isOpaqueCall(*IP) || isOpaqueCall(*IH))
           OK = false;
-        else if (!instsMatch(IH, InstsP[i], H, P, M))
+        else if (IH->getOpcode() != IP->getOpcode() ||
+                 IH->getType() != IP->getType() ||
+                 IH->getNumOperands() != IP->getNumOperands())
           OK = false;
-        else if (!IH->getType()->isVoidTy()) {
-          M.A2B[IH] = InstsP[i];
-          M.B2A[InstsP[i]] = IH;
+        else
+          for (unsigned o = 0; o < IH->getNumOperands() && OK; ++o) {
+            Value *HO = IH->getOperand(o), *PO = IP->getOperand(o);
+            if (HO == PO)
+              continue;
+            auto ItM = M.A2B.find(HO);
+            if (ItM != M.A2B.end()) {
+              OK = ItM->second == PO;
+              continue;
+            }
+            // H-phi vs invariant P value: record init.
+            if (isa<PHINode>(HO)) {
+              OK = noteInit(HO, PO);
+              continue;
+            }
+            // Both constants by value.
+            if (auto *HC = dyn_cast<Constant>(HO))
+              if (auto *PC = dyn_cast<Constant>(PO)) {
+                OK = HC == PC;
+                continue;
+              }
+            OK = false;
+          }
+        if (OK && !IH->getType()->isVoidTy()) {
+          M.A2B[IH] = IP;
+          M.B2A[IP] = IH;
         }
       }
-      // Fold: G jumps straight to H. The peeled block P dies, so H's phis
-      // cannot keep reading values computed in P. Move the (transitive) def
-      // chain of phi incoming values defined in P into G (before its
-      // terminator), then rename the phi edge P->G. Memory effects block
-      // the fold: stores/calls in P would die with it (loads are fine, they
-      // re-execute in H's first iteration on the same memory).
+      if (!OK)
+        continue;
+      // Fold precondition (checked BEFORE any mutation):
+      // - every H phi with a P incoming must have a recorded init (else the
+      //   peeled copy and the loop disagree on entry values: bail);
+      // - init values must dominate G's terminator (constant, argument,
+      //   global, or defined in G or an ancestor: check by dominance later
+      //   via a light rule: constant/argument/global, or defined in G);
+      // - every P-defined value used outside P must be covered (in M.B2A).
+      // Memory effects block the fold (stores/calls in P would die with it;
+      // loads are fine, they re-execute in H's first iteration).
       bool HasMemFx = false;
       for (Instruction &I : *P)
         if (!I.isTerminator() && (isa<StoreInst>(&I) || isa<CallInst>(&I) ||
@@ -833,6 +1001,54 @@ bool undoPeel(Function &F) {
           HasMemFx = true;
       if (HasMemFx)
         continue;
+      bool PreOK = true;
+      for (PHINode &HP : H->phis()) {
+        bool HasP = false;
+        for (unsigned i = 0, e = HP.getNumIncomingValues(); i != e; ++i)
+          if (HP.getIncomingBlock(i) == P)
+            HasP = true;
+        if (!HasP)
+          continue;
+        auto It = InitFor.find(&HP);
+        if (It == InitFor.end())
+          PreOK = false;
+        else {
+          const Value *Init = It->second;
+          bool Live = isa<Constant>(Init) || isa<Argument>(Init);
+          if (!Live)
+            if (auto *ID = dyn_cast<Instruction>(Init))
+              Live = ID->getParent() == G;
+            else
+              Live = true; // globals
+          if (!Live)
+            PreOK = false;
+        }
+      }
+      if (!PreOK)
+        continue;
+      // Escape check: P defs used outside P must be covered by M.B2A.
+      for (Instruction &I : *P) {
+        if (I.isTerminator() || I.getType()->isVoidTy())
+          continue;
+        if (M.B2A.count(&I))
+          continue;
+        for (User *U : I.users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI || UI->getParent() != P)
+            PreOK = false;
+        }
+        if (!PreOK)
+          break;
+      }
+      if (!PreOK)
+        continue;
+      // All covered: mutate. Retarget G->H; rewrite each phi's P incoming
+      // value to the recorded init and rename the edge P->G; remap P's
+      // covered body values to H's instructions (they compute the same
+      // thing on entry: P's peeled values equal H's first-iteration values
+      // under init substitution... careful: H's body values on the ENTRY
+      // edge equal P's values, so outside uses of P's values (e.g. exit
+      // phis reached via H) correctly map to H's values).
       BranchInst *GT = dyn_cast<BranchInst>(G->getTerminator());
       bool Retargeted = false;
       if (GT) {
@@ -844,41 +1060,17 @@ bool undoPeel(Function &F) {
       }
       if (!Retargeted)
         continue;
-      SmallPtrSet<Instruction *, 8> Need;
-      SmallVector<Instruction *, 8> Stack;
       for (PHINode &HP : H->phis())
         for (unsigned i = 0, e = HP.getNumIncomingValues(); i != e; ++i)
-          if (HP.getIncomingBlock(i) == P)
-            if (auto *ID = dyn_cast<Instruction>(HP.getIncomingValue(i)))
-              if (ID->getParent() == P)
-                Stack.push_back(ID);
-      while (!Stack.empty()) {
-        Instruction *I = Stack.pop_back_val();
-        if (!Need.insert(I).second)
-          continue;
-        for (Value *Op : I->operands())
-          if (auto *ID = dyn_cast<Instruction>(Op))
-            if (ID->getParent() == P)
-              Stack.push_back(ID);
-      }
-      SmallVector<Instruction *, 8> Ordered;
-      for (Instruction &I : *P)
-        if (Need.count(&I))
-          Ordered.push_back(&I);
-      Instruction *GTerm = G->getTerminator();
-      for (Instruction *I : Ordered)
-        I->moveBefore(GTerm);
-      for (PHINode &HP : H->phis())
-        for (unsigned i = 0, e = HP.getNumIncomingValues(); i != e; ++i)
-          if (HP.getIncomingBlock(i) == P)
+          if (HP.getIncomingBlock(i) == P) {
+            auto It = InitFor.find(&HP);
+            if (It != InitFor.end())
+              HP.setIncomingValue(i, const_cast<Value *>(It->second));
             HP.setIncomingBlock(i, G);
+          }
       for (auto &KV : M.B2A) {
         Value *VP = const_cast<Value *>(KV.first);
         Value *VH = const_cast<Value *>(KV.second);
-        if (isa<PHINode>(VH))
-          continue;
-        if (Need.count(dyn_cast<Instruction>(VP)))
-          continue;
         if (VP->getType() == VH->getType())
           VP->replaceAllUsesWith(VH);
       }

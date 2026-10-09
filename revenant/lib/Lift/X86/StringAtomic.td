@@ -282,16 +282,14 @@ def : RVLift {
   dag Body = (rv_set $dst, (rv_atomicrmw "xchg", (rv_addr $ptr), $val));
 }
 
-// ---- XADD rm: old -> reg, flags of (old + val) ------------------------------
-// $dst holds old after the write, so rv_fadd($dst, $val) sets exactly the
-// add flags with no second atomic. rr forms live in X86Lift.td.
+// ---- XADD rm: old -> reg, memory = old + reg ---------------------------------
+// rv_xadd with a memory destination is one atomicrmw under LOCK and the
+// add flags of (old + val) either way. rr forms live in X86Lift.td.
 
 foreach I = [XADD8rm, XADD16rm, XADD32rm, XADD64rm] in
 def : RVLift {
   let Insn = I;
-  dag Body = (rv_seq
-    (rv_set $dst, (rv_atomicrmw "add", (rv_addr $ptr), $val)),
-    (rv_fadd $dst, $val));
+  dag Body = (rv_xadd $ptr, $dst);
 }
 
 // ---- CMPXCHG rm: hook returns old and writes ZF, body writes acc ------------

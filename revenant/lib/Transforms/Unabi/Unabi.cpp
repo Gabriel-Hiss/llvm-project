@@ -26,7 +26,11 @@
 // width, and any indirect use, musttail call, callbr, intrinsic, opaque
 // stub, or pre-existing sret/byval attribute bails the whole function out.
 // Consumed attributes are removed on success and kept on no-fire so a
-// re-run is a no-op either way.
+// re-run is a no-op either way. V (struct-by-pointer, callee owns a copy)
+// keeps a plain ptr: ir-pre carries no byval marker on Win64, and the
+// statically-linked slice plugin cannot add param attributes (nodes it
+// interns are invisible to the in-process verifier), so ownership stays
+// with sigs for now (open question with MuseSigs2).
 //
 // Provenance: every created instruction copies !revenant.va from the
 // instruction it replaces (call-site argument shuffles copy from the call
@@ -57,6 +61,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Support/Debug.h"
+#include <cassert>
 
 using namespace llvm;
 
@@ -158,6 +164,10 @@ bool parseParam(StringRef T, ParamTok &Out, uint64_t &Offset) {
     T.consume_front("%");
     if (T.empty())
       return false;
+    // Struct passed by pointer where the callee owns a copy. Win64 clang
+    // passes these as plain pointers (ir-pre carries no byval marker),
+    // so the rewrite keeps a plain ptr; the name only validates that the
+    // annotation refers to a real struct type (checked in rewriteFunction).
     Out.K = ParamTok::ByVal;
     Out.Name = T.str();
     return true;
@@ -299,10 +309,18 @@ Type *paramType(LLVMContext &C, const ParamTok &P) {
 }
 
 // Named struct lookup that works whether or not the type is used yet:
-// scan the module's identified types. Returns null when absent.
+// scan the module's identified types. Accepts the name with or without a
+// leading '%' (the sig grammar strips it, the module keeps it).
+// Returns null when absent.
 StructType *findStruct(Module &M, StringRef Name) {
+  StringRef Bare = Name;
+  Bare.consume_front("%");
   for (StructType *ST : M.getIdentifiedStructTypes()) {
-    if (ST->hasName() && ST->getName() == Name)
+    if (!ST->hasName())
+      continue;
+    StringRef Have = ST->getName();
+    Have.consume_front("%");
+    if (Have == Bare)
       return ST;
   }
   return nullptr;
@@ -348,8 +366,11 @@ void collectFieldUses(Value *V, SmallVectorImpl<User *> &Out) {
   }
 }
 
-// The sret slot may only feed stores through field addressing. Any load of
-// the slot or of a derived field pointer, or any non-store use, bails.
+// The sret slot may only feed stores through field addressing: plain
+// stores, or llvm.memcpy/memmove/memset that write the whole slot (the
+// common lowering for struct copies in ir-pre, e.g. vector iterators).
+// Any load of the slot or of a derived field pointer, or any other use,
+// bails.
 bool sretSlotIsStoreOnly(Argument *A) {
   SmallVector<User *, 16> Uses;
   collectFieldUses(A, Uses);
@@ -371,6 +392,25 @@ bool sretSlotIsStoreOnly(Argument *A) {
       }
       if (P != A)
         return false;
+      continue;
+    }
+    if (auto *MI = dyn_cast<MemIntrinsic>(U)) {
+      // memcpy/memmove write through operand 0, memset through operand 0
+      // too; the slot must be the written pointer, not the source.
+      Value *Dst = MI->getOperand(0)->stripPointerCasts();
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(Dst)) {
+        if (!GEP->hasAllConstantIndices())
+          return false;
+        Dst = GEP->getPointerOperand()->stripPointerCasts();
+      }
+      if (Dst != A)
+        return false;
+      if (isa<MemTransferInst>(MI)) {
+        // The slot must not also be the copy source (that would read it).
+        Value *Src = MI->getOperand(1)->stripPointerCasts();
+        if (Src == A)
+          return false;
+      }
       continue;
     }
     if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U))
@@ -555,6 +595,8 @@ bool rewriteFunction(Module &M, Function &F, const Sig &S) {
       return false;
   }
 
+  // V params keep a plain ptr (ir-pre shape); the named struct must exist
+  // so a typo'd annotation bails instead of rewriting blind.
   for (unsigned I = 0; I < S.Params.size(); ++I) {
     if (S.Params[I].K == ParamTok::ByVal) {
       Type *BT = findStruct(M, S.Params[I].Name);
@@ -666,50 +708,36 @@ bool rewriteFunction(Module &M, Function &F, const Sig &S) {
   if (SretArg && !sretSlotIsStoreOnly(SretArg))
     return false;
 
-  // Build the new function shell first (no body yet).
+  // Build the new function shell first (no body yet). copyAttributesFrom
+  // copies the old (opt-side, verifier-recognized) attribute list; the
+  // consumed sig is stripped by rebuilding just the fn set, and old param
+  // attributes are dropped (they belong to the old signature; lifter
+  // output carries none). New param attributes are NOT added here: nodes
+  // interned by this statically-linked plugin live in its own folding
+  // sets, which the in-process verifier does not recognize (see V handling
+  // below).
   FunctionType *NewFTy = FunctionType::get(NewRet, NewParams, S.Vararg);
   Function *NewF =
       Function::Create(NewFTy, F.getLinkage(), F.getAddressSpace());
   NewF->copyAttributesFrom(&F);
-  NewF->removeFnAttr(StringRef(SigAttr));
   // copyAttributesFrom copies the name too; drop it before inserting.
   NewF->setName("");
-  NewF->setCallingConv(F.getCallingConv());
-  NewF->setVisibility(F.getVisibility());
-  NewF->setUnnamedAddr(F.getUnnamedAddr());
-  NewF->setDLLStorageClass(F.getDLLStorageClass());
   if (F.hasComdat())
     NewF->setComdat(F.getComdat());
-  if (F.hasSection())
-    NewF->setSection(F.getSection());
   if (F.hasGC())
     NewF->setGC(F.getGC());
   if (F.hasPersonalityFn())
     NewF->setPersonalityFn(F.getPersonalityFn());
-  NewF->setAlignment(F.getAlign());
-  // The function must live in the module before param attributes are set:
-  // byval carries a type that the verifier resolves against the module.
+  // The function must live in the module before attributes are set: every
+  // AttributeList is interned in the module context.
   M.getFunctionList().insert(F.getIterator(), NewF);
-  for (unsigned I = 0; I < S.Params.size(); ++I) {
-    if ((int)I == SretIdx)
-      continue;
-    unsigned N = OldToNew[I];
-    for (Attribute A : F.getArg(I)->getAttributes()) {
-      if (A.isEnumAttribute() && !A.isTypeAttribute())
-        NewF->addParamAttr(N, Attribute::get(C, A.getKindAsEnum()));
-      else if (A.isStringAttribute())
-        NewF->addParamAttr(
-            N, Attribute::get(C, A.getKindAsString(), A.getValueAsString()));
-      else if (A.isTypeAttribute())
-        NewF->addParamAttr(
-            N, Attribute::get(C, A.getKindAsEnum(), A.getValueAsType()));
-    }
-    if (S.Params[I].K == ParamTok::ByVal) {
-      Type *BT = findStruct(M, S.Params[I].Name);
-      if (!BT || !BT->isStructTy())
-        return false;
-      NewF->addParamAttr(N, Attribute::getWithByValType(C, BT));
-    }
+  {
+    AttrBuilder FnB(C, NewF->getAttributes().getFnAttrs());
+    FnB.removeAttribute(SigAttr);
+    AttributeSet Fn = AttributeSet::get(C, FnB);
+    NewF->setAttributes(AttributeList::get(C, Fn,
+                                           NewF->getAttributes().getRetAttrs(),
+                                           {}));
   }
   // Name new args; `this` for param 0 of T-methods.
   for (unsigned I = 0; I < S.Params.size(); ++I) {
@@ -974,7 +1002,8 @@ bool rewriteFunction(Module &M, Function &F, const Sig &S) {
     CB->eraseFromParent();
   }
 
-  // Swap names: NewF takes F's name, F dies.
+  // Swap names: NewF takes F's name, F dies. The sig attribute was already
+  // dropped when the shell was built, so a re-run is a no-op.
   std::string Name = F.getName().str();
   F.eraseFromParent();
   NewF->setName(Name);

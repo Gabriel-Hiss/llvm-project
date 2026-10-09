@@ -97,7 +97,7 @@ public:
     if (M.getOperand(2).isReg() && M.getOperand(2).getReg() != 0)
       return false;
     const MCOperand &Base = M.getOperand(0);
-    if (Base.isReg() && MRI->getName(Base.getReg()) == "RIP")
+    if (Base.isReg() && StringRef(MRI->getName(Base.getReg())) == "RIP")
       return I.HasMemTarget && !Img.isExecutable(I.MemTarget);
     return true;
   }
@@ -147,7 +147,7 @@ private:
     if (mnemonic(I) != "XCHG16rr" || I.Inst.getNumOperands() < 2)
       return false;
     for (const MCOperand &Op : I.Inst)
-      if (!Op.isReg() || MRI->getName(Op.getReg()) != "AX")
+      if (!Op.isReg() || StringRef(MRI->getName(Op.getReg())) != "AX")
         return false;
     return true;
   }

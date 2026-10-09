@@ -142,10 +142,8 @@ static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
 
   if (I.Flow == FlowKind::CondBranch) {
     llvm::Value *Cond = LS.B.getFalse();
-    if (I.Inst.getNumOperands() && I.Inst.getOperand(0).isImm()) {
-      unsigned CC = static_cast<unsigned>(I.Inst.getOperand(0).getImm());
-      Cond = LS.condFor(CC, I.Addr);
-    }
+    if (auto CC = LS.condCodeOf(I))
+      Cond = LS.condFor(*CC, I.Addr);
     // The taken edge is whichever edge targets the jcc operand (the
     // SwitchDefault edge is the taken side for `ja` guards).
     std::optional<size_t> Taken, Other;
@@ -221,48 +219,7 @@ static llvm::Error emitSwitch(LiftState &LS, const FuncRecord &F,
     Loc.Tag = CmpOperand::Kind::Reg;
     Loc.Reg = (unsigned)llvm::X86::RAX;
   }
-  // The guard is the predecessor ending in a jcc that branches here.
-  std::optional<BlockRec> Guard;
-  Va GuardLastVA;
-  for (const BlockRec &G : F.Blocks) {
-    if (G.InstrsEnd == 0 || G.InstrsBegin >= G.InstrsEnd)
-      continue;
-    bool BranchesHere = false;
-    for (const EdgeRec &E : F.edgesOf(G))
-      if (F.edgeTo(Img, &E - F.Edges.data()) == Start)
-        BranchesHere = true;
-    if (!BranchesHere)
-      continue;
-    Va LastVA = F.instrVa(Img, G.InstrsEnd - 1);
-    for (const Instr &GI : LS.Instrs) {
-      if (GI.Addr == LastVA && GI.Flow == FlowKind::CondBranch) {
-        Guard = G;
-        GuardLastVA = LastVA;
-        break;
-      }
-    }
-    if (Guard)
-      break;
-  }
-  llvm::Value *Base = nullptr;
-  bool Captured = false;
-  if (LS.SwOperand && Guard && LS.SwOperand->first == GuardLastVA) {
-    Base = LS.SwOperand->second;
-    Captured = true;
-  } else {
-    if (Guard) {
-      llvm::BasicBlock *GLB = LS.Blocks.find(Guard->startVa(Img))->second;
-      if (llvm::Instruction *Term = GLB->getTerminator())
-        LS.B.SetInsertPoint(Term);
-      else
-        LS.B.SetInsertPoint(GLB);
-      Base = LS.evalCmpOperand(Loc, Guard->startVa(Img));
-      LS.B.SetInsertPoint(Cur);
-    } else {
-      LS.B.SetInsertPoint(Cur);
-      Base = LS.evalCmpOperand(Loc, Start);
-    }
-  }
+  llvm::Value *Base = LS.evalCmpOperand(Loc, Start);
   int64_t MinCase = 0;
   bool HaveMin = false;
   for (size_t E = BR.EdgesBegin; E < BR.EdgesEnd; ++E) {
@@ -276,7 +233,7 @@ static llvm::Error emitSwitch(LiftState &LS, const FuncRecord &F,
             HaveMin = true;
           }
   }
-  int64_t Total = Captured ? MinCase : (Off + MinCase);
+  int64_t Total = Off + MinCase;
   LS.B.SetInsertPoint(Cur);
   llvm::Value *Operand = LS.extTo(Base, 64);
   if (Total != 0)
@@ -378,9 +335,10 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
 
   while (!Fn->empty())
     Fn->begin()->eraseFromParent();
-  llvm::BasicBlock *Entry =
-      llvm::BasicBlock::Create(M.getContext(), "entry", Fn);
+  llvm::BasicBlock *Entry = llvm::BasicBlock::Create(M.getContext(), "", Fn);
+  ir::nameBlock(*Entry, F.Start.Value);
   LiftState LS(M, *Fn, P, F, D, Sigs, std::move(*StackOrErr), Instrs);
+  LS.Blocks.emplace(F.Start, Entry);
   LS.B.SetInsertPoint(Entry);
 
   // Register file: 15 GPR roots as i64, xmm0-15 as i128, 5 flags as i1.
@@ -424,7 +382,8 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
         break;
       llvm::Argument &A = *(Fn->arg_begin() + K++);
       if (Pm.Loc.IsStack) {
-        LS.B.CreateStore(&A, LS.framePtrOff(Pm.Loc.StackOff));
+        LS.B.CreateAlignedStore(&A, LS.framePtrOff(Pm.Loc.StackOff),
+                                llvm::Align(1));
       } else if (Pm.Float) {
         auto It = LS.Xmm.find(Pm.Loc.Reg == llvm::X86::XMM0   ? 0u
                               : Pm.Loc.Reg == llvm::X86::XMM1 ? 1u
@@ -481,7 +440,6 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     ir::nameBlock(*BB, Start.Value);
     LS.Blocks.emplace(Start, BB);
   }
-  LS.B.CreateBr(LS.Blocks.find(F.Start)->second);
 
   for (const BlockRec &BR : F.Blocks) {
     Va Start = BR.startVa(*P.Img);
@@ -563,10 +521,13 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
         }
       }
     } else {
-      // Fallthrough end: the last instruction carries real work.
-      if (llvm::Error E = LS.liftInstr(Last)) {
-        Fn->deleteBody();
-        return std::move(E);
+      // Fallthrough end. Conditional branches, returns and traps carry no
+      // work of their own: liftTerminator lowers them.
+      if (Last.Flow == FlowKind::None) {
+        if (llvm::Error E = LS.liftInstr(Last)) {
+          Fn->deleteBody();
+          return std::move(E);
+        }
       }
       if (llvm::Error E = liftTerminator(LS, F, BR, Last, *P.Img)) {
         Fn->deleteBody();

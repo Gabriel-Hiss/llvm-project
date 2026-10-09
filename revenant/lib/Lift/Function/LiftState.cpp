@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LiftState.h"
+#include "LiftX86.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 
@@ -204,9 +205,16 @@ std::vector<LogOp> lift::logicalOps(const MCInst &MI, const MCInstrDesc &Desc) {
   unsigned NumDefs = Desc.getNumDefs();
   unsigned MIPos = 0;
 
+  // lea64mem and friends carry no OPERAND_MEMORY type; the address group is
+  // the second descriptor operand.
+  unsigned Opc = MI.getOpcode();
+  bool IsLea = Opc == X86::LEA16r || Opc == X86::LEA32r || Opc == X86::LEA64r ||
+               Opc == X86::LEA64_32r;
   auto kindAt = [&](unsigned DescOp) -> LogOpKind {
     if (DescOp >= Desc.NumOperands)
       return LogOpKind::Invalid;
+    if (IsLea && DescOp == 1)
+      return LogOpKind::Mem;
     uint8_t OT = Desc.operands()[DescOp].OperandType;
     if (OT == MCOI::OPERAND_REGISTER)
       return LogOpKind::Reg;
@@ -214,24 +222,42 @@ std::vector<LogOp> lift::logicalOps(const MCInst &MI, const MCInstrDesc &Desc) {
       return LogOpKind::Mem;
     return LogOpKind::Imm;
   };
+  auto logicalKindAt = [&](unsigned DescOp) {
+    LogOpKind K = kindAt(DescOp);
+    if (K == LogOpKind::Mem &&
+        MIPos + X86::AddrNumOperands > MI.getNumOperands()) {
+      const MCOperand &O = MI.getOperand(MIPos);
+      return O.isReg()    ? LogOpKind::Reg
+             : O.isExpr() ? LogOpKind::Invalid
+                          : LogOpKind::Imm;
+    }
+    return K;
+  };
 
   // outs: first NumDefs desc operands == first NumDefs MI operands (a def
   // memory operand still occupies the 5-operand group).
   for (unsigned D = 0; D < NumDefs && MIPos < MI.getNumOperands(); ++D) {
-    LogOpKind K = kindAt(D);
+    LogOpKind K = logicalKindAt(D);
     Out.push_back({K, MIPos});
     MIPos += (K == LogOpKind::Mem) ? X86::AddrNumOperands : 1;
+    if (K == LogOpKind::Mem)
+      D += X86::AddrNumOperands - 1;
   }
-  // ins: desc operands after the defs; tied uses collapse into their def
-  // and have no MI operand of their own.
+  // Decoded MCInsts carry tied inputs ($src1 = $dst) as real operands; they
+  // name the same register as their def, so they merge into it and the
+  // logical view matches the iced one (`add rax, rcx` is two operands).
   for (unsigned D = NumDefs; D < Desc.NumOperands; ++D) {
-    if (Desc.getOperandConstraint(D, MCOI::TIED_TO) >= 0)
-      continue;
     if (MIPos >= MI.getNumOperands())
       break;
-    LogOpKind K = kindAt(D);
+    if (Desc.getOperandConstraint(D, MCOI::TIED_TO) != -1) {
+      ++MIPos;
+      continue;
+    }
+    LogOpKind K = logicalKindAt(D);
     Out.push_back({K, MIPos});
     MIPos += (K == LogOpKind::Mem) ? X86::AddrNumOperands : 1;
+    if (K == LogOpKind::Mem)
+      D += X86::AddrNumOperands - 1;
   }
   // Variable operands: whatever is left.
   while (MIPos < MI.getNumOperands()) {
@@ -461,7 +487,8 @@ LiftState::LiftState(llvm::Module &M, llvm::Function &Fn, const Program &P,
 
 llvm::AllocaInst *LiftState::entryAlloca(llvm::Type *Ty,
                                          llvm::StringRef Name) {
-  llvm::IRBuilder<> EB(&*Fn.getEntryBlock().getFirstInsertionPt());
+  llvm::IRBuilder<> EB(Fn.getEntryBlock().getContext());
+  EB.SetInsertPoint(&Fn.getEntryBlock(), Fn.getEntryBlock().begin());
   return EB.CreateAlloca(Ty, nullptr, Name);
 }
 
@@ -810,7 +837,8 @@ Value *LiftState::globalPtr(Va Addr) {
     Sz = 16;
   auto *G = new GlobalVariable(
       Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/!!Init,
-      GlobalValue::InternalLinkage, nullptr, Name);
+      Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
+      nullptr, Name);
   if (Init) {
     SmallVector<Constant *, 16> Vals;
     Vals.reserve(Init->size());
@@ -839,7 +867,7 @@ Value *LiftState::memRead(const Instr &I, unsigned L, unsigned Bits,
   if (M.Seg != X86::NoRegister)
     return UndefValue::get(Ty);
   Value *P = memPtr(I, L);
-  return B.CreateLoad(Ty, P, "m");
+  return B.CreateAlignedLoad(Ty, P, Align(1), "m");
 }
 
 void LiftState::memWrite(const Instr &I, unsigned L, Value *V) {
@@ -847,18 +875,18 @@ void LiftState::memWrite(const Instr &I, unsigned L, Value *V) {
   if (M.Seg != X86::NoRegister)
     return;
   Value *P = memPtr(I, L);
-  B.CreateStore(V, P);
+  B.CreateAlignedStore(V, P, Align(1));
 }
 
 void LiftState::pushVal(Value *V, const Instr &I) {
   // New rsp = old - 8 -> frame offset at delta+8.
   int64_t Off = -(Stack.deltaAt(I.Addr) + 8);
-  B.CreateStore(extTo(V, 64), framePtrOff(Off));
+  B.CreateAlignedStore(extTo(V, 64), framePtrOff(Off), Align(1));
 }
 
 Value *LiftState::popVal(const Instr &I) {
   int64_t Off = -Stack.deltaAt(I.Addr);
-  return B.CreateLoad(i64(), framePtrOff(Off), "pv");
+  return B.CreateAlignedLoad(i64(), framePtrOff(Off), Align(1), "pv");
 }
 
 void LiftState::emitDynAlloca(const Instr &I) {
@@ -1056,15 +1084,6 @@ Value *LiftState::condFor(unsigned CC, Va JccVa) {
   if (Prod) {
     FlagProd P2 = *Prod;
     Prod.reset();
-    // If this jcc guards a jump table, the producer's compared operand is
-    // the table index — remember it for emitSwitch.
-    Value *A = nullptr;
-    if (P2.K == FlagProd::Cmp)
-      A = P2.A;
-    else if (P2.K == FlagProd::Arith)
-      A = P2.A ? P2.A : P2.Res;
-    if (A)
-      SwOperand = {JccVa, A};
     if (auto C = fuseCond(CC, P2))
       return *C;
   }
@@ -1093,7 +1112,7 @@ Value *LiftState::evalCmpOperand(const CmpOperand &Loc, Va At) {
     Addr = B.CreateAdd(Addr, ci(Loc.Disp), "d");
     P = B.CreateIntToPtr(Addr, ptrTy(), "p");
   }
-  return B.CreateLoad(i64(), P, "sv");
+  return B.CreateAlignedLoad(i64(), P, Align(1), "sv");
 }
 
 void LiftState::clobberFlags() {
@@ -1126,18 +1145,19 @@ std::string lift::mnemonicOf(const Instr &I, const Disasm &D) {
   std::string Text = D.format(I, {});
   // First non-prefix token, lowercased.
   StringRef T(Text);
-  T = T.trim();
   std::string Mn;
   while (!T.empty()) {
-    auto Tok = T.split(' ');
-    StringRef W = Tok.first.trim();
+    size_t Split = T.find_first_of(" \t");
+    StringRef W = T.take_front(Split).trim();
     if (!W.empty() && W != "rep" && W != "repe" && W != "repz" &&
         W != "repne" && W != "repnz" && W != "lock" && W != "rex64" &&
-        W != "data16")
+        W != "data16") {
       Mn = W.lower();
-    T = Tok.second;
-    if (!Mn.empty())
       break;
+    }
+    if (Split == StringRef::npos)
+      break;
+    T = T.drop_front(Split + 1).trim();
   }
   if (Mn.empty())
     Mn = X86MCTools::get().MII->getName(I.Inst.getOpcode()).lower();

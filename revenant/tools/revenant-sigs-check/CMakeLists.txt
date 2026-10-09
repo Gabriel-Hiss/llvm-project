@@ -6,5 +6,6 @@ target_link_libraries(revenant-sigs-check PRIVATE
   RevenantAnalysis
   RevenantDisasm
   RevenantObject
+  RevenantTargetX86
   LLVMDebugInfoPDB
   )

@@ -25,8 +25,10 @@
 //             becomes a ptr named `this`
 //           | S<name>                         sret slot: removed from the
 //             params, returned as struct `name` instead
-//           | V<name>                         struct passed by pointer:
-//             ptr with byval(`name`)
+//           | V<name>                         struct passed by pointer where
+//             the callee owns a copy: stays a plain ptr (ir-pre carries no
+//             byval marker on Win64; the name only validates the struct
+//             exists). Ownership stays with sigs (open question).
 //   ret    := v                               void
 //           | r8 | r16 | r32 | r64 | f32 | f64 | p
 //           | S<name>                         struct return (pairs with an
@@ -36,19 +38,20 @@
 //           | t                               ctor/dtor: every return hands
 //             back param 0, becomes void
 //
-// `name` is the LLVM struct name as in getTypeByName (no quotes), and the
-// type must be defined in the module or the function is left untouched.
+// `name` is the LLVM struct name (no quotes), matched with or without a
+// leading `%`, and the type must be used in the module (opaque-pointer IR
+// drops unused named types) or the function is left untouched.
 // Positional rule: param tokens (excluding `...`) must match the current
 // parameter count exactly, anything else is left untouched.
 //
 // Trust model: the attribute is trusted the way sigs are trusted. Value
 // rewrites (narrowing) assume the annotation names the true source type;
 // shape rewrites (sret, pair bitcopy, this) are guarded on the IR itself:
-// the sret slot may only feed stores, a `t` return must provably hand back
-// param 0, pair bitcopies require equal store sizes, and any indirect use,
-// musttail call, callbr, intrinsic, opaque stub, or pre-existing sret/byval
-// bails the function out. Consumed attributes are removed on success and
-// kept on no-fire.
+// the sret slot may only feed stores or slot-writing mem intrinsics, a `t`
+// return must provably hand back param 0, pair bitcopies require equal
+// store sizes, and any indirect use, musttail call, callbr, intrinsic,
+// opaque stub, or pre-existing sret/byval bails the function out.
+// Consumed attributes are removed on success and kept on no-fire.
 //
 //===----------------------------------------------------------------------===//
 

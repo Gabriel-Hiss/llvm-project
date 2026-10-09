@@ -1,23 +1,34 @@
+#include "revenant/Analysis/Analysis.h"
 #include "revenant/Analysis/Signatures.h"
 #include "revenant/Core/Program.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/Object/PeFile.h"
-#include "llvm/DebugInfo/PDB/IPDBEnumChildren.h"
+#include "revenant/Target/TargetHooks.h"
+#include "llvm/DebugInfo/CodeView/SymbolDeserializer.h"
+#include "llvm/DebugInfo/CodeView/SymbolRecord.h"
+#include "llvm/DebugInfo/CodeView/TypeDeserializer.h"
+#include "llvm/DebugInfo/CodeView/TypeRecord.h"
+#include "llvm/DebugInfo/PDB/Native/DbiStream.h"
+#include "llvm/DebugInfo/PDB/Native/ModuleDebugStream.h"
+#include "llvm/DebugInfo/PDB/Native/PDBFile.h"
+#include "llvm/DebugInfo/PDB/IPDBSession.h"
 #include "llvm/DebugInfo/PDB/Native/NativeSession.h"
-#include "llvm/DebugInfo/PDB/PDBSymbolData.h"
-#include "llvm/DebugInfo/PDB/PDBSymbolFunc.h"
+#include "llvm/DebugInfo/PDB/Native/TpiStream.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cstdint>
-#include <fstream>
+#include <map>
+#include <set>
 #include <memory>
 #include <string>
+#include <optional>
+#include <utility>
 #include <vector>
+
 
 using namespace llvm;
 using namespace llvm::pdb;
@@ -30,58 +41,142 @@ static cl::opt<std::string> PdbPath(cl::Positional, cl::Required,
 static cl::opt<std::string> CsvPath(cl::Positional, cl::Required,
                                     cl::desc("recovered signatures CSV"));
 
-static bool buildPdataProgram(const PeFile &PE, const Disasm &Dis,
-                              Program &P) {
-  P.Img = PE.Img;
-  P.Externs = std::make_shared<std::map<Va, Extern>>();
-  P.Names = std::make_shared<std::map<Va, std::string>>();
-  for (const RuntimeFunction &RF : PE.Pdata) {
-    if (RF.ChainedTo || RF.End <= RF.Begin)
-      continue;
-    auto StartRva = RF.Begin.offsetFrom(PE.Img->Base);
-    auto EndRva = RF.End.offsetFrom(PE.Img->Base);
-    if (!StartRva || !EndRva || *StartRva > UINT32_MAX ||
-        *EndRva > UINT32_MAX)
-      continue;
 
-    FuncRecord F;
-    F.Start = RF.Begin;
-    F.End = RF.End;
-    F.HasPdata = true;
-    F.Chunks.push_back({RF.Begin, RF.End});
-    for (Va IP = RF.Begin; IP < RF.End;) {
-      auto Ins = Dis.decodeOne(IP);
-      if (!Ins || Ins->Size == 0)
-        break;
-      auto Rva = IP.offsetFrom(PE.Img->Base);
-      if (!Rva || *Rva > UINT32_MAX)
-        break;
-      F.InstrRvas.push_back(static_cast<uint32_t>(*Rva));
-      IP = Ins->nextVa();
+static std::optional<std::pair<unsigned, bool>>
+functionTypeParameters(TpiStream &TPI, TpiStream &IPI,
+                       codeview::TypeIndex TI, bool IsId) {
+  using namespace codeview;
+  if (!IsId && TI.getIndex() >= TPI.TypeIndexBegin() &&
+      TI.getIndex() < TPI.TypeIndexEnd()) {
+    CVType Type = TPI.getType(TI);
+    if (Type.kind() == TypeLeafKind::LF_PROCEDURE) {
+      ProcedureRecord Record;
+      if (Error E = TypeDeserializer::deserializeAs(Type, Record)) {
+        consumeError(std::move(E));
+        return std::nullopt;
+      }
+      return std::pair<unsigned, bool>(Record.getParameterCount(), false);
     }
-    if (F.InstrRvas.empty())
-      continue;
-
-    BlockRec B;
-    B.Start = static_cast<uint32_t>(*StartRva);
-    B.End = static_cast<uint32_t>(*EndRva);
-    B.InstrsBegin = 0;
-    B.InstrsEnd = F.InstrRvas.size();
-    B.EndKind = BlockEnd::Return;
-    F.Blocks.push_back(B);
-    P.Functions.emplace(F.Start, std::move(F));
+    if (Type.kind() == TypeLeafKind::LF_MFUNCTION) {
+      MemberFunctionRecord Record;
+      if (Error E = TypeDeserializer::deserializeAs(Type, Record)) {
+        consumeError(std::move(E));
+        return std::nullopt;
+      }
+      return std::pair<unsigned, bool>(Record.getParameterCount(), true);
+    }
+    return std::nullopt;
   }
-  return true;
+  if (!IsId || TI.getIndex() < IPI.TypeIndexBegin() ||
+      TI.getIndex() >= IPI.TypeIndexEnd())
+    return std::nullopt;
+  CVType IdType = IPI.getType(TI);
+  TypeIndex FunctionType;
+  bool IsMember = false;
+  if (IdType.kind() == TypeLeafKind::LF_FUNC_ID) {
+    FuncIdRecord Record;
+    if (Error E = TypeDeserializer::deserializeAs(IdType, Record)) {
+      consumeError(std::move(E));
+      return std::nullopt;
+    }
+    FunctionType = Record.getFunctionType();
+  } else if (IdType.kind() == TypeLeafKind::LF_MFUNC_ID) {
+    MemberFuncIdRecord Record;
+    if (Error E = TypeDeserializer::deserializeAs(IdType, Record)) {
+      consumeError(std::move(E));
+      return std::nullopt;
+    }
+    FunctionType = Record.getFunctionType();
+    IsMember = true;
+  } else {
+    return std::nullopt;
+  }
+  auto Params = functionTypeParameters(TPI, IPI, FunctionType, false);
+  if (!Params)
+    return std::nullopt;
+  Params->second = IsMember || Params->second;
+  return Params;
 }
 
-static unsigned pdbParameterCount(IPDBSession &Session, uint32_t Rva) {
-  std::unique_ptr<PDBSymbol> Symbol =
-      Session.findSymbolByRVA(Rva, PDB_SymType::Function);
-  auto *Func = dyn_cast_or_null<PDBSymbolFunc>(Symbol.get());
-  if (!Func)
-    return UINT32_MAX;
-  auto Args = Func->getArguments();
-  return Args ? Args->getChildCount() : 0;
+static std::map<uint32_t, unsigned>
+pdbParameterCounts(NativeSession &Session) {
+  std::map<uint32_t, unsigned> Counts;
+  auto DbiOrErr = Session.getPDBFile().getPDBDbiStream();
+  if (!DbiOrErr) {
+    consumeError(DbiOrErr.takeError());
+    return Counts;
+  }
+  auto TPIOrErr = Session.getPDBFile().getPDBTpiStream();
+  if (!TPIOrErr) {
+    consumeError(TPIOrErr.takeError());
+    return Counts;
+  }
+  auto IPIOrErr = Session.getPDBFile().getPDBIpiStream();
+  if (!IPIOrErr) {
+    consumeError(IPIOrErr.takeError());
+    return Counts;
+  }
+  TpiStream &TPI = *TPIOrErr;
+  TpiStream &IPI = *IPIOrErr;
+  const DbiModuleList &Modules = DbiOrErr->modules();
+  for (uint32_t M = 0; M < Modules.getModuleCount(); ++M) {
+    auto StreamOrErr = Session.getModuleDebugStream(M);
+    if (!StreamOrErr) {
+      consumeError(StreamOrErr.takeError());
+      continue;
+    }
+    bool HadError = false;
+    for (const codeview::CVSymbol &Symbol : StreamOrErr->symbols(&HadError)) {
+      using codeview::SymbolKind;
+      bool IsProcId = Symbol.kind() == SymbolKind::S_GPROC32_ID ||
+                      Symbol.kind() == SymbolKind::S_LPROC32_ID ||
+                      Symbol.kind() == SymbolKind::S_LPROC32_DPC_ID;
+      bool IsProc = IsProcId || Symbol.kind() == SymbolKind::S_GPROC32 ||
+                    Symbol.kind() == SymbolKind::S_LPROC32 ||
+                    Symbol.kind() == SymbolKind::S_LPROC32_DPC;
+      if (!IsProc)
+        continue;
+      auto ProcOrErr = codeview::SymbolDeserializer::deserializeAs<
+          codeview::ProcSym>(Symbol);
+      if (!ProcOrErr) {
+        consumeError(ProcOrErr.takeError());
+        continue;
+      }
+      const codeview::ProcSym &Proc = *ProcOrErr;
+      uint32_t Rva = Session.getRVAFromSectOffset(Proc.Segment, Proc.CodeOffset);
+      auto Params =
+          functionTypeParameters(TPI, IPI, Proc.FunctionType, IsProcId);
+      if (Params)
+        Counts[Rva] = Params->first + Params->second;
+    }
+    (void)HadError;
+  }
+  return Counts;
+}
+
+/// Shape tag for mismatch triage: how the function body looks.
+static const char *shapeTag(const Function &F) {
+  if (F.Instrs.empty())
+    return "empty";
+  if (F.Instrs.size() == 1) {
+    const Instr &I = F.Instrs[0];
+    if (I.Flow == FlowKind::Branch)
+      return "jmp1";
+    if (I.Flow == FlowKind::IndirectBranch)
+      return "ijmp1";
+    if (I.Flow == FlowKind::Return)
+      return "ret1";
+    return "other1";
+  }
+  if (F.Instrs.size() == 2 && F.Instrs[1].Flow == FlowKind::Return &&
+      F.Instrs[0].Flow == FlowKind::None)
+    return "movret";
+  const Instr &Last = F.Instrs.back();
+  if ((Last.Flow == FlowKind::Branch ||
+       Last.Flow == FlowKind::IndirectBranch) &&
+      !(Last.HasTarget && F.contains(Last.Target)))
+    return "tailjmp";
+  return "body";
 }
 
 int main(int Argc, char **Argv) {
@@ -93,14 +188,18 @@ int main(int Argc, char **Argv) {
     return 1;
   }
   PeFile PE = std::move(*PEOrErr);
+  auto Hooks = createX86TargetHooks();
+  if (!Hooks) {
+    errs() << "target hooks setup failed\n";
+    return 1;
+  }
+  Program P = revenant::analyze(PE, *Hooks);
   auto DisOrErr = Disasm::create(*PE.Img);
   if (!DisOrErr) {
     logAllUnhandledErrors(DisOrErr.takeError(), errs(), "decoder setup failed: ");
     return 1;
   }
   Disasm Dis = std::move(*DisOrErr);
-  Program P;
-  buildPdataProgram(PE, Dis, P);
   Signatures Sigs = analyzeSignatures(P, Dis);
 
   std::unique_ptr<IPDBSession> Session;
@@ -109,6 +208,8 @@ int main(int Argc, char **Argv) {
     return 1;
   }
   Session->setLoadAddress(PE.Img->Base.Value);
+  auto PdbCounts =
+      pdbParameterCounts(static_cast<NativeSession &>(*Session));
 
   std::error_code EC;
   raw_fd_ostream CSV(CsvPath, EC, sys::fs::OF_Text);
@@ -116,18 +217,49 @@ int main(int Argc, char **Argv) {
     errs() << "cannot open " << CsvPath << ": " << EC.message() << '\n';
     return 1;
   }
-  CSV << "function_va,param_count,return_kind\n";
+  CSV << "function_va,param_count,return_kind,pdb_param_count,callers,min_prefix,max_prefix,shape,ninstrs\n";
   uint64_t Compared = 0, Matched = 0, MissingPdb = 0;
   for (const auto &[VA, Sig] : Sigs.Funcs) {
     auto RVA = VA.offsetFrom(PE.Img->Base);
     if (!RVA || *RVA > UINT32_MAX)
       continue;
-    unsigned PdbCount = pdbParameterCount(*Session, static_cast<uint32_t>(*RVA));
+    auto PdbIt = PdbCounts.find(static_cast<uint32_t>(*RVA));
+    unsigned PdbCount =
+        PdbIt == PdbCounts.end() ? UINT32_MAX : PdbIt->second;
     const char *ReturnKind = !Sig.HasRet ? "none"
                              : Sig.Ret.Float ? "float"
                                              : "integer";
+    unsigned NCallers = 0, MinPrefix = UINT32_MAX, MaxPrefix = 0;
+    for (const auto &[Site, N] : Sigs.CallsiteArgs) {
+      auto CallIns = Dis.decodeOne(Site);
+      if (!CallIns || !CallIns->HasTarget || CallIns->Target != VA)
+        continue;
+      ++NCallers;
+      MinPrefix = std::min(MinPrefix, N);
+      MaxPrefix = std::max(MaxPrefix, N);
+    }
+    std::string Shape = "?";
+    size_t NInstrs = 0;
+    if (auto F = revenant::function(P, VA)) {
+      Shape = shapeTag(*F);
+      NInstrs = F->Instrs.size();
+    }
     CSV << format_hex_no_prefix(VA.Value, 0, true) << ',' << Sig.Params.size()
-        << ',' << ReturnKind << '\n';
+        << ',' << ReturnKind << ',';
+    if (PdbCount == UINT32_MAX)
+      CSV << ',';
+    else
+      CSV << PdbCount << ',';
+    CSV << NCallers << ',';
+    if (NCallers == 0)
+      CSV << ',';
+    else
+      CSV << MinPrefix << ',';
+    if (NCallers == 0)
+      CSV << ',';
+    else
+      CSV << MaxPrefix << ',';
+    CSV << Shape << ',' << NInstrs << '\n';
     if (PdbCount == UINT32_MAX) {
       ++MissingPdb;
       continue;

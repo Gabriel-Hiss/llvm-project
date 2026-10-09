@@ -4,6 +4,7 @@ add_llvm_library(RevenantLift
   LiftCalls.cpp
   LiftCore.cpp
   LiftEH.cpp
+  LiftX86.cpp
 
   LINK_COMPONENTS
   Analysis
@@ -11,6 +12,7 @@ add_llvm_library(RevenantLift
   InstCombine
   MC
   MCDisassembler
+  Passes
   ScalarOpts
   Support
   TargetParser

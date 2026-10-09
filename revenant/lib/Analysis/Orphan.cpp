@@ -27,7 +27,6 @@ namespace {
 
 using Range = std::pair<Va, Va>;
 
-bool overlaps(Range R, Va A, Va B) { return R.first < B && A < R.second; }
 
 std::vector<Range> mergeRanges(std::vector<Range> Ranges) {
   llvm::sort(Ranges);
@@ -40,23 +39,6 @@ std::vector<Range> mergeRanges(std::vector<Range> Ranges) {
       Out.push_back(R);
   }
   return Out;
-}
-
-void addClaim(std::vector<Range> &Covered, Va Start, Va End) {
-  if (End <= Start)
-    return;
-  // Covered stays sorted/disjoint with few entries, so a linear merge is
-  // the boring correct choice.
-  Range R{Start, End};
-  auto It = Covered.begin();
-  while (It != Covered.end() && It->second < R.first)
-    ++It;
-  while (It != Covered.end() && It->first <= R.second) {
-    R.first = std::min(R.first, It->first);
-    R.second = std::max(R.second, It->second);
-    It = Covered.erase(It);
-  }
-  Covered.insert(It, R);
 }
 
 /// Jump-over-blob barriers: Go assembly wrappers emit raw `BYTE` data
@@ -141,12 +123,8 @@ bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd,
 }
 
 bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd) {
-  // Decoder-only fallback for tests that link this slice without the x86
-  // hooks. `jmp reg` decodes as JMP64r with a single register operand;
-  // memory forms carry base/scale/index/disp/segment, with the index in
-  // slot 2 (reg 0 = no index). RIP-relative detection uses the decoded
-  // absolute slot instead of a register table: `HasMemTarget` into
-  // non-executable bytes is a thunk slot however the base is spelled.
+  // Without target hooks, accept only direct-register jumps and resolved
+  // memory slots into non-executable bytes. Other memory forms stay unknown.
   struct LocalHooks final : public TargetHooks {
     llvm::StringRef mnemonic(const Instr &) const override { return ""; }
     bool isFiller(const Instr &) const override { return false; }
@@ -158,9 +136,7 @@ bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd) {
       if (I.Flow != FlowKind::IndirectBranch)
         return false;
       const llvm::MCInst &M = I.Inst;
-      if (M.getNumOperands() == 0 || !M.getOperand(0).isReg())
-        return false;
-      if (M.getNumOperands() == 1)
+      if (M.getNumOperands() == 1 && M.getOperand(0).isReg())
         return true;
       return M.getNumOperands() >= 5 && I.HasMemTarget &&
              !Img.isExecutable(I.MemTarget);
@@ -187,53 +163,53 @@ bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd) {
   return orphanFunctionOk(Img, F, BoundEnd, Hooks);
 }
 
-std::vector<Range> orphanProbeRanges(const PeFile &Pe,
-                                     llvm::ArrayRef<Function> Functions) {
+OrphanSweep planOrphanSweep(const PeFile &Pe,
+                            llvm::ArrayRef<Function> Functions) {
   const Image &Img = *Pe.Img;
+  OrphanSweep Plan;
   std::vector<Range> Covered;
   Covered.reserve(Pe.Pdata.size() + Functions.size() * 2);
   for (const RuntimeFunction &R : Pe.Pdata)
-    addClaim(Covered, R.Begin, R.End);
+    Covered.emplace_back(R.Begin, R.End);
   for (const Function &F : Functions) {
-    for (const Range &C : F.Chunks)
-      addClaim(Covered, C.first, C.second);
+    Covered.insert(Covered.end(), F.Chunks.begin(), F.Chunks.end());
     // Resolved/recognized jump-table spans are data: they block probes
     // and bound the surrounding runs.
-    for (const Range &D : F.DataRanges)
-      addClaim(Covered, D.first, D.second);
+    Covered.insert(Covered.end(), F.DataRanges.begin(), F.DataRanges.end());
   }
+  const std::vector<Range> Merged = mergeRanges(std::move(Covered));
+  for (const Range &R : Merged)
+    Plan.Claimed.emplace(R.first, R.second);
+
   // Recorded data inside executable sections (relocation slots, the Go
-  // build-id blob) is never orphan code.
+  // build-id blob) and Go jump-over-blob spans are never orphan code. They
+  // join `Claimed` but not the gap carving, so a probe running into one is
+  // bounded by it.
+  std::vector<Range> Barriers;
   for (const VaRange &R : Img.InlineData)
-    addClaim(Covered, R.Start, R.End);
-  // Go blob barriers on top of the claims so a barrier overlapping a
-  // covered span only fills its unclaimed remainder.
-  if (Pe.GoBuildId) {
-    std::vector<Range> Barriers;
+    Barriers.emplace_back(R.Start, R.End);
+  if (Pe.GoBuildId)
     appendGoBarriers(Functions, Img, Barriers);
-    for (const Range &B : Barriers) {
-      if (B.second <= B.first)
-        continue;
-      // Snapshot: addClaim mutates Covered, so iterate a copy.
-      const std::vector<Range> Snap = Covered;
-      Va Cur = B.first;
-      for (const Range &C : Snap) {
-        if (C.second <= Cur)
-          continue;
-        if (C.first >= B.second)
-          break;
-        if (Cur < C.first)
-          addClaim(Covered, Cur, C.first);
-        Cur = std::max(Cur, C.second);
-        if (Cur >= B.second)
-          break;
-      }
-      if (Cur < B.second)
-        addClaim(Covered, Cur, B.second);
+  for (const Range &B : Barriers) {
+    Va Cur = B.first;
+    auto Prev = Plan.Claimed.upper_bound(Cur);
+    if (Prev != Plan.Claimed.begin()) {
+      --Prev;
+      Cur = std::max(Cur, std::min(Prev->second, B.second));
     }
+    std::vector<Range> Overlaps;
+    for (auto It = Plan.Claimed.lower_bound(Cur);
+         It != Plan.Claimed.end() && It->first < B.second; ++It)
+      Overlaps.emplace_back(It->first, It->second);
+    for (const Range &O : Overlaps) {
+      if (Cur < O.first)
+        Plan.Claimed[Cur] = O.first;
+      Cur = std::min(std::max(Cur, O.second), B.second);
+    }
+    if (Cur < B.second)
+      Plan.Claimed[Cur] = B.second;
   }
 
-  std::vector<Range> Out;
   for (const Section &S : Img.Sections) {
     if (!S.Flags.Execute)
       continue;
@@ -241,25 +217,22 @@ std::vector<Range> orphanProbeRanges(const PeFile &Pe,
     // Only backed bytes are probeable: the mapped tail past `Data` is
     // zero-fill, and running a probe over it manufactures code out of
     // zeros.
-    const uint64_t Backed =
-        std::min<uint64_t>(S.Vsize, (uint64_t)S.Data.size());
-    const Va Hi = Lo.wrappingAdd(Backed);
+    const Va Hi = Lo.wrappingAdd(
+        std::min<uint64_t>(S.Vsize, (uint64_t)S.Data.size()));
     Va Cursor = Lo;
-    for (const Range &C : Covered) {
-      if (C.second <= Cursor)
+    for (const Range &C : Merged) {
+      if (C.second <= Cursor || C.first >= Hi)
         continue;
-      if (C.first >= Hi)
-        break;
       if (C.first > Cursor)
-        Out.emplace_back(Cursor, std::min(C.first, Hi));
+        Plan.Gaps.emplace_back(Cursor, std::min(C.first, Hi));
       Cursor = std::max(Cursor, C.second);
       if (Cursor >= Hi)
         break;
     }
     if (Cursor < Hi)
-      Out.emplace_back(Cursor, Hi);
+      Plan.Gaps.emplace_back(Cursor, Hi);
   }
-  return mergeRanges(std::move(Out));
+  return Plan;
 }
 
 } // namespace analysis_detail

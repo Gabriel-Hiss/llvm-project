@@ -209,8 +209,13 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   TypeInference TI(F);
   TI.collect();
 
-  // CU plumbing lives in RevenantIR: one shared compile unit per module.
-  DIBuilder DIB(*M);
+  // CU plumbing lives in RevenantIR: one shared compile unit per module. The
+  // builder starts over the module's existing CU so finalize() has one.
+  DICompileUnit *ExistingCU = nullptr;
+  if (NamedMDNode *CUs = M->getNamedMetadata("llvm.dbg.cu"))
+    if (CUs->getNumOperands() > 0)
+      ExistingCU = dyn_cast<DICompileUnit>(CUs->getOperand(0));
+  DIBuilder DIB(*M, /*AllowUnresolved=*/true, ExistingCU);
   DICompileUnit &CU = ir::getOrCreateCompileUnit(*M, DIB, "revenant.ll");
   DISubprogram *SP = F.getSubprogram();
   if (!SP)
@@ -357,6 +362,16 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
     DIB.retainType(Ptr);
     Changed = true;
   }
+
+  // The verifier wants a !dbg location on every call in a function that has a
+  // DISubprogram; lifted calls only carry !revenant.va.
+  DILocation *CallLoc = DILocation::get(F.getContext(), 1, 1, SP);
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (isa<CallBase>(I) && !I.getDebugLoc()) {
+        I.setDebugLoc(CallLoc);
+        Changed = true;
+      }
 
   if (!Changed)
     return PreservedAnalyses::all();

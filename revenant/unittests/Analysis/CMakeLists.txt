@@ -1,4 +1,5 @@
 revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
+  AnalysisTest.cpp
   CandidatesTest.cpp
   JumpTableTest.cpp
   NoreturnTest.cpp
@@ -6,10 +7,10 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   OverlapsTest.cpp
   PaddingTest.cpp
   ResolverTest.cpp
+  SignaturesTest.cpp
   StackPtrTest.cpp
   StringsTest.cpp
   XrefsTest.cpp
-  SignaturesTest.cpp
   EHTablesTest.cpp
 )
 

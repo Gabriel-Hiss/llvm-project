@@ -85,6 +85,9 @@ private:
   void voteSigned(const llvm::Value *V);
   void votePointer(const llvm::Value *V);
   void voteInt(const llvm::Value *V, unsigned Bits);
+  /// Width evidence from V's own type: integers vote their width, pointers
+  /// vote as pointers, anything else (vectors, floats) abstains.
+  void voteIntOf(const llvm::Value *V);
   void voteFloat(const llvm::Value *V, unsigned Bits);
   void recordFieldAccess(const llvm::Value *Ptr, uint64_t BaseOffset,
                          bool DirectMemOp, const llvm::Instruction *I);

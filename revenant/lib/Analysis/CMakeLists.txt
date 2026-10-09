@@ -9,10 +9,10 @@ add_llvm_library(RevenantAnalysis
   Padding.cpp
   ProgramAnalyze.cpp
   Resolver.cpp
+  Signatures.cpp
   StackPtr.cpp
   Strings.cpp
   Xrefs.cpp
-  Signatures.cpp
   EHTables.cpp
 
   LINK_COMPONENTS

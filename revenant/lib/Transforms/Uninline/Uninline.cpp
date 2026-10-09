@@ -52,13 +52,9 @@
 // rejected), and debug locations are preserved per instruction where one
 // exists.
 //
-// Why only single-block callees: multi-block bodies inline into multiple
-// caller blocks with cloned branches, and matching those against later
-// optimization (loop rotation, jump threading, tail duplication) is a
-// different, much weaker-evidenced job. The corpus inline events this pass
-// recovers (`-O1`/`-O2`/`-O3`/LTO small helpers: null checks folded to a
-// select, bound arithmetic, flag setup) are single-block after optimization,
-// and every rewrite here is checkable with `opt -passes=verify`.
+// Multi-block callees additionally use an exact CFG-isomorphism proof.
+// Branch folding, side entrances, extra live definitions and reordered
+// operations are not repaired speculatively. See CFGMatch.inc.
 //
 // Liveness subtlety: the escaping value must dominate its uses the way a
 // call result would. Because the region sits in one block and the call is
@@ -76,6 +72,9 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -303,6 +302,16 @@ public:
   }
 
   void bindLocal(const Value *C, Value *R) { LocalBind[C] = R; }
+
+  Value *boundValue(const Value *V) const {
+    if (!V)
+      return nullptr;
+    if (isa<Constant>(V))
+      return const_cast<Value *>(V);
+    if (const auto *A = dyn_cast<Argument>(V))
+      return ArgBind.lookup(A);
+    return LocalBind.lookup(V);
+  }
 
   // Snapshot/restore for trial matches of candidate regions.
   DenseMap<const Value *, Value *> snapLocals() const { return LocalBind; }
@@ -637,28 +646,35 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
   return Changed;
 }
 
+#include "CFGMatch.inc"
+
 } // namespace
 
 PreservedAnalyses revenant::UninlinePass::run(Module &M,
                                              ModuleAnalysisManager &) {
-  // Collect eligible callees first: the rewrite never adds or removes
-  // functions, so pointers stay valid.
-  SmallVector<CalleeBody, 16> Callees;
-  for (Function &F : M) {
-    if (F.isDeclaration() || F.isIntrinsic())
-      continue;
-    CalleeBody B = analyzeCallee(F);
-    if (B.Valid)
-      Callees.push_back(std::move(B));
-  }
+  // Analyze each callee when its turn starts: earlier rewrites may have
+  // changed its body. It stays unchanged while rewriting other functions.
+  SmallVector<Function *, 16> Callees;
+  for (Function &F : M)
+    if (!F.isDeclaration() && !F.isIntrinsic())
+      Callees.push_back(&F);
   bool Changed = false;
-  for (CalleeBody &CB : Callees) {
+  for (Function *Callee : Callees) {
+    CalleeBody CB = analyzeCallee(*Callee);
+    CFGBody B = analyzeCFG(*Callee);
+    if (!CB.Valid && !B.Valid)
+      continue;
     for (Function &F : M) {
-      if (F.isDeclaration() || F.isIntrinsic())
+      if (F.isDeclaration() || F.isIntrinsic() || &F == Callee)
         continue;
-      if (&F == CB.Fn)
-        continue;
-      Changed |= tryUninlineCaller(F, CB);
+      if (CB.Valid)
+        Changed |= tryUninlineCaller(F, CB);
+      unsigned Guard = 0;
+      while (Guard++ < 64) {
+        if (!B.Valid || !tryUninlineCFG(F, B))
+          break;
+        Changed = true;
+      }
     }
   }
   if (!Changed)

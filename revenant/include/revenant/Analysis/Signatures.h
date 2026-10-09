@@ -82,6 +82,9 @@ struct Signature {
   bool HasRet = false;
   RetLoc Ret;
   bool Noreturn = false;
+  /// Set when the function spills all four Win64 register arguments to
+  /// their home slots before consuming a variadic argument list.
+  bool VarArgs = false;
   /// Rust `sigs::SigSource`.
   enum class Source : uint8_t {
     /// Signature came from debug info. Never produced by this port;

@@ -135,7 +135,7 @@ void LiftState::coerceArgs(llvm::Function *F,
 llvm::Value *LiftState::readCallerArg(int64_t Off) {
   // Incoming stack args live above entry rsp: frame offset Off counts from
   // entry rsp, and Sp0 sits at entry rsp inside the frame.
-  return B.CreateLoad(i64(), framePtrOff(Off), "sa");
+  return B.CreateAlignedLoad(i64(), framePtrOff(Off), llvm::Align(1), "sa");
 }
 
 void LiftState::emitCall(const Instr &I) {
@@ -169,7 +169,9 @@ void LiftState::emitCall(const Instr &I) {
                          llvm::formatv("0x{0:x}", I.MemTarget.Value).str());
       std::vector<llvm::Value *> Args = callArgs(Sig, std::nullopt);
       coerceArgs(Callee, Args);
-      llvm::CallInst *Call = B.CreateCall(Callee, Args, "c");
+      llvm::CallInst *Call =
+          B.CreateCall(Callee, Args,
+                       Callee->getReturnType()->isVoidTy() ? "" : "c");
       ir::setInstructionVA(*Call, I.Addr.Value);
       if (llvm::StringRef(Callee->getName()) == "__security_check_cookie")
         clobberFlags();
@@ -219,7 +221,9 @@ void LiftState::emitCall(const Instr &I) {
     llvm::Function *Callee = calleeFn(T, Sigs ? Sigs->of(T) : nullptr);
     std::vector<llvm::Value *> Args = callArgs(Sig, std::nullopt);
     coerceArgs(Callee, Args);
-    llvm::CallInst *Call = B.CreateCall(Callee, Args, "c");
+    llvm::CallInst *Call =
+        B.CreateCall(Callee, Args,
+                     Callee->getReturnType()->isVoidTy() ? "" : "c");
     ir::setInstructionVA(*Call, I.Addr.Value);
     clobberVolatile();
     if (Call->getType()->isIntegerTy())
@@ -262,7 +266,9 @@ void LiftState::emitTailCall(Va Target) {
   Empty.Ret.reset();
   std::vector<llvm::Value *> Args = callArgs(Sig ? Sig : &Empty, std::nullopt);
   coerceArgs(Callee, Args);
-  llvm::CallInst *Call = B.CreateCall(Callee, Args, "tc");
+  llvm::CallInst *Call =
+      B.CreateCall(Callee, Args,
+                   Callee->getReturnType()->isVoidTy() ? "" : "tc");
   ir::setInstructionVA(*Call, CurVa.Value);
   const Signature *Caller = Sigs ? Sigs->of(F.Start) : nullptr;
   if (Caller && Caller->Ret) {
@@ -307,7 +313,8 @@ void LiftState::emitIndirectTailCall(const Instr &I) {
     Args.push_back(llvm::UndefValue::get(i64()));
   llvm::Value *FP =
       B.CreateIntToPtr(TV, llvm::PointerType::getUnqual(FT), "fp");
-  llvm::CallInst *Call = B.CreateCall(FT, FP, Args, "itc");
+  llvm::CallInst *Call =
+      B.CreateCall(FT, FP, Args, FT->getReturnType()->isVoidTy() ? "" : "itc");
   ir::setInstructionVA(*Call, I.Addr.Value);
   if (Call->getType()->isVoidTy()) {
     B.CreateRetVoid();

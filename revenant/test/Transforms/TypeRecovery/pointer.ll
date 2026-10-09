@@ -5,7 +5,7 @@
 
 ; CHECK-LABEL: define i32 @sub_140003000(
 ; CHECK: %v0 = load i32, ptr %p, align 4, !revenant.va !{{[0-9]+}}
-; CHECK: %q = call ptr @revenant.asm.lea(ptr %p), !revenant.va !{{[0-9]+}}, !revenant.opaque !{{[0-9]+}}
+; CHECK: %q = call ptr @revenant.asm.lea(ptr %p), !dbg !{{[0-9]+}}, !revenant.va !{{[0-9]+}}, !revenant.opaque !{{[0-9]+}}
 ; CHECK-DAG: !DILocalVariable(name: "a0", arg: 1, scope: !{{[0-9]+}}, file: !{{[0-9]+}}, line: 1, type: !{{[0-9]+}})
 ; CHECK-DAG: !DIBasicType(name: "int64_t", size: 64, encoding: DW_ATE_signed)
 declare ptr @revenant.asm.lea(ptr)

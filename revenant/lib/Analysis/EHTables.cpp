@@ -605,7 +605,6 @@ std::vector<FunctionEH> revenant::decodeEHTables(const PeFile &PE) {
       } else if (HandlerName->find("gxx_personality_seh0") != std::string::npos) {
         readLSDA(I, F, U->Data);
       } else if (HandlerName->find("rust_eh_personality") != std::string::npos) {
-        // Rust on non-Windows targets: Itanium LSDA with cleanup-only actions.
         readLSDA(I, F, U->Data);
         if (F.Model == EHModel::Itanium)
           F.Model = EHModel::Rust;

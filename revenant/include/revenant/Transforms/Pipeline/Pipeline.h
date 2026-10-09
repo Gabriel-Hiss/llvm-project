@@ -46,12 +46,12 @@ inline constexpr llvm::StringLiteral CleanupPipeline =
     "instcombine<no-verify-fixpoint>";
 
 /// The unopt stage in pipeline order, ported from
-/// `crates/unopt/src/lib.rs` (`passes()`). `lane0` exposes scalar low-lane
-/// accumulators so `devectorize` sees plain scalar loops; `devectorize`
+/// `crates/unopt/src/lib.rs` (`passes()`). `revenant-devectorize` runs the
+/// lane-0 scalarization first (exposing scalar low-lane accumulators), then
 /// produces the canonical one-element-per-iteration form that `reroll`
 /// compacts further; `unrotate`/`untailrec` normalize loop structure.
 inline constexpr llvm::StringLiteral UnoptPipeline =
-    "revenant-lane0,revenant-devectorize,revenant-reroll,revenant-unrotate,"
+    "revenant-devectorize,revenant-reroll,revenant-unrotate,"
     "revenant-untailrec";
 
 /// The IR-level idiom stage, ported from `crates/idioms/src/lib.rs`

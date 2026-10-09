@@ -13,7 +13,7 @@ integrator after each merge loop.
 | IR contract | RevenantIR, revenant-ir-verify | builds |
 | Structure | RevenantStructure, rv-structure-tool | builds |
 | Target/X86 | RevenantTargetX86 | builds |
-| Transforms | SsaOut, Unrotate, Devectorize, TypeRecovery, and newly merged deopt passes | integrated build pending; SsaOut and Unrotate now select STATIC libraries for the superbuild |
+| Transforms | SsaOut, Unrotate, Devectorize, TypeRecovery, and newly merged deopt passes | integrated build blocked in Analysis; SsaOut and Unrotate superbuild targets are STATIC, standalone plugins remain MODULEs |
 | Frontend clang | RevenantClangCore, revenant-clang | merged ClangAccept fixes, integrated rebuild pending |
 | Driver | tools/revenant | builds |
 
@@ -36,8 +36,8 @@ integrator after each merge loop.
 ## Latest integration loop
 
 - Merged new commits from MuseXrefs, Discovery, CompilerProfile, DeoptAbi/Licm/Noreturn/StackPtr/Select/HotCold/Inline/TailDup/EH, LiftSystem/LiftFunction/LiftGen2, TxDevec/TxPipeline/TxUnrotate, JumpTables, Sigs, and ClangAccept. Resolved Analysis, X86, and TableGen CMake conflicts by retaining all distinct sources, tests, and target links.
-- Registered new Candidates, Overlaps, StackPtr, and signature sources/tests. Added `UnrotatePlugin.cpp` to its static superbuild source list and changed SsaOut to build STATIC in the superbuild while retaining the standalone plugin mode.
-- Full `rv-int-build.cmd` now stops compiling Candidates.cpp and Overlaps.cpp because `AnalysisImpl.h` is still untracked in LunaDiscovery's worktree. LunaDiscovery confirmed the header is shared by those sources and plans to commit it. The earlier CMake scan errors for unregistered sources are fixed.
+- Registered new Candidates, Overlaps, StackPtr, Signatures, and Orphan sources/tests. SsaOut now builds STATIC in the superbuild and keeps its standalone MODULE. UnrotatePlugin.cpp is standalone-only; its static superbuild target omits that plugin entry.
+- CMake configuration succeeds after registering all committed sources. The full build then fails because Candidates.cpp and Overlaps.cpp include `AnalysisImpl.h`, still untracked in LunaDiscovery's worktree. Orphan.cpp also calls TargetHooks methods/types absent from the current Core interface; LunaSkeleton was asked to reconcile the contract.
 - `ctest --test-dir build-rv` has no registered tests. Direct gtests and RUN lines above describe the last fully built integration state; the latest merged changes still need a clean integrated build and test run.
 
 ## Integration fixes applied (on revenant, not slice branches)

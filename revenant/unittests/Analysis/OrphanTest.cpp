@@ -140,7 +140,7 @@ TEST(OrphanTest, ProbeRangesSkipPdata) {
   R.End = Va(0x140001200);
   R.Unwind = Va(0x140001100);
   Pe.Pdata.push_back(R);
-  auto Ranges = orphanProbeRanges(Pe, {});
+  auto Ranges = planOrphanSweep(Pe, {}).Gaps;
   ASSERT_EQ(Ranges.size(), 2u);
   EXPECT_EQ(Ranges[0].first, Va(0x140001000));
   EXPECT_EQ(Ranges[0].second, Va(0x140001100));
@@ -163,7 +163,7 @@ TEST(OrphanTest, ProbeRangesSkipChunksAndData) {
                                  {{Va(0x140001080), Va(0x1400010C0)}}));
   Funcs.push_back(funcWithChunks(Va(0x140001200),
                                  {{Va(0x140001200), Va(0x140001280)}}));
-  auto Ranges = orphanProbeRanges(Pe, Funcs);
+  auto Ranges = planOrphanSweep(Pe, Funcs).Gaps;
   ASSERT_EQ(Ranges.size(), 2u);
   EXPECT_EQ(Ranges[0].first, Va(0x1400010C0));
   EXPECT_EQ(Ranges[0].second, Va(0x140001200));
@@ -171,18 +171,21 @@ TEST(OrphanTest, ProbeRangesSkipChunksAndData) {
   EXPECT_EQ(Ranges[1].second, Va(0x140001400));
 }
 
-// Inline-data barriers (reloc slots, the Go build-id blob) carve out of
-// the section even with no function claiming them.
-TEST(OrphanTest, ProbeRangesSkipInlineData) {
+// Inline-data barriers (reloc slots, the Go build-id blob) stay in the
+// gap but join the claimed map, so a probe running into one stops there.
+TEST(OrphanTest, ProbeRangesClaimInlineData) {
   Env E;
   E.addText(Va(0x140001000), std::vector<uint8_t>(0x400, 0x90));
   E.decode();
   E.Img->InlineData.push_back({Va(0x140001100), Va(0x140001140)});
   PeFile Pe = makePe(E.Img, Va(0x140001000));
-  auto Ranges = orphanProbeRanges(Pe, {});
-  ASSERT_EQ(Ranges.size(), 2u);
-  EXPECT_EQ(Ranges[0].second, Va(0x140001100));
-  EXPECT_EQ(Ranges[1].first, Va(0x140001140));
+  OrphanSweep Plan = planOrphanSweep(Pe, {});
+  ASSERT_EQ(Plan.Gaps.size(), 1u);
+  EXPECT_EQ(Plan.Gaps[0].first, Va(0x140001000));
+  EXPECT_EQ(Plan.Gaps[0].second, Va(0x140001400));
+  ASSERT_EQ(Plan.Claimed.size(), 1u);
+  EXPECT_EQ(Plan.Claimed.begin()->first, Va(0x140001100));
+  EXPECT_EQ(Plan.Claimed.begin()->second, Va(0x140001140));
 }
 
 // Non-executable sections never produce probes.
@@ -192,7 +195,7 @@ TEST(OrphanTest, ProbeRangesIgnoreDataSections) {
   E.addData(Va(0x140002000), 0x100);
   E.decode();
   PeFile Pe = makePe(E.Img, Va(0x140001000));
-  auto Ranges = orphanProbeRanges(Pe, {});
+  auto Ranges = planOrphanSweep(Pe, {}).Gaps;
   ASSERT_EQ(Ranges.size(), 1u);
   EXPECT_EQ(Ranges[0].first, Va(0x140001000));
   EXPECT_EQ(Ranges[0].second, Va(0x140001100));
@@ -218,19 +221,22 @@ TEST(OrphanTest, BlobBarrierNeedsGoBuildId) {
   std::vector<Function> Funcs{F};
 
   PeFile Plain = makePe(E.Img, Va(0x140001000));
-  auto PlainRanges = orphanProbeRanges(Plain, Funcs);
+  OrphanSweep PlainPlan = planOrphanSweep(Plain, Funcs);
+  auto &PlainRanges = PlainPlan.Gaps;
   ASSERT_EQ(PlainRanges.size(), 1u);
   EXPECT_EQ(PlainRanges[0].first, Va(0x140001000));
   EXPECT_EQ(PlainRanges[0].second, Va(0x140001008));
+  EXPECT_TRUE(PlainPlan.Claimed.empty());
 
   PeFile Go = makePe(E.Img, Va(0x140001000));
   Go.GoBuildId = VaRange{Va(0x140003000), Va(0x140003020)};
-  auto GoRanges = orphanProbeRanges(Go, Funcs);
-  ASSERT_EQ(GoRanges.size(), 2u);
-  EXPECT_EQ(GoRanges[0].first, Va(0x140001000));
-  EXPECT_EQ(GoRanges[0].second, Va(0x140001002));
-  EXPECT_EQ(GoRanges[1].first, Va(0x140001007));
-  EXPECT_EQ(GoRanges[1].second, Va(0x140001008));
+  OrphanSweep GoPlan = planOrphanSweep(Go, Funcs);
+  ASSERT_EQ(GoPlan.Gaps.size(), 1u);
+  EXPECT_EQ(GoPlan.Gaps[0].first, Va(0x140001000));
+  EXPECT_EQ(GoPlan.Gaps[0].second, Va(0x140001008));
+  ASSERT_EQ(GoPlan.Claimed.size(), 1u);
+  EXPECT_EQ(GoPlan.Claimed.begin()->first, Va(0x140001002));
+  EXPECT_EQ(GoPlan.Claimed.begin()->second, Va(0x140001007));
 }
 
 // A jump into the middle of the flow is real code: no barrier even for
@@ -253,7 +259,7 @@ TEST(OrphanTest, MidFunctionJumpIsNotABlob) {
   std::vector<Function> Funcs{F};
   PeFile Go = makePe(E.Img, Va(0x140001000));
   Go.GoBuildId = VaRange{Va(0x140003000), Va(0x140003020)};
-  auto Ranges = orphanProbeRanges(Go, Funcs);
+  auto Ranges = planOrphanSweep(Go, Funcs).Gaps;
   ASSERT_EQ(Ranges.size(), 1u);
   EXPECT_EQ(Ranges[0].first, Va(0x140001000));
   EXPECT_EQ(Ranges[0].second, Va(0x140001008));
@@ -325,8 +331,7 @@ TEST(OrphanTest, IndexedDispatchRejected) {
 // call; into data it is a thunk and accepted.
 TEST(OrphanTest, RipSlotIntoCodeRejectedSlotIntoDataAccepted) {
   Env E;
-  E.addText(Va(0x140001000), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
-  E.addText(Va(0x140002000), std::vector<uint8_t>(0x100, 0x90));
+  E.addText(Va(0x140001000), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x90});
   E.addData(Va(0x140003000), 0x100);
   E.decode();
   // Slot at next_ip + 0 lands at 0x140001006 (executable): rejected.
@@ -390,7 +395,7 @@ TEST(OrphanTest, FixtureOutsidePdata) {
     llvm::consumeError(Pe.takeError());
     return;
   }
-  auto Ranges = orphanProbeRanges(*Pe, {});
+  auto Ranges = planOrphanSweep(*Pe, {}).Gaps;
   // Every pdata range splits the section, so the fixture's gap must show
   // up as a probe range covering it.
   EXPECT_FALSE(Ranges.empty());
@@ -417,7 +422,7 @@ TEST(OrphanTest, ProbeRangesExcludeAllClaims) {
       llvm::consumeError(Pe.takeError());
       continue;
     }
-    auto Ranges = orphanProbeRanges(*Pe, {});
+    auto Ranges = planOrphanSweep(*Pe, {}).Gaps;
     for (const RuntimeFunction &R : Pe->Pdata) {
       for (auto [A, B] : Ranges)
         EXPECT_FALSE(A < R.End && R.Begin < B)

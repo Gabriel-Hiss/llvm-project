@@ -7,12 +7,13 @@
 //===----------------------------------------------------------------------===//
 //
 // Single registration site for every Revenant transform pass. Each pass is
-// a FunctionPassManager pass named `revenant-<name>` — except
-// `revenant-unabi`, which rewrites function signatures and must run as a
-// ModulePassManager pass (erasing a Function while the FPM iterates the
-// module is a use-after-free; LLVM's own ArgPromotion/DeadArgElim are
-// module passes for the same reason). Each pass is declared in its own
-// header under revenant/include/revenant/Transforms/<Name>/ and defined in
+// a FunctionPassManager pass named `revenant-<name>` — except the
+// signature-rewriting module passes (`revenant-unabi`, `revenant-uninline`,
+// `revenant-unipo`), which must run as ModulePassManager passes (erasing a
+// Function while the FPM iterates the module is a use-after-free; LLVM's
+// own ArgPromotion/DeadArgElim are module passes for the same reason).
+// Each pass is declared in its own header under
+// revenant/include/revenant/Transforms/<Name>/ and defined in
 // its own library RevenantTransform<Name> (both owned by the pass agent).
 // This file only wires names to classes so agents never conflict.
 //
@@ -25,9 +26,6 @@
 
 // Per-pass headers. One include per pass, guarded so this file builds before
 // the pass agent lands.
-#if __has_include("revenant/Transforms/Lane0/Lane0.h")
-#include "revenant/Transforms/Lane0/Lane0.h"
-#endif
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
 #include "revenant/Transforms/Devectorize/Devectorize.h"
 #endif
@@ -43,8 +41,8 @@
 #if __has_include("revenant/Transforms/Patterns/Patterns.h")
 #include "revenant/Transforms/Patterns/Patterns.h"
 #endif
-#if __has_include("revenant/Transforms/Structure/Structure.h")
-#include "revenant/Transforms/Structure/Structure.h"
+#if __has_include("revenant/Structure/RevenantStructure.h")
+#include "revenant/Structure/RevenantStructure.h"
 #endif
 #if __has_include("revenant/Transforms/TypeRecovery/TypeRecovery.h")
 #include "revenant/Transforms/TypeRecovery/TypeRecovery.h"
@@ -58,10 +56,33 @@
 #if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
 #include "revenant/Transforms/Unhoist/Unhoist.h"
 #endif
+#if __has_include("revenant/Transforms/Uninline/Uninline.h")
+#include "revenant/Transforms/Uninline/Uninline.h"
+#endif
+#if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
+#include "revenant/Transforms/UnhotCold/UnhotCold.h"
+#endif
+#if __has_include("revenant/Transforms/Unselect/Unselect.h")
+#include "revenant/Transforms/Unselect/Unselect.h"
+#endif
+#if __has_include("revenant/Transforms/UntailDup/UntailDup.h")
+#include "revenant/Transforms/UntailDup/UntailDup.h"
+#endif
+#if __has_include("revenant/Transforms/Uneh/Uneh.h")
+#include "revenant/Transforms/Uneh/Uneh.h"
+#endif
+#if __has_include("revenant/Transforms/Unipo/Unipo.h")
+#include "revenant/Transforms/Unipo/Unipo.h"
+#endif
 #if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
 #include "revenant/Transforms/UnloopVec/UnloopVec.h"
 #endif
-
+#if __has_include("revenant/Transforms/Unsroa/Unsroa.h")
+#include "revenant/Transforms/Unsroa/Unsroa.h"
+#endif
+#if __has_include("revenant/Transforms/Unrust/Unrust.h")
+#include "revenant/Transforms/Unrust/Unrust.h"
+#endif
 using namespace llvm;
 
 namespace revenant {
@@ -70,12 +91,6 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, FunctionPassManager &FPM,
          ArrayRef<PassBuilder::PipelineElement>) {
-#if __has_include("revenant/Transforms/Lane0/Lane0.h")
-        if (Name == "revenant-lane0") {
-          FPM.addPass(Lane0Pass());
-          return true;
-        }
-#endif
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
         if (Name == "revenant-devectorize") {
           FPM.addPass(DevectorizePass());
@@ -110,9 +125,9 @@ void registerRevenantPasses(PassBuilder &PB) {
           return true;
         }
 #endif
-#if __has_include("revenant/Transforms/Structure/Structure.h")
+#if __has_include("revenant/Structure/RevenantStructure.h")
         if (Name == "revenant-structure") {
-          FPM.addPass(StructurePass());
+          FPM.addPass(RevenantStructurePass());
           return true;
         }
 #endif
@@ -140,18 +155,66 @@ void registerRevenantPasses(PassBuilder &PB) {
           return true;
         }
 #endif
+#if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
+        if (Name == "revenant-unhotcold") {
+          FPM.addPass(UnhotColdPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unselect/Unselect.h")
+        if (Name == "revenant-unselect") {
+          FPM.addPass(UnselectPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/UntailDup/UntailDup.h")
+        if (Name == "revenant-untaildup") {
+          FPM.addPass(UntailDupPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Uneh/Uneh.h")
+        if (Name == "revenant-uneh") {
+          FPM.addPass(UnehPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unsroa/Unsroa.h")
+        if (Name == "revenant-unsroa") {
+          FPM.addPass(UnsroaPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unrust/Unrust.h")
+        if (Name == "revenant-unrust") {
+          FPM.addPass(UnrustPass());
+          return true;
+        }
+#endif
         return false;
       });
   // Module passes: only passes that must erase/replace Function objects
-  // (today just revenant-unabi, which rewrites signatures). Registered on
-  // the Module pipeline so top-level `-passes=revenant-unabi` resolves
-  // without the function adaptor.
+  // (revenant-unabi/uninline/unipo, which rewrite signatures or outline
+  // regions). Registered on the Module pipeline so top-level
+  // `-passes=revenant-<name>` resolves without the function adaptor.
   PB.registerPipelineParsingCallback(
       [](StringRef Name, ModulePassManager &MPM,
          ArrayRef<PassBuilder::PipelineElement>) {
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Uninline/Uninline.h")
+        if (Name == "revenant-uninline") {
+          MPM.addPass(UninlinePass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unipo/Unipo.h")
+        if (Name == "revenant-unipo") {
+          MPM.addPass(UnipoPass());
           return true;
         }
 #endif
