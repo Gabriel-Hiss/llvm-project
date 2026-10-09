@@ -1,10 +1,23 @@
 revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
-  PaddingTest.cpp
+  AnalysisTest.cpp
+  CandidatesTest.cpp
+  JumpTableTest.cpp
   NoreturnTest.cpp
+  OrphanTest.cpp
+  OverlapsTest.cpp
+  PaddingTest.cpp
+  ResolverTest.cpp
   SignaturesTest.cpp
+  StackPtrTest.cpp
+  StringsTest.cpp
+  XrefsTest.cpp
 )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
   RevenantAnalysis
   RevenantObject
+  RevenantTargetX86
   RevenantDisasm)
+
+target_compile_definitions(RevenantAnalysisTests PRIVATE
+  REVENANT_TEST_C_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2/c-o2.exe")

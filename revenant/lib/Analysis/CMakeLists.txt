@@ -1,7 +1,18 @@
 add_llvm_library(RevenantAnalysis
-  Padding.cpp
+  Analysis.cpp
+  Builder.cpp
+  Candidates.cpp
+  JumpTable.cpp
   Noreturn.cpp
+  Orphan.cpp
+  Overlaps.cpp
+  Padding.cpp
+  ProgramAnalyze.cpp
+  Resolver.cpp
   Signatures.cpp
+  StackPtr.cpp
+  Strings.cpp
+  Xrefs.cpp
 
   LINK_COMPONENTS
   MC

@@ -19,10 +19,18 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <map>
+#include <utility>
 
 #include "llvm/ADT/ArrayRef.h"
 
 namespace revenant {
+
+/// Per-target instruction operations for jump-table recovery
+/// (revenant/Analysis/JumpTable.h). Forward-declared so this header
+/// stays free of the Analysis layer.
+class JtInsnOps;
+const JtInsnOps *getX86JumpTableInsnOps();
 
 /// Result of jump-table shape matching at an indirect `jmp` (Rust
 /// `analysis::jump_table::SwitchResolution`).
@@ -45,6 +53,18 @@ struct JumpTableInfo {
   std::optional<size_t> Guard;
 };
 
+enum class StackBase : uint8_t { Rsp, Rbp };
+
+struct StackSlots {
+  std::vector<std::pair<StackBase, int64_t>> Slots;
+  bool HasDynamicMem = false;
+};
+
+struct FpEstablish {
+  enum class Kind : uint8_t { None, MovRbpRsp, LeaRbpRsp } Tag = Kind::None;
+  int64_t Disp = 0;
+};
+
 /// Target-specific queries and shape matchers used by function
 /// discovery, CFG building and padding classification.
 class TargetHooks {
@@ -58,15 +78,33 @@ public:
   /// `int3`, and `xchg ax,ax` (`66 90` decodes as an xchg, not nop).
   virtual bool isFiller(const Instr &I) const = 0;
 
-  /// Instruction that never returns: `ud2`, `int3` as deliberate trap,
-  /// `int 29h` (__fastfail), etc. Feeds `BlockEnd::Noreturn`.
-  virtual bool isNoreturnTrap(const Instr &I) const = 0;
+  enum class TrapKind : uint8_t { NotTrap, Exception, Absorbable, Interrupt };
+  virtual TrapKind trapKind(const Instr &I) const = 0;
 
-  /// Effect on the architectural stack pointer at `va`, in bytes (push
-  /// = -8, pop = +8, `sub rsp, imm`, ...). Unset when the instruction
-  /// doesn't touch rsp or the effect isn't statically known (e.g. `leave`
-  /// handles fine: it is `mov rsp,rbp; pop rbp`).
+  /// Instruction that never returns, derived from its classified trap kind.
+  bool isNoreturnTrap(const Instr &I) const {
+    return trapKind(I) != TrapKind::NotTrap;
+  }
+
+  /// The strict alignment-nop set used to reject filler-only candidates.
+  virtual bool isNopOrInt3(const Instr &I) const = 0;
+
+  virtual bool isOpaqueTailJmp(const Image &Img, const Instr &I) const = 0;
+
+  /// Entry-relative stack depth change: push +8, pop -8,
+  /// `sub rsp, imm` +imm, and `add rsp, imm` -imm.
   virtual std::optional<int64_t> stackDelta(const Instr &I) const = 0;
+  virtual StackSlots stackSlots(const Instr &I) const = 0;
+  virtual FpEstablish fpEstablish(const Instr &I) const = 0;
+  virtual bool restoresSpFromFp(const Instr &I) const = 0;
+  virtual std::optional<int64_t> movEaxImm(const Instr &I) const = 0;
+  virtual bool writesSpDynamically(const Instr &I) const = 0;
+
+  /// Instruction operand decoding for jump-table analysis (iced-level
+  /// operand view). Implemented by the target's X86JumpTables; null when
+  /// the target has no jump-table support.
+  /// Return the target's jump-table instruction adapter.
+  virtual const JtInsnOps *jumpTableInsnOps() const { return nullptr; }
 
   /// Try to resolve the indirect `jmp` terminating `Blocks[Dispatch]`
   /// through a jump table. Mirrors `analysis::jump_table::resolve`.
