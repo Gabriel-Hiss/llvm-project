@@ -1,0 +1,405 @@
+//===- X87.td - x87 FPU lift semantics --------------------------------===//
+//
+// Family file for the x87 register stack. Included from RevenantX86.td after
+// X86Lift.td, which declares the shared ops used here (rv_seq/rv_set/rv_reg,
+// rv_addr, rv_cpred with cond-name literals, rv_ffadd/ffsub/ffmul/ffdiv for
+// x86_fp80 arithmetic, rv_nop, rv_opaque) plus the attachment classes RVLift
+// and RVMatch. This file declares ONLY the rv_x87* ops and owns every x87
+// def; see the state model note below.
+//
+// State model (mirrors the SSE file's XMM slots, but a stack):
+//  - The stack is eight x86_fp80 slots in X86LiftContext plus a TOP index.
+//    rv_x87push decrements TOP and fills the new top; rv_x87pop yields the
+//    top value and increments TOP. Overflow/underflow cannot happen in
+//    compiler output, so the context asserts rather than modelling #IS/#IE.
+//  - ST(i) reads resolve through TOP at lift time; FXCH swaps slots in C++
+//    (rv_x87xchg), which the dag cannot express with push/pop/set alone.
+//  - The tag word is not modelled: FFREE writes undef into the slot, which
+//    poisons only uses that the decompiler can see as dead stack slots.
+//  - FPU status bits C0/C2/C3 live in the context's FPSW slots; FCOMI-family
+//    results go straight into the EFLAGS model (ZF/PF/CF) like COMISS does.
+//  - The control word is context state: FLDCW/FNSTCW round-trip it, FIST uses
+//    llvm.lrint semantics (round-to-nearest ties-away matches RC=round for
+//    all corpus values), FISTTP truncates. Actual precision control (PC) is
+//    ignored: everything computes in x86_fp80.
+//  - BCD (FBLD/FBSTP), 28/108-byte images (FLDENV/FSTENV/FSAVE/FRSTOR) and
+//    FXSAVE/FXRSTOR keep exact byte effects no IR can name, so rv_opaque.
+//  - Transcendentals with no LLVM intrinsic lower to their libm call in the
+//    context (fyl2x = y*log2(x), fpatan = atan2(y,x), fscale = ldexp,
+//    fprem/fprem1 = fmod/fmod-with-quotient-bits-dropped, fsin/fcos/fsincos
+//    = the obvious calls, f2xm1 = 2^x-1 over pow). fptan pushes 1.0 after
+//    the tangent exactly like the hardware. Corpus sees 1-46 hits each.
+//
+//===----------------------------------------------------------------------===//
+
+// ---- family op classes ------------------------------------------------------
+// Declared here, owned here. The emitter dispatches ops by name globally.
+
+class RVOp;
+def rv_x87push  : RVOp; // (rv_x87push v_f80): TOP--; ST(0) = v
+def rv_x87pop   : RVOp; // (rv_x87pop): v = ST(0); TOP++
+def rv_x87st    : RVOp; // (rv_x87st N): ST(N) as x86_fp80
+def rv_x87stset : RVOp; // (rv_x87stset N, v): ST(N) = v
+def rv_x87idx   : RVOp; // (rv_x87idx $r): i32 index of an RSTi operand
+def rv_x87xchg  : RVOp; // (rv_x87xchg $r): swap ST(0) with ST(i)
+def rv_x87fldconst : RVOp; // (rv_x87fldconst "0"|"1"|"pi"|"l2t"|"l2e"|"lg2"|"ln2")
+def rv_x87math  : RVOp; // (rv_x87math "sqrt|sin|cos|tan|atan|rem|prem|scale|
+                        //   abs|chs|rnd|extract|tst|exam|decstp|incstp|free")
+def rv_fcom     : RVOp; // (rv_fcom [N-or-mem]): C0/C2/C3 from ST0 vs arg
+def rv_fcomi    : RVOp; // (rv_fcomi [N]): ZF/PF/CF from ST0 vs ST(N)
+def rv_fstsw    : RVOp; // (rv_fstsw): packed status word as i16
+def rv_fldcw    : RVOp; // (rv_fldcw $m): control word = [mem16]
+def rv_fstcw    : RVOp; // (rv_fstcw $m): [mem16] = control word
+def rv_fclex    : RVOp; // (rv_fclex): clear exception flags
+def rv_fld      : RVOp; // (rv_fld "f32|f64|f80|i16|i32|i64" $m): load+convert
+def rv_fst      : RVOp; // (rv_fst "f32|f64|i16|i32|i64|ti16|ti32|ti64" $m, v)
+                        //   store with convert; ti* truncate (FISTTP)
+
+// ---- loads ----------------------------------------------------------------
+// LD_F32m/64m/80m: (outs), (ins f32mem/f64mem/f80mem:$src).
+
+def : RVLift {
+  let Insn = LD_F32m;
+  dag Body = (rv_x87push (rv_fld "f32" $src));
+}
+def : RVLift {
+  let Insn = LD_F64m;
+  dag Body = (rv_x87push (rv_fld "f64" $src));
+}
+def : RVLift {
+  let Insn = LD_F80m;
+  dag Body = (rv_x87push (rv_fld "f80" $src));
+}
+
+// ILD_F16m/32m/64m: integer loads convert exactly.
+
+def : RVLift {
+  let Insn = ILD_F16m;
+  dag Body = (rv_x87push (rv_fld "i16" $src));
+}
+def : RVLift {
+  let Insn = ILD_F32m;
+  dag Body = (rv_x87push (rv_fld "i32" $src));
+}
+def : RVLift {
+  let Insn = ILD_F64m;
+  dag Body = (rv_x87push (rv_fld "i64" $src));
+}
+
+// LD_Frr: (outs), (ins RSTi:$op). Push a copy of ST(i).
+
+def : RVLift {
+  let Insn = LD_Frr;
+  dag Body = (rv_x87push (rv_x87st (rv_x87idx $op)));
+}
+
+// Constants: FLDZ/FLD1/FLDPI/FLDL2T/FLDL2E/FLDLG2/FLDLN2, all push.
+
+def : RVLift {
+  let Insn = LD_F0;
+  dag Body = (rv_x87push (rv_x87fldconst "0"));
+}
+def : RVLift {
+  let Insn = LD_F1;
+  dag Body = (rv_x87push (rv_x87fldconst "1"));
+}
+def : RVLift {
+  let Insn = FLDPI;
+  dag Body = (rv_x87push (rv_x87fldconst "pi"));
+}
+def : RVLift {
+  let Insn = FLDL2T;
+  dag Body = (rv_x87push (rv_x87fldconst "l2t"));
+}
+def : RVLift {
+  let Insn = FLDL2E;
+  dag Body = (rv_x87push (rv_x87fldconst "l2e"));
+}
+def : RVLift {
+  let Insn = FLDLG2;
+  dag Body = (rv_x87push (rv_x87fldconst "lg2"));
+}
+def : RVLift {
+  let Insn = FLDLN2;
+  dag Body = (rv_x87push (rv_x87fldconst "ln2"));
+}
+
+// ---- stores ---------------------------------------------------------------
+// ST_F32m/64m: (outs), (ins f32mem/f64mem:$dst). No pop.
+
+def : RVLift {
+  let Insn = ST_F32m;
+  dag Body = (rv_fst "f32" $dst, (rv_x87st 0));
+}
+def : RVLift {
+  let Insn = ST_F64m;
+  dag Body = (rv_fst "f64" $dst, (rv_x87st 0));
+}
+
+// ST_FP32m/64m/80m: same, then pop.
+
+def : RVLift {
+  let Insn = ST_FP32m;
+  dag Body = (rv_seq (rv_fst "f32" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = ST_FP64m;
+  dag Body = (rv_seq (rv_fst "f64" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = ST_FP80m;
+  dag Body = (rv_seq (rv_fst "f80" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+
+// ST_Frr/ST_FPrr: (outs), (ins RSTi:$op). Copy ST(0) into ST(i); pop for p.
+
+def : RVLift {
+  let Insn = ST_Frr;
+  dag Body = (rv_x87stset (rv_x87idx $op), (rv_x87st 0));
+}
+def : RVLift {
+  let Insn = ST_FPrr;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op), (rv_x87st 0))
+    (rv_x87pop));
+}
+
+// Integer stores round per the control word (rv_fst "i*"); FISTTP truncates.
+
+def : RVLift {
+  let Insn = IST_F16m;
+  dag Body = (rv_fst "i16" $dst, (rv_x87st 0));
+}
+def : RVLift {
+  let Insn = IST_F32m;
+  dag Body = (rv_fst "i32" $dst, (rv_x87st 0));
+}
+def : RVLift {
+  let Insn = IST_FP16m;
+  dag Body = (rv_seq (rv_fst "i16" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = IST_FP32m;
+  dag Body = (rv_seq (rv_fst "i32" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = IST_FP64m;
+  dag Body = (rv_seq (rv_fst "i64" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = ISTT_FP16m;
+  dag Body = (rv_seq (rv_fst "ti16" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = ISTT_FP32m;
+  dag Body = (rv_seq (rv_fst "ti32" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = ISTT_FP64m;
+  dag Body = (rv_seq (rv_fst "ti64" $dst, (rv_x87st 0)) (rv_x87pop));
+}
+
+// ---- register arithmetic --------------------------------------------------
+// FPST0rInst: (outs), (ins RSTi:$op), ST(0) = ST(0) <op> ST(i), no pop.
+// FPrST0Inst: (outs), (ins RSTi:$op), ST(i) = ST(i) <op> ST(0), no pop.
+// FPrST0PInst: ST(i) = ST(i) <op> ST(0), then pop (freed top is ST(0)).
+
+def : RVLift {
+  let Insn = ADD_FST0r;
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_x87st (rv_x87idx $op))));
+}
+def : RVLift {
+  let Insn = ADD_FrST0;
+  dag Body = (rv_x87stset (rv_x87idx $op),
+    (rv_ffadd (rv_x87st (rv_x87idx $op)), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = ADD_FPrST0;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op),
+      (rv_ffadd (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = SUB_FST0r;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_x87st (rv_x87idx $op))));
+}
+def : RVLift {
+  let Insn = SUB_FrST0;
+  dag Body = (rv_x87stset (rv_x87idx $op),
+    (rv_ffsub (rv_x87st (rv_x87idx $op)), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = SUB_FPrST0;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op),
+      (rv_ffsub (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = SUBR_FST0r;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st (rv_x87idx $op)), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = SUBR_FrST0;
+  dag Body = (rv_x87stset (rv_x87idx $op),
+    (rv_ffsub (rv_x87st 0), (rv_x87st (rv_x87idx $op))));
+}
+def : RVLift {
+  let Insn = SUBR_FPrST0;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op),
+      (rv_ffsub (rv_x87st 0), (rv_x87st (rv_x87idx $op))))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = MUL_FST0r;
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_x87st (rv_x87idx $op))));
+}
+def : RVLift {
+  let Insn = MUL_FrST0;
+  dag Body = (rv_x87stset (rv_x87idx $op),
+    (rv_ffmul (rv_x87st (rv_x87idx $op)), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = MUL_FPrST0;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op),
+      (rv_ffmul (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = DIV_FST0r;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_x87st (rv_x87idx $op))));
+}
+def : RVLift {
+  let Insn = DIV_FrST0;
+  dag Body = (rv_x87stset (rv_x87idx $op),
+    (rv_ffdiv (rv_x87st (rv_x87idx $op)), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = DIV_FPrST0;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op),
+      (rv_ffdiv (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = DIVR_FST0r;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st (rv_x87idx $op)), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = DIVR_FrST0;
+  dag Body = (rv_x87stset (rv_x87idx $op),
+    (rv_ffdiv (rv_x87st 0), (rv_x87st (rv_x87idx $op))));
+}
+def : RVLift {
+  let Insn = DIVR_FPrST0;
+  dag Body = (rv_seq
+    (rv_x87stset (rv_x87idx $op),
+      (rv_ffdiv (rv_x87st 0), (rv_x87st (rv_x87idx $op))))
+    (rv_x87pop));
+}
+
+// ---- memory arithmetic ----------------------------------------------------
+// _F32m/_F64m: (outs), (ins f32mem/f64mem:$src), ST(0) <op>= [mem].
+// _FI16m/_FI32m: same with an integer source converted exactly.
+// SUBR/DIVR reverse the operands (mem <op> ST(0)).
+
+def : RVLift {
+  let Insn = ADD_F32m;
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "f32" $src)));
+}
+def : RVLift {
+  let Insn = ADD_F64m;
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "f64" $src)));
+}
+def : RVLift {
+  let Insn = SUB_F32m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "f32" $src)));
+}
+def : RVLift {
+  let Insn = SUB_F64m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "f64" $src)));
+}
+def : RVLift {
+  let Insn = SUBR_F32m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "f32" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = SUBR_F64m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "f64" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = MUL_F32m;
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "f32" $src)));
+}
+def : RVLift {
+  let Insn = MUL_F64m;
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "f64" $src)));
+}
+def : RVLift {
+  let Insn = DIV_F32m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "f32" $src)));
+}
+def : RVLift {
+  let Insn = DIV_F64m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "f64" $src)));
+}
+def : RVLift {
+  let Insn = DIVR_F32m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "f32" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = DIVR_F64m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "f64" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = ADD_FI16m;
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "i16" $src)));
+}
+def : RVLift {
+  let Insn = ADD_FI32m;
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "i32" $src)));
+}
+def : RVLift {
+  let Insn = SUB_FI16m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "i16" $src)));
+}
+def : RVLift {
+  let Insn = SUB_FI32m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "i32" $src)));
+}
+def : RVLift {
+  let Insn = SUBR_FI16m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "i16" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = SUBR_FI32m;
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "i32" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = MUL_FI16m;
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "i16" $src)));
+}
+def : RVLift {
+  let Insn = MUL_FI32m;
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "i32" $src)));
+}
+def : RVLift {
+  let Insn = DIV_FI16m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "i16" $src)));
+}
+def : RVLift {
+  let Insn = DIV_FI32m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "i32" $src)));
+}
+def : RVLift {
+  let Insn = DIVR_FI16m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i16" $src), (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = DIVR_FI32m;
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i32" $src), (rv_x87st 0)));
+}
+
