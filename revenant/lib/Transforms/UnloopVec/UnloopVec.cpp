@@ -469,9 +469,51 @@ struct Candidate {
   ScalarLoopInfo TailLoop;      // scalar tail latch info
   DenseSet<BasicBlock *> R;     // vector region to erase
   DenseSet<BasicBlock *> Chain; // dispatch-chain blocks to erase (D excl)
+  // S-routing phis the tail dispatch condition depends on (strict
+  // mode records, the post check after the top-body match keeps only
+  // resume phis) and the accepted resume set.
+  SmallVector<const PHINode *, 4> CondPhis;
+  DenseSet<const PHINode *> Resume;
 };
 
-// Shared tail checks: S's own condition never depends on an S phi,
+// A resume phi restarts its range at 0 on the folded path: its D
+// incoming is constant 0, every other incoming comes from R, and at
+// least one R incoming is Bound-derived (the same n.vec, possibly
+// through casts like the trunc in corpus copy_bytes; anything that
+// strips to the same trip-count root is restart-consistent because it
+// is a pure function of N). Accumulators (fed by reductions) never
+// qualify: routing or bounds depending on them would differ after the
+// restart, so they keep failing the S-condition and bound checks.
+void collectResumePhis(BasicBlock *S, BasicBlock *D,
+                       const DenseSet<BasicBlock *> &R, Value *Bound,
+                       Value *IVNext, const Function &F,
+                       DenseSet<const PHINode *> &Out) {
+  Value *RootB = stripCountDerivation(Bound, F);
+  for (PHINode &Phi : S->phis()) {
+    bool DZero = false, OK = true, Fed = false;
+    for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+      BasicBlock *IB = Phi.getIncomingBlock(I);
+      Value *Inc = Phi.getIncomingValue(I);
+      if (IB == D) {
+        auto *CZ = dyn_cast<ConstantInt>(Inc);
+        if (!CZ || !CZ->isZero())
+          OK = false;
+        else
+          DZero = true;
+      } else if (!R.count(IB)) {
+        OK = false;
+      } else if (Inc == Bound || Inc == IVNext ||
+                 stripCountDerivation(Inc, F) == RootB) {
+        Fed = true;
+      }
+    }
+    if (OK && DZero && Fed)
+      Out.insert(&Phi);
+  }
+}
+
+// Shared tail checks: S entered from D (and R in strict mode), S phis
+// agree, S-routing S-phi deps are recorded for the resume post check,
 // and the single-block scalar self-loop L sits directly under S with
 // preds exactly {S, L}.
 bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
@@ -503,10 +545,14 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
       }
     }
   }
-  // S terminator condition must not transitively use an S phi (strict
-  // only; tier dispatches between vector levels legitimately route on
+  // S terminator condition deps on S phis are recorded (strict only;
+  // tier dispatches between vector levels legitimately route on
   // N-derived conditions, and R membership decides later).
+  // Resume-ness needs the vector bound, known only after the top-body
+  // match, so matchDispatch verifies the recorded phis against the
+  // resume set afterwards.
   if (StrictPreds) {
+    C.CondPhis.clear();
     if (auto *Br = dyn_cast<BranchInst>(S->getTerminator())) {
       if (Br->isConditional()) {
         SmallPtrSet<const Value *, 16> Seen2;
@@ -517,7 +563,7 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
             continue;
           if (const auto *P = dyn_cast<PHINode>(V)) {
             if (P->getParent() == S)
-              return false;
+              C.CondPhis.push_back(P);
             continue;
           }
           if (const auto *I = dyn_cast<Instruction>(V)) {
@@ -569,29 +615,23 @@ bool matchScalarTail(BasicBlock *S, BasicBlock *D,
 // constant step K >= 2, exit == (IV.next == n.vec). n.vec must match
 // the trip count N (masked or sub/urem form) and the same n.vec value
 // must feed S's resume phi from an R block.
-bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F) {
-  ScalarLoopInfo V;
-  if (!matchScalarLoop(B, V))
-    return false;
-  // IV start must be constant 0 from the non-self predecessor.
-  for (unsigned I = 0; I < V.IV->getNumIncomingValues(); ++I) {
-    if (V.IV->getIncomingBlock(I) == B)
-      continue;
-    auto *C0 = dyn_cast<ConstantInt>(V.IV->getIncomingValue(I));
-    if (!C0 || !C0->isZero())
-      return false;
-  }
-  uint64_t Step = V.Step->getZExtValue();
-  if (Step < 2)
-    return false;
-  Value *Bound = loopBound(V);
-  if (!Bound)
-    return false;
+//
+// Multi-tier cascades (AVX2 8-wide + 4-wide + scalar, corpus fill_vec):
+// every extra vector tier is a secondary body: same checks, except
+// the IV may start at an R-defined resume value instead of constant 0
+// (it restarts inside the erased region, so no S resume feed is
+// needed) and only the direct bound form is accepted. At least one
+// primary body is required per candidate.
+bool matchTierBound(BasicBlock *B, ScalarLoopInfo &V, Candidate &C,
+                    Function &F, Value *Bound, uint64_t Step,
+                    const DenseSet<const PHINode *> &Resume) {
   // Bound must be pure w.r.t. R.
   DenseSet<const Value *> Seen;
   if (!isPureChain(Bound, C.R, Seen))
     return false;
-  // Tail bound must derive from the same N.
+  // Tail bound must derive from the same N: directly, or as a
+  // remainder (N minus a resume phi, the byte-tail shape in corpus
+  // copy_bytes where the scalar latch counts the leftover).
   Value *TailBound = loopBound(C.TailLoop);
   if (!TailBound)
     return false;
@@ -599,44 +639,83 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F) {
   uint64_t Found = 0;
   // Try bound directly, else through a pure chain root.
   if (!matchVecBound(Bound, NTail, Found)) {
-    // Bound may be (N mod form) chain; try the operands.
-    return false;
+    // Remainder form: sub(N, resume) or sub(resume, N) with the phi
+    // side in the resume set.
+    Value *NAlt = nullptr;
+    if (auto *BO = dyn_cast<BinaryOperator>(NTail)) {
+      if (BO->getOpcode() == Instruction::Sub) {
+        Value *Op0 = stripCountDerivation(BO->getOperand(0), F);
+        Value *Op1 = stripCountDerivation(BO->getOperand(1), F);
+        bool Op0Res = isa<PHINode>(Op0) &&
+                      Resume.count(cast<PHINode>(Op0));
+        bool Op1Res = isa<PHINode>(Op1) &&
+                      Resume.count(cast<PHINode>(Op1));
+        if (Op0Res != Op1Res)
+          NAlt = Op0Res ? Op1 : Op0;
+      }
+    }
+    if (!NAlt || !matchVecBound(Bound, NAlt, Found)) {
+      // Bound may be (N mod form) chain; try the operands.
+      return false;
+    }
   }
   // Interleaved groups: the latch step and the mask step must divide
   // each other (the mask step covers one group, the latch strides all
   // groups); anything else is not a vectorizer bound.
   if (Found != Step && Step % Found != 0 && Found % Step != 0)
     return false;
-  // Same n.vec value must feed S's resume phi from an R block: the
-  // resume phi's R-incoming value is Bound (or its IV.next source).
-  bool ResumeOK = false;
+  return true;
+}
+
+bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
+                     bool Secondary) {
+  ScalarLoopInfo V;
+  if (!matchScalarLoop(B, V))
+    return false;
+  // IV start: constant 0 from the non-self predecessor (primary), or
+  // additionally an R-defined resume value (secondary tiers restart
+  // inside the erased region).
+  for (unsigned I = 0; I < V.IV->getNumIncomingValues(); ++I) {
+    if (V.IV->getIncomingBlock(I) == B)
+      continue;
+    Value *Start = V.IV->getIncomingValue(I);
+    if (auto *C0 = dyn_cast<ConstantInt>(Start)) {
+      if (!C0->isZero())
+        return false;
+      continue;
+    }
+    if (Secondary) {
+      if (auto *I2 = dyn_cast<Instruction>(Start)) {
+        if (C.R.count(I2->getParent()))
+          continue;
+      }
+    }
+    return false;
+  }
+  uint64_t Step = V.Step->getZExtValue();
+  if (Step < 2)
+    return false;
+  Value *Bound = loopBound(V);
+  if (!Bound)
+    return false;
   Value *IVNext = nullptr;
   for (unsigned I = 0; I < V.IV->getNumIncomingValues(); ++I)
     if (V.IV->getIncomingBlock(I) == B)
       IVNext = V.IV->getIncomingValue(I);
-  for (PHINode &Phi : C.S->phis()) {
-    for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
-      BasicBlock *IB = Phi.getIncomingBlock(I);
-      if (!C.R.count(IB))
-        continue;
-      Value *Inc = Phi.getIncomingValue(I);
-      if (Inc == Bound || Inc == IVNext) {
-        // The IV phi supplying the resume must start at constant 0
-        // on the D edge.
-        if (auto *RPhi = dyn_cast<PHINode>(&Phi)) {
-          for (unsigned J = 0; J < RPhi->getNumIncomingValues(); ++J) {
-            if (RPhi->getIncomingBlock(J) == C.D) {
-              if (auto *CZ = dyn_cast<ConstantInt>(RPhi->getIncomingValue(J))) {
-                if (CZ->isZero())
-                  ResumeOK = true;
-              }
-            }
-          }
-        }
-      }
-    }
+  // The resume set is meaningful only for the primary body (it feeds
+  // S); secondaries confirm their remainder against the candidate set
+  // once the primary has filled it, else against their local set.
+  DenseSet<const PHINode *> Local;
+  const DenseSet<const PHINode *> *Resume = &C.Resume;
+  if (!Secondary) {
+    collectResumePhis(C.S, C.D, C.R, Bound, IVNext, F, C.Resume);
+    if (C.Resume.empty())
+      return false;
+  } else if (C.Resume.empty()) {
+    collectResumePhis(C.S, C.D, C.R, Bound, IVNext, F, Local);
+    Resume = &Local;
   }
-  if (!ResumeOK)
+  if (!matchTierBound(B, V, C, F, Bound, Step, *Resume))
     return false;
   return true;
 }
@@ -760,7 +839,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     }
     // R cycles: every cycle is a single-block self-loop. Check via
     // SCC-lite: any block with a back edge from a different R block
-    // fails; self-loops must be vector-typed/counted loops.
+    // fails. What each self-loop is (primary vector body, secondary
+    // tier, or scalarized tier) is settled by the body classification
+    // after the escape checks.
     for (BasicBlock *BB : Cand.R) {
       for (BasicBlock *Su : successors(BB)) {
         if (Su == BB)
@@ -789,64 +870,6 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
             goto next_pick;
           }
         }
-      }
-    }
-    // Every self-loop in R must be vector-typed or a counted loop
-    // from constant 0 (scalarized tiers are fine).
-    for (BasicBlock *BB : Cand.R) {
-      bool Self = false;
-      for (BasicBlock *Su : successors(BB))
-        if (Su == BB)
-          Self = true;
-      if (!Self)
-        continue;
-      bool HasVec = false;
-      for (Instruction &I : *BB) {
-        if (isa<PHINode>(&I))
-          continue;
-        if (isVectorTyped(I.getType())) {
-          HasVec = true;
-          break;
-        }
-        if (auto *CB = dyn_cast<CallBase>(&I)) {
-          if (const Function *CF = CB->getCalledFunction()) {
-            StringRef N = CF->getName();
-            if (N.starts_with("llvm.vector.reduce.") ||
-                N.starts_with("llvm.masked.") || N.starts_with("llvm.vp.")) {
-              HasVec = true;
-              break;
-            }
-          }
-        }
-      }
-      if (HasVec)
-        continue;
-      // Counted loop from constant 0: every phi's non-self incoming
-      // is constant 0 or defined outside R.
-      bool Counted = true;
-      for (PHINode &Phi : BB->phis()) {
-        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
-          if (Phi.getIncomingBlock(I) == BB)
-            continue;
-          Value *Inc = Phi.getIncomingValue(I);
-          if (auto *CZ = dyn_cast<ConstantInt>(Inc)) {
-            if (!CZ->isZero())
-              Counted = false;
-          } else if (auto *I2 = dyn_cast<Instruction>(Inc)) {
-            if (Cand.R.count(I2->getParent()))
-              Counted = false;
-          }
-        }
-      }
-      // Also require a constant-step IV.
-      ScalarLoopInfo Tmp;
-      if (!matchScalarLoop(BB, Tmp)) {
-        ULV_BAIL();
-        goto next_pick;
-      }
-      if (!Counted) {
-        ULV_BAIL();
-        goto next_pick;
       }
     }
     // No calls except intrinsics, no asm/volatile/atomic, no
@@ -1027,14 +1050,19 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
         }
       }
     }
-    // Top vector body check.
+    // Top vector body check: at least one primary body (IV from
+    // constant 0, S resume feed), plus any secondary tiers (IV from an
+    // R-defined resume, same trip count). Every R self-loop must be
+    // one or the other; other R blocks must not be self-loops (the
+    // single-entry and cycle checks already confined cycles to
+    // self-loops).
     {
       bool Found = false;
       // The top body is an R block whose IV starts at constant 0
       // from D or the chain.
       for (BasicBlock *BB : Cand.R) {
         Candidate Probe = Cand;
-        if (matchVectorBody(BB, Probe, F)) {
+        if (matchVectorBody(BB, Probe, F, false)) {
           Cand = Probe;
           Found = true;
           break;
@@ -1044,8 +1072,31 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
         ULV_BAIL();
         goto next_pick;
       }
+      for (BasicBlock *BB : Cand.R) {
+        bool Self = false;
+        for (BasicBlock *Su : successors(BB))
+          if (Su == BB)
+            Self = true;
+        if (!Self)
+          continue;
+        Candidate Probe = Cand;
+        if (matchVectorBody(BB, Probe, F, false) ||
+            matchVectorBody(BB, Probe, F, true))
+          continue;
+        ULV_BAIL();
+        goto next_pick;
+      }
     }
-    Cand.Chain = Chain;
+    // S-routing post check: every S phi the tail dispatch routes on
+    // must be a resume phi (D-incoming 0, R-incomings Bound-derived,
+    // so the routing is a pure function of N on the folded path).
+    // Anything else (notably accumulators) still bails.
+    for (const PHINode *P : Cand.CondPhis) {
+      if (!Cand.Resume.count(P)) {
+        ULV_BAIL();
+        goto next_pick;
+      }
+    }
     C = Cand;
     return true;
   next_pick:;
