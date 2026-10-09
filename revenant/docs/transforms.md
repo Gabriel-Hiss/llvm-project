@@ -65,11 +65,12 @@ hoisted/sunk common instructions, no speculated blocks. The late
 Folds verified multiply-high and correction DAGs back into constant
 `udiv`/`sdiv`, then folds quotient-times-divisor residuals into
 `urem`/`srem`. It checks every input for i8/i16 and quotient boundaries plus
-integer extrema for i32/i64. It also canonicalizes select-based abs/min/max,
-three-way signed compare flag chains, Kernighan popcount loops, unsigned
-saturating add/sub, rotates and byte swaps. Bit tests retain their direct
-`and`/`icmp` form; intrinsic popcount calls pass through unchanged.
-Ambiguous arithmetic remains intact.
+integer extrema for i32/i64. It converts llvm.abs/min/max, three-way compare,
+and unsigned saturation intrinsics back into compare/subtract/select IR.
+Signed three-way compare flag chains become source-level comparisons/selects.
+Source-level Kernighan popcount, rotate and byte-swap operations remain
+arithmetic/loop IR; source builtin intrinsics such as llvm.bswap pass through.
+Bit tests retain direct `and`/`icmp`. Ambiguous arithmetic remains intact.
 AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax) run after
 structuring, outside this LLVM pipeline.
 

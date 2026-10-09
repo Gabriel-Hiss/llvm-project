@@ -14,19 +14,16 @@
 //   as q(x), even when x is itself an instruction. Recover |d| from the
 //   first positive nonzero result, then exhaustively verify i8/i16 or check
 //   quotient boundaries and extrema for i32/i64 before rewriting.
-// - abs/min/max/clamp: icmp+select (signed and unsigned, both operand
-//   orders) become llvm.abs/llvm.{s,u}{min,max}; xor+sub negations fold to
-//   sub(0,x). Signed subtraction-flag chains become llvm.scmp.
-// - Saturating arithmetic: exact unsigned add/sub select forms become
-//   llvm.uadd.sat/llvm.usub.sat.
-// - Rotates: (a<<c)|(a>>(w-c)) folds to llvm.fshl.
-// - Byte-swap: only a complete, reversed byte permutation becomes
-//   llvm.bswap.
-// - Kernighan popcount loops become llvm.ctpop after checking their loop
-//   state and side-effect-free body. Existing ctpop calls pass through.
-// - Bit tests already use the readable `and`/`icmp` IR form.
-// - Strength-reduced multiplies: mul by a power of two folds to shl; other
-//   constant multiplies stay as mul.
+// - abs/min/max/clamp, three-way comparisons and unsigned saturation
+//   intrinsics return to source-level compare/subtract/select operations.
+//   Signed subtraction-flag chains also become comparisons/selects, never
+//   llvm.scmp.
+// - Kernighan popcount loops, rotate idioms and plain-C byte swaps remain
+//   loops or bitwise arithmetic. Builtin intrinsics such as llvm.bswap pass
+//   through unchanged.
+// - Bit tests already use the source-level `and`/`icmp` IR form.
+// - Multiplication strength reduction is not reversed speculatively:
+//   multiply and shift spellings can both be source-level C.
 // - Memset/memcpy loop recovery belongs to revenant-patterns, not this pass.
 
 #include "revenant/Transforms/Idioms/Idioms.h"
@@ -36,9 +33,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Constants.h"
-#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/NoFolder.h"
@@ -51,7 +46,6 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Compiler.h"
-#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
@@ -615,46 +609,9 @@ std::optional<Quotient> analyzeRem(BinaryOperator *Root) {
   return Q;
 }
 
-// (c ? -x : x) / (c ? x : -x) with a sign-test condition -> x.
-bool matchAbsFromSelect(SelectInst *SI, Value *&X) {
-  auto *IC = dyn_cast<ICmpInst>(SI->getCondition());
-  if (!IC)
-    return false;
-  ICmpInst::Predicate P = IC->getPredicate();
-  Value *A = IC->getOperand(0), *B = IC->getOperand(1);
-  Value *T = SI->getTrueValue(), *F = SI->getFalseValue();
-  auto isNeg = [](Value *E, Value *V) {
-    return match(E, m_Sub(m_Zero(), m_Specific(V)));
-  };
-  auto isZero = [](Value *V) {
-    if (auto *C = dyn_cast<ConstantInt>(V))
-      return C->isZero();
-    return false;
-  };
-  auto isNegOne = [](Value *V) {
-    if (auto *C = dyn_cast<ConstantInt>(V))
-      return C->isMinusOne();
-    return false;
-  };
-  // x < 0 ? -x : x  and  x <= -1 ? -x : x.
-  if (((P == ICmpInst::ICMP_SLT && isZero(B)) ||
-       (P == ICmpInst::ICMP_SLE && isNegOne(B))) &&
-      isNeg(T, A) && F == A) {
-    X = A;
-    return true;
-  }
-  // x >= 0 ? x : -x  and  x > -1 ? x : -x.
-  if (((P == ICmpInst::ICMP_SGE && isZero(B)) ||
-       (P == ICmpInst::ICMP_SGT && isNegOne(B))) &&
-      T == A && isNeg(F, A)) {
-    X = A;
-    return true;
-  }
-  return false;
-}
 
-// Recover the compare-with-flags idiom emitted for a signed three-way
-// comparison: sign(x-y) plus an overflow-corrected nonzero bit.
+// Recover signed compare flags directly to source-level comparisons, never
+// to llvm.scmp, which is an optimizer representation rather than C source IR.
 bool matchSignedCompare(Value *V, Value *&LHS, Value *&RHS) {
   auto *Add = dyn_cast<BinaryOperator>(V);
   if (!Add || Add->getOpcode() != Instruction::Add)
@@ -668,197 +625,49 @@ bool matchSignedCompare(Value *V, Value *&LHS, Value *&RHS) {
     if (!Less || !And || And->getOpcode() != Instruction::And ||
         Less->getPredicate() != ICmpInst::ICMP_SLT)
       continue;
-    auto *GreaterOrEqual =
-        dyn_cast<ICmpInst>(And->getOperand(0));
-    auto *Unequal = dyn_cast<ICmpInst>(And->getOperand(1));
-    if (!GreaterOrEqual || !Unequal) {
-      GreaterOrEqual = dyn_cast<ICmpInst>(And->getOperand(1));
-      Unequal = dyn_cast<ICmpInst>(And->getOperand(0));
+    auto *Gt = dyn_cast<ICmpInst>(And->getOperand(0));
+    auto *Ne = dyn_cast<ICmpInst>(And->getOperand(1));
+    if (!Gt || !Ne) {
+      Gt = dyn_cast<ICmpInst>(And->getOperand(1));
+      Ne = dyn_cast<ICmpInst>(And->getOperand(0));
     }
-    if (!GreaterOrEqual || !Unequal ||
-        GreaterOrEqual->getPredicate() != ICmpInst::ICMP_SGT ||
-        Unequal->getPredicate() != ICmpInst::ICMP_NE)
+    auto *MinusOne = Gt ? dyn_cast<ConstantInt>(Gt->getOperand(1)) : nullptr;
+    if (!Gt || !Ne || Gt->getPredicate() != ICmpInst::ICMP_SGT ||
+        Ne->getPredicate() != ICmpInst::ICMP_NE || !MinusOne ||
+        !MinusOne->isMinusOne())
       continue;
-    auto *NegOne = dyn_cast<ConstantInt>(GreaterOrEqual->getOperand(1));
-    if (!NegOne || !NegOne->isMinusOne())
+    Value *A = Less->getOperand(0);
+    Value *B = Less->getOperand(1);
+    if (Ne->getOperand(0) != A || Ne->getOperand(1) != B)
       continue;
-    Value *X = Less->getOperand(0);
-    Value *Y = Less->getOperand(1);
-    if (Unequal->getOperand(0) != X || Unequal->getOperand(1) != Y)
+    auto *OverflowAdjusted = dyn_cast<BinaryOperator>(Gt->getOperand(0));
+    if (!OverflowAdjusted || OverflowAdjusted->getOpcode() != Instruction::Xor)
       continue;
-    auto *Sub = dyn_cast<BinaryOperator>(GreaterOrEqual->getOperand(0));
-    if (!Sub || Sub->getOpcode() != Instruction::Xor)
-      continue;
-    auto matchXor = [](Value *V, Value *A, Value *B) {
+    auto matchesXor = [](Value *V, Value *X, Value *Y) {
       auto *Xor = dyn_cast<BinaryOperator>(V);
       return Xor && Xor->getOpcode() == Instruction::Xor &&
-             ((Xor->getOperand(0) == A && Xor->getOperand(1) == B) ||
-              (Xor->getOperand(0) == B && Xor->getOperand(1) == A));
+             ((Xor->getOperand(0) == X && Xor->getOperand(1) == Y) ||
+              (Xor->getOperand(0) == Y && Xor->getOperand(1) == X));
     };
     Value *Difference = nullptr;
     Value *Overflow = nullptr;
     for (unsigned K = 0; K != 2; ++K) {
-      auto *Candidate = dyn_cast<BinaryOperator>(Sub->getOperand(K));
-      if (Candidate && Candidate->getOpcode() == Instruction::Sub &&
-          Candidate->getOperand(0) == X &&
-          Candidate->getOperand(1) == Y) {
-        Difference = Candidate;
-        Overflow = Sub->getOperand(1 - K);
+      auto *Sub = dyn_cast<BinaryOperator>(OverflowAdjusted->getOperand(K));
+      if (Sub && Sub->getOpcode() == Instruction::Sub &&
+          Sub->getOperand(0) == A && Sub->getOperand(1) == B) {
+        Difference = Sub;
+        Overflow = OverflowAdjusted->getOperand(1 - K);
         break;
       }
     }
     auto *OverflowAnd = dyn_cast<BinaryOperator>(Overflow);
     if (!Difference || !OverflowAnd ||
-        OverflowAnd->getOpcode() != Instruction::And)
+        OverflowAnd->getOpcode() != Instruction::And ||
+        !matchesXor(OverflowAnd->getOperand(0), A, B) ||
+        !matchesXor(OverflowAnd->getOperand(1), A, Difference))
       continue;
-    if (!matchXor(OverflowAnd->getOperand(0), X, Y) ||
-        !matchXor(OverflowAnd->getOperand(1), X, Difference))
-      continue;
-    LHS = X;
-    RHS = Y;
-    return true;
-  }
-  return false;
-}
-bool recoverKernighanPopcount(Function &F) {
-  DominatorTree DT(F);
-  LoopInfo LI(DT);
-  SmallVector<Loop *, 4> Loops(LI.begin(), LI.end());
-  for (Loop *L : Loops) {
-    if (!L->getSubLoops().empty() || L->getNumBlocks() != 2)
-      continue;
-    BasicBlock *Header = L->getHeader();
-    BasicBlock *Preheader = L->getLoopPreheader();
-    BasicBlock *Latch = L->getLoopLatch();
-    auto *Branch = dyn_cast<BranchInst>(Header->getTerminator());
-    if (!Preheader || !Latch || Latch == Header || !Branch ||
-        !Branch->isConditional())
-      continue;
-    BasicBlock *Continue = L->contains(Branch->getSuccessor(0))
-                               ? Branch->getSuccessor(0)
-                               : Branch->getSuccessor(1);
-    BasicBlock *Exit = Branch->getSuccessor(0) == Continue
-                           ? Branch->getSuccessor(1)
-                           : Branch->getSuccessor(0);
-    if (Continue != Latch || L->contains(Exit))
-      continue;
-    auto *LatchBranch = dyn_cast<BranchInst>(Latch->getTerminator());
-    if (!LatchBranch || !LatchBranch->isUnconditional() ||
-        LatchBranch->getSuccessor(0) != Header)
-      continue;
-    auto *Test = dyn_cast<ICmpInst>(Branch->getCondition());
-    if (!Test || (Test->getPredicate() != ICmpInst::ICMP_NE &&
-                  Test->getPredicate() != ICmpInst::ICMP_EQ))
-      continue;
-    auto *X = dyn_cast<PHINode>(Test->getOperand(0));
-    Value *Zero = Test->getOperand(1);
-    if (!X) {
-      X = dyn_cast<PHINode>(Test->getOperand(1));
-      Zero = Test->getOperand(0);
-    }
-    auto *ZeroC = dyn_cast<ConstantInt>(Zero);
-    if (!X || !ZeroC || !ZeroC->isZero() ||
-        !X->getType()->isIntegerTy() || X->getParent() != Header)
-      continue;
-    bool LoopOnTrue = Continue == Branch->getSuccessor(0);
-    if ((Test->getPredicate() == ICmpInst::ICMP_NE) != LoopOnTrue)
-      continue;
-    int PreIndex = X->getBasicBlockIndex(Preheader);
-    int BackIndex = X->getBasicBlockIndex(Latch);
-    if (PreIndex < 0 || BackIndex < 0 || X->getNumIncomingValues() != 2)
-      continue;
-    Value *Input = X->getIncomingValue(PreIndex);
-    Value *XNext = X->getIncomingValue(BackIndex);
-    auto *And = dyn_cast<BinaryOperator>(XNext);
-    if (!And || And->getOpcode() != Instruction::And)
-      continue;
-    Value *MinusOne = nullptr;
-    if (And->getOperand(0) == X)
-      MinusOne = And->getOperand(1);
-    else if (And->getOperand(1) == X)
-      MinusOne = And->getOperand(0);
-    else
-      continue;
-    auto *Sub = dyn_cast<BinaryOperator>(MinusOne);
-    auto *One = Sub ? dyn_cast<ConstantInt>(Sub->getOperand(1)) : nullptr;
-    if (!Sub || Sub->getOpcode() != Instruction::Sub ||
-        Sub->getOperand(0) != X || !One || !One->isOne())
-      continue;
-
-    PHINode *Count = nullptr;
-    BinaryOperator *CountNext = nullptr;
-    for (PHINode &Phi : Header->phis()) {
-      if (&Phi == X || !Phi.getType()->isIntegerTy() ||
-          Phi.getType() != X->getType())
-        continue;
-      PreIndex = Phi.getBasicBlockIndex(Preheader);
-      BackIndex = Phi.getBasicBlockIndex(Latch);
-      if (PreIndex < 0 || BackIndex < 0 || Phi.getNumIncomingValues() != 2)
-        continue;
-      auto *Init = dyn_cast<ConstantInt>(Phi.getIncomingValue(PreIndex));
-      auto *Inc = dyn_cast<BinaryOperator>(Phi.getIncomingValue(BackIndex));
-      if (!Init || !Init->isZero() || !Inc ||
-          Inc->getOpcode() != Instruction::Add)
-        continue;
-      ConstantInt *IncOne = dyn_cast<ConstantInt>(Inc->getOperand(1));
-      Value *Counter = Inc->getOperand(0);
-      if (!IncOne || !IncOne->isOne()) {
-        IncOne = dyn_cast<ConstantInt>(Inc->getOperand(0));
-        Counter = Inc->getOperand(1);
-      }
-      if (!IncOne || !IncOne->isOne() || Counter != &Phi)
-        continue;
-      Count = &Phi;
-      CountNext = Inc;
-      break;
-    }
-    if (!Count || !CountNext)
-      continue;
-
-    bool Safe = true;
-    for (BasicBlock *BB : L->blocks()) {
-      for (Instruction &I : *BB) {
-        if (&I == X || &I == Count || &I == Test || &I == And ||
-            &I == Sub || &I == CountNext || &I == Branch ||
-            &I == LatchBranch || isa<DbgInfoIntrinsic>(&I))
-          continue;
-        Safe = false;
-        break;
-      }
-      if (!Safe)
-        break;
-    }
-    if (!Safe)
-      continue;
-    for (BasicBlock *BB : L->blocks())
-      for (Instruction &I : *BB)
-        for (User *U : I.users())
-          if (auto *UseI = dyn_cast<Instruction>(U))
-            if (!L->contains(UseI->getParent()) && &I != Count)
-              Safe = false;
-    if (!Safe)
-      continue;
-
-    SmallVector<WeakTrackingVH, 16> Dead;
-    for (BasicBlock *BB : L->blocks())
-      for (Instruction &I : *BB)
-        Dead.push_back(&I);
-    IRBuilder<NoFolder> B(Branch);
-    Function *Ctpop = Intrinsic::getOrInsertDeclaration(
-        F.getParent(), Intrinsic::ctpop, {X->getType()});
-    Value *Pop = B.CreateCall(Ctpop, {Input});
-    auto *PopI = cast<Instruction>(Pop);
-    copyProvenance(PopI, Count);
-    PopI->copyMetadata(*Count);
-    Count->replaceAllUsesWith(Pop);
-    BranchInst::Create(Exit, Branch);
-    Branch->eraseFromParent();
-    SmallVector<BasicBlock *, 2> DeadBlocks;
-    for (BasicBlock *BB : L->blocks())
-      if (BB != Header)
-        DeadBlocks.push_back(BB);
-    DeleteDeadBlocks(DeadBlocks);
-    RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+    LHS = A;
+    RHS = B;
     return true;
   }
   return false;
@@ -965,361 +774,87 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
     for (Instruction &I : make_early_inc_range(instructions(F))) {
       if (hasOpaque(&I))
         continue;
+      if (auto *Call = dyn_cast<CallInst>(&I)) {
+          B.SetInsertPoint(Call);
+        Function *Callee = Call->getCalledFunction();
+        if (Callee && Callee->isIntrinsic()) {
+          Intrinsic::ID ID = Callee->getIntrinsicID();
+          Value *A = Call->getArgOperand(0);
+          Value *R = nullptr;
+          Value *Cond = nullptr;
+          if (ID == Intrinsic::scmp || ID == Intrinsic::ucmp) {
+            Value *Bv = Call->getArgOperand(1);
+            bool Signed = ID == Intrinsic::scmp;
+            Value *Less = B.CreateICmp(
+                Signed ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_ULT, A, Bv);
+            Value *Greater = B.CreateICmp(
+                Signed ? ICmpInst::ICMP_SGT : ICmpInst::ICMP_UGT, A, Bv);
+            Value *One = ConstantInt::get(Call->getType(), 1);
+            Value *MinusOne = ConstantInt::getSigned(Call->getType(), -1);
+            Value *Zero = ConstantInt::getNullValue(Call->getType());
+            R = B.CreateSelect(Less, MinusOne,
+                               B.CreateSelect(Greater, One, Zero));
+          } else if (ID == Intrinsic::smin || ID == Intrinsic::smax ||
+                     ID == Intrinsic::umin || ID == Intrinsic::umax) {
+            Value *Bv = Call->getArgOperand(1);
+            bool Signed = ID == Intrinsic::smin || ID == Intrinsic::smax;
+            bool Min = ID == Intrinsic::smin || ID == Intrinsic::umin;
+            Cond = B.CreateICmp(
+                Signed ? (Min ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_SGT)
+                       : (Min ? ICmpInst::ICMP_ULT : ICmpInst::ICMP_UGT),
+                A, Bv);
+            R = B.CreateSelect(Cond, A, Bv);
+          } else if (ID == Intrinsic::abs) {
+            Cond = B.CreateICmpSLT(
+                A, ConstantInt::getNullValue(A->getType()));
+            Value *Neg = B.CreateSub(ConstantInt::getNullValue(A->getType()),
+                                     A);
+            R = B.CreateSelect(Cond, Neg, A);
+          } else if (ID == Intrinsic::usub_sat) {
+            Value *Bv = Call->getArgOperand(1);
+            Cond = B.CreateICmpULT(A, Bv);
+            Value *Difference = B.CreateSub(A, Bv);
+            R = B.CreateSelect(Cond, ConstantInt::getNullValue(A->getType()),
+                               Difference);
+          } else if (ID == Intrinsic::uadd_sat) {
+            Value *Bv = Call->getArgOperand(1);
+            Value *Sum = B.CreateAdd(A, Bv);
+            Cond = B.CreateICmpULT(Sum, A);
+            R = B.CreateSelect(Cond, ConstantInt::getAllOnesValue(A->getType()),
+                               Sum);
+          }
+          if (R) {
+            auto *Replacement = cast<Instruction>(R);
+            copyProvenance(Replacement, Call);
+            Replacement->copyMetadata(*Call);
+            Call->replaceAllUsesWith(R);
+            R->takeName(Call);
+            Call->eraseFromParent();
+            LocalChanged = true;
+            continue;
+          }
+        }
+      }
       Value *CmpLHS = nullptr;
       Value *CmpRHS = nullptr;
       if (matchSignedCompare(&I, CmpLHS, CmpRHS)) {
-        SmallVector<WeakTrackingVH, 16> Dead;
-        SmallVector<Value *, 16> Work{&I};
-        SmallPtrSet<Value *, 16> Seen;
-        while (!Work.empty()) {
-          Value *V = Work.pop_back_val();
-          auto *Node = dyn_cast<Instruction>(V);
-          if (!Node || !Seen.insert(V).second)
-            continue;
-          Dead.push_back(Node);
-          for (Value *Operand : Node->operands())
-            Work.push_back(Operand);
-        }
         B.SetInsertPoint(&I);
-        Function *Scmp = Intrinsic::getOrInsertDeclaration(
-            F.getParent(), Intrinsic::scmp,
-            {CmpLHS->getType(), CmpLHS->getType()});
-        Value *Call = B.CreateCall(Scmp, {CmpLHS, CmpRHS});
-        auto *CI = cast<Instruction>(Call);
-        copyProvenance(CI, &I);
-        CI->copyMetadata(I);
-        I.replaceAllUsesWith(Call);
-        Call->takeName(&I);
+        Value *Less = B.CreateICmpSLT(CmpLHS, CmpRHS);
+        Value *Greater = B.CreateICmpSGT(CmpLHS, CmpRHS);
+        Value *MinusOne = ConstantInt::getSigned(I.getType(), -1);
+        Value *One = ConstantInt::get(I.getType(), 1);
+        Value *Zero = ConstantInt::getNullValue(I.getType());
+        Value *Result =
+            B.CreateSelect(Less, MinusOne,
+                           B.CreateSelect(Greater, One, Zero));
+        auto *ResultI = cast<Instruction>(Result);
+        copyProvenance(ResultI, &I);
+        ResultI->copyMetadata(I);
+        I.replaceAllUsesWith(Result);
+        Result->takeName(&I);
         I.eraseFromParent();
-        RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
         LocalChanged = true;
         continue;
-      }
-      // -- mul by power of two -> shl. Mul by any other constant is
-      //    already the canonical readable form and stays.
-      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        if (BO->getOpcode() == Instruction::Mul) {
-          ConstantInt *C = dyn_cast<ConstantInt>(BO->getOperand(1));
-          Value *X = BO->getOperand(0);
-          if (!C || !C->getValue().isPowerOf2()) {
-            C = dyn_cast<ConstantInt>(BO->getOperand(0));
-            X = BO->getOperand(1);
-          }
-          if (C && C->getValue().isPowerOf2() && !C->getValue().isOne()) {
-            B.SetInsertPoint(BO);
-            Value *Sh = ConstantInt::get(
-                BO->getType(), C->getValue().exactLogBase2());
-            Value *S = B.CreateShl(X, Sh);
-            auto *SI2 = cast<Instruction>(S);
-            copyProvenance(SI2, BO);
-            SI2->copyMetadata(*BO);
-            BO->replaceAllUsesWith(S);
-            S->takeName(BO);
-            BO->eraseFromParent();
-            LocalChanged = true;
-            continue;
-          }
-        }
-      }
-      // -- select-based abs/min/max/clamp -> intrinsics.
-      if (auto *SI = dyn_cast<SelectInst>(&I)) {
-        Value *X = nullptr;
-        if (matchAbsFromSelect(SI, X)) {
-          B.SetInsertPoint(SI);
-          Function *Abs = Intrinsic::getOrInsertDeclaration(
-              F.getParent(), Intrinsic::abs, {SI->getType()});
-          Value *Call =
-              B.CreateCall(Abs, {X, ConstantInt::getFalse(Ctx)});
-          auto *CI = cast<Instruction>(Call);
-          copyProvenance(CI, SI);
-          CI->copyMetadata(*SI);
-          SI->replaceAllUsesWith(Call);
-          Call->takeName(SI);
-          SI->eraseFromParent();
-          LocalChanged = true;
-          continue;
-        }
-        // Select forms of unsigned saturation produced by ordinary C/C++
-        // arithmetic. Keep the operands tied to the exact add/sub node.
-        if (auto *IC = dyn_cast<ICmpInst>(SI->getCondition())) {
-          Intrinsic::ID ID = Intrinsic::not_intrinsic;
-          Value *LHS = nullptr;
-          Value *RHS = nullptr;
-          auto *Sub = dyn_cast<BinaryOperator>(SI->getFalseValue());
-          auto *Zero = dyn_cast<ConstantInt>(SI->getTrueValue());
-          if (Sub && Sub->getOpcode() == Instruction::Sub && Zero &&
-              Zero->isZero() &&
-              IC->getPredicate() == ICmpInst::ICMP_ULT &&
-              IC->getOperand(0) == Sub->getOperand(0) &&
-              IC->getOperand(1) == Sub->getOperand(1)) {
-            ID = Intrinsic::usub_sat;
-            LHS = Sub->getOperand(0);
-            RHS = Sub->getOperand(1);
-          }
-          auto *Add = dyn_cast<BinaryOperator>(SI->getFalseValue());
-          auto *Max = dyn_cast<ConstantInt>(SI->getTrueValue());
-          if (Add && Add->getOpcode() == Instruction::Add && Max &&
-              Max->isMinusOne() &&
-              IC->getPredicate() == ICmpInst::ICMP_ULT &&
-              IC->getOperand(0) == Add &&
-              (IC->getOperand(1) == Add->getOperand(0) ||
-               IC->getOperand(1) == Add->getOperand(1))) {
-            ID = Intrinsic::uadd_sat;
-            LHS = Add->getOperand(0);
-            RHS = Add->getOperand(1);
-          }
-          if (ID != Intrinsic::not_intrinsic) {
-            B.SetInsertPoint(SI);
-            Function *Decl = Intrinsic::getOrInsertDeclaration(
-                F.getParent(), ID, {SI->getType()});
-            Value *Call = B.CreateCall(Decl, {LHS, RHS});
-            auto *CI = cast<Instruction>(Call);
-            copyProvenance(CI, SI);
-            CI->copyMetadata(*SI);
-            SI->replaceAllUsesWith(Call);
-            Call->takeName(SI);
-            SI->eraseFromParent();
-            LocalChanged = true;
-            continue;
-          }
-        }
-        // icmp+select min/max (signed and unsigned, either order).
-        if (auto *IC = dyn_cast<ICmpInst>(SI->getCondition())) {
-          ICmpInst::Predicate P = IC->getPredicate();
-          Value *A = IC->getOperand(0), *Bv = IC->getOperand(1);
-          Value *T = SI->getTrueValue(), *Fv = SI->getFalseValue();
-          bool TIsA = (T == A && Fv == Bv);
-          bool FIsA = (T == Bv && Fv == A);
-          if (TIsA || FIsA) {
-            Intrinsic::ID ID = Intrinsic::not_intrinsic;
-            switch (P) {
-            case ICmpInst::ICMP_SLT:
-            case ICmpInst::ICMP_SLE:
-              ID = TIsA ? Intrinsic::smin : Intrinsic::smax;
-              break;
-            case ICmpInst::ICMP_SGT:
-            case ICmpInst::ICMP_SGE:
-              ID = TIsA ? Intrinsic::smax : Intrinsic::smin;
-              break;
-            case ICmpInst::ICMP_ULT:
-            case ICmpInst::ICMP_ULE:
-              ID = TIsA ? Intrinsic::umin : Intrinsic::umax;
-              break;
-            case ICmpInst::ICMP_UGT:
-            case ICmpInst::ICMP_UGE:
-              ID = TIsA ? Intrinsic::umax : Intrinsic::umin;
-              break;
-            default:
-              break;
-            }
-            if (ID != Intrinsic::not_intrinsic) {
-              B.SetInsertPoint(SI);
-              Function *Decl = Intrinsic::getOrInsertDeclaration(
-                  F.getParent(), ID, {SI->getType()});
-              Value *Call = B.CreateCall(Decl, {A, Bv});
-              auto *CI = cast<Instruction>(Call);
-              copyProvenance(CI, SI);
-              CI->copyMetadata(*SI);
-              SI->replaceAllUsesWith(Call);
-              Call->takeName(SI);
-              SI->eraseFromParent();
-              LocalChanged = true;
-              continue;
-            }
-          }
-        }
-      }
-      // -- rotates: (x << c) | (x >> (w-c)) -> llvm.fshl. The ror mirror
-      //    (operands swapped) matches the same pattern; the frontend
-      //    prints whichever direction the shift amounts describe.
-      {
-        // Match (x<<c)|(x>>(w-c)) in either or-operand order; the ror
-        // mirror (x>>c)|(x<<(w-c)) matches with the shift roles swapped
-        // and folds to fshl(x,x,w-c) (== fshr(x,x,c)).
-        Value *ShlX = nullptr, *ShlC = nullptr;
-        Value *ShrX = nullptr, *ShrC = nullptr;
-        bool Rot = false;
-        Value *Amt = nullptr;
-        auto tryPair = [&](Value *A, Value *B) {
-          ShlX = ShlC = ShrX = ShrC = nullptr;
-          if (match(A, m_Shl(m_Value(ShlX), m_Value(ShlC))) &&
-              match(B, m_LShr(m_Value(ShrX), m_Value(ShrC))) &&
-              ShlX == ShrX && I.getType()->isIntegerTy()) {
-            unsigned W = I.getType()->getIntegerBitWidth();
-            Value *SubA = nullptr, *SubB = nullptr;
-            if (match(ShrC, m_Sub(m_Value(SubA), m_Value(SubB)))) {
-              if (auto *CW = dyn_cast<ConstantInt>(SubA))
-                if (CW->getZExtValue() == W && SubB == ShlC) {
-                  Rot = true; // rol: fshl(x,x,c).
-                  Amt = ShlC;
-                  return;
-                }
-            }
-            if (match(ShlC, m_Sub(m_Value(SubA), m_Value(SubB)))) {
-              if (auto *CW = dyn_cast<ConstantInt>(SubA))
-                if (CW->getZExtValue() == W && SubB == ShrC) {
-                  Rot = true; // ror: fshl(x,x,w-c).
-                  Amt = ShlC;
-                  return;
-                }
-            }
-          }
-        };
-        if (auto *BO = dyn_cast<BinaryOperator>(&I);
-            BO && BO->getOpcode() == Instruction::Or) {
-          tryPair(BO->getOperand(0), BO->getOperand(1));
-          if (!Rot)
-            tryPair(BO->getOperand(1), BO->getOperand(0));
-          if (Rot) {
-            B.SetInsertPoint(&I);
-            Function *Fshl = Intrinsic::getOrInsertDeclaration(
-                F.getParent(), Intrinsic::fshl, {I.getType()});
-            Value *Call = B.CreateCall(Fshl, {ShlX, ShlX, Amt});
-            auto *CI = cast<Instruction>(Call);
-            copyProvenance(CI, &I);
-            CI->copyMetadata(I);
-            I.replaceAllUsesWith(Call);
-            Call->takeName(&I);
-            I.eraseFromParent();
-            LocalChanged = true;
-            continue;
-          }
-        }
-      }
-      // -- byte-swap: shift-and-or byte shuffle -> llvm.bswap.
-      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        if (BO->getOpcode() == Instruction::Or) {
-          // Collect the OR tree leaves and prove that they select each input
-          // byte exactly once, in reverse order. Merely seeing shifts of one
-          // base value is not sufficient to establish a byte swap.
-          SmallVector<Value *, 8> Leaves;
-          SmallVector<Value *, 8> Stack{BO->getOperand(0),
-                                        BO->getOperand(1)};
-          while (!Stack.empty()) {
-            Value *V = Stack.pop_back_val();
-            if (auto *O = dyn_cast<BinaryOperator>(V);
-                O && O->getOpcode() == Instruction::Or) {
-              Stack.push_back(O->getOperand(0));
-              Stack.push_back(O->getOperand(1));
-            } else {
-              Leaves.push_back(V);
-            }
-          }
-          if (auto *IntTy = dyn_cast<IntegerType>(I.getType())) {
-            unsigned W = IntTy->getBitWidth();
-            unsigned ByteCount = W / 8;
-            if ((W == 16 || W == 32 || W == 64) &&
-                Leaves.size() == ByteCount) {
-              Value *Base = nullptr;
-              bool Ok = true;
-              SmallVector<bool, 8> DestSeen(ByteCount, false);
-              SmallVector<bool, 8> SourceSeen(ByteCount, false);
-              for (Value *L : Leaves) {
-                Value *Shifted = L;
-                APInt Mask(W, 0);
-                bool HasMask = false;
-                if (auto *And = dyn_cast<BinaryOperator>(L);
-                    And && And->getOpcode() == Instruction::And) {
-                  auto *MC = dyn_cast<ConstantInt>(And->getOperand(1));
-                  if (!MC)
-                    MC = dyn_cast<ConstantInt>(And->getOperand(0));
-                  if (!MC) {
-                    Ok = false;
-                    break;
-                  }
-                  Mask = MC->getValue();
-                  HasMask = true;
-                  Shifted = And->getOperand(0) == MC ? And->getOperand(1)
-                                                      : And->getOperand(0);
-                }
-                auto *Shift = dyn_cast<BinaryOperator>(Shifted);
-                if (!Shift || (Shift->getOpcode() != Instruction::Shl &&
-                               Shift->getOpcode() != Instruction::LShr)) {
-                  Ok = false;
-                  break;
-                }
-                auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
-                if (!Amount || Amount->getValue().uge(W)) {
-                  Ok = false;
-                  break;
-                }
-                unsigned ShiftBy = Amount->getZExtValue();
-                bool IsRight = Shift->getOpcode() == Instruction::LShr;
-                unsigned DestShift = 0;
-                if (HasMask) {
-                  unsigned First = Mask.countTrailingZeros();
-                  APInt ExpectedMask(W, 255);
-                  ExpectedMask <<= First;
-                  if ((First % 8) != 0 || Mask != ExpectedMask) {
-                    Ok = false;
-                    break;
-                  }
-                  DestShift = First;
-                } else {
-                  APInt NaturalMask(W, 0);
-                  NaturalMask.setAllBits();
-                  if (IsRight)
-                    NaturalMask = NaturalMask.lshr(ShiftBy);
-                  else
-                    NaturalMask = NaturalMask.shl(ShiftBy);
-                  DestShift = IsRight ? 0 : ShiftBy;
-                  if (NaturalMask != (APInt(W, 255) << DestShift)) {
-                    Ok = false;
-                    break;
-                  }
-                }
-                if (DestShift >= W || (DestShift % 8) != 0) {
-                  Ok = false;
-                  break;
-                }
-                APInt ByteMask(W, 255);
-                ByteMask <<= DestShift;
-                if (HasMask && Mask != ByteMask) {
-                  Ok = false;
-                  break;
-                }
-                int SourceShift = IsRight
-                                      ? static_cast<int>(ShiftBy + DestShift)
-                                      : static_cast<int>(DestShift) -
-                                            static_cast<int>(ShiftBy);
-                if (SourceShift < 0 || (SourceShift % 8) != 0 ||
-                    SourceShift + 8 > static_cast<int>(W)) {
-                  Ok = false;
-                  break;
-                }
-                unsigned DestByte = DestShift / 8;
-                unsigned SourceByte = static_cast<unsigned>(SourceShift) / 8;
-                if (DestSeen[DestByte] || SourceSeen[SourceByte] ||
-                    SourceByte != ByteCount - DestByte - 1) {
-                  Ok = false;
-                  break;
-                }
-                DestSeen[DestByte] = true;
-                SourceSeen[SourceByte] = true;
-                Value *SX = Shift->getOperand(0);
-                if (!Base)
-                  Base = SX;
-                else if (Base != SX)
-                  Ok = false;
-              }
-              if (Ok && Base &&
-                  llvm::all_of(DestSeen, [](bool Seen) { return Seen; })) {
-                B.SetInsertPoint(BO);
-                Function *Bswap = Intrinsic::getOrInsertDeclaration(
-                    F.getParent(), Intrinsic::bswap, {I.getType()});
-                Value *Call = B.CreateCall(Bswap, {Base});
-                auto *CI = cast<Instruction>(Call);
-                copyProvenance(CI, BO);
-                CI->copyMetadata(*BO);
-                BO->replaceAllUsesWith(Call);
-                Call->takeName(BO);
-                BO->eraseFromParent();
-                LocalChanged = true;
-                continue;
-              }
-            }
-          }
-        }
       }
       // -- xor(x,-1)+1 -> sub(0,x), the abs building block.
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
@@ -1356,7 +891,6 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
       break;
   }
 
-  Changed |= recoverKernighanPopcount(F);
   if (!Changed)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();

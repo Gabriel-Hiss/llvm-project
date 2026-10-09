@@ -1,5 +1,5 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
-; rotate-right: ror mirror shape -> llvm.fshl (frontend prints ror).
+; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; Source-level rotate shift/or shapes stay as plain arithmetic operations.
 define i32 @rotr32(i32 %x, i32 %c) {
 entry:
   %w = sub i32 32, %c
@@ -9,4 +9,6 @@ entry:
   ret i32 %o
 }
 ; CHECK-LABEL: define i32 @rotr32(
-; CHECK: call i32 @llvm.fshl.i32(i32 %x, i32 %x, i32 %w)
+; CHECK: lshr i32 %x, %c
+; CHECK: shl i32 %x, %w
+; CHECK: or i32 %r, %l

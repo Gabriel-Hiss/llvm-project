@@ -1,5 +1,5 @@
 ; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
-; Kernighan's x &= x-1 loop counts set bits and becomes llvm.ctpop.
+; Kernighan's source-level popcount loop remains a loop, matching clang -O0.
 define i32 @popcount_loop(i32 %x) {
 entry:
   br label %loop
@@ -17,6 +17,6 @@ exit:
   ret i32 %count
 }
 ; CHECK-LABEL: define i32 @popcount_loop(
-; CHECK: call i32 @llvm.ctpop.i32(i32 %x)
-; CHECK-NOT: br i1
-; CHECK-NOT: phi i32
+; CHECK: %count = phi i32
+; CHECK: br i1 %nonzero
+; CHECK: and i32 %remaining, %minus_one
