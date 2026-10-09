@@ -168,7 +168,7 @@ std::vector<Instr> Disasm::decodeSlice(Va Addr,
 std::string Disasm::format(const Instr &I, const SharedNames &Names) const {
   std::string Out;
   raw_string_ostream OS(Out);
-  IP->printInst(&I.Inst, I.Addr.Value, "", *STI, OS);
+  IP->printInst(&I.Inst, I.nextVa().Value, "", *STI, OS);
   OS.flush();
   if (Names)
     return Names->decorateLine(I, Out, refs(I));
