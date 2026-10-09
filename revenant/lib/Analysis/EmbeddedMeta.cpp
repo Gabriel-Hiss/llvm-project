@@ -126,7 +126,12 @@ std::string classNameFromRTTI(StringRef Decorated) {
 }
 
 void collectRtti(Program &P, const Image &Img) {
+  // One row per class name. MSVC links a template's RTTI once per object that
+  // instantiates it, so the same `.?AV` descriptor can appear several times in
+  // the image; keeping a row per copy would emit the same class (with a
+  // different vtable) many times over.
   std::map<Va, size_t> TypeByDescriptor;
+  std::map<std::string, size_t> TypeByName;
   for (const Section &S : Img.Sections) {
     for (size_t Off = 16; Off + 8 < S.Data.size(); ++Off) {
       StringRef Tail(reinterpret_cast<const char *>(S.Data.data() + Off),
@@ -145,7 +150,14 @@ void collectRtti(Program &P, const Image &Img) {
       auto Spare = Img.readU64(Descriptor.wrappingAdd(8));
       if (!Vftable || !*Vftable || !Spare || *Spare != 0)
         continue;
-      TypeByDescriptor.emplace(Descriptor, P.EmbeddedTypes.size());
+      auto ByName = TypeByName.find(Name);
+      if (ByName != TypeByName.end()) {
+        TypeByDescriptor.emplace(Descriptor, ByName->second);
+        continue;
+      }
+      size_t Index = P.EmbeddedTypes.size();
+      TypeByName.emplace(Name, Index);
+      TypeByDescriptor.emplace(Descriptor, Index);
       P.EmbeddedTypes.push_back(
           {Descriptor, std::move(Name), Decorated.str(), Va(), {}});
     }
