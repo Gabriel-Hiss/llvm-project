@@ -27,7 +27,6 @@ namespace {
 
 using Range = std::pair<Va, Va>;
 
-bool overlaps(Range R, Va A, Va B) { return R.first < B && A < R.second; }
 
 std::vector<Range> mergeRanges(std::vector<Range> Ranges) {
   llvm::sort(Ranges);
