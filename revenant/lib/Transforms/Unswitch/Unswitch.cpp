@@ -106,7 +106,7 @@ bool regionIsPure(ArrayRef<BasicBlock *> Blocks) {
       if (auto *LI = dyn_cast<LoadInst>(&I))
         if (!LI->isSimple())
           return false;
-      if (I.mayHaveSideEffects())
+      if (!I.isTerminator() && I.mayHaveSideEffects())
         return false;
     }
   }
