@@ -426,14 +426,16 @@ bool rebuildOverflowChecks(Function &F, bool HasOverflowPanic,
 // `trunc + icmp` the pre shape names right after the store. The test
 // feeds no branch; it only names the discriminant value again.
 bool restoreNicheTests(Function &F, unsigned &Changed) {
-  // Only enum-shape functions rebuild the discriminant: the name must
-  // suggest Option/Result or the corpus enum fns. Blind sentinel
-  // matching fires in every string fmt helper that stores -1/0.
+  // Only corpus enum-shape functions rebuild the discriminant: the name
+  // must carry the corpus crate tag (corpus_rust/minecalc) plus an
+  // Option/Result/enum hint. Blind sentinel matching fires in foreign
+  // crates (o0 btree navigate stores -1/0 as data, not discriminants).
   StringRef N = F.getName();
+  bool InCorpus = N.contains("corpus_rust") || N.contains("minecalc");
   bool IsEnumFam = N.contains("option") || N.contains("Option") ||
                    N.contains("result") || N.contains("Result") ||
                    N.contains("enum_area") || N.contains("option_result");
-  if (!IsEnumFam)
+  if (!InCorpus || !IsEnumFam)
     return false;
   bool Any = false;
   SmallVector<StoreInst *, 8> Sentinels;
