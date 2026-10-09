@@ -13,29 +13,31 @@ integrator after each merge loop.
 | IR contract | RevenantIR, revenant-ir-verify | builds |
 | Structure | RevenantStructure, rv-structure-tool | builds |
 | Target/X86 | RevenantTargetX86 | builds |
-| Transforms | SsaOut, Unrotate, Devectorize, TypeRecovery | prior integrated build passed; current full build fails compiling untracked Unswitch checkout changes |
-| Frontend clang | RevenantClangCore, revenant-clang | prior integrated build passed; current full build fails compiling new Expr slice |
+| Transforms | SsaOut, Unrotate, Devectorize, TypeRecovery | core libraries build; `revenant-opt` link fails because Unrotate/SsaOut DLLs are passed as inputs instead of static libraries |
+| Frontend clang | RevenantClangCore, revenant-clang | builds after merging ExprBuilder API fix |
 | Driver | tools/revenant | builds |
 
 ## Tests
 
 | Suite | Result |
 |---|---|
-| RevenantObjectTests (gtest) | 5/5 pass |
-| RevenantDisasmTests (gtest) | 3/3 pass |
-| RevenantClangTypeTests + TypeSmoke (gtest) | 4/4 pass; TypeSmoke needs an .ll arg (no default) |
-| StructuredStmtBuilderTests (gtest) | compile-fixed by integrator; all tests abort at `CreateCondBr` on i32 condition (i1 required) — owner: Swe2ClangStmt/LunaClangStmt |
+| RevenantObjectTests | 5/5 pass |
+| RevenantDisasmTests | 4/4 pass |
+| RevenantAnalysisTests | 16/16 pass (Padding and Noreturn) |
+| RevenantClangTypeTests | 4/4 pass |
+| StructuredStmtBuilderTests | 5/7 pass; IfThen label assertion fails, Switch aborts on integer constant width |
 | test/ir-contract (revenant-ir-verify) | 10/10 valid accepted, 10/10 invalid rejected |
-| test/Structure (lit-style) | 5/5 pass |
-| test/Transforms/Unrotate + SsaOut (opt plugin) | 12/12 pass |
-| test/Transforms/Devectorize, TypeRecovery | not runnable: no revenant-opt / plugin DLL in superbuild — owner: MuseTxPipeline |
-| revenant-clang on ir-contract modules | 3/10 emit (for, if-else, while); crashes on call-import, cpp-method, leaf-locals, opaque-asm, rust-result, struct-di, switch — owners: Swe2ClangCore/MuseClangCpp; emitted .c fails clang-cl /c (undeclared v0/v2/v3 temporaries, missing labels) |
+| test/Structure (RUN lines via CMD) | 5/5 pass |
+| test/Transforms/Unrotate (RUN lines via CMD) | 7/7 pass |
+| TypeSmoke | aborts on `for.ll` because expected vtable global is missing |
+| test/Transforms/Devectorize, TypeRecovery | not runnable through `revenant-opt`; the tool fails to link with Unrotate/SsaOut DLLs as inputs |
+| revenant-clang on ir-contract modules | 4/10 emit; clang-cl compilation fails on every emitted file. `for.c` uses undeclared `v0`/`v1` and label `L_bb_140001308`. |
 
 ## Latest integration loop
 
 - Merged new commits from MuseLiftSse, MuseNoreturn, MuseClangExpr, and RvSkeleton into `revenant`. The analysis CMake merge retains both Padding and Noreturn sources and tests; unit-test registration retains Compiler and ClangFrontend.
-- `rv-int-build.cmd` reconfigured `build-rv` against the existing `build-revenant`, then failed compiling `ExprCore.cpp` (`ExprBuilderImpl::inverted` missing; `functionDecl` called with a lambda instead of `TypeBuilder&`) and the pre-existing untracked Unswitch source (LLVM API incompatibilities). Expr owner was notified. MuseTxPipeline confirmed Unswitch is not its work and exists only as untracked changes in the integration checkout; its owner is unknown.
-- `ctest --test-dir build-rv --output-on-failure` found no tests. The build stopped before linking the current gtest executables or completing tool targets, so integration tests were not rerun this loop.
+- `rv-int-build.cmd` initially exposed Expr API mismatches and untracked Unswitch code. MuseClangExpr fixed the API mismatch in a follow-up commit. The deopt agent moved Unswitch tests/code out of the integration checkout; no untracked Unswitch source is currently in the build. The full `rv-int-build.cmd` then completed successfully against the existing `build-revenant`.
+- `revenant-opt` still fails to link because SsaOut/Unrotate are shared plugin DLLs rather than static libraries. The pass owners were notified. `ctest` has no registered tests; gtests and RUN lines were executed directly.
 
 ## Integration fixes applied (on revenant, not slice branches)
 
