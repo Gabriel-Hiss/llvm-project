@@ -218,9 +218,14 @@ Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
   llvm::FunctionType *FTy = I.getFunctionType();
   for (unsigned A = 0; A < I.arg_size(); ++A) {
     Expr *E = value(I.getArgOperand(A), Scope);
-    // Cast variadic extras and mismatched params to the declared type
-    // so the output compiles under clang-cl's checking.
-    (void)FTy;
+    // Opaque pointer signatures lose pointee constness. Make the IR pointer
+    // type explicit when a constant string is passed to an unknown void *.
+    if (E && A < FTy->getNumParams()) {
+      QualType ParamTy = Types.typeOf(FTy->getParamType(A), nullptr);
+      if (E->getType()->isPointerType() && ParamTy->isPointerType() &&
+          E->getType() != ParamTy)
+        E = makeCStyleCast(ParamTy, CK_BitCast, E);
+    }
     Args.push_back(E);
   }
   clang::CallExpr *Call =

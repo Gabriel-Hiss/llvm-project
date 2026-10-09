@@ -26,6 +26,9 @@ their owning `Program` code ranges, lifted with the MSVC frame pointer in
 `rdx`, and inlined into catch or cleanup pads. A catch funclet's constant
 `rax` continuation selects the parent block when the lifted body exposes one.
 The Clang frontend turns the native pads into C++ try/catch or SEH constructs.
+Invokes from the same decoded try-table region carry a shared
+`!revenant.eh.region` ID. The Clang frontend groups them into one source
+`try` statement with a shared handler set.
 
 For Itanium LSDA call sites, positive action filters retain their RTTI
 descriptor and decoded type name. Lifting emits those descriptors as landingpad
