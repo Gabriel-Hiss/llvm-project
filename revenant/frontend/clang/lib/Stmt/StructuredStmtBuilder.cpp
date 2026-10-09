@@ -431,6 +431,9 @@ Expr *StructuredStmtBuilder::caseValue(const ConstantInt *V, QualType CT) {
     CT = AST->getPromotedIntegerType(CT);
   if (!CT->isIntegerType())
     CT = AST->IntTy;
+  // Promote small int types to int to avoid Ui8/Ui16 suffixes
+  if (CT->isIntegerType() && AST->getTypeSize(CT) < 32)
+    CT = AST->IntTy;
   unsigned W = (unsigned)AST->getIntWidth(CT);
   APInt Raw = V->getValue();
   if (CT->isSignedIntegerType())
@@ -1214,11 +1217,15 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
     return nullptr;
 
   // Personality decides the spelling: __C_specific_handler -> SEH.
+  // For non-MSVC targets (gcc/MinGW), never emit SEH.
   bool IsSEH = false;
   if (Fn && Fn->hasPersonalityFn()) {
-    if (const auto *GV = dyn_cast<GlobalValue>(
-            Fn->getPersonalityFn()->stripPointerCasts()))
-      IsSEH = GV->getName() == "__C_specific_handler";
+    llvm::StringRef Triple = Fn->getParent()->getTargetTriple();
+    if (Triple.contains("msvc")) {
+      if (const auto *GV = dyn_cast<GlobalValue>(
+              Fn->getPersonalityFn()->stripPointerCasts()))
+        IsSEH = GV->getName() == "__C_specific_handler";
+    }
   }
 
   // Try body: spell the invoke's call through a scratch CallInst so

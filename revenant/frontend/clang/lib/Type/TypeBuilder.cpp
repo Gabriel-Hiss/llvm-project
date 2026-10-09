@@ -398,38 +398,19 @@ private:
     case 64:
       return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
     case 128: {
-      // MSVC does not support __int128. Use a 16-byte struct instead.
+      // MSVC does not support __int128. Use target-conditional:
+      // gcc/clang targets get unsigned __int128; MSVC gets u64 pairs
+      // via inline helpers (see TranslationUnit.cpp).
       clang::ASTContext &A = Ctx.ast();
-      std::string Name = Signed ? "__int128_s" : "__int128_u";
-      clang::IdentifierInfo &II = A.Idents.get(Name);
-      clang::TagDecl *TD = nullptr;
-      for (clang::NamedDecl *D : A.getTranslationUnitDecl()->lookup(&II))
-        if (auto *T = llvm::dyn_cast<clang::TagDecl>(D))
-          TD = T;
-      if (!TD) {
-        TD = clang::RecordDecl::Create(A, clang::TagTypeKind::Struct,
-                                       A.getTranslationUnitDecl(),
-                                       clang::SourceLocation(),
-                                       clang::SourceLocation(), &II);
-        TD->setImplicit(false);
-        A.getTranslationUnitDecl()->addDecl(TD);
-        // Add two 64-bit fields to make it 16 bytes
-        clang::QualType LongLongTy = Signed ? A.LongLongTy : A.UnsignedLongLongTy;
-        clang::IdentifierInfo &FII1 = A.Idents.get("__lo");
-        clang::FieldDecl *FD1 = clang::FieldDecl::Create(A, TD, clang::SourceLocation(),
-                                                        clang::SourceLocation(), &FII1,
-                                                        LongLongTy, nullptr, nullptr, false,
-                                                        clang::ICIS_NoInit);
-        TD->addDecl(FD1);
-        clang::IdentifierInfo &FII2 = A.Idents.get("__hi");
-        clang::FieldDecl *FD2 = clang::FieldDecl::Create(A, TD, clang::SourceLocation(),
-                                                        clang::SourceLocation(), &FII2,
-                                                        LongLongTy, nullptr, nullptr, false,
-                                                        clang::ICIS_NoInit);
-        TD->addDecl(FD2);
-        llvm::cast<clang::RecordDecl>(TD)->completeDefinition();
+      llvm::StringRef Triple = Ctx.module().getTargetTriple();
+      bool IsMSVC = Triple.contains("msvc");
+      if (!IsMSVC) {
+        return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
       }
-      return A.getCanonicalTagType(TD);
+      // MSVC: emit as u64 pair (two 64-bit halves)
+      clang::QualType U64Ty = A.UnsignedLongLongTy;
+      return A.getConstantArrayType(U64Ty, llvm::APInt(64, 2), nullptr,
+                                   clang::ArraySizeModifier::Normal, 0);
     }
     default:
       return uintptrT();
