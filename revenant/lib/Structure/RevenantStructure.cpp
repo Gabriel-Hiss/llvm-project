@@ -43,6 +43,10 @@ constexpr unsigned MaxRegionDepth = 2048;
 // Ceiling on region-walk steps per function; past it the CFG is in
 // exponential tail duplication and ends in the flat fallback anyway.
 constexpr unsigned MaxRegionVisits = 250000;
+// Cap on short-circuit folds per branch, mirroring the reference's
+// MAX_FOLD_COND_HEIGHT: cyclic chains of empty cond blocks (dense dispatch
+// knots) fold back into themselves forever without it.
+constexpr unsigned MaxFoldDepth = 64;
 
 enum class ArmKind { Normal, Break, Continue };
 
@@ -648,7 +652,12 @@ private:
     // Short-circuit fold: consume pure-cond arm blocks and retry with the
     // folded targets until nothing folds.
     if (Depth < MaxRegionDepth - 48) {
-      while (auto Fold = tryShortCircuit(Head, T, F)) {
+      unsigned Folds = 0;
+      while (Folds < MaxFoldDepth) {
+        auto Fold = tryShortCircuit(Head, T, F);
+        if (!Fold)
+          break;
+        ++Folds;
         T = Fold->first;
         F = Fold->second;
         TK = armKind(T, LCtx);
