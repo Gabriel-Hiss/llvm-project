@@ -10,6 +10,7 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include <map>
 using namespace llvm;
+
 namespace revenant {
 namespace {
 class Bases {
@@ -85,6 +86,9 @@ PreservedAnalyses LiftStructsPass::run(Module &M, ModuleAnalysisManager &) {
       }
       if (!P || !Ty->isSized() || Ty->isVectorTy() || Ty->isAggregateType())
         continue;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(P))
+        if (GEP->getMetadata("revenant.pointee"))
+          continue;
       int64_t Offset = 0;
       Value *Root = base(P, Offset, DL);
       if (Offset < 0 || Offset > 65536 || isa<GlobalValue>(Root))
@@ -152,24 +156,6 @@ PreservedAnalyses LiftStructsPass::run(Module &M, ModuleAnalysisManager &) {
           CU.getFile(), 1, Bits, 8, F.first * 8, DINode::FlagZero, DT));
     }
     DIType *Composite = ir::createStructType(DIB, &CU, Name, End * 8, Members);
-    for (Function &Fn : M) {
-      if (Fn.isDeclaration())
-        continue;
-      for (Argument &A : Fn.args()) {
-        if (!A.getType()->isPointerTy() || Shared.find(&A) != KV.first)
-          continue;
-        DISubprogram *SP = Fn.getSubprogram();
-        if (!SP)
-          SP = &ir::createSubprogramFor(Fn, DIB, CU);
-        std::string ArgName = A.hasName() ? A.getName().str() :
-                                           "arg_" + std::to_string(A.getArgNo());
-        auto *Var = ir::createLocalVariable(DIB, SP, ArgName,
-            ir::createPointerType(DIB, Composite), A.getArgNo() + 1);
-        DIB.insertDbgValueIntrinsic(&A, Var, DIB.createExpression(),
-            DILocation::get(M.getContext(), 1, 1, SP),
-            Fn.getEntryBlock().getFirstInsertionPt());
-      }
-    }
     for (auto &F : Fields)
       for (Instruction *I : F.second.Accesses) {
         Value *Old = isa<LoadInst>(I) ? cast<LoadInst>(I)->getPointerOperand() :
@@ -191,6 +177,7 @@ PreservedAnalyses LiftStructsPass::run(Module &M, ModuleAnalysisManager &) {
       }
     Changed = true;
   }
+
   // Struct metadata can add a subprogram to a lifted function. LLVM then
   // requires every call in that function to carry a debug location.
   for (Function &F : M)
@@ -202,7 +189,9 @@ PreservedAnalyses LiftStructsPass::run(Module &M, ModuleAnalysisManager &) {
           Changed = true;
         }
     }
-  DIB.finalize();
+  if (NamedMDNode *CUs = M.getNamedMetadata("llvm.dbg.cu"))
+    if (CUs->getNumOperands())
+      DIB.finalize();
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 } // namespace revenant
