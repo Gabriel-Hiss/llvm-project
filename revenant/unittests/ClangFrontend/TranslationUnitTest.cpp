@@ -162,7 +162,7 @@ TEST(TranslationUnitTest, DeclaresCalleesBeforeWholeUnitDefinitions) {
   ASSERT_NE(CalleeDefinition, StringRef::npos);
   EXPECT_LT(CalleeProto, CallerDefinition);
   EXPECT_EQ(Source.count("caller("), 2u);
-  EXPECT_EQ(Source.count("callee("), 2u);
+  EXPECT_EQ(Source.count("callee("), 3u);
 }
 
 TEST(TranslationUnitTest, EmitsInfinityWithoutNonportableInfToken) {

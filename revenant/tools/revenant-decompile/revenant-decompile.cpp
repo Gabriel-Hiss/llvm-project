@@ -16,13 +16,19 @@
 
 #include "revenant/Analysis/LibMatch.h"
 #include "revenant/Core/Instr.h"
+#include "revenant/Core/Program.h"
+#include "revenant/Disasm/Disasm.h"
 #include "revenant/Object/PeFile.h"
+#include <initializer_list>
+
 #include <optional>
 #include <queue>
 #include <set>
 #include <tuple>
 #include <string>
 #include <vector>
+
+#include "llvm/ADT/STLExtras.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
@@ -35,6 +41,87 @@
 #include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 using namespace revenant;
+
+static bool isConstructorArrayDispatcher(const Session &S,
+                                         const revenant::Function &F) {
+  bool HasIndirectCall = false;
+  std::vector<Va> TableBases;
+  for (const Instr &I : F.Instrs) {
+    if (I.Flow == FlowKind::Call && !I.HasTarget)
+      HasIndirectCall = true;
+    if (!I.HasMemTarget)
+      continue;
+    TableBases.push_back(I.MemTarget);
+    if (auto Pointer = S.pe().Img->readU64(I.MemTarget))
+      TableBases.push_back(Va(*Pointer));
+  }
+  if (!HasIndirectCall)
+    return false;
+  for (Va Base : TableBases) {
+    if (!S.pe().Img->sectionOf(Base))
+      continue;
+    unsigned FunctionPointers = 0;
+    for (unsigned I = 0; I < 512; ++I) {
+      auto Entry = S.pe().Img->readU64(Base.wrappingAdd(8ULL * I));
+      if (!Entry)
+        break;
+      if (*Entry == 0) {
+        if (FunctionPointers)
+          return true;
+        break;
+      }
+      if (*Entry == UINT64_MAX)
+        continue;
+      Va Target(*Entry);
+      if (S.pe().Img->isExecutable(Target) &&
+          S.program().Functions.count(Target))
+        ++FunctionPointers;
+    }
+  }
+  return false;
+}
+
+static std::optional<Va>
+firstConstructorRuntimeCall(const Session &S, Va UserEntry,
+                            const std::set<Va> &LibraryStarts) {
+  auto UserOrErr = S.materialize(UserEntry);
+  if (!UserOrErr) {
+    consumeError(UserOrErr.takeError());
+    return std::nullopt;
+  }
+  const Instr *FirstCall = nullptr;
+  for (const Instr &I : UserOrErr->Instrs)
+    if (I.Flow == FlowKind::Call &&
+        (!FirstCall || I.Addr < FirstCall->Addr))
+      FirstCall = &I;
+  if (!FirstCall || !FirstCall->HasTarget ||
+      LibraryStarts.count(FirstCall->Target))
+    return std::nullopt;
+
+  std::queue<std::pair<Va, unsigned>> Pending;
+  std::set<Va> Seen;
+  Pending.push({FirstCall->Target, 0});
+  while (!Pending.empty()) {
+    auto [At, Depth] = Pending.front();
+    Pending.pop();
+    if (Depth > 8 || !Seen.insert(At).second)
+      continue;
+    auto FOrErr = S.materialize(At);
+    if (!FOrErr) {
+      consumeError(FOrErr.takeError());
+      continue;
+    }
+    if (isConstructorArrayDispatcher(S, *FOrErr))
+      return FirstCall->Target;
+    if (LibraryStarts.count(At))
+      continue;
+    for (const Instr &I : FOrErr->Instrs)
+      if (I.Flow == FlowKind::Call && I.HasTarget &&
+          S.program().Functions.count(I.Target))
+        Pending.push({I.Target, Depth + 1});
+  }
+  return std::nullopt;
+}
 
 static std::optional<Va>
 findUserEntry(const Session &S, Lang Out,
@@ -77,6 +164,7 @@ findUserEntry(const Session &S, Lang Out,
   std::queue<std::pair<Va, unsigned>> Pending;
   std::set<Va> Seen;
   std::optional<std::pair<size_t, Va>> PointerEntry;
+  std::optional<std::tuple<unsigned, size_t, Va>> MinGWEntry;
   std::optional<std::tuple<unsigned, size_t, Va>> TailEntry;
   Pending.push({Entry->first, 0});
   while (!Pending.empty()) {
@@ -90,7 +178,41 @@ findUserEntry(const Session &S, Lang Out,
       continue;
     }
     std::optional<Va> PendingCodePointer;
+    std::vector<std::string> PriorInstructions;
+    auto WritesOneOf = [](StringRef Line,
+                          std::initializer_list<StringRef> Registers) {
+      Line = Line.trim();
+      size_t Split = Line.find_first_of(" \t");
+      if (Split == StringRef::npos)
+        return false;
+      StringRef Operands = Line.drop_front(Split).trim();
+      StringRef Dest = Operands.split(',').first.trim();
+      return llvm::any_of(Registers, [&](StringRef Reg) {
+        return Dest.equals_insensitive(Reg);
+      });
+    };
     for (const Instr &I : FunctionOrErr->Instrs) {
+      std::string Printed = S.disasm().format(I);
+      if (Out != Lang::Rust && I.Flow == FlowKind::Call && I.HasTarget &&
+          P.Functions.count(I.Target) && !LibraryStarts.count(I.Target)) {
+        bool HasFirst = false, HasSecond = false, HasThird = false;
+        for (const std::string &Prior : PriorInstructions) {
+          StringRef Line(Prior);
+          HasFirst |= WritesOneOf(Line, {"rcx", "ecx", "cx", "cl"});
+          HasSecond |= WritesOneOf(Line, {"rdx", "edx", "dx", "dl"});
+          HasThird |= WritesOneOf(Line, {"r8", "r8d", "r8w", "r8b"});
+        }
+        if (HasFirst && HasSecond && HasThird) {
+          size_t Size = P.Functions.find(I.Target)->second.InstrRvas.size();
+          if (!MinGWEntry || Depth < std::get<0>(*MinGWEntry) ||
+              (Depth == std::get<0>(*MinGWEntry) &&
+               Size > std::get<1>(*MinGWEntry)))
+            MinGWEntry = {Depth, Size, I.Target};
+        }
+      }
+      PriorInstructions.push_back(std::move(Printed));
+      if (PriorInstructions.size() > 6)
+        PriorInstructions.erase(PriorInstructions.begin());
       if (I.HasMemTarget && P.Functions.count(I.MemTarget))
         PendingCodePointer = I.MemTarget;
       if (!I.HasTarget || !P.Functions.count(I.Target))
@@ -117,6 +239,9 @@ findUserEntry(const Session &S, Lang Out,
         Pending.push({I.Target, Depth + 1});
     }
   }
+  if (MinGWEntry)
+    return std::get<2>(*MinGWEntry);
+
   if (PointerEntry)
     return PointerEntry->second;
   if (TailEntry)
@@ -230,6 +355,7 @@ int main(int Argc, char **Argv) {
     std::set<Va> LibraryStarts;
     std::map<Va, std::string> LibraryNames;
     std::optional<Va> UserEntry;
+    std::optional<Va> RuntimeCtorHook;
     std::set<Va> Startup;
     std::set<Va> UserReachable;
     if (ClassifyFuncs) {
@@ -251,6 +377,8 @@ int main(int Argc, char **Argv) {
         errs() << "revenant-decompile: unable to trace user entry from PE startup\n";
         return 2;
       }
+      RuntimeCtorHook =
+          firstConstructorRuntimeCall(*S, *UserEntry, LibraryStarts);
       auto Entry = S->program().Functions.upper_bound(S->pe().EntryPoint);
       if (Entry != S->program().Functions.begin()) {
         --Entry;
@@ -288,6 +416,10 @@ int main(int Argc, char **Argv) {
           continue;
         }
         for (const Instr &I : FOrErr->Instrs) {
+          if (At == *UserEntry && RuntimeCtorHook &&
+              I.Flow == FlowKind::Call && I.HasTarget &&
+              I.Target == *RuntimeCtorHook)
+            continue;
           if (I.HasTarget && S->program().Functions.count(I.Target) &&
               (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
             UserPending.push(I.Target);

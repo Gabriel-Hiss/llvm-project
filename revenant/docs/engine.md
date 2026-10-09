@@ -43,10 +43,14 @@ revenant-decompile <pe> [--func <va|name>]... [--func-file <path>]
 
 `--list --classify --libdb=<path>` prints `user-entry<TAB><va>` followed by
 one row per function with its name and `user`, `library`, or `startup`
-classification. It follows direct calls and address-taken function pointers
-from the discovered user entry, stopping at library matches. An adjacent
-`libdb.json` is optional by default; an explicitly supplied missing database
-is an error. `--func-file=<path>` reads one function selector per line.
+classification. It traces the PE entry through CRT startup to the user entry
+(including MinGW's startup call convention), follows direct calls and
+address-taken function pointers from user code, and stops at library matches.
+When the user's first call reaches an unmatched MinGW constructor-list
+dispatcher, that hook and code reachable only through it are treated as
+runtime. An adjacent `libdb.json` is optional by default; an explicitly
+supplied missing database is an error. `--func-file=<path>` reads one selector
+per line.
 
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
