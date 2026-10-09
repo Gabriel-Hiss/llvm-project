@@ -10,9 +10,13 @@ That ranking favors field accessors and destructor paths where the caller may re
 
 ## Conservative field classification
 
-Vector empty detection requires both compared operands to be loads of the same object's +0 and +8 fields. A comparison between an iterator and a vector's +16 end field is a loop-exit test, not `vector.empty()`.
+Vector empty detection requires both compared operands to load the same object's +0 and +8 fields. An iterator-to-end comparison is a loop-exit test, not `vector.empty()`.
 
-For MSVC, a string-size candidate at +16 is accepted only when the same object also has the string capacity field at +24 and lacks the vector middle pointer at +8. The `{first,last,end}` vector evidence therefore blocks misclassification as `string.size`, even if other accesses reach +24. Ambiguous layouts stay unchanged.
+For MSVC, accept a string-size candidate at +16 only when the same object also has string capacity at +24 and lacks the vector middle pointer at +8. Ambiguous layouts stay unchanged.
+## Rewrite eligibility
+
+`revenant-uncxx` runs only on functions tagged `"revenant.user"="true"`. A field layout alone is not enough: the pass also needs a call on that same object to a function tagged with a libdb-derived `"revenant.lib"` name. It resolves the call target after `stripPointerCastsAndAliases()` and reads the attribute from the callee `Function`, not the call site. The attributes survive every metadata mode.
+
 
 ## Regression coverage
 
@@ -34,20 +38,8 @@ remarks compare with 10 `string_dtor` calls. The other ranked comparisons are
 140 vector-empty remarks vs 19 recovered calls and 323 string-size remarks vs
 452 helper calls.
 
-On normalized C IR, the integer-field guard prevents the false `vector.empty`
-rewrite, and a `revenant.lang = "c"` module flag disables Uncxx entirely. Both
-`c-o2` and `c-clang-o2` then produce no helper calls. The current `cpp-o2`
-normalizer output is also tagged `"c"` by the old detector and is gated; the
-C++ detection fix must land before measuring Uncxx on that binary again.
+## Current corpus check
 
-The current normalized `cpp-o2` module is also tagged `"c"` by the old
-detector, so the language gate skips it. Changing only that scratch module
-flag to `"cpp"` yielded one `vector.size` helper in `sub_140001630`; rerun the
-actual decompiler after C++ detection lands.
+The `cpp-o2` image classifies both source functions `vector_ops` and `sum_vec<int>` as user functions. The IR after cleanup retains those user tags and the libdb-derived library tags. Running static `revenant-opt -passes=revenant-uncxx` on that IR produced no helper calls. The user functions contain no direct calls to a libdb-identified vector or string member on their container object, so the pass correctly rejects their layout-only candidates under the evidence rule.
 
-The existing `revenant-decompile` accepts `--emit ir-raw|ir-clean|ir-final`,
-not `--emit ir`. On `cpp-o2.exe`, `--emit ir-final` succeeded, but applying
-`revenant-uncxx` to that lifted IR emitted no helper calls. On `json-cl-o2.exe`,
-the driver failed LLVM verification before writing IR: `Entry block to function
-must not have predecessors! label %bb_140057412`. These are observations from
-the current driver build; they do not establish parity for either target.
+The clean IR measurement is saved under `rv-scratch/LunaUncxxUser/cpp-o2.ir-clean.ll`; the static pass output is `cpp-o2.ir-uncxx.ll`. The full decompiler's `--emit ir-final` run still reports an unrelated `revenant-ssaout` verification failure for nonnull/noundef metadata, after a duplicate lifted-function failure at `0x140062f70`. The `ir-clean` stage and static Uncxx pass complete.

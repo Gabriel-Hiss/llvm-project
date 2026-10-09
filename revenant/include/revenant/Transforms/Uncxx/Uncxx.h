@@ -35,6 +35,7 @@
 #ifndef REVENANT_TRANSFORMS_UNCXX_UNCXX_H
 #define REVENANT_TRANSFORMS_UNCXX_UNCXX_H
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/PassManager.h"
 
 namespace revenant {
@@ -44,9 +45,12 @@ enum class CxxFlavor { Auto, Msvc, Gnu, Libcxx };
 
 class UncxxPass : public llvm::PassInfoMixin<UncxxPass> {
   CxxFlavor Flavor = CxxFlavor::Auto;
+  const llvm::DenseSet<llvm::Function *> *UserFns = nullptr;
 
 public:
-  explicit UncxxPass(CxxFlavor F = CxxFlavor::Auto) : Flavor(F) {}
+  explicit UncxxPass(CxxFlavor F = CxxFlavor::Auto,
+                     const llvm::DenseSet<llvm::Function *> *Users = nullptr)
+      : Flavor(F), UserFns(Users) {}
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &FAM);
   static bool isRequired() { return false; }

@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uncxx -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uncxx,verify -S %s | %FileCheck %s
 ; Regression cases for MSVC's overlapping vector-end/string-size offset.
 ; A real vector empty check compares the vector's first and last fields.
 ; A loop exit compares an unrelated iterator with a loaded vector end.
@@ -7,14 +7,17 @@
 ; CHECK-LABEL: define i1 @loop_exit
 ; CHECK-NOT: revenant.cxx.vector.empty
 ; CHECK: icmp eq ptr %it, %end
+; CHECK-LABEL: define i1 @library_body
+; CHECK-NOT: revenant.cxx.vector.empty
+; CHECK: icmp eq ptr %first, %last
 ; CHECK-LABEL: define i64 @vector_end_not_string_size
 ; CHECK-NOT: revenant.cxx.string.size
 ; CHECK: load ptr, ptr %end.addr
-
  target triple = "x86_64-pc-windows-msvc"
 
-define i1 @vector_empty(ptr %v) {
+define i1 @vector_empty(ptr %v) "revenant.user"="true" {
 entry:
+  call void @libdb_vector_push_back(ptr %v)
   %first.addr = getelementptr i8, ptr %v, i64 0
   %last.addr = getelementptr i8, ptr %v, i64 8
   %end.addr = getelementptr i8, ptr %v, i64 16
@@ -34,6 +37,21 @@ entry:
   %done = icmp eq ptr %it, %end
   ret i1 %done
 }
+define i1 @library_body(ptr %v) "revenant.lib"="std::vector<int>::_Emplace_one_at_back" {
+entry:
+  call void @libdb_vector_push_back(ptr %v)
+  %first.addr = getelementptr i8, ptr %v, i64 0
+  %last.addr = getelementptr i8, ptr %v, i64 8
+  %end.addr = getelementptr i8, ptr %v, i64 16
+  %first = load ptr, ptr %first.addr, align 8
+  %last = load ptr, ptr %last.addr, align 8
+  %end = load ptr, ptr %end.addr, align 8
+  %empty = icmp eq ptr %first, %last
+  %keep.vector.shape = icmp ne ptr %end, null
+  %result = and i1 %empty, %keep.vector.shape
+  ret i1 %result
+}
+
 
 define i64 @vector_end_not_string_size(ptr %v) {
 entry:
@@ -52,8 +70,9 @@ entry:
 ; CHECK-LABEL: define i32 @vector_back
 ; CHECK: call ptr @revenant.cxx.vector.back(ptr %v)
 
-define i32 @vector_back(ptr %v) {
+define i32 @vector_back(ptr %v) "revenant.user"="true" {
 entry:
+  call void @libdb_vector_push_back(ptr %v)
   %first.addr = getelementptr i8, ptr %v, i64 0
   %last.addr = getelementptr i8, ptr %v, i64 8
   %end.addr = getelementptr i8, ptr %v, i64 16
@@ -73,8 +92,9 @@ declare void @"?vector@std@@"()
 
 @fallback = private constant [5 x i8] c"error"
 
-define ptr @string_null_fallback(ptr %s) {
+define ptr @string_null_fallback(ptr %s) "revenant.user"="true" {
 entry:
+  call void @libdb_string_push_back(ptr %s)
   %data.addr = getelementptr i8, ptr %s, i64 0
   %data = load ptr, ptr %data.addr, align 8
   %is.null = icmp eq ptr %data, null
@@ -84,8 +104,9 @@ entry:
 ; CHECK-LABEL: define ptr @string_sso_data
 ; CHECK: call ptr @revenant.cxx.string.data(ptr %s)
 
-define ptr @string_sso_data(ptr %s) {
+define ptr @string_sso_data(ptr %s) "revenant.user"="true" {
 entry:
+  call void @libdb_string_push_back(ptr %s)
   %data.addr = getelementptr i8, ptr %s, i64 0
   %cap.addr = getelementptr i8, ptr %s, i64 24
   %data = load ptr, ptr %data.addr, align 8
@@ -97,8 +118,9 @@ entry:
 ; CHECK-LABEL: define i64 @vector_back_byte_offset
 ; CHECK: call ptr @revenant.cxx.vector.back
 
-define i64 @vector_back_byte_offset(ptr %v) {
+define i64 @vector_back_byte_offset(ptr %v) "revenant.user"="true" {
 entry:
+  call void @libdb_vector_push_back(ptr %v)
   %first.addr = getelementptr i8, ptr %v, i64 0
   %last.addr = getelementptr i8, ptr %v, i64 8
   %first = load ptr, ptr %first.addr, align 8
@@ -122,5 +144,7 @@ entry:
   %equal = icmp eq i32 %first, %last
   ret i1 %equal
 }
+declare void @libdb_vector_push_back(ptr) memory(none) "revenant.lib"="std::vector<int>::push_back"
+declare void @libdb_string_push_back(ptr) memory(none) "revenant.lib"="std::basic_string<char>::push_back"
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"cpp"}
