@@ -26,7 +26,19 @@ bool hasImport(const PeFile &PE, llvm::StringRef Needle) {
 
 bool hasSection(const PeFile &PE, llvm::StringRef Name) {
   return std::any_of(PE.Img->Sections.begin(), PE.Img->Sections.end(),
-                     [&](const Section &S) { return S.Name == Name; });
+                     [&](const Section &S) {
+                       // COFF truncates and uppercases long names, so
+                       // compare case-insensitively.
+                       return llvm::StringRef(S.Name).equals_insensitive(Name);
+                     });
+}
+
+bool hasSectionPrefix(const PeFile &PE, llvm::StringRef Prefix) {
+  return std::any_of(PE.Img->Sections.begin(), PE.Img->Sections.end(),
+                     [&](const Section &S) {
+                       return llvm::StringRef(S.Name)
+                           .starts_with_insensitive(Prefix);
+                     });
 }
 
 bool hasImageText(const Image &Img, llvm::StringRef Needle) {
@@ -48,33 +60,56 @@ bool hasSymbolPrefix(const std::vector<std::string> &Names,
 CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
   CompilerInfo I;
   bool HasMsvc = false, HasLto = false, HasPgo = false, HasRust = false;
-  // Rich-header product ids: 0x108/0x109 are LTCG, 0x10b/0x0fe are
-  // MSVC PGO, and 0x93 is rustc. Other MSVC product ids identify cl.
+  // Rich-header product ids, validated against the parity corpus:
+  // 0x93 is rustc; 0x101-0x105/0xfd/0x100/0x102 are MSVC toolchains.
+  // At the link build (highest build number) 0x104/0x105 mean a plain
+  // link, 0x108/0x109 mean /GL+LTCG, 0x10d means LTCG+PGO, and 0xff is
+  // the rust-cargo self-link marker. 0xfd at a tool build is a stock
+  // cl/c2 object marker, not evidence of anything on its own.
   for (const RichEntry &E : PE.RichHeader) {
     switch (E.ProdId) {
     case 0x108: case 0x109: HasMsvc = true; HasLto = true; break;
     case 0x10b: case 0x0fe: HasMsvc = true; HasPgo = true; break;
+    case 0x10d: HasMsvc = true; HasLto = true; HasPgo = true; break;
     case 0x93: HasRust = true; break;
-    default: if (E.ProdId >= 0x100 && E.ProdId <= 0x10f) HasMsvc = true;
+    case 0xff: HasRust = true; break;
+    default:
+      if ((E.ProdId >= 0x101 && E.ProdId <= 0x105) || E.ProdId == 0xfd ||
+          E.ProdId == 0x100 || E.ProdId == 0x102)
+        HasMsvc = true;
     }
   }
   if (HasMsvc) I.Evidence.emplace_back("MSVC Rich-header product ids");
   if (HasRust) I.Evidence.emplace_back("rustc Rich-header product id 0x93");
 
   const bool IsGo = PE.GoBuildId.has_value() || hasSection(PE, ".gosymtab") ||
-                    hasSection(PE, ".gopclntab") || hasText(Symbols, "runtime.");
+                    hasSection(PE, ".gopclntab") || hasText(Symbols, "runtime.") ||
+                    hasImageText(*PE.Img, "gopclntab") ||
+                    hasImageText(*PE.Img, "gosymtab") ||
+                    hasImageText(*PE.Img, "go1.") ||
+                    hasImageText(*PE.Img, "Go build ID");
   const bool IsRust = HasRust || hasSymbolPrefix(Symbols, "_R") ||
                      hasText(Symbols, "_$LT$") ||
                      hasImageText(*PE.Img, "/rustc/") ||
                      hasImageText(*PE.Img, "rustc version");
   const bool IsGcc = hasImport(PE, "mingw") || hasImport(PE, "libgcc") ||
                      hasImport(PE, "__gxx_personality_seh0") ||
+                     hasImport(PE, "libstdc++") ||
                      hasSection(PE, ".eh_frame");
+  // clang-cl leaves no Rich header: folded builtins (memcpy_/memset_) and
+  // the CRT guard folding tables (_RDATA, _guard_c/_guard_d) are its
+  // stable fingerprint on this corpus. Section-name comparison ignores
+  // case: COFF truncates and uppercases long names.
   const bool IsClang = hasImageText(*PE.Img, "clang version") ||
                        hasText(Symbols, "clang version") ||
-                       hasSection(PE, ".llvm") || hasSection(PE, ".clang");
+                       hasSection(PE, ".llvm") || hasSection(PE, ".clang") ||
+                       (hasSectionPrefix(PE, "memcpy_") &&
+                        hasSectionPrefix(PE, "memset_")) ||
+                       (hasSectionPrefix(PE, "_RDATA") &&
+                        hasSectionPrefix(PE, "_guard_"));
   const bool IsCpp = hasText(Symbols, "?AV") || hasText(Symbols, "?AU") ||
-                     hasSymbolPrefix(Symbols, "_Z");
+                     hasSymbolPrefix(Symbols, "_Z") ||
+                     hasImport(PE, "__CxxFrameHandler");
 
   if (IsGo) {
     I.Producer = CompilerProducer::Go; I.Language = SourceLanguage::Go;
@@ -90,7 +125,9 @@ CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
     I.Producer = CompilerProducer::Clang;
     I.Language = IsCpp ? SourceLanguage::Cpp : SourceLanguage::C;
     I.Evidence.emplace_back("LLVM/Clang symbol or section");
-  } else if (HasMsvc || hasImport(PE, "__CxxFrameHandler")) {
+  } else if (HasMsvc || hasImport(PE, "__CxxFrameHandler") ||
+             hasImport(PE, "VCRUNTIME") || hasImport(PE, "MSVCRT") ||
+             hasSection(PE, ".fptable")) {
     I.Producer = CompilerProducer::Msvc;
     I.Language = IsCpp ? SourceLanguage::Cpp : SourceLanguage::C;
     I.Evidence.emplace_back("MSVC Rich-header or runtime evidence");
@@ -99,6 +136,11 @@ CompilerInfo detect(const PeFile &PE, const std::vector<std::string> &Symbols) {
   CompilerBuildTraits &T = I.Traits;
   if (HasLto) { T.Lto = true; I.Evidence.emplace_back("Rich-header LTCG product id"); }
   if (HasPgo) { T.Pgo = true; I.Evidence.emplace_back("Rich-header PGO product id"); }
+  // LLVM PGO (clang -fprofile-use) keeps .lprfc/.lprfn sections.
+  if (!HasPgo && (hasSectionPrefix(PE, ".lprfc") || hasSectionPrefix(PE, ".lprfn"))) {
+    T.Pgo = true;
+    I.Evidence.emplace_back("LLVM PGO counter sections (.lprfc/.lprfn)");
+  }
   if (hasText(Symbols, "__security_cookie") ||
       hasImport(PE, "__security_check_cookie") || hasImport(PE, "__stack_chk_fail") ||
       hasImport(PE, "__stack_chk_guard")) {
