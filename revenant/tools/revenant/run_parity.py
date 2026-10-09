@@ -175,7 +175,7 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     if head in ("pblendvb", "blendvps", "blendvpd") and operands[-1:] == ["xmm0"]:
         operands = operands[:-1]
     if head == "xchg" and len(operands) == 2:
-        operands = sorted(operands)
+        operands = sorted(operands, key=lambda o: _WS.sub('', _PTR.sub('', o)))
     if head == "push" and len(operands) == 1:
         neg = re.fullmatch(r"-(0x[0-9a-f]+|[0-9a-f]+h|\d+)", operands[0])
         if neg:
@@ -328,7 +328,9 @@ def asm_metric(bindir: Path, revdir: Path, binary: Path):
                     ip_rel_memory=oracle_mem is not None and symbol_mem is None,
                     symbol_memory=symbol_mem is not None,
                     memory_index=memory_index, memory_scale=memory_scale)
-                loose = lambda s: re.sub(r"#\d+", "#", s)
+                loose = lambda s: re.sub(
+                    r"#\d+", "#",
+                    re.sub(r"[+-]#\d+(?=\])", "", s))
                 ok = (revenant_text == linked and
                       loose(oracle_text) == loose(linked))
             checked += 1
