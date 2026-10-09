@@ -26,3 +26,9 @@ their owning `Program` code ranges, lifted with the MSVC frame pointer in
 `rdx`, and inlined into catch or cleanup pads. A catch funclet's constant
 `rax` continuation selects the parent block when the lifted body exposes one.
 The Clang frontend turns the native pads into C++ try/catch or SEH constructs.
+
+For Itanium LSDA call sites, positive action filters retain their RTTI
+descriptor and decoded type name. Lifting emits those descriptors as landingpad
+catch clauses and consumes matched exceptions with the `__cxa_begin_catch` /
+`__cxa_end_catch` sequence; the C++ frontend uses the recovered Itanium type
+name when spelling the catch declaration.

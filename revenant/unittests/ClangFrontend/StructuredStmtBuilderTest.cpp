@@ -356,6 +356,52 @@ TEST(StructuredStmtBuilderTest, TryCatch) {
   EXPECT_NE(S.find("catch (const ::std::runtime_error &e)"),
             std::string::npos);
 }
+TEST(StructuredStmtBuilderTest, ItaniumTryCatch) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_itanium_try", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  auto *Ptr = llvm::PointerType::getUnqual(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "may_throw_itanium", M);
+  llvm::Function *Pers = llvm::Function::Create(
+      llvm::FunctionType::get(I32, true), llvm::GlobalValue::ExternalLinkage,
+      "__gxx_personality_seh0", M);
+  llvm::Function *BeginCatch = llvm::Function::Create(
+      llvm::FunctionType::get(Ptr, {Ptr}, false),
+      llvm::GlobalValue::ExternalLinkage, "__cxa_begin_catch", M);
+  llvm::Function *EndCatch = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(C), {}, false),
+      llvm::GlobalValue::ExternalLinkage, "__cxa_end_catch", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_itanium_try", M);
+  F->setPersonalityFn(Pers);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_8100", F);
+  llvm::BasicBlock *Normal = BasicBlock::Create(C, "bb_8110", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_8120", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateInvoke(Callee->getFunctionType(), Callee, Normal, Dispatch, {X});
+  B.SetInsertPoint(Normal);
+  B.CreateRet(llvm::ConstantInt::get(I32, 0));
+  B.SetInsertPoint(Dispatch);
+  auto *LP = B.CreateLandingPad(
+      llvm::StructType::get(C, {Ptr, I32}), 1, "eh.lpad");
+  LP->addClause(llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(C), 0x140010000), Ptr));
+  LP->setMetadata("revenant.catchtype",
+                  MDNode::get(C, MDString::get(C, "St9exception")));
+  auto *ExceptionObject = B.CreateExtractValue(LP, 0);
+  B.CreateCall(BeginCatch, {ExceptionObject});
+  B.CreateCall(EndCatch);
+  B.CreateBr(Normal);
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("try"), std::string::npos);
+  EXPECT_NE(S.find("catch (const ::std::exception &e)"),
+            std::string::npos);
+}
 
 TEST(StructuredStmtBuilderTest, SehTryExcept) {
   LLVMContext &C = ctx();
