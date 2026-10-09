@@ -444,21 +444,6 @@ bool rewrite(Function &F, const LoopShape &S) {
   for (Instruction &LI : *L)
     for (Value *Op : LI.operands())
       Work.push_back(Op);
-  // Latch-local clones (their name ends in ".ut", from splitSelfLoop)
-  // already compute the matching header def: record the mapping so the
-  // walk prefers the clone over moving the original out of H.
-  DenseMap<Instruction *, Value *> ClonePref;
-  for (Instruction &LI : *L) {
-    StringRef N = LI.getName();
-    StringRef Base;
-    if (!N.consume_back(".ut"))
-      continue;
-    Base = N;
-    for (Instruction &HI : *H)
-      if (HI.getName() == Base && HI.getType() == LI.getType() &&
-          HI.getOpcode() == LI.getOpcode())
-        ClonePref[&HI] = &LI;
-  }
   SmallVector<Instruction *, 16> ToMove;
   DenseMap<Instruction *, Value *> PhiRepl;
   while (!Work.empty()) {
@@ -472,26 +457,24 @@ bool rewrite(Function &F, const LoopShape &S) {
       Work.push_back(Repl);
       continue;
     }
-    // A latch clone already computes this def: use the clone, and visit
-    // the clone's operands (already rewritten) instead of moving.
-    auto ItC = ClonePref.find(I);
-    if (ItC != ClonePref.end()) {
-      PhiRepl[I] = ItC->second;
-      continue;
-    }
     Moved.insert(I);
     ToMove.push_back(I);
     for (Value *Op : I->operands())
       Work.push_back(Op);
   }
-  // Insert moved defs before the first non-phi of L (keep L's own order); a
-  // latch that held only its terminator is empty now, so they go at the end.
-  Instruction *Anchor = L->getFirstNonPHI();
-  BasicBlock::iterator At = Anchor ? Anchor->getIterator() : L->end();
-  for (Instruction *I : llvm::reverse(ToMove))
+  // Header order is already topological. A reverse worklist order is not:
+  // shared dependencies can be visited before another user is discovered.
+  // Do not infer clone identity from instruction names, which are optional.
+  // Needed originals dominate the existing latch clones when inserted first.
+  SmallPtrSet<Instruction *, 16> Needed(ToMove.begin(), ToMove.end());
+  SmallVector<Instruction *, 16> Ordered;
+  for (Instruction &I : *H)
+    if (Needed.contains(&I))
+      Ordered.push_back(&I);
+  BasicBlock::iterator At = L->getFirstNonPHIIt();
+  for (Instruction *I : Ordered)
     I->moveBefore(*L, At);
-  // Rewrite L operands: header phis -> entry values, moved originals ->
-  // their latch clones.
+  // Rewrite header PHIs to the values supplied by the entry edge.
   SmallVector<Instruction *, 16> Fix;
   for (Instruction &FI : *L)
     Fix.push_back(&FI);
