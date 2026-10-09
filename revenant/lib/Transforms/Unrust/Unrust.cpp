@@ -112,41 +112,76 @@ bool isRustModule(const Function &F) {
 }
 
 bool isPanicBoundsCheckName(StringRef N) {
-  return N.contains("panic_bounds_check");
+  // The bounds family: `data[i]` panics through panic_bounds_check, the
+  // slice Index impl through slice_index_fail, and str slicing through
+  // slice_error_fail. All three take the (len, index) pair.
+  return N.contains("panic_bounds_check") || N.contains("slice_index_fail") ||
+         N.contains("slice_error_fail");
 }
 
 bool isPanicName(StringRef N) {
   // Matches core::panicking::{panic,panic_fmt,panic_bounds_check}, the
-  // user `panic_path` shape, and test-shim panics (my_panic); narrow
-  // enough that C++ abort/unreachable idioms never match.
-  return N.contains("panicking") || N.contains("panic_bounds_check") ||
-         N.contains("panic_fmt") || N.contains("panic");
+  // user `panic_path` shape, unwrap/slice failures, and test-shim panics
+  // (my_panic); narrow enough that C++ abort/unreachable idioms never
+  // match.
+  return isPanicBoundsCheckName(N) || N.contains("panicking") ||
+         N.contains("panic_fmt") || N.contains("unwrap_failed") ||
+         N.contains("panic");
 }
 
+// A dedicated panic block: one call plus `unreachable`, nothing else.
+// Lifted IR cannot always name the callee (sigs recover
+// core::panicking::* often but not always), so the noreturn-call shape
+// is the witness: a call whose block ends in `unreachable` and holds no
+// other effect is the tail of a panic path. Named panic callees match
+// directly; an unnamed direct callee (a `sub_<VA>` declaration) matches
+// on shape. `revenant.asm.jmp` tails also end in unreachable but carry
+// the opaque marker and are excluded.
+bool isPanicPathBlock(const BasicBlock *BB) {
+  if (BB->size() > 2)
+    return false;
+  if (!isa<UnreachableInst>(BB->getTerminator()))
+    return false;
+  const Instruction *First = nullptr;
+  for (const Instruction &I : *BB) {
+    if (isa<PHINode>(&I))
+      continue;
+    First = &I;
+    break;
+  }
+  const auto *CB = dyn_cast_or_null<CallBase>(First);
+  if (!CB || hasOpaqueMarker(*CB))
+    return false;
+  const Function *C = CB->getCalledFunction();
+  if (!C)
+    return false;
+  if (isPanicName(C->getName()))
+    return true;
+  // Unnamed lift callee: a declaration named sub_<VA> (or an import the
+  // sigs left anonymous). The unreachable terminator says noreturn, and
+  // in a rust module the noreturn callees are the panic family.
+  return C->isDeclaration();
+}
+
+// A block reaches a panic path when it is one, or when a single
+// unconditional edge leads to one (the lifter's critical-edge blocks).
+bool blockReachesPanicPath(const BasicBlock *BB) {
+  if (isPanicPathBlock(BB))
+    return true;
+  auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+  if (!BI || !BI->isUnconditional())
+    return false;
+  return isPanicPathBlock(BI->getSuccessor(0));
+}
+
+// The function still panics on a bounds check: a call to a bounds-family
+// callee (panic_bounds_check / slice_index_fail / slice_error_fail), or a
+// dedicated panic block (the lifted spelling, where the callee is named
+// or the noreturn-call shape names it).
 bool callsPanicBoundsCheck(const Function &F) {
-  for (const BasicBlock &BB : F)
-    for (const Instruction &I : BB) {
-      if (hasOpaqueMarker(I))
-        continue;
-      if (auto *CI = dyn_cast<CallInst>(&I)) {
-        const Function *C = CI->getCalledFunction();
-        if (!C)
-          continue;
-        if (isPanicBoundsCheckName(C->getName()))
-          return true;
-      } else if (auto *II = dyn_cast<InvokeInst>(&I)) {
-        const Function *C = II->getCalledFunction();
-        if (!C)
-          continue;
-        if (isPanicBoundsCheckName(C->getName()))
-          return true;
-      }
-    }
-  return false;
-}
-
-bool callsOverflowPanic(const Function &F) {
-  for (const BasicBlock &BB : F)
+  for (const BasicBlock &BB : F) {
+    if (isPanicPathBlock(&BB))
+      return true;
     for (const Instruction &I : BB) {
       if (hasOpaqueMarker(I))
         continue;
@@ -154,11 +189,30 @@ bool callsOverflowPanic(const Function &F) {
       if (!CB)
         continue;
       const Function *C = CB->getCalledFunction();
-      if (!C)
-        continue;
-      if (isPanicName(C->getName()))
+      if (C && isPanicBoundsCheckName(C->getName()))
         return true;
     }
+  }
+  return false;
+}
+
+// The function still panics on overflow: a call to a panic callee, or a
+// dedicated panic block (the lifted spelling of the panic edge).
+bool callsOverflowPanic(const Function &F) {
+  for (const BasicBlock &BB : F) {
+    if (isPanicPathBlock(&BB))
+      return true;
+    for (const Instruction &I : BB) {
+      if (hasOpaqueMarker(I))
+        continue;
+      const auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      const Function *C = CB->getCalledFunction();
+      if (C && isPanicName(C->getName()))
+        return true;
+    }
+  }
   return false;
 }
 
@@ -167,13 +221,11 @@ bool callsOverflowPanic(const Function &F) {
 // (ult idx len -> ugt len idx) when it threads range facts; flipping it
 // back is a pure predicate rename with swapped operands, provably the
 // same boolean. Only rewrites compares that feed a conditional branch
-// whose false edge reaches a panic_bounds_check block (or when the
-// function still calls panic_bounds_check anywhere: the check was
-// deleted but the shape facts survive). samesign/nneg markers are
-// dropped back to the plain predicate: removing poison markers only
-// removes refinement.
-bool canonicalizeBoundsPredicates(Function &F, bool HasPanicCall,
-                                  unsigned &Changed) {
+// whose false edge reaches a panic path: a dedicated panic block, named
+// (panic_bounds_check / slice_index_fail / slice_error_fail) or the
+// lifted noreturn-call shape. samesign/nneg markers are dropped back to
+// the plain predicate: removing poison markers only removes refinement.
+bool canonicalizeBoundsPredicates(Function &F, unsigned &Changed) {
   bool Any = false;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
@@ -186,43 +238,16 @@ bool canonicalizeBoundsPredicates(Function &F, bool HasPanicCall,
       auto *BI = dyn_cast<BranchInst>(Cmp->getParent()->getTerminator());
       if (!BI || !BI->isConditional() || BI->getCondition() != Cmp)
         continue;
-      // False edge must reach a panic block, or the function must still
-      // call panic_bounds_check (deleted-check shape: the compare
-      // survives only as range-implied facts in a loop header or an
-      // assume). Without either, this is a generic unsigned compare.
+      // The false edge must reach a panic path: a dedicated panic block
+      // (the call + unreachable shape, named callee or the lifted
+      // noreturn-call spelling) or, through one trivial edge, another
+      // block that is one. Without it this is a generic unsigned
+      // compare: pure range-check idioms (char-boundary tests like
+      // `ult %c, 128`) leave them, samesign and all.
       bool FalseHitsPanic = false;
-      for (BasicBlock *Succ : BI->successors()) {
-        for (Instruction &SI : *Succ) {
-          if (hasOpaqueMarker(SI))
-            continue;
-          if (auto *CB = dyn_cast<CallBase>(&SI)) {
-            const Function *C = CB->getCalledFunction();
-            if (C && isPanicBoundsCheckName(C->getName()))
-              FalseHitsPanic = true;
-          }
-          if (isa<UnreachableInst>(&SI) && Succ->size() <= 3)
-            FalseHitsPanic = FalseHitsPanic || HasPanicCall;
-        }
-        // One-block lookahead through a trivial forward edge.
-        if (Succ->size() <= 2 && isa<BranchInst>(Succ->getTerminator())) {
-          auto *Next = dyn_cast<BranchInst>(Succ->getTerminator());
-          if (Next && Next->isUnconditional()) {
-            BasicBlock *T = Next->getSuccessor(0);
-            for (Instruction &SI : *T) {
-              if (auto *CB = dyn_cast<CallBase>(&SI)) {
-                const Function *C = CB->getCalledFunction();
-                if (C && isPanicBoundsCheckName(C->getName()))
-                  FalseHitsPanic = true;
-              }
-            }
-          }
-        }
-      }
-      // Pure range-check idioms (char-boundary tests like `ult %c, 128`)
-      // never touch a panic block: leave them, samesign and all. Only
-      // compares whose false edge can reach a panic get the plain
-      // predicate back (removing poison markers only removes
-      // refinement).
+      for (BasicBlock *Succ : BI->successors())
+        if (blockReachesPanicPath(Succ))
+          FalseHitsPanic = true;
       if (!FalseHitsPanic)
         continue;
       bool DroppedFlags = false;
@@ -230,19 +255,32 @@ bool canonicalizeBoundsPredicates(Function &F, bool HasPanicCall,
         Cmp->setSameSign(false);
         DroppedFlags = true;
       }
-      // Canonicalize ugt/uge (len vs idx) back to ult/ule (idx vs len).
+      // Canonicalize the flipped spellings back toward the rustc form
+      // `icmp ult idx, len` (true = in bounds). `ugt len, idx` and
+      // `uge len, idx` swap operands and predicate with the same
+      // boolean; `ule len, idx` (len <= idx, the panic condition) also
+      // negates, so its branch successors swap.
       ICmpInst::Predicate P = Cmp->getPredicate();
       ICmpInst::Predicate Want = ICmpInst::BAD_ICMP_PREDICATE;
+      bool Negated = false;
       if (P == ICmpInst::ICMP_UGT)
         Want = ICmpInst::ICMP_ULT;
       else if (P == ICmpInst::ICMP_UGE)
         Want = ICmpInst::ICMP_ULE;
+      else if (P == ICmpInst::ICMP_ULE)
+        Want = ICmpInst::ICMP_ULT, Negated = true;
       if (Want != ICmpInst::BAD_ICMP_PREDICATE) {
         Value *A = Cmp->getOperand(0);
         Value *B = Cmp->getOperand(1);
         Cmp->setOperand(0, B);
         Cmp->setOperand(1, A);
         Cmp->setPredicate(Want);
+        if (Negated) {
+          BasicBlock *T = BI->getSuccessor(0);
+          BasicBlock *E = BI->getSuccessor(1);
+          BI->setSuccessor(0, E);
+          BI->setSuccessor(1, T);
+        }
         ++Changed;
         Any = true;
       } else if (DroppedFlags) {
@@ -864,7 +902,7 @@ PreservedAnalyses revenant::UnrustPass::run(Function &F,
   bool HasPanicCall = callsPanicBoundsCheck(F);
   bool HasOverflowPanic = callsOverflowPanic(F);
 
-  canonicalizeBoundsPredicates(F, HasPanicCall, Changed);
+  canonicalizeBoundsPredicates(F, Changed);
   materializeAssumeCompares(F, HasPanicCall, Changed);
   rebuildOverflowChecks(F, HasOverflowPanic, Changed);
   restoreNicheTests(F, Changed);
