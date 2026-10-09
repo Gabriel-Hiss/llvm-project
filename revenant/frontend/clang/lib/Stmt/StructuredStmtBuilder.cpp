@@ -204,10 +204,16 @@ LabelDecl *StructuredStmtBuilder::labelFor(BasicBlock *BB) {
   if (It != Labels.end())
     return It->second;
   StringRef BlockName = BB->getName();
-  std::string Name = BlockName.empty()
-                         ? "L_anon" + Twine(Labels.size()).str()
-                         : labelName(*BB);
+  std::string FunctionName = FD->getNameAsString();
+  for (char &C : FunctionName)
+    if (!isAlnum(C) && C != '_')
+      C = '_';
+  std::string Name =
+      FunctionName + "_" +
+      (BlockName.empty() ? "L_anon" + Twine(Labels.size()).str()
+                         : labelName(*BB));
   IdentifierInfo *II = Ctx.ident(Name);
+
   if (LabelNames.contains(II)) {
     Name += "_" + Twine(Labels.size()).str();
     II = Ctx.ident(Name);

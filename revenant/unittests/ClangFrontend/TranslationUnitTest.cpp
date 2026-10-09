@@ -164,3 +164,30 @@ TEST(TranslationUnitTest, DeclaresCalleesBeforeWholeUnitDefinitions) {
   EXPECT_EQ(Source.count("caller("), 2u);
   EXPECT_EQ(Source.count("callee("), 2u);
 }
+
+TEST(TranslationUnitTest, EmitsInfinityWithoutNonportableInfToken) {
+  LLVMContext Context;
+  Module M("infinity", Context);
+  M.setTargetTriple("x86_64-pc-windows-msvc");
+  Function *F = Function::Create(
+      FunctionType::get(Type::getDoubleTy(Context), false),
+      Function::ExternalLinkage, "infinity_value", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", F);
+  IRBuilder<> Builder(Entry);
+  Builder.CreateRet(ConstantFP::getInfinity(Type::getDoubleTy(Context)));
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  ASSERT_TRUE(TUOrErr) << toString(TUOrErr.takeError());
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  SmallString<256> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  EXPECT_EQ(StringRef(OS.str()).find("Inf"), StringRef::npos);
+}

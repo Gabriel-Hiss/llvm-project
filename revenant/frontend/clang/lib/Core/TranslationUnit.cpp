@@ -29,6 +29,8 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/Error.h"
+#include <unordered_set>
+
 
 using llvm::APInt;
 using llvm::ArrayRef;
@@ -209,8 +211,13 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = DI ? Types.typeOfDI(DI)
-                            : Types.typeOf(AI->getAllocatedType(), nullptr);
+        // The allocated LLVM object determines storage shape: a debug type
+        // may describe the address held by an alloca (e.g. `char *frame`)
+        // while the alloca itself is the backing byte array.
+        c::QualType LT = AI->getAllocatedType()->isArrayTy()
+                             ? Types.typeOf(AI->getAllocatedType(), nullptr)
+                             : (DI ? Types.typeOfDI(DI)
+                                   : Types.typeOf(AI->getAllocatedType(), nullptr));
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
@@ -289,16 +296,26 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
+  std::unordered_set<std::string> PrintedRecords;
   for (unsigned Pass = 0; Pass != 3; ++Pass) {
     for (c::Decl *D : TU->decls()) {
       if (D->isImplicit())
         continue;
       auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
-      bool IsRecord = llvm::isa<c::RecordDecl>(D);
+      auto *Record = llvm::dyn_cast<c::RecordDecl>(D);
+      bool IsRecord = Record != nullptr;
       bool HasBody = FD && FD->doesThisDeclarationHaveABody();
       if ((Pass == 0 && !IsRecord) || (Pass == 1 && !FD) ||
           (Pass == 2 && (IsRecord || (FD && !HasBody))))
         continue;
+      if (Pass == 0 && Record->isCompleteDefinition() &&
+          !Record->getName().empty()) {
+        std::string Key =
+            (Record->isUnion() ? "union " : "struct ") +
+            Record->getNameAsString();
+        if (!PrintedRecords.insert(std::move(Key)).second)
+          continue;
+      }
       if (Pass == 1 && HasBody) {
         prototypeFor(FD, TU->getASTContext())
             ->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);

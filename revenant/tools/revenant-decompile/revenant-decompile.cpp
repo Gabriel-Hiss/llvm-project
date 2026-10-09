@@ -154,8 +154,8 @@ static cl::opt<bool> Patterns("patterns",
 static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
 static cl::opt<std::string>
     LibraryDB("libdb",
-              cl::desc("static-library database (default: libdb.json next to "
-                       "the executable)"),
+              cl::desc("static-library match database (default: optional "
+                       "libdb.json next to the executable)"),
               cl::value_desc("file"));
 static std::optional<EmitKind> emitKind(StringRef S) {
   return StringSwitch<std::optional<EmitKind>>(S)
@@ -189,6 +189,8 @@ int main(int Argc, char **Argv) {
         sys::fs::getMainExecutable(Argv[0], reinterpret_cast<void *>(&main)));
     LibraryDBPath = sys::path::parent_path(ExePath);
     sys::path::append(LibraryDBPath, "libdb.json");
+    if (!sys::fs::exists(LibraryDBPath))
+      LibraryDBPath.clear();
   }
 
   EmitKind Emit = EmitKind::Source;
@@ -229,6 +231,7 @@ int main(int Argc, char **Argv) {
     std::map<Va, std::string> LibraryNames;
     std::optional<Va> UserEntry;
     std::set<Va> Startup;
+    std::set<Va> UserReachable;
     if (ClassifyFuncs) {
       auto DBOrErr = LibraryDatabase::load(LibraryDBPath);
       if (!DBOrErr) {
@@ -266,9 +269,43 @@ int main(int Argc, char **Argv) {
           for (const Instr &I : FOrErr->Instrs) {
             if (!I.HasTarget || !S->program().Functions.count(I.Target))
               continue;
-            if (I.Flow == FlowKind::Call ||
-                (I.Flow == FlowKind::Branch && I.Target != *UserEntry))
+            if (I.Target != *UserEntry &&
+                (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
               Pending.push(I.Target);
+          }
+        }
+      }
+      std::queue<Va> UserPending;
+      UserPending.push(*UserEntry);
+      while (!UserPending.empty()) {
+        Va At = UserPending.front();
+        UserPending.pop();
+        if (LibraryStarts.count(At) || !UserReachable.insert(At).second)
+          continue;
+        auto FOrErr = S->materialize(At);
+        if (!FOrErr) {
+          consumeError(FOrErr.takeError());
+          continue;
+        }
+        for (const Instr &I : FOrErr->Instrs) {
+          if (I.HasTarget && S->program().Functions.count(I.Target) &&
+              (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
+            UserPending.push(I.Target);
+          // LEA-based function pointers are not call edges, but still make
+          // the target part of the user program's reachable code.
+          if (I.HasMemTarget &&
+              S->program().Functions.count(I.MemTarget))
+            UserPending.push(I.MemTarget);
+
+          // Address-taken functions in hand-written dispatch tables may only
+          // appear as absolute immediates, not direct call edges.
+          for (unsigned OpIdx = 0; OpIdx < I.Inst.getNumOperands(); ++OpIdx) {
+            const llvm::MCOperand &Operand = I.Inst.getOperand(OpIdx);
+            if (!Operand.isImm() || Operand.getImm() < 0)
+              continue;
+            Va Target(static_cast<uint64_t>(Operand.getImm()));
+            if (S->program().Functions.count(Target))
+              UserPending.push(Target);
           }
         }
       }
@@ -282,12 +319,12 @@ int main(int Argc, char **Argv) {
       outs() << format_hex(Start.Value, 0) << "\t" << Name << "\t";
       if (!ClassifyFuncs)
         outs() << Rec.InstrRvas.size() << " instrs\n";
+      else if (UserReachable.count(Start))
+        outs() << "user\n";
       else if (Startup.count(Start))
         outs() << "startup\n";
-      else if (LibraryStarts.count(Start))
-        outs() << "library\n";
       else
-        outs() << "user\n";
+        outs() << "library\n";
     }
     return 0;
   }

@@ -366,9 +366,30 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
     // literal; here produce the canonical decimal literal.
     return buildIntegerLiteral(CI->getValue(), exprTypeOf(C));
   }
-  if (auto *CF = llvm::dyn_cast<llvm::ConstantFP>(C))
-    return clang::FloatingLiteral::Create(*AST, CF->getValueAPF(), true,
-                                          exprTypeOf(C), SourceLocation());
+  if (auto *CF = llvm::dyn_cast<llvm::ConstantFP>(C)) {
+    const llvm::APFloat &Value = CF->getValueAPF();
+    clang::QualType Ty = exprTypeOf(C);
+    if (Value.isInfinity()) {
+      clang::SourceLocation L;
+      clang::Expr *Numerator = clang::FloatingLiteral::Create(
+          *AST, llvm::APFloat(1.0), true, AST->DoubleTy, L);
+      clang::Expr *Denominator = clang::FloatingLiteral::Create(
+          *AST, llvm::APFloat(0.0), true, AST->DoubleTy, L);
+      clang::Expr *Infinity = clang::BinaryOperator::Create(
+          *AST, Numerator, Denominator, clang::BO_Div, AST->DoubleTy,
+          clang::VK_PRValue, clang::OK_Ordinary, L, clang::FPOptionsOverride());
+      if (Value.isNegative())
+        Infinity = clang::UnaryOperator::Create(
+            *AST, Infinity, clang::UO_Minus, AST->DoubleTy, clang::VK_PRValue,
+            clang::OK_Ordinary, L, /*CanOverflow=*/false,
+            clang::FPOptionsOverride());
+      return Ty == AST->DoubleTy
+                 ? Infinity
+                 : makeImplicit(Ty, clang::CK_FloatingCast, Infinity);
+    }
+    return clang::FloatingLiteral::Create(*AST, Value, true, Ty,
+                                          SourceLocation());
+  }
   if (llvm::isa<llvm::ConstantPointerNull>(C)) {
     // emit-cpp prints null pointers as `nullptr` in C++ mode, `(T*)0`
     // otherwise.
