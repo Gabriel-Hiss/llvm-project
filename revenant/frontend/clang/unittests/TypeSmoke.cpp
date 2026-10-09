@@ -1,6 +1,6 @@
 //===- TypeSmoke.cpp - reference-module type smoke test ---------*- C++ -*-===//
 //
-// Loads LunaIRContract's cpp-method.ll, runs RealTypeBuilder over it, and
+// Loads LunaIRContract's cpp-method.ll, runs the type builder over it, and
 // checks the contract-relevant facts: the vtable global has array type,
 // the method function type resolves, the record materializes with its
 // _vptr member, and the demangled method name recovers Klass::Method.
@@ -11,7 +11,6 @@
 
 #include "revenant/Clang/TypeBuilder.h"
 #include "revenant/Clang/FrontendContext.h"
-#include "RealTypeBuilder.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
@@ -93,11 +92,10 @@ int main(int argc, char **argv) {
 
   // 4. Register the vtable global (Core's job in production), then slot 0
   // must dispatch to the method named by the vtable initializer.
-  // This smoke target links the concrete TypeBuilder factory, so the
-  // downcast is static. RTTI is disabled for LLVM builds.
+  // Core's TypeBuilder interface registers the recovered vtable.
   if (auto *VTB = dyn_cast<GlobalVariable>(
           M->getNamedValue("??_7Klass@@6B@"))) {
-    static_cast<RealTypeBuilder *>(Types.get())->addVTable("Klass", VTB);
+    Types->addVTable("Klass", VTB);
   }
   const DISubprogram *Slot0 = Types->virtualMethod(Klass, 0);
   outs() << "slot0: " << (Slot0 ? Slot0->getName() : StringRef("<unknown>"))
