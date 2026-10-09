@@ -214,24 +214,37 @@ std::vector<LogOp> lift::logicalOps(const MCInst &MI, const MCInstrDesc &Desc) {
       return LogOpKind::Mem;
     return LogOpKind::Imm;
   };
+  auto logicalKindAt = [&](unsigned DescOp) {
+    LogOpKind K = kindAt(DescOp);
+    if (K == LogOpKind::Mem &&
+        MIPos + X86::AddrNumOperands > MI.getNumOperands()) {
+      const MCOperand &O = MI.getOperand(MIPos);
+      return O.isReg()    ? LogOpKind::Reg
+             : O.isExpr() ? LogOpKind::Invalid
+                          : LogOpKind::Imm;
+    }
+    return K;
+  };
 
   // outs: first NumDefs desc operands == first NumDefs MI operands (a def
   // memory operand still occupies the 5-operand group).
   for (unsigned D = 0; D < NumDefs && MIPos < MI.getNumOperands(); ++D) {
-    LogOpKind K = kindAt(D);
+    LogOpKind K = logicalKindAt(D);
     Out.push_back({K, MIPos});
     MIPos += (K == LogOpKind::Mem) ? X86::AddrNumOperands : 1;
+    if (K == LogOpKind::Mem)
+      D += X86::AddrNumOperands - 1;
   }
-  // ins: desc operands after the defs; tied uses collapse into their def
-  // and have no MI operand of their own.
+  // MCInst operands include tied inputs on decoded instructions, so account
+  // for each descriptor operand even when LLVM marks it tied to a def.
   for (unsigned D = NumDefs; D < Desc.NumOperands; ++D) {
-    if (Desc.getOperandConstraint(D, MCOI::TIED_TO) >= 0)
-      continue;
     if (MIPos >= MI.getNumOperands())
       break;
-    LogOpKind K = kindAt(D);
+    LogOpKind K = logicalKindAt(D);
     Out.push_back({K, MIPos});
     MIPos += (K == LogOpKind::Mem) ? X86::AddrNumOperands : 1;
+    if (K == LogOpKind::Mem)
+      D += X86::AddrNumOperands - 1;
   }
   // Variable operands: whatever is left.
   while (MIPos < MI.getNumOperands()) {
@@ -461,7 +474,8 @@ LiftState::LiftState(llvm::Module &M, llvm::Function &Fn, const Program &P,
 
 llvm::AllocaInst *LiftState::entryAlloca(llvm::Type *Ty,
                                          llvm::StringRef Name) {
-  llvm::IRBuilder<> EB(&*Fn.getEntryBlock().getFirstInsertionPt());
+  llvm::IRBuilder<> EB(Fn.getEntryBlock().getContext());
+  EB.SetInsertPoint(&Fn.getEntryBlock(), Fn.getEntryBlock().begin());
   return EB.CreateAlloca(Ty, nullptr, Name);
 }
 
@@ -810,7 +824,8 @@ Value *LiftState::globalPtr(Va Addr) {
     Sz = 16;
   auto *G = new GlobalVariable(
       Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/!!Init,
-      GlobalValue::InternalLinkage, nullptr, Name);
+      Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
+      nullptr, Name);
   if (Init) {
     SmallVector<Constant *, 16> Vals;
     Vals.reserve(Init->size());
@@ -1056,15 +1071,6 @@ Value *LiftState::condFor(unsigned CC, Va JccVa) {
   if (Prod) {
     FlagProd P2 = *Prod;
     Prod.reset();
-    // If this jcc guards a jump table, the producer's compared operand is
-    // the table index — remember it for emitSwitch.
-    Value *A = nullptr;
-    if (P2.K == FlagProd::Cmp)
-      A = P2.A;
-    else if (P2.K == FlagProd::Arith)
-      A = P2.A ? P2.A : P2.Res;
-    if (A)
-      SwOperand = {JccVa, A};
     if (auto C = fuseCond(CC, P2))
       return *C;
   }
@@ -1126,18 +1132,19 @@ std::string lift::mnemonicOf(const Instr &I, const Disasm &D) {
   std::string Text = D.format(I, {});
   // First non-prefix token, lowercased.
   StringRef T(Text);
-  T = T.trim();
   std::string Mn;
   while (!T.empty()) {
-    auto Tok = T.split(' ');
-    StringRef W = Tok.first.trim();
+    size_t Split = T.find_first_of(" \t");
+    StringRef W = T.take_front(Split).trim();
     if (!W.empty() && W != "rep" && W != "repe" && W != "repz" &&
         W != "repne" && W != "repnz" && W != "lock" && W != "rex64" &&
-        W != "data16")
+        W != "data16") {
       Mn = W.lower();
-    T = Tok.second;
-    if (!Mn.empty())
       break;
+    }
+    if (Split == StringRef::npos)
+      break;
+    T = T.drop_front(Split + 1).trim();
   }
   if (Mn.empty())
     Mn = X86MCTools::get().MII->getName(I.Inst.getOpcode()).lower();

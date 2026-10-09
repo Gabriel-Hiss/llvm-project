@@ -42,6 +42,14 @@ ninja -C <worktree>/build-rv revenant RevenantUnitTests
 Clang is optional: only `frontend/clang` needs it.
 Never reconfigure or rebuild `build-revenant` itself.
 
+## Lift tests
+
+`RevenantLiftTests` checks function lifting and cleanup verification. Its corpus
+test runs full analysis and CFG lifting for every discovered function in
+`c-o0.exe`, `c-o2.exe`, `cpp-o2.exe`, `c-clang-o2.exe`, and `c-gcc-o2.exe`.
+It reports verification totals, failure categories, and opaque fallback
+mnemonic counts for each binary.
+
 ## Adding a slice
 
 Drop a `CMakeLists.txt` into `lib/<Area>` (use `add_llvm_library`),
