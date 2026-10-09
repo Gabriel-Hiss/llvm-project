@@ -162,6 +162,11 @@ through `APInt::getSExtValue`. Constant differences use 65-bit arithmetic
 and must fit signed 64 bits before the model consumes them. The minimum
 signed stride also vetoes the candidate because its magnitude cannot fit.
 
+Untailrec moves required header definitions into the recursive call block
+in their original instruction order. Shared dependencies stay before
+every user. It does not match split-latch clones by instruction name:
+unnamed numeric SSA values have empty names, so names cannot identify them.
+
 The engine verifies every function after each function pass. If a pass
 produces invalid IR, it restores the previous body, reports the function,
 stage and pass, and continues with the next pass. A returned lift error
