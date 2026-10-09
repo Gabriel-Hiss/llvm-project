@@ -50,7 +50,7 @@ entry:
   ret i64 %use
 }
 ; CHECK-LABEL: define i32 @vector_back
-; CHECK: call i32 @revenant.cxx.vector.back(ptr %v)
+; CHECK: call ptr @revenant.cxx.vector.back(ptr %v)
 
 define i32 @vector_back(ptr %v) {
 entry:
@@ -93,4 +93,20 @@ entry:
   %short = icmp ult i64 %cap, 16
   %result = select i1 %short, ptr %s, ptr %data
   ret ptr %result
+}
+; CHECK-LABEL: define i64 @vector_back_byte_offset
+; CHECK: call ptr @revenant.cxx.vector.back
+
+define i64 @vector_back_byte_offset(ptr %v) {
+entry:
+  %first.addr = getelementptr i8, ptr %v, i64 0
+  %last.addr = getelementptr i8, ptr %v, i64 8
+  %first = load ptr, ptr %first.addr, align 8
+  %last = load ptr, ptr %last.addr, align 8
+  %back.addr = getelementptr i8, ptr %last, i64 -16
+  %field.addr = getelementptr i8, ptr %back.addr, i64 8
+  %field = load i64, ptr %field.addr, align 8
+  %keep.shape = icmp ne ptr %first, %last
+  %result = select i1 %keep.shape, i64 %field, i64 0
+  ret i64 %result
 }

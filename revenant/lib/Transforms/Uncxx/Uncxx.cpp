@@ -87,6 +87,7 @@
 #include "llvm/Plugins/PassPlugin.h"
 #endif
 
+#include <algorithm>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -421,6 +422,55 @@ bool matchVectorBack(const DataLayout &DL, LoadInst *L, Value *&Vec) {
   return true;
 }
 
+bool hasVectorExtent(const DataLayout &DL, Value *Base, Function &F) {
+  if (containerKind(DL, Base, F) == 1)
+    return true;
+  SmallVector<LoadInst *, 4> Firsts, Lasts;
+  loadsAtField(DL, Base, VecFirst, Firsts);
+  loadsAtField(DL, Base, VecLast, Lasts);
+  Firsts.erase(std::remove_if(Firsts.begin(), Firsts.end(),
+                              [](LoadInst *L) {
+                                return !L->getType()->isPointerTy();
+                              }),
+               Firsts.end());
+  Lasts.erase(std::remove_if(Lasts.begin(), Lasts.end(),
+                             [](LoadInst *L) {
+                               return !L->getType()->isPointerTy();
+                             }),
+              Lasts.end());
+  if (Firsts.empty() || Lasts.empty())
+    return false;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+        if (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+            Cmp->getPredicate() != ICmpInst::ICMP_NE)
+          continue;
+        Value *A = stripPtr(Cmp->getOperand(0));
+        Value *B = stripPtr(Cmp->getOperand(1));
+        for (LoadInst *First : Firsts)
+          for (LoadInst *Last : Lasts)
+            if ((A == First && B == Last) || (A == Last && B == First))
+              return true;
+      }
+  return false;
+}
+
+bool matchVectorBackAddress(const DataLayout &DL, GetElementPtrInst *G,
+                            Value *&Vec, Function &F) {
+  auto *Last = dyn_cast<LoadInst>(stripPtr(G->getPointerOperand()));
+  if (!Last || !Last->getType()->isPointerTy())
+    return false;
+  auto R = rootOff(DL, Last->getPointerOperand());
+  if (!R || R->second != VecLast || !hasVectorExtent(DL, R->first, F))
+    return false;
+  auto Offset = gepByteOffset(DL, cast<GEPOperator>(G));
+  if (!Offset || *Offset >= 0 || *Offset < -4096)
+    return false;
+  Vec = R->first;
+  return true;
+}
+
 // string.size(): load of the size field (MSVC +16, gnu/libc++ +8).
 // The load must be the only string-field access feeding the value and
 // post-dominate any SSO branch (callers check allUsersInPureRange).
@@ -668,6 +718,18 @@ unsigned runScalarIdioms(Function &F, const DataLayout &DL, CxxFlavor Fl) {
           continue;
         }
         // vector.data / begin_ptr: bare first load.
+        if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+          if (matchVectorBackAddress(DL, G, Obj, F) &&
+              KnownFlavor && stableBase(Obj, F)) {
+            auto *C = emitCxxCall(*M, "vector.back", G->getType(),
+                                  {Obj}, G, G);
+            G->replaceAllUsesWith(C);
+            eraseIfDead(G);
+            ++N;
+            Any = true;
+            continue;
+          }
+        }
         if (auto *L = dyn_cast<LoadInst>(&I)) {
           if (L->isUnordered() && matchVectorData(DL, L, Obj) &&
               !isVectorEmptyOperand(DL, L)) {
