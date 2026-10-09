@@ -81,17 +81,6 @@ bool isEaxReg(const llvm::MCRegisterInfo &MRI, unsigned Reg) {
   return N == "eax";
 }
 
-/// First memory-operand group start, or -1. Real x86 instructions carry
-/// the 5-slot [base,scale,index,disp,seg] group flagged OPERAND_MEMORY.
-int memStart(const llvm::MCInstrDesc &Desc) {
-  unsigned N = Desc.getNumOperands();
-  if (N < 5)
-    return -1;
-  for (unsigned I = 0; I + 5 <= N; ++I)
-    if (Desc.operands()[I].OperandType == llvm::MCOI::OPERAND_MEMORY)
-      return (int)I;
-  return -1;
-}
 
 struct MemRef {
   bool Found = false;
@@ -102,23 +91,6 @@ struct MemRef {
   bool IndexIsReg = false;
 };
 
-MemRef memRefAt(const llvm::MCInst &M, int At) {
-  MemRef R;
-  if (At < 0 || (unsigned)At + 5 > M.getNumOperands())
-    return R;
-  const llvm::MCOperand &Base = M.getOperand(At + 0);
-  const llvm::MCOperand &Index = M.getOperand(At + 2);
-  const llvm::MCOperand &Disp = M.getOperand(At + 3);
-  if (!Base.isReg() || !Index.isReg() || !Disp.isImm())
-    return R;
-  R.Found = true;
-  R.Base = Base.getReg();
-  R.Index = Index.getReg();
-  R.Disp = Disp.getImm();
-  R.BaseIsReg = Base.getReg() != 0;
-  R.IndexIsReg = Index.getReg() != 0;
-  return R;
-}
 
 bool isPushName(llvm::StringRef N) {
   return N.starts_with("PUSH");

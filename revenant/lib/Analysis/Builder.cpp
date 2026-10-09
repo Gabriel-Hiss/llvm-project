@@ -12,6 +12,13 @@ namespace {
 
 using Range = std::pair<Va, Va>;
 
+Edge makeEdge(Va To, EdgeKind Kind) {
+  Edge E;
+  E.To = To;
+  E.Kind = Kind;
+  return E;
+}
+
 struct Builder {
   const Image &Img;
   const Disasm &Dis;
@@ -360,8 +367,8 @@ struct Builder {
             break;
           }
           EndKind = Foreign ? BlockEnd::TailCall : BlockEnd::Fallthrough;
-          Edges.push_back({IP, Foreign ? EdgeKind::TailCall
-                                       : EdgeKind::Fallthrough});
+          Edges.push_back(makeEdge(
+              IP, Foreign ? EdgeKind::TailCall : EdgeKind::Fallthrough));
           if (Foreign && !Img.inInlineData(IP))
             ForeignTargets.push_back(IP);
           else if (!Foreign)
@@ -371,7 +378,7 @@ struct Builder {
       }
       if (Bound && !inBound(IP)) {
         EndKind = BlockEnd::TailCall;
-        Edges.push_back({IP, EdgeKind::TailCall});
+        Edges.push_back(makeEdge(IP, EdgeKind::TailCall));
         break;
       }
       std::optional<Instr> MaybeI = Dis.decodeOne(IP);
@@ -418,7 +425,7 @@ struct Builder {
              return It != FunctionStarts.end() && *It < Next;
            }())) {
         EndKind = BlockEnd::TailCall;
-        Edges.push_back({IP, EdgeKind::TailCall});
+        Edges.push_back(makeEdge(IP, EdgeKind::TailCall));
         break;
       }
       InstrStarts.insert(IP);
@@ -443,14 +450,14 @@ struct Builder {
           const Va Target = I.Target;
           if (foreignTarget(Target) || !inBound(Target)) {
             ForeignTargets.push_back(Target);
-            Edges.push_back({Target, EdgeKind::TailCall});
+            Edges.push_back(makeEdge(Target, EdgeKind::TailCall));
           } else {
-            Edges.push_back({Target, EdgeKind::CondTaken});
+            Edges.push_back(makeEdge(Target, EdgeKind::CondTaken));
             enqueue(Target);
           }
         }
         if (enqueue(IP))
-          Edges.push_back({IP, EdgeKind::CondNotTaken});
+          Edges.push_back(makeEdge(IP, EdgeKind::CondNotTaken));
         goto done;
       case FlowKind::Branch:
         if (I.HasTarget) {
@@ -458,10 +465,10 @@ struct Builder {
           if (foreignTarget(Target) || !inBound(Target)) {
             ForeignTargets.push_back(Target);
             EndKind = BlockEnd::TailCall;
-            Edges.push_back({Target, EdgeKind::TailCall});
+            Edges.push_back(makeEdge(Target, EdgeKind::TailCall));
           } else {
             EndKind = BlockEnd::Branch;
-            Edges.push_back({Target, EdgeKind::Jump});
+            Edges.push_back(makeEdge(Target, EdgeKind::Jump));
             enqueue(Target);
           }
         } else {
@@ -550,7 +557,7 @@ struct Builder {
         Piece.End = Leader;
         Piece.InstrsBegin = First;
         Piece.InstrsEnd = Cut;
-        Piece.Edges.push_back({Leader, EdgeKind::Fallthrough});
+        Piece.Edges.push_back(makeEdge(Leader, EdgeKind::Fallthrough));
         Piece.EndKind = BlockEnd::Fallthrough;
         Piece.SwitchIndex = B.SwitchIndex;
         Out.push_back(std::move(Piece));

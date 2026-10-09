@@ -325,8 +325,7 @@ TEST(OrphanTest, IndexedDispatchRejected) {
 // call; into data it is a thunk and accepted.
 TEST(OrphanTest, RipSlotIntoCodeRejectedSlotIntoDataAccepted) {
   Env E;
-  E.addText(Va(0x140001000), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
-  E.addText(Va(0x140002000), std::vector<uint8_t>(0x100, 0x90));
+  E.addText(Va(0x140001000), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x90});
   E.addData(Va(0x140003000), 0x100);
   E.decode();
   // Slot at next_ip + 0 lands at 0x140001006 (executable): rejected.
