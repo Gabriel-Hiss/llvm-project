@@ -23,7 +23,6 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TargetOptions.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -169,24 +168,6 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
   }
 }
 
-static void collectLabels(c::Stmt *S, llvm::DenseSet<c::LabelDecl *> &Defined,
-                          llvm::DenseSet<c::LabelDecl *> &Used) {
-  if (!S)
-    return;
-  if (auto *L = llvm::dyn_cast<c::LabelStmt>(S))
-    Defined.insert(L->getDecl());
-  if (auto *G = llvm::dyn_cast<c::GotoStmt>(S))
-    Used.insert(G->getLabel());
-  for (c::Stmt *Child : S->children())
-    collectLabels(Child, Defined, Used);
-}
-
-/// True when every goto in `Body` has a label statement in the same body.
-static bool gotosResolve(c::Stmt *Body) {
-  llvm::DenseSet<c::LabelDecl *> Defined, Used;
-  collectLabels(Body, Defined, Used);
-  return llvm::all_of(Used, [&](c::LabelDecl *L) { return Defined.count(L); });
-}
 
 static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
                           TypeBuilder &Types, StmtBuilder &Stmts,
@@ -245,17 +226,6 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
   c::CompoundStmt *Body = Stmts.buildBody(F, FD, Exprs, Scope);
   SmallVector<llvm::Instruction *, 16> Temps(Scope.PendingTemps.begin(),
                                              Scope.PendingTemps.end());
-  if (!gotosResolve(Body)) {
-    // A region swallowed a block that a goto still targets. The flat
-    // label + goto body is complete for any CFG, so rebuild this function
-    // with it, starting from unbound temporaries.
-    for (llvm::Instruction *I : Temps)
-      FCtx.forgetDecl(I);
-    GotoStmtBuilder Flat(FCtx, Types);
-    ExprScope FlatScope;
-    Body = Flat.buildBody(F, FD, Exprs, FlatScope);
-    Temps.assign(FlatScope.PendingTemps.begin(), FlatScope.PendingTemps.end());
-  }
   for (llvm::Instruction *I : Temps) {
     auto *VD = llvm::dyn_cast_or_null<c::VarDecl>(FCtx.lookupDecl(I));
     if (!VD)
