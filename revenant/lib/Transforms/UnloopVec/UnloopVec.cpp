@@ -1134,6 +1134,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     for (BasicBlock *ES : successors(L))
       if (ES != L)
         Stop.insert(ES);
+    for (BasicBlock &BB : F)
+      if (isa<ReturnInst>(BB.getTerminator()))
+        Stop.insert(&BB);
     DenseSet<BasicBlock *> R;
     if (!collectRegion(V, Stop, R, F)) {
       continue;
