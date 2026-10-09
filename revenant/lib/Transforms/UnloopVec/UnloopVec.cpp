@@ -1180,10 +1180,10 @@ bool scalarizeCountedWideMemory(Function &F) {
     IRBuilder<> B(Store);
     for (unsigned I = 0; I < VT->getNumElements(); ++I) {
       Value *Ptr = Store->getPointerOperand();
-      if (I)
+      if (I) {
         Ptr = B.CreateGEP(ElementTy, Ptr, B.getInt32(I));
-      if (auto *GEP = dyn_cast<Instruction>(Ptr))
-        copyVA(Store, GEP);
+        copyVA(Store, cast<Instruction>(Ptr));
+      }
       auto *ScalarStore = B.CreateStore(Scalar, Ptr);
       ScalarStore->setAlignment(Align(1));
       copyVA(Store, ScalarStore);
