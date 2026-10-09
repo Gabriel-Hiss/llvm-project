@@ -1037,7 +1037,7 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   }
   if (matchTierBound(B, V, C, F, Bound, Step, *Resume))
     return true;
-  if (!Secondary) {
+  if (!Secondary && C.Versioned) {
     for (Instruction &I : *B)
       if (isOrderedLaneReduction(I, *B))
         return true;
