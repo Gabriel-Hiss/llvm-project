@@ -135,6 +135,15 @@ TEST(DisasmTest, IntelFormat) {
   EXPECT_FALSE(Text.empty());
 }
 
+TEST(DisasmTest, RelativeBranchUsesNextInstructionAddress) {
+  auto F = open();
+  ASSERT_TRUE(F.has_value());
+  const uint8_t Call[] = {0xE8, 0, 0, 0, 0};
+  auto Instrs = F->Dis->decodeSlice(Va(0x1000), Call);
+  ASSERT_EQ(Instrs.size(), 1u);
+  EXPECT_NE(F->Dis->format(Instrs[0]).find("0x1005"), std::string::npos);
+}
+
 TEST(DisasmTest, FlowInfo) {
   auto F = open();
   ASSERT_TRUE(F.has_value());

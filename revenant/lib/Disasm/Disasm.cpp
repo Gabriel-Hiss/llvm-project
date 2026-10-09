@@ -168,8 +168,15 @@ std::vector<Instr> Disasm::decodeSlice(Va Addr,
 std::string Disasm::format(const Instr &I, const SharedNames &Names) const {
   std::string Out;
   raw_string_ostream OS(Out);
-  IP->printInst(&I.Inst, I.Addr.Value, "", *STI, OS);
-  return OS.str();
+  IP->printInst(&I.Inst, I.nextVa().Value, "", *STI, OS);
+  OS.flush();
+  if (Names)
+    return Names->decorateLine(I, Out, refs(I));
+  return Out;
+}
+
+bool Disasm::isStore(const Instr &I) const {
+  return MII->get(I.Inst.getOpcode()).mayStore();
 }
 
 std::vector<std::string> Disasm::formatAll(ArrayRef<Instr> Instrs,
