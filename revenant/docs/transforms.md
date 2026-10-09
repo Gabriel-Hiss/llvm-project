@@ -141,3 +141,20 @@ Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
 runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
+
+**revenant-unrust (owner: MuseDeoptRust2).** Expects a module with
+`revenant.lang == "rust"` (any other module is a no-op). Inverts six rustc
+codegen shapings toward the compiler's ir-pre spelling: bounds compares back
+to `icmp ult idx, len` with the panic path recognized by name
+(`panic_bounds_check`, `slice_index_fail`, `slice_error_fail`) or by the
+lifted `call + unreachable` panic-block shape (`ule` spellings also swap the
+branch successors); folded overflow checks back to
+`llvm.*.with.overflow` when the function still panics; Range/slice-iter
+frames rebuilt only when the function holds no alloca at all and the `ult`
+compare tests an induction phi with a constant step; Option/Result niche
+discriminant tests restored from the sentinel-plus-payload ladder; Vec/String
+triple frames rebuilt only when the raw buffer pointer walks through a phi;
+inlined drop glue re-outlined into `drop_glue.unrust` when every operand the
+free arm reads is remappable. Guarantees semantics-preserving rewrites only,
+`!revenant.va` preserved, `!revenant.opaque` untouched. Runs explicitly via
+`-passes=revenant-unrust`, not in the default pipeline.
