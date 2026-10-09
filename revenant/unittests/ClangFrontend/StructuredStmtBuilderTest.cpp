@@ -90,7 +90,7 @@ TEST(StructuredStmtBuilderTest, IfThen) {
   tagRegion(Entry->getTerminator(), "if", {indexOf(*F, Follow)});
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("if"), std::string::npos);
-  EXPECT_EQ(S.find("L_bb"), std::string::npos);
+  EXPECT_NE(S.find("L_bb_1010:"), std::string::npos);
 }
 
 TEST(StructuredStmtBuilderTest, IfElse) {

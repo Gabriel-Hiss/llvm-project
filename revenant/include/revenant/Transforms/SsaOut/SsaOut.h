@@ -45,9 +45,11 @@ namespace revenant {
 //
 // Guarantees: the CFG is unchanged apart from critical-edge splits;
 // provenance (`!revenant.va`) is copied onto every new instruction;
-// `!revenant.opaque` markers are never moved or dropped; structuring
-// annotations (`!revenant.region`) on terminators survive (split edges
-// copy them to the new terminator).
+//     `!revenant.opaque` markers are never moved or dropped; structuring
+//     annotations (`!revenant.region`) on terminators survive (split edges
+//     copy them to the new terminator). Split blocks are appended at the
+//     end of the block list so the index space the region operands refer
+//     to stays valid.
 struct SsaOutPass : public llvm::PassInfoMixin<SsaOutPass> {
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &AM);
