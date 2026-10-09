@@ -73,9 +73,23 @@ public:
   explicit PrototypeVisitor(clang::ASTContext &Context) : Ctx(Context) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl *FD) {
-    if (FD->isImplicit() || FD->getName().empty() ||
-        !FD->getDeclName().isIdentifier())
+    if (FD->isImplicit() || !FD->getDeclName().isIdentifier() ||
+        FD->getName().empty())
       return true;
+    const clang::FunctionProtoType *FnTy =
+        FD->getType()->getAs<clang::FunctionProtoType>();
+    if (!FnTy)
+      return true;
+    clang::QualType ReturnType = FnTy->getReturnType();
+    if (ReturnType->isDependentType() || ReturnType->isIncompleteType() ||
+        ReturnType->isVariablyModifiedType())
+      return true;
+    for (const clang::ParmVarDecl *Param : FD->parameters()) {
+      clang::QualType Type = Param->getType();
+      if (Type->isDependentType() || Type->isIncompleteType() ||
+          Type->isVariablyModifiedType())
+        return true;
+    }
     std::string Mangled;
     raw_string_ostream OS(Mangled);
     clang::MangleContext *MC = Ctx.createMangleContext();
