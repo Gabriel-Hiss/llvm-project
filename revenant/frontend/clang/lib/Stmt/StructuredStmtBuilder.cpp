@@ -415,10 +415,8 @@ void StructuredStmtBuilder::emitBlockStmts(BasicBlock *BB,
 }
 
 Expr *StructuredStmtBuilder::inverted(Value *V) {
-  Expr *C = Exprs->cond(V, *Scope);
-  return clang::UnaryOperator::Create(*AST, C, UO_LNot, AST->BoolTy, VK_PRValue,
-                               OK_Ordinary, SourceLocation(),
-                               /*CanOverflow=*/false, FPOptionsOverride());
+  // Predicate flip or a parenthesized `!`, as the expression builder decides.
+  return Exprs->inverted(V, *Scope);
 }
 
 /// Condition for a conditional branch where `ContinueSucc` is the

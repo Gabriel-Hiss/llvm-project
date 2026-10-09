@@ -231,7 +231,25 @@ Expr *ExprBuilderImpl::parenIfNeeded(Expr *E, Prec Parent,
   return E;
 }
 
+/// Clang asserts that any cast to bool carries a *ToBoolean kind (or NoOp
+/// from bool): pick it from the operand's type.
+static CastKind boolDestKind(QualType T, CastKind K, const Expr *Op) {
+  if (!T->isBooleanType())
+    return K;
+  QualType S = Op->getType();
+  if (S->isBooleanType())
+    return CK_NoOp;
+  if (S->isPointerType())
+    return CK_PointerToBoolean;
+  if (S->isFloatingType())
+    return CK_FloatingToBoolean;
+  return CK_IntegralToBoolean;
+}
+
 Expr *ExprBuilderImpl::makeCStyleCast(QualType T, CastKind K, Expr *Op) {
+  // `(T)a + b` casts only `a`: a binary operand needs its own parentheses.
+  Op = parenIfNeeded(Op, Prec::Unary);
+  K = boolDestKind(T, K, Op);
   TypeSourceInfo *TSI = AST->getTrivialTypeSourceInfo(T);
   clang::CStyleCastExpr *C =
       CStyleCastExpr::Create(*AST, T, VK_PRValue, K, Op, nullptr,
@@ -274,7 +292,8 @@ bool ExprBuilderImpl::isStoredVar(llvm::Value *PtrOp, const clang::Expr *Ptr) {
   if (!llvm::isa<llvm::AllocaInst>(PtrOp) &&
       !llvm::isa<llvm::GlobalVariable>(PtrOp))
     return false;
-  return llvm::isa<clang::DeclRefExpr>(Ptr);
+  // An array designator is not assignable: access it through a pointer.
+  return llvm::isa<clang::DeclRefExpr>(Ptr) && !Ptr->getType()->isArrayType();
 }
 
 // ---- literals -------------------------------------------------------------
@@ -286,10 +305,13 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
   // the type width first, preserving the value under the type's own
   // signedness. Non-integer types fall back to `uintptr_t`.
   QualType T = Ty->isIntegerType() ? Ty : uintptrTy();
-  // Bool context: 0/1 become `false`/`true` in C++ mode.
-  if (T->isBooleanType() && Ctx.isCPlusPlus()) {
-    return CXXBoolLiteralExpr::Create(*AST, !V.isZero(), T,
-                                      SourceLocation());
+  // Bool context: 0/1 become `false`/`true` in C++ mode. IntegerLiteral
+  // cannot carry a bool type, so C prints a plain `0`/`1`.
+  if (T->isBooleanType()) {
+    if (Ctx.isCPlusPlus())
+      return CXXBoolLiteralExpr::Create(*AST, !V.isZero(), T,
+                                        SourceLocation());
+    T = AST->IntTy;
   }
   unsigned W = (unsigned)AST->getIntWidth(T);
   llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative())
@@ -406,6 +428,10 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
       return makeCStyleCast(exprTypeOf(C), CK_IntegralToPointer,
                             value(CE->getOperand(0), Scope));
     case llvm::Instruction::PtrToInt:
+      // The operand may be an array or function designator: the cast makes
+      // the decay and the integer result explicit.
+      return makeCStyleCast(exprTypeOf(C), CK_PointerToIntegral,
+                            value(CE->getOperand(0), Scope));
     case llvm::Instruction::BitCast:
       return value(CE->getOperand(0), Scope);
     default:

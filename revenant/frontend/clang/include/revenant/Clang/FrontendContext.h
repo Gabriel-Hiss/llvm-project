@@ -69,6 +69,10 @@ public:
   /// The temporary must live in the current function's scope.
   void bindTemp(llvm::Value *V, clang::VarDecl *D) { bindDecl(V, D); }
 
+  /// Drop the binding of `V`, so a second build of the same function starts
+  /// from a clean state (the flat fallback body re-materializes its temps).
+  void forgetDecl(const llvm::Value *V) { ValueDecls.erase(V); }
+
   /// Function declaration for `F`, creating a declaration-only FunctionDecl
   /// on first use (used for imports and for callees referenced before their
   /// definition is emitted). Function types come from the TypeBuilder.

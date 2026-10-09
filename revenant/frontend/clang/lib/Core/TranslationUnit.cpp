@@ -23,14 +23,15 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TargetOptions.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/Error.h"
 
-using llvm::ArrayRef;
 using llvm::APInt;
+using llvm::ArrayRef;
 using llvm::DenseMap;
 using llvm::SmallVector;
 using llvm::StringRef;
@@ -77,15 +78,13 @@ createASTContext(llvm::Module &M, const ClangFrontendOptions &Opts) {
   if (TripleStr.empty())
     TripleStr = "x86_64-pc-windows-msvc";
   TargetOpts->Triple = TripleStr;
-  T->Target.reset(
-      c::TargetInfo::CreateTargetInfo(*T->Diags, *TargetOpts));
+  T->Target.reset(c::TargetInfo::CreateTargetInfo(*T->Diags, *TargetOpts));
 
   T->Idents = std::make_unique<c::IdentifierTable>(LO);
   T->Selectors = std::make_unique<c::SelectorTable>();
   T->Builtins = std::make_unique<c::Builtin::Context>();
-  T->AST = std::make_unique<c::ASTContext>(LO, *T->Sources, *T->Idents,
-                                           *T->Selectors, *T->Builtins,
-                                           c::TU_Complete);
+  T->AST = std::make_unique<c::ASTContext>(
+      LO, *T->Sources, *T->Idents, *T->Selectors, *T->Builtins, c::TU_Complete);
   if (T->Target)
     T->AST->InitBuiltinTypes(*T->Target);
   T->Builtins->initializeBuiltins(*T->Idents, LO);
@@ -138,19 +137,22 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
       continue;
     llvm::Constant *Init = GV.getInitializer();
     c::SourceLocation L;
-    auto *CDS =
-        llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(Init);
+    auto *CDS = llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(Init);
     if (!CDS)
       continue;
-    if (CDS->isString()) {
+    // C allows a string literal that exactly fills the array; C++ always
+    // counts the terminator, so there only a NUL-terminated array prints as a
+    // literal (without its last byte) and the rest as a byte list.
+    if (CDS->isString() && (!FCtx.isCPlusPlus() || CDS->isCString())) {
       StringRef S = CDS->getRawDataValues();
       c::QualType ArrTy = AST.getConstantArrayType(
           AST.CharTy, APInt(64, S.size()), nullptr,
           c::ArraySizeModifier::Normal, 0);
+      if (FCtx.isCPlusPlus())
+        S = S.drop_back();
       VD->setType(ArrTy);
-      VD->setInit(c::StringLiteral::Create(AST, S,
-                                           c::StringLiteralKind::Ordinary,
-                                           false, ArrTy, L));
+      VD->setInit(c::StringLiteral::Create(
+          AST, S, c::StringLiteralKind::Ordinary, false, ArrTy, L));
       VD->setInitStyle(c::VarDecl::CInit);
     } else if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
       SmallVector<c::Expr *, 64> Elems;
@@ -165,6 +167,25 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
       VD->setInitStyle(c::VarDecl::CInit);
     }
   }
+}
+
+static void collectLabels(c::Stmt *S, llvm::DenseSet<c::LabelDecl *> &Defined,
+                          llvm::DenseSet<c::LabelDecl *> &Used) {
+  if (!S)
+    return;
+  if (auto *L = llvm::dyn_cast<c::LabelStmt>(S))
+    Defined.insert(L->getDecl());
+  if (auto *G = llvm::dyn_cast<c::GotoStmt>(S))
+    Used.insert(G->getLabel());
+  for (c::Stmt *Child : S->children())
+    collectLabels(Child, Defined, Used);
+}
+
+/// True when every goto in `Body` has a label statement in the same body.
+static bool gotosResolve(c::Stmt *Body) {
+  llvm::DenseSet<c::LabelDecl *> Defined, Used;
+  collectLabels(Body, Defined, Used);
+  return llvm::all_of(Used, [&](c::LabelDecl *L) { return Defined.count(L); });
 }
 
 static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
@@ -187,9 +208,9 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       II = FCtx.ident(V->getName());
     if (!II)
       II = FCtx.ident(("a" + Twine(Idx)).str());
-    c::ParmVarDecl *PD = c::ParmVarDecl::Create(
-        AST, FD, c::SourceLocation(), c::SourceLocation(), II, PT, nullptr,
-        c::SC_None, nullptr);
+    c::ParmVarDecl *PD = c::ParmVarDecl::Create(AST, FD, c::SourceLocation(),
+                                                c::SourceLocation(), II, PT,
+                                                nullptr, c::SC_None, nullptr);
     FCtx.bindDecl(&A, PD);
     Params.push_back(PD);
     ++Idx;
@@ -207,15 +228,14 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
         const llvm::DIType *DI = V ? V->getType() : nullptr;
         c::QualType LT = DI ? Types.typeOfDI(DI)
                             : Types.typeOf(AI->getAllocatedType(), nullptr);
-        c::IdentifierInfo *II = FCtx.ident(
-            V ? V->getName()
-              : (AI->getName().empty()
-                     ? Twine("v_").concat(Twine((uintptr_t)AI)).str()
-                     : AI->getName().str()));
-        c::VarDecl *VD =
-            c::VarDecl::Create(AST, FD, c::SourceLocation(),
-                               c::SourceLocation(), II, LT, nullptr,
-                               c::SC_None);
+        c::IdentifierInfo *II =
+            FCtx.ident(V ? V->getName()
+                         : (AI->getName().empty()
+                                ? Twine("v_").concat(Twine((uintptr_t)AI)).str()
+                                : AI->getName().str()));
+        c::VarDecl *VD = c::VarDecl::Create(AST, FD, c::SourceLocation(),
+                                            c::SourceLocation(), II, LT,
+                                            nullptr, c::SC_None);
         FCtx.bindDecl(AI, VD);
         LocalDecls.push_back(new (AST) c::DeclStmt(
             c::DeclGroupRef(VD), c::SourceLocation(), c::SourceLocation()));
@@ -223,7 +243,20 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
 
   ExprScope Scope;
   c::CompoundStmt *Body = Stmts.buildBody(F, FD, Exprs, Scope);
-  for (llvm::Instruction *I : Scope.PendingTemps) {
+  SmallVector<llvm::Instruction *, 16> Temps(Scope.PendingTemps.begin(),
+                                             Scope.PendingTemps.end());
+  if (!gotosResolve(Body)) {
+    // A region swallowed a block that a goto still targets. The flat
+    // label + goto body is complete for any CFG, so rebuild this function
+    // with it, starting from unbound temporaries.
+    for (llvm::Instruction *I : Temps)
+      FCtx.forgetDecl(I);
+    GotoStmtBuilder Flat(FCtx, Types);
+    ExprScope FlatScope;
+    Body = Flat.buildBody(F, FD, Exprs, FlatScope);
+    Temps.assign(FlatScope.PendingTemps.begin(), FlatScope.PendingTemps.end());
+  }
+  for (llvm::Instruction *I : Temps) {
     auto *VD = llvm::dyn_cast_or_null<c::VarDecl>(FCtx.lookupDecl(I));
     if (!VD)
       continue;
@@ -231,27 +264,23 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
         c::DeclGroupRef(VD), c::SourceLocation(), c::SourceLocation()));
   }
   if (!LocalDecls.empty()) {
-    SmallVector<c::Stmt *, 32> WithLocals(LocalDecls.begin(),
-                                          LocalDecls.end());
+    SmallVector<c::Stmt *, 32> WithLocals(LocalDecls.begin(), LocalDecls.end());
     WithLocals.push_back(Body);
     Body = c::CompoundStmt::Create(AST, WithLocals, c::FPOptionsOverride(),
-                                   c::SourceLocation(),
-                                   c::SourceLocation());
+                                   c::SourceLocation(), c::SourceLocation());
   }
 
-  c::QualType RT =
-      FD->getType()->castAs<c::FunctionType>()->getReturnType();
+  c::QualType RT = FD->getType()->castAs<c::FunctionType>()->getReturnType();
   if (!RT->isVoidType()) {
     SmallVector<c::Stmt *, 2> Tail;
     Tail.push_back(Body);
     Tail.push_back(c::ReturnStmt::Create(
         AST, c::SourceLocation(),
-        c::IntegerLiteral::Create(
-            AST, APInt(AST.getIntWidth(RT), 0), RT, c::SourceLocation()),
+        c::IntegerLiteral::Create(AST, APInt(AST.getIntWidth(RT), 0), RT,
+                                  c::SourceLocation()),
         nullptr));
     Body = c::CompoundStmt::Create(AST, Tail, c::FPOptionsOverride(),
-                                   c::SourceLocation(),
-                                   c::SourceLocation());
+                                   c::SourceLocation(), c::SourceLocation());
   }
   FD->setBody(Body);
 }
@@ -278,8 +307,7 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
       auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
       bool IsRecord = llvm::isa<c::RecordDecl>(D);
       bool IsPrototype = FD && !FD->doesThisDeclarationHaveABody();
-      if ((Pass == 0 && !IsRecord) ||
-          (Pass == 1 && !IsPrototype) ||
+      if ((Pass == 0 && !IsRecord) || (Pass == 1 && !IsPrototype) ||
           (Pass == 2 && (IsRecord || IsPrototype)))
         continue;
       D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);

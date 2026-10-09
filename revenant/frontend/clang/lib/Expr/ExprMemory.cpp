@@ -53,6 +53,13 @@ Expr *ExprBuilderImpl::decayToPointer(Expr *E, QualType Pointee) {
 
 Expr *ExprBuilderImpl::derefPointer(Expr *Ptr, QualType Pointee) {
   Expr *P = decayToPointer(Ptr, Pointee);
+  // A byte-array global read as i64 decays to `unsigned char *`: view it as a
+  // pointer to the accessed type instead of reading one element.
+  if (const auto *PT = P->getType()->getAs<clang::PointerType>())
+    if (!Pointee->isVoidType() &&
+        AST->getCanonicalType(PT->getPointeeType().getUnqualifiedType()) !=
+            AST->getCanonicalType(Pointee.getUnqualifiedType()))
+      P = makeCStyleCast(AST->getPointerType(Pointee), CK_BitCast, P);
   // Clang's printer does not parenthesize unary operands itself
   // (Sema normally inserts ParenExpr); wrap anything below postfix so
   // `*(p + k)` does not print as `*p + k`.
