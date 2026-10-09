@@ -151,6 +151,25 @@ public:
   Value *bswapOp(Value *V);
   Value *rorxOp(Value *V, Value *Cnt); // rotate right, no flags
 
+  // ---- BMI1/BMI2 -------------------------------------------------------------
+  /// BEXTR: (V >> start) & ((1<<len)-1); control[7:0]=start, [15:8]=len.
+  /// ZF=(R==0), CF=OF=0; SF/AF/PF undefined per SDM.
+  Value *bextrOp(Value *V, Value *Control);
+  /// BZHI: V with bits Index..W-1 zeroed. ZF/SF from result, CF=(Index>=W),
+  /// OF=0; AF/PF undefined.
+  Value *bzhiOp(Value *V, Value *Index);
+  /// BLSR (x & x-1) / BLSMSK ((x-1) ^ x) / BLSI (x & -x). ZF/SF from result,
+  /// OF=0, BLSI CF=(x!=0) else CF=(x==0); AF/PF undefined.
+  Value *blsOp(StringRef Name, Value *V);
+  /// SHLX/SHRX/SARX: shift by Count & (W-1), no flags.
+  Value *shiftXOp(StringRef Name, Value *V, Value *Count);
+  /// ADCX (CF chain) / ADOX (OF chain): A+B+carry; only that flag is written.
+  Value *carryAddOp(Value *A, Value *B, bool UseOF);
+  /// MULX: RDX*Src -> Dst1(hi):Dst2(lo), no flags. The low half is
+  /// written first so an equal-register pair keeps the high, like the
+  /// hardware.
+  void mulxOp(const MCInst &MI, unsigned DstHi, unsigned DstLo,
+              unsigned Src, unsigned Width);
   // ---- mul/div families ----------------------------------------------------
   /// Unsigned one-operand mul: rax*src -> rdx:rax, CF=OF=(high!=0).
   void mulPair(Value *Src, unsigned W, bool Signed);

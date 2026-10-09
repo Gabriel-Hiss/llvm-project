@@ -757,6 +757,122 @@ Value *X86LiftContext::rorxOp(Value *V, Value *Cnt) {
   return B.CreateIntrinsic(Intrinsic::fshr, {V->getType()}, {V, V, C});
 }
 
+// ---- BMI1/BMI2 -----------------------------------------------------------------
+
+Value *X86LiftContext::bextrOp(Value *V, Value *Control) {
+  unsigned W = V->getType()->getIntegerBitWidth();
+  Value *Ctl = B.CreateZExtOrTrunc(Control, V->getType());
+  Value *Start = B.CreateAnd(Ctl, constI(0xff, W));
+  Value *Len = B.CreateAnd(B.CreateLShr(Ctl, constI(8, W)), constI(0xff, W));
+  // Both fields saturate at the operand width: start >= W yields 0 and
+  // len >= W keeps every shifted bit (differential-verified: a 32-bit
+  // BEXTR with start=64 returns 0, a 64-bit one with len=64 returns the
+  // unshifted value). i2W keeps the edge shifts defined.
+  auto Sat = [&](Value *X) {
+    return B.CreateSelect(B.CreateICmpULT(X, constI(W, W)), X,
+                          constI(W, W));
+  };
+  Value *Shifted = B.CreateTrunc(
+      B.CreateLShr(B.CreateZExt(V, iN(2 * W)),
+                   B.CreateZExtOrTrunc(Sat(Start), iN(2 * W))),
+      iN(W));
+  Value *Mask = B.CreateTrunc(
+      B.CreateSub(B.CreateShl(ConstantInt::get(iN(2 * W), 1),
+                              B.CreateZExtOrTrunc(Sat(Len), iN(2 * W))),
+                  ConstantInt::get(iN(2 * W), 1)),
+      iN(W));
+  Value *R = B.CreateAnd(Shifted, Mask);
+  flagWrite(ZF, B.CreateICmpEQ(R, constI(0, W)));
+  // SDM: CF/OF cleared, AF/SF/PF undefined. Silicon drives SF/PF to 0;
+  // we model them undefined and tests mask them out.
+  flagWrite(CF, B.getFalse());
+  flagWrite(OF, B.getFalse());
+  for (FlagId F : {SF, PF, AF})
+    flagWrite(F, UndefValue::get(iN(1)));
+  return R;
+}
+
+Value *X86LiftContext::bzhiOp(Value *V, Value *Index) {
+  unsigned W = V->getType()->getIntegerBitWidth();
+  // SDM clears bits [n, OperandSize): an index >= W leaves the register
+  // unchanged (and sets CF), so the keep-mask saturates at n == W.
+  Value *N = B.CreateAnd(B.CreateZExtOrTrunc(Index, V->getType()),
+                         constI(0xff, W));
+  Value *NSat = B.CreateSelect(B.CreateICmpULT(N, constI(W, W)), N,
+                               constI(W, W));
+  Value *NIn2W = B.CreateZExtOrTrunc(NSat, iN(2 * W));
+  // (1 << n) - 1 keeps bits [0,n); computing in i2W keeps the n==W case
+  // defined (i2W holds bit W).
+  Value *Mask = B.CreateTrunc(
+      B.CreateSub(B.CreateShl(ConstantInt::get(iN(2 * W), 1), NIn2W),
+                  ConstantInt::get(iN(2 * W), 1)),
+      iN(W));
+  Value *R = B.CreateAnd(V, Mask);
+  flagWrite(ZF, B.CreateICmpEQ(R, constI(0, W)));
+  flagWrite(SF, B.CreateICmpSLT(R, constI(0, W)));
+  flagWrite(CF, B.CreateICmpUGE(N, constI(W, W)));
+  flagWrite(OF, B.getFalse());
+  for (FlagId F : {PF, AF})
+    flagWrite(F, UndefValue::get(iN(1)));
+  return R;
+}
+
+Value *X86LiftContext::blsOp(StringRef Name, Value *V) {
+  unsigned W = V->getType()->getIntegerBitWidth();
+  Value *R;
+  if (Name == "blsi")
+    R = B.CreateAnd(V, B.CreateNeg(V));
+  else if (Name == "blsmsk")
+    R = B.CreateXor(B.CreateSub(V, constI(1, W)), V);
+  else // blsr
+    R = B.CreateAnd(V, B.CreateSub(V, constI(1, W)));
+  flagWrite(ZF, B.CreateICmpEQ(R, constI(0, W)));
+  flagWrite(SF, B.CreateICmpSLT(R, constI(0, W)));
+  flagWrite(CF, Name == "blsi" ? B.CreateICmpNE(V, constI(0, W))
+                               : B.CreateICmpEQ(V, constI(0, W)));
+  flagWrite(OF, B.getFalse());
+  for (FlagId F : {PF, AF})
+    flagWrite(F, UndefValue::get(iN(1)));
+  return R;
+}
+
+Value *X86LiftContext::shiftXOp(StringRef Name, Value *V, Value *Count) {
+  unsigned W = V->getType()->getIntegerBitWidth();
+  Value *C = B.CreateAnd(B.CreateZExtOrTrunc(Count, V->getType()),
+                         constI(W - 1, W));
+  if (Name == "shl" || Name == "shlx")
+    return B.CreateShl(V, C);
+  if (Name == "shr" || Name == "shrx")
+    return B.CreateLShr(V, C);
+  return B.CreateAShr(V, C); // sar/sarx
+}
+
+Value *X86LiftContext::carryAddOp(Value *A, Value *Bv, bool UseOF) {
+  Value *B2 = zextOrTrunc(Bv, A->getType());
+  Value *C = B.CreateZExt(flagRead(UseOF ? OF : CF), A->getType());
+  Value *Sum = B.CreateAdd(A, B2);
+  Value *R = B.CreateAdd(Sum, C);
+  // Unsigned carry out of A + B + carry: two disjoint overflow halves.
+  Value *Carry = B.CreateOr(B.CreateICmpULT(Sum, A), B.CreateICmpULT(R, Sum));
+  flagWrite(UseOF ? OF : CF, Carry);
+  return R;
+}
+
+void X86LiftContext::mulxOp(const MCInst &MI, unsigned DstHi, unsigned DstLo,
+                            unsigned Src, unsigned Width) {
+  MCRegister Acc = Width == 32 ? X86::EDX : X86::RDX;
+  Value *Wide = B.CreateMul(
+      B.CreateZExt(regRead(Acc, iN(Width)), iN(2 * Width)),
+      B.CreateZExt(readOp(MI, Src, iN(Width)), iN(2 * Width)));
+  // $dst1 takes the high half, $dst2 the low. The low half is written
+  // first so an equal-register pair keeps the high half, like hardware
+  // (differential-verified: mulx rbx,rbx,src leaves hi in rbx).
+  writeOp(MI, DstLo, B.CreateTrunc(Wide, iN(Width)));
+  writeOp(MI, DstHi,
+          B.CreateTrunc(B.CreateLShr(Wide, constI(Width, 2 * Width)),
+                        iN(Width)));
+}
+
 // ---- writes with zeroing --------------------------------------------------------
 
 void X86LiftContext::regWriteZ(MCRegister Reg, Value *V) {

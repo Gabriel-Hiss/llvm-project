@@ -158,6 +158,81 @@ std::vector<Case> cases() {
   add(Case("bswap64", "bswap rcx").r("rcx", 0x1122334455667788ull));
   add(Case("rorx32", "rorx eax, ecx, 8").r("rcx", 0x11223344ull));
   add(Case("rorx64", "rorx rax, rcx, 12").r("rcx", 0x1122334455667788ull));
+  // BMI1/BMI2: bls/andn/bextr/bzhi write only some flags; shiftx/rorx/mulx
+  // none; adcx/adox exactly one each.
+  for (const char *Op : {"blsr", "blsmsk", "blsi"}) {
+    std::string O = Op;
+    for (uint64_t X : {0ull, 1ull, 0x10ull, 0x8000000000000000ull,
+                       0xffffffffffffffffull}) {
+      add(Case(O + " r32 " + hexQ(X), O + " eax, ecx").r("rcx", X)
+              .flags(ZF | SF | CF | OF));
+      add(Case(O + " r64 " + hexQ(X), O + " rax, rcx").r("rcx", X)
+              .flags(ZF | SF | CF | OF));
+    }
+    add(Case(O + " m64", O + " rax, qword ptr [rsp+0x20]").stack({0x42})
+            .flags(ZF | SF | CF | OF));
+  }
+  // PF is undefined for ANDN per SDM (silicon drives it to 0), so compare
+  // the defined four.
+  add(Case("andn r32", "andn eax, ecx, edx")
+          .r("rcx", 0xFF00FF00ull).r("rdx", 0xFFFF0000ull)
+          .flags(ZF | SF | CF | OF));
+  add(Case("andn r64", "andn rax, rcx, rdx")
+          .r("rcx", 0xFF00FF00FF00FF00ull).r("rdx", 0xFFull)
+          .flags(ZF | SF | CF | OF));
+  add(Case("andn m64", "andn rax, rcx, qword ptr [rsp+0x20]")
+          .r("rcx", 0xFFull).stack({0x0F0F0F0F0F0F0F0Full})
+          .flags(ZF | SF | CF | OF));
+  // bextr: edx packs [15:8]=len, [7:0]=start. SF/PF/AF are undefined per
+  // SDM (silicon drives them to 0); compare only ZF/CF/OF.
+  for (uint64_t Ctl : {0x0800ull, 0x0408ull, 0x2000ull, 0x4020ull, 0xff40ull}) {
+    add(Case("bextr r64 " + hexQ(Ctl), "bextr rax, rcx, rdx")
+            .r("rcx", 0xdeadbeefcafebabeull).r("rdx", Ctl)
+            .flags(ZF | CF | OF));
+    add(Case("bextr r32 " + hexQ(Ctl), "bextr eax, ecx, edx")
+            .r("rcx", 0xdeadbeefull).r("rdx", Ctl).flags(ZF | CF | OF));
+  }
+  add(Case("bextr m64", "bextr rax, qword ptr [rsp+0x20], rdx")
+          .r("rdx", 0x0808ull).stack({0x8877665544332211ull})
+          .flags(ZF | CF | OF));
+  for (uint64_t Idx : {0ull, 4ull, 32ull, 63ull, 64ull, 200ull}) {
+    add(Case("bzhi r64 " + std::to_string(Idx), "bzhi rax, rcx, rdx")
+            .r("rcx", 0xffffffffffffffffull).r("rdx", Idx)
+            .flags(ZF | SF | CF | OF));
+    add(Case("bzhi r32 " + std::to_string(Idx), "bzhi eax, ecx, edx")
+            .r("rcx", 0xffffffffull).r("rdx", Idx).flags(ZF | SF | CF | OF));
+  }
+  for (const char *Op : {"shlx", "shrx", "sarx"}) {
+    std::string O = Op;
+    for (uint64_t N : {0ull, 1ull, 31ull, 32ull, 63ull, 64ull, 255ull}) {
+      add(Case(O + " r32 " + std::to_string(N), O + " eax, ecx, edx")
+              .r("rcx", 0x80000001ull).r("rdx", N).flags(AllFlags));
+      add(Case(O + " r64 " + std::to_string(N), O + " rax, rcx, rdx")
+              .r("rcx", 0x8000000000000001ull).r("rdx", N).flags(AllFlags));
+    }
+    add(Case(O + " m64", O + " rax, qword ptr [rsp+0x20], rdx")
+            .r("rdx", 40).stack({0x8000000000000001ull}).flags(AllFlags));
+  }
+  add(Case("mulx r64", "mulx rbx, rax, rcx")
+          .r("rdx", 0xfffffffffffffffeull).r("rcx", 0xffffffffffffffffull)
+          .r("rax", 0x55).r("rbx", 0x77).flags(AllFlags));
+  add(Case("mulx r32", "mulx ebx, eax, ecx")
+          .r("rdx", 0xfffffffeull).r("rcx", 0x80000001ull)
+          .r("rax", 0x55).r("rbx", 0x77).flags(AllFlags));
+  add(Case("mulx m64", "mulx rbx, rax, qword ptr [rsp+0x20]")
+          .r("rdx", 0x100ull).stack({0x12345678ull}).r("rax", 1)
+          .r("rbx", 2).flags(AllFlags));
+  add(Case("mulx same dst", "mulx rbx, rbx, rcx")
+          .r("rdx", 3).r("rcx", 7).r("rbx", 0x11).flags(AllFlags));
+  add(Case("adcx chain", "stc\nadcx eax, ecx\nadcx edx, ecx")
+          .r("rax", 0xffffffffull).r("rcx", 1).r("rdx", 0)
+          .flags(AllFlags));
+  add(Case("adcx m", "stc\nadcx rax, qword ptr [rsp+0x20]")
+          .r("rax", 0xffffffffffffffffull).stack({1}).flags(AllFlags));
+  add(Case("adox chain", "stc\nadox eax, ecx\nadox edx, ecx")
+          .r("rax", 0xffffffffull).r("rcx", 1).r("rdx", 0).flags(AllFlags));
+  add(Case("adox m64", "adox rax, qword ptr [rsp+0x20]")
+          .r("rax", 0xffffffffffffffffull).stack({1}).flags(AllFlags));
 
   // Moves and extensions.
   add(Case("movzx r32,m8", "movzx eax, byte ptr [rsp+0x20]").stack({0xF1}));
@@ -212,6 +287,17 @@ std::vector<Case> cases() {
         "punpckhwd", "punpckhdq", "punpckhqdq", "pmuludq", "pmullw", "paddusb",
         "paddsw", "psubusb", "psubsw", "pavgb", "packuswb", "packsswb",
         "xorps", "andps", "orps", "andnps"}) {
+    add(Case(std::string(Op) + " xmm,xmm", std::string(Op) + " xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1));
+    add(Case(std::string(Op) + " xmm,m128", std::string(Op) +
+                                              " xmm0, xmmword ptr [rsp+0x20]")
+            .xmm(0, A0, A1).stack({B0, B1}));
+  }
+  // Lane-wise coverage for the remaining packed families (SSE4.1 integer
+  // mul/min/max and the qword compare gcc -O3 emits in add_vec-style
+  // loops).
+  for (const char *Op : {"pmulld", "pminsd", "pminsb", "pmaxsd", "pmaxud",
+                         "pmaxuw", "pcmpgtq", "pcmpeqq"}) {
     add(Case(std::string(Op) + " xmm,xmm", std::string(Op) + " xmm0, xmm1")
             .xmm(0, A0, A1).xmm(1, B0, B1));
     add(Case(std::string(Op) + " xmm,m128", std::string(Op) +
