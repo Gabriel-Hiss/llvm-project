@@ -9,11 +9,71 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/DIBuilder.h"
 #include <algorithm>
 #include <vector>
 using namespace llvm;
 namespace revenant {
 namespace {
+DIType *irDebugType(Type *Ty, DIBuilder &DIB) {
+  if (Ty->isVoidTy())
+    return nullptr;
+  if (Ty->isPointerTy())
+    return DIB.createPointerType(nullptr, 64);
+  if (Ty->isIntegerTy())
+    return DIB.createBasicType("integer", Ty->getIntegerBitWidth(),
+                               dwarf::DW_ATE_signed);
+  if (Ty->isFloatingPointTy())
+    return DIB.createBasicType("float", Ty->getPrimitiveSizeInBits(),
+                               dwarf::DW_ATE_float);
+  return nullptr;
+}
+
+void updateSubprogramType(Function &F, DIBuilder &DIB,
+                          ArrayRef<DIType *> PointerArgs,
+                          bool PointerReturn) {
+  DISubprogram *SP = F.getSubprogram();
+  if (!SP || !SP->isDistinct())
+    return;
+  auto *OldType = SP->getType();
+  DITypeRefArray OldTypes =
+      OldType ? OldType->getTypeArray() : DITypeRefArray();
+  SmallVector<Metadata *, 8> Types;
+  if (PointerReturn)
+    Types.push_back(DIB.createPointerType(nullptr, 64));
+  else if (F.getReturnType()->isVoidTy())
+    Types.push_back(nullptr);
+  else
+    Types.push_back(OldTypes.size() && OldTypes[0]
+                        ? OldTypes[0]
+                        : irDebugType(F.getReturnType(), DIB));
+  for (Argument &A : F.args()) {
+    unsigned I = A.getArgNo();
+    if (I < PointerArgs.size() && PointerArgs[I])
+      Types.push_back(PointerArgs[I]);
+    else if (I + 1 < OldTypes.size() && OldTypes[I + 1])
+      Types.push_back(OldTypes[I + 1]);
+    else
+      Types.push_back(irDebugType(A.getType(), DIB));
+  }
+  SP->replaceType(DIB.createSubroutineType(DIB.getOrCreateTypeArray(Types)));
+}
+
+void updateSubprogramType(Function &F, ArrayRef<bool> PointerArgs,
+                          bool PointerReturn) {
+  DISubprogram *SP = F.getSubprogram();
+  if (!SP || !SP->getUnit())
+    return;
+  DIBuilder DIB(*F.getParent(), true, SP->getUnit());
+  SmallVector<DIType *, 8> Types(PointerArgs.size(), nullptr);
+  for (unsigned I = 0; I < PointerArgs.size(); ++I)
+    if (PointerArgs[I])
+      Types[I] = DIB.createPointerType(nullptr, 64);
+  updateSubprogramType(F, DIB, Types, PointerReturn);
+  DIB.finalize();
+}
+
 /// Convert V to Ty for a rebuilt call operand. Returns undef when no
 /// conversion exists; lifted signatures are integer/float/pointer only.
 Value *coerceTo(Value *V, Type *Ty, IRBuilder<> &B) {
@@ -179,7 +239,7 @@ void rewriteSignature(Function &F, Signature &S) {
     Attrs.push_back(S.Pointers[J] ? AttributeSet() : F.getAttributes().getParamAttrs(J));
   N->setAttributes(AttributeList::get(M.getContext(), F.getAttributes().getFnAttrs(),
       S.PointerReturn ? AttributeSet() : F.getAttributes().getRetAttrs(), Attrs));
-  M.getFunctionList().insert(F.getIterator(), N);
+  updateSubprogramType(*N, ArrayRef<bool>(S.Pointers), S.PointerReturn);
   N->takeName(&F);
   N->splice(N->end(), &F);
   for (Argument &Old : F.args()) {
