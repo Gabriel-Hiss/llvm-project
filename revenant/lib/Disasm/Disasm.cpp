@@ -7,6 +7,7 @@
 
 #include "revenant/Disasm/Disasm.h"
 
+#include "X86BaseInfo.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
@@ -80,8 +81,27 @@ Expected<Disasm> Disasm::create(const Image &Img) {
 // instruction; the decoder reports Size).
 static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
                                      const MCInstrAnalysis &MIA,
+                                     const MCInstrInfo &MII,
                                      const MCSubtargetInfo &STI, Va Addr,
                                      ArrayRef<uint8_t> Bytes) {
+  // LLVM's X86 decoder can surface an F0 LOCK prefix as its own one-byte
+  // pseudo-instruction even when the following instruction is lockable.
+  // Fold it into the following atomic memory operation to preserve hardware
+  // instruction boundaries and MCInstPrinter's lock-prefix rendering.
+  if (!Bytes.empty() && Bytes.front() == 0xF0 && Bytes.size() > 1) {
+    if (auto Locked = decodeAt(Dis, MIA, MII, STI, Addr.wrappingAdd(1),
+                               Bytes.drop_front())) {
+      const MCInstrDesc &Desc = MII.get(Locked->Inst.getOpcode());
+      int MemOp = X86II::getMemoryOperandNo(Desc.TSFlags);
+      if (Locked->Size < 15 && MemOp >= 0 && Desc.mayLoad() &&
+          Desc.mayStore()) {
+        Locked->Addr = Addr;
+        ++Locked->Size;
+        Locked->Inst.setFlags(Locked->Inst.getFlags() | X86::IP_HAS_LOCK);
+        return Locked;
+      }
+    }
+  }
   if (Bytes.empty())
     return std::nullopt;
   MCInst Inst;
@@ -125,7 +145,7 @@ static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
 
 std::optional<Instr> Disasm::decodeOne(Va Addr) const {
   ArrayRef<uint8_t> Bytes = Img->dataAt(Addr, 16);
-  return decodeAt(*Dis, *MIA, *STI, Addr, Bytes);
+  return decodeAt(*Dis, *MIA, *MII, *STI, Addr, Bytes);
 }
 
 std::vector<Instr> Disasm::decodeRange(Va Start, Va End) const {
@@ -138,7 +158,7 @@ std::vector<Instr> Disasm::decodeRange(Va Start, Va End) const {
   size_t Off = 0;
   while (Off < Bytes.size() && Ip < End) {
     auto One =
-        decodeAt(*Dis, *MIA, *STI, Ip, Bytes.drop_front(Off));
+        decodeAt(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
     if (!One)
       break;
     Off += One->Size;
@@ -155,7 +175,7 @@ std::vector<Instr> Disasm::decodeSlice(Va Addr,
   size_t Off = 0;
   while (Off < Bytes.size()) {
     auto One =
-        decodeAt(*Dis, *MIA, *STI, Ip, Bytes.drop_front(Off));
+        decodeAt(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
     if (!One)
       break;
     Off += One->Size;

@@ -144,6 +144,21 @@ TEST(DisasmTest, RelativeBranchUsesNextInstructionAddress) {
   EXPECT_NE(F->Dis->format(Instrs[0]).find("0x1005"), std::string::npos);
 }
 
+TEST(DisasmTest, LockPrefixFoldsIntoAtomicInstruction) {
+  auto F = open();
+  ASSERT_TRUE(F.has_value());
+  const uint8_t LockCmpxchg[] = {0xF0, 0x48, 0x0F, 0xB1, 0x0D,
+                                  0x03, 0x01, 0x08, 0x00};
+  Va Start(0x1000);
+  auto Instrs = F->Dis->decodeSlice(Start, LockCmpxchg);
+  ASSERT_EQ(Instrs.size(), 1u);
+  EXPECT_EQ(Instrs[0].Addr, Start);
+  EXPECT_EQ(Instrs[0].Size, sizeof(LockCmpxchg));
+  std::string Text = F->Dis->format(Instrs[0]);
+  EXPECT_NE(Text.find("lock"), std::string::npos);
+  EXPECT_NE(Text.find("cmpxchg"), std::string::npos);
+}
+
 TEST(DisasmTest, FlowInfo) {
   auto F = open();
   ASSERT_TRUE(F.has_value());
