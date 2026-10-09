@@ -80,7 +80,7 @@ foreach ($Mode in $Modes) {
     $Object = Join-Path $ObjectDirectory "$($Mode.Name).obj"
     $Archive = Join-Path $ArchiveDirectory "$($Mode.Name).lib"
     $Compiler = if ($Mode.Compiler -eq 'cl') { 'cl.exe' } else { "`"$ClangCl`"" }
-    $Command = "$Compiler /nologo /c $($Mode.Flag) /std:c++20 /EHsc /Fo`"$Object`" `"$Source`" && lib.exe /nologo /OUT:`"$Archive`" `"$Object`""
+    $Command = "$Compiler /nologo /c $($Mode.Flag) /std:c++20 /Zi /EHsc /utf-8 /FAcs /Fo`"$Object`" `"$Source`" && lib.exe /nologo /OUT:`"$Archive`" `"$Object`""
     Invoke-VcCommand $Mode.Name $Command
     $Archives.Add($Archive)
 }
