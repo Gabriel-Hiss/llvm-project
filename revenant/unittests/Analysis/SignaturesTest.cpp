@@ -270,6 +270,26 @@ TEST(SignaturesTest, LibraryPrototypeOverridesInferredSignature) {
   EXPECT_EQ(S.of(Start)->Params[2].Loc.Tag, ParamLoc::Kind::Reg);
 }
 
+TEST(SignaturesTest, LibraryMatchesDisambiguateFunctionNames) {
+  Program P;
+  P.Names = std::make_shared<std::map<Va, std::string>>();
+  Va First(0x140008000), Second(0x140008100);
+  FuncRecord FirstFunction, SecondFunction;
+  FirstFunction.Start = First;
+  SecondFunction.Start = Second;
+  FirstFunction.Name = SecondFunction.Name = "Widget::run";
+  P.Functions.emplace(First, std::move(FirstFunction));
+  P.Functions.emplace(Second, std::move(SecondFunction));
+  (*P.Names)[First] = (*P.Names)[Second] = "Widget::run";
+
+  Signatures S;
+  LibraryDatabase DB;
+  applyLibraryMatches(P, S, {}, DB);
+
+  EXPECT_NE(P.Names->at(First), P.Names->at(Second));
+  EXPECT_EQ(P.Functions.at(First).Name, P.Names->at(First));
+  EXPECT_EQ(P.Functions.at(Second).Name, P.Names->at(Second));
+}
 TEST(SignaturesTest, LookupUsesFunctionStart) {
   Signatures S;
   Signature Sig;

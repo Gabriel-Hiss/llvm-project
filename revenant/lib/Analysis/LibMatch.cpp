@@ -358,16 +358,27 @@ void applyLibraryMatches(Program &P, Signatures &Sigs,
     }
   } while (Changed);
 
+  std::set<std::string> UsedNames;
+  for (const auto &[Address, Name] : *P.Names)
+    if (!Chosen.count(Address) || !StringRef(Name).starts_with("sub_"))
+      UsedNames.insert(nameKey(Name));
+
   for (const auto &[Start, Index] : Chosen) {
     const LibraryFunction &F = DB.Functions[Index];
     auto Existing = P.Names->find(Start);
     bool ReplaceName = Existing == P.Names->end() ||
                        StringRef(Existing->second).starts_with("sub_");
     if (ReplaceName) {
-      (*P.Names)[Start] = F.Name;
+      std::string Name = F.Name;
+      if (UsedNames.count(nameKey(Name)))
+        Name += "__" + utohexstr(Start.Value, true);
+      UsedNames.insert(nameKey(Name));
+      (*P.Names)[Start] = Name;
       auto RecordIt = P.Functions.find(Start);
       if (RecordIt != P.Functions.end())
-        RecordIt->second.Name = F.Name;
+        RecordIt->second.Name = std::move(Name);
+    } else {
+      UsedNames.insert(nameKey(Existing->second));
     }
     auto SigIt = Sigs.Funcs.find(Start);
     if (SigIt == Sigs.Funcs.end() || !F.Prototype)
@@ -392,6 +403,22 @@ void applyLibraryMatches(Program &P, Signatures &Sigs,
     Sig.Ret.Float = F.Prototype->ReturnFloat;
     Sig.Ret.Bits = F.Prototype->ReturnBits;
     Sig.SigSource = Signature::Source::Library;
+  }
+  std::set<std::string> EmittedNames;
+  for (const auto &[Address, Name] : *P.Names)
+    if (!P.Functions.count(Address))
+      EmittedNames.insert(nameKey(Name));
+  for (auto &[Start, Record] : P.Functions) {
+    std::string &Name = (*P.Names)[Start];
+    if (Name.empty())
+      Name = Record.Name;
+    std::string Key = nameKey(Name);
+    if (EmittedNames.count(Key)) {
+      Name += "__" + utohexstr(Start.Value, true);
+      Key = nameKey(Name);
+    }
+    EmittedNames.insert(Key);
+    Record.Name = Name;
   }
 }
 

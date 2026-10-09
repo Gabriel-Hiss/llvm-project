@@ -68,6 +68,10 @@ revenant --export-parity <pe> <dir>   revenant-items.bin + file-spans.tsv
                                       + meta.json (contract format)
 ```
 
+`revenant-decompile <pe> [--libdb <file>]` uses the static-library database
+for recovered function names and prototypes. Without `--libdb`, it looks for
+`libdb.json` beside the executable.
+
 The parity export runs full program analysis without loading a PDB; the
 per-binary command and results are tracked in `parity.md`.
 

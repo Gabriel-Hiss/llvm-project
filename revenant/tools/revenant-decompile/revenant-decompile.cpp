@@ -22,6 +22,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Path.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -50,6 +51,11 @@ static cl::opt<bool> ListFuncs("list",
 static cl::opt<bool> Patterns("patterns",
                               cl::desc("run the opt-in revenant-patterns pass"));
 static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
+static cl::opt<std::string>
+    LibraryDB("libdb",
+              cl::desc("static-library database (default: libdb.json next to "
+                       "the executable)"),
+              cl::value_desc("file"));
 static std::optional<EmitKind> emitKind(StringRef S) {
   return StringSwitch<std::optional<EmitKind>>(S)
       .Case("asm", EmitKind::Asm)
@@ -75,6 +81,14 @@ int main(int Argc, char **Argv) {
   cl::ParseCommandLineOptions(
       Argc, Argv,
       "revenant-decompile: PE -> asm -> IR -> source, all stages\n");
+
+  SmallString<256> LibraryDBPath(LibraryDB);
+  if (LibraryDBPath.empty()) {
+    SmallString<256> ExePath(
+        sys::fs::getMainExecutable(Argv[0], reinterpret_cast<void *>(&main)));
+    LibraryDBPath = sys::path::parent_path(ExePath);
+    sys::path::append(LibraryDBPath, "libdb.json");
+  }
 
   EmitKind Emit = EmitKind::Source;
   if (!EmitOpt.empty()) {
@@ -133,6 +147,7 @@ int main(int Argc, char **Argv) {
   DecompileOpts Opts;
   Opts.Emit = Emit;
   Opts.Patterns = Patterns;
+  Opts.LibraryDBPath = LibraryDBPath.str().str();
   // Artifact base: the output path if given, else <pe>.decompiled.
   std::string Base =
       Output.empty() ? (Input + ".decompiled") : Output.getValue();
