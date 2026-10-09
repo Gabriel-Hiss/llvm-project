@@ -16,12 +16,10 @@ find_package(Clang REQUIRED CONFIG PATHS "${CLANG_CMAKE_DIR}" NO_DEFAULT_PATH)
 endif()
 
 if(NOT DEFINED REVENANT_CLANG_INCLUDE_DIR)
-  get_filename_component(REVENANT_CLANG_INCLUDE_DIR
-      "${CMAKE_CURRENT_SOURCE_DIR}/../include" ABSOLUTE)
+  set(REVENANT_CLANG_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../include")
 endif()
 if(NOT DEFINED REVENANT_TYPE_SRC_DIR)
-  get_filename_component(REVENANT_TYPE_SRC_DIR
-      "${CMAKE_CURRENT_SOURCE_DIR}/../lib/Type" ABSOLUTE)
+  set(REVENANT_TYPE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../lib/Type")
 endif()
 
 llvm_map_components_to_libnames(LLVM_LIBS Demangle DebugInfoDWARF
