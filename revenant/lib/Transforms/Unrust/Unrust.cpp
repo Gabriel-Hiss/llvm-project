@@ -739,11 +739,7 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
           continue;
         if (auto *CB = dyn_cast<CallBase>(&SI)) {
           const Function *CF = CB->getCalledFunction();
-          if (!CF)
-            continue;
-          StringRef N = CF->getName();
-          if (N.contains("__rust_dealloc") || N.contains("__rust_realloc") ||
-              (N.contains("Drop") && N.contains("drop")))
+          if (isFreeCallee(CF))
             Frees = true;
         }
       }
@@ -766,7 +762,13 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
     if (!HasDropGlueDef) {
       // Build drop_glue.unrust(ptr-to-aggregate): move the test + free
       // arm. The aggregate pointer is the load's pointer operand base.
-      Value *AggPtr = Load->getPointerOperand();
+      Value *AggPtr = Load->getPointerOperand()->stripPointerCasts();
+      Value *Base = AggPtr;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr))
+        Base = GEP->getPointerOperand()->stripPointerCasts();
+      // Bail when the arm reads values the outline cannot reach.
+      if (!canOutlineFreeArm(FreeArm, Base, AggPtr, TestVal))
+        continue;
       LLVMContext &Ctx = F.getContext();
       Type *PtrTy = PointerType::get(Ctx, 0);
       FunctionType *FTy =
@@ -785,20 +787,21 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
       BasicBlock *NBL = BasicBlock::Create(Ctx, "live", NF);
       IRBuilder<> B(NBT);
       B.SetCurrentDebugLocation(DebugLoc());
-      // Reload the discriminant from the parameter at the same offset.
-      Value *Base = AggPtr;
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr)) {
-        (void)GEP;
-        Base = GEP->getPointerOperand();
-      }
-      // Conservative: reload from arg base + 0 (len/niche slot). The
-      // load type matches the original test value type.
-      auto *NLoad = B.CreateLoad(TestVal->getType(), Arg, "discr");
+      // Reload the discriminant from the parameter at the same offset:
+      // the argument is the aggregate base, so a GEP-offset test value
+      // gets its GEP recreated on the parameter.
+      Value *NArg = Arg;
+      if (AggPtr != Base)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr))
+          NArg = B.CreateGEP(GEP->getSourceElementType(), Arg,
+                             SmallVector<Value *, 4>(GEP->indices()), "discr.p");
+      auto *NLoad = B.CreateLoad(TestVal->getType(), NArg, "discr");
       auto *NCmp = B.CreateICmp(ICmpInst::ICMP_EQ, NLoad, C, "drop.test");
       B.CreateCondBr(NCmp, NBL, NBF);
       // Clone the free arm body (up to its terminator) into NBF.
       DenseMap<Value *, Value *> VMap;
-      VMap[AggPtr] = Arg;
+      VMap[Base] = Arg;
+      VMap[AggPtr] = NArg;
       VMap[TestVal] = NLoad;
       IRBuilder<> BF(NBF);
       BF.SetCurrentDebugLocation(DebugLoc());
@@ -806,7 +809,7 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
         if (SI.isTerminator())
           break;
         if (auto *Load2 = dyn_cast<LoadInst>(&SI)) {
-          Value *PO = Load2->getPointerOperand();
+          Value *PO = Load2->getPointerOperand()->stripPointerCasts();
           Value *NPO = VMap.count(PO) ? VMap[PO] : PO;
           auto *NL = BF.CreateLoad(Load2->getType(), NPO,
                                    SI.getName() + ".og");
@@ -889,10 +892,11 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
     bool ArmDrops = false;
     for (BasicBlock *Succ : BI->successors())
       for (Instruction &SI : *Succ) {
+        if (hasOpaqueMarker(SI))
+          continue;
         if (auto *CB = dyn_cast<CallBase>(&SI)) {
           const Function *C = CB->getCalledFunction();
-          if (C && C->getName().contains("Drop") &&
-              C->getName().contains("drop"))
+          if (isFreeCallee(C))
             ArmDrops = true;
         }
       }
