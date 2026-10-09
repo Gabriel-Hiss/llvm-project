@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; An opaque call prevents table reconstruction; range-to-switch may still fire.
 ; CHECK-LABEL: define i32 @opaquekept(
 ; CHECK: switch i32 %0

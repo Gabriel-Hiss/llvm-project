@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unhotcold -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unhotcold -S %s | %FileCheck %s
 
 ; PGO branch inversion: cjson-cl-o2pgo shape. Weights 1:99 say the false
 ; edge dominates, but layout has the true successor (cold) first. After

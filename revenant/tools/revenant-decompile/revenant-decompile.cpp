@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+#include "llvm/ADT/STLExtras.h"
+
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -49,8 +51,8 @@ static cl::opt<std::string>
             cl::value_desc("lang"));
 static cl::opt<std::string>
     EmitOpt("emit",
-            cl::desc("what to print/write: asm|ir-raw|ir-clean|ir-final|"
-                     "source (default: source)"),
+            cl::desc("what to print/write: asm|ir-raw|ir-clean|ir-pre-like|"
+                     "ir-final|source (default: source)"),
             cl::value_desc("kind"));
 static cl::opt<std::string> Output("o", cl::desc("output file (default stdout)"),
                                    cl::value_desc("file"));
@@ -84,6 +86,7 @@ static std::optional<EmitKind> emitKind(StringRef S) {
       .Case("ir-raw", EmitKind::IrRaw)
       .Case("ir-clean", EmitKind::IrClean)
       .Case("ir-final", EmitKind::IrFinal)
+      .Case("ir-pre-like", EmitKind::IrPreLike)
       .Case("source", EmitKind::Source)
       .Default(std::nullopt);
 }

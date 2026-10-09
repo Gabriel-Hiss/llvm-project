@@ -1,6 +1,6 @@
 ; Smoke test: the pass loads under the name revenant-unipo and leaves
 ; code with no IPO shape alone (opaque stubs and live signatures stay).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define i32 @scalar_add(i32 %a, i32 %b)
 define i32 @scalar_add(i32 %a, i32 %b) {

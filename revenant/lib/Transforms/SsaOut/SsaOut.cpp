@@ -123,7 +123,10 @@ bool inlineableByKind(Instruction *I, unsigned Uses) {
 // instruction. Opaque markers (`!revenant.opaque`) live on the original
 // call and are never moved; new stores/loads need no marker.
 void copyProvenance(const Instruction *Src, Instruction *Dst) {
-  Dst->copyMetadata(*Src);
+  // Copy only revenant.va and dbg; nonnull/noundef on the source describe
+  // the original pointer/value and are invalid on a fresh alloca or store.
+  if (MDNode *VA = Src->getMetadata("revenant.va"))
+    Dst->setMetadata("revenant.va", VA);
   Dst->setDebugLoc(Src->getDebugLoc());
 }
 
@@ -493,6 +496,21 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
             IRBuilder<> B(&F.getEntryBlock(), F.getEntryBlock().begin());
             Spill = B.CreateAlloca(Dst->getAllocatedType(), nullptr,
                                    "v_spill");
+            DIType *SpillTy = nullptr;
+            if (Dst->getAllocatedType()->isFloatingPointTy())
+              SpillTy = DIB.createBasicType("double", 64, dwarf::DW_ATE_float);
+            else if (Dst->getAllocatedType()->isIntegerTy(1))
+              SpillTy = DIB.createBasicType("bool", 1, dwarf::DW_ATE_boolean);
+            else if (Dst->getAllocatedType()->isIntegerTy())
+              SpillTy = DIB.createBasicType("long",
+                                           Dst->getAllocatedType()->getIntegerBitWidth(),
+                                           dwarf::DW_ATE_signed);
+            else
+              SpillTy = DIB.createBasicType("ptr", 64, dwarf::DW_ATE_address);
+            DILocalVariable *SpillVar =
+                DIB.createAutoVariable(SP, Spill->getName(), File, 1, SpillTy);
+            DIB.insertDeclare(Spill, SpillVar, DIB.createExpression(),
+                              DILocation::get(Ctx, 1, 0, SP), Spill->getNextNode());
           }
           SpilledVal = Dst;
           Ordered.push_back({Spill, Pending[0].second});

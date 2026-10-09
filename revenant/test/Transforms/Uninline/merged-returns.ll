@@ -1,7 +1,7 @@
 ; The null-check/load is from miniz-clang-o3 mz_zip_get_mode, as in cfg.ll.
 ; This variant keeps two returns to exercise the inliner's shared exit PHI.
 ; Other cases exercise proof failures, rather than claiming corpus events.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline,verify -S %s | %FileCheck %s
 
 define i32 @two_returns(ptr %p) {
 entry:

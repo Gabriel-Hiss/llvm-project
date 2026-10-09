@@ -9,7 +9,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Dominators.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
@@ -41,6 +40,8 @@ void copyProvenance(const Instruction &From, Instruction &To) {
   To.setDebugLoc(From.getDebugLoc());
 }
 
+/// A load replacing a PHI operand must live on the incoming edge, not in the
+/// PHI's block (a PHI cannot reference a value defined in its own block).
 Instruction *useInsertionPoint(Use &U, Instruction &User) {
   if (auto *PN = dyn_cast<PHINode>(&User)) {
     unsigned Incoming = PN->getIncomingValueNumForOperand(U.getOperandNo());
@@ -76,7 +77,6 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     return PreservedAnalyses::all();
 
   BasicBlock &Entry = F.getEntryBlock();
-  DominatorTree DT(F);
   LLVMContext &Ctx = F.getContext();
   bool Changed = false;
 
@@ -97,12 +97,6 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
   }
 
   SmallVector<PHINode *, 32> Phis;
-  DenseMap<PHINode *, char> DebugVars;
-  for (BasicBlock &BB : F)
-    for (Instruction &I : BB)
-      if (auto *DVI = dyn_cast<DbgValueInst>(&I))
-        if (auto *PN = dyn_cast<PHINode>(DVI->getValue()))
-          DebugVars[PN] = 1;
   DenseMap<PHINode *, unsigned> PhiIndex;
   for (BasicBlock &BB : F)
     for (PHINode &PN : BB.phis()) {
@@ -114,16 +108,6 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
       if (auto *PN = dyn_cast_or_null<PHINode>(RI->getReturnValue()))
         ReturnVars[PN] = 1;
-  SmallVector<uint8_t, 32> MaterializePhi(Phis.size(), 0);
-  for (unsigned I = 0; I != Phis.size(); ++I) {
-    PHINode *PN = Phis[I];
-    MaterializePhi[I] =
-        DebugVars.count(PN) != 0 || ReturnVars.count(PN) != 0;
-    for (unsigned J = 0; J != PN->getNumIncomingValues(); ++J) {
-      BasicBlock *Pred = PN->getIncomingBlock(J);
-      MaterializePhi[I] |= DT.dominates(PN->getParent(), Pred);
-    }
-  }
   SmallVector<unsigned, 32> Parent;
   Parent.reserve(Phis.size());
   for (unsigned I = 0; I != Phis.size(); ++I)
@@ -142,8 +126,7 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
       if (!Other)
         continue;
       auto It = PhiIndex.find(Other);
-      if (It == PhiIndex.end() || !MaterializePhi[I] ||
-          !MaterializePhi[It->second] || Other == PN ||
+      if (It == PhiIndex.end() || Other == PN ||
           Other->getType() != PN->getType() || !Other->hasOneUse())
         continue;
       bool OnlyUseIsThisPhi = false;
@@ -159,8 +142,6 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
 
   DenseMap<unsigned, AllocaInst *> Slots;
   for (unsigned I = 0; I != Phis.size(); ++I) {
-    if (!MaterializePhi[I])
-      continue;
     unsigned R = Root(I);
     if (Slots.count(R))
       continue;
@@ -209,8 +190,6 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
   SmallVector<CopyPlan, 64> EdgeCopies;
   for (unsigned I = 0; I != Phis.size(); ++I) {
     PHINode *PN = Phis[I];
-    if (!MaterializePhi[I])
-      continue;
     AllocaInst *Slot = Slots.lookup(Root(I));
     for (unsigned J = 0; J != PN->getNumIncomingValues(); ++J) {
       Value *V = PN->getIncomingValue(J);
@@ -263,42 +242,21 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
       copyProvenance(*P.Phi, *Load);
       Stored = Load;
     }
-    if (auto *IncomingPhi = dyn_cast<PHINode>(Stored)) {
-      auto It = PhiIndex.find(IncomingPhi);
-      if (It != PhiIndex.end() && MaterializePhi[It->second]) {
-        LoadInst *Load = B.CreateLoad(
-            IncomingPhi->getType(), Slots.lookup(Root(It->second)));
+    if (auto *IncomingPhi = dyn_cast<PHINode>(Stored))
+      if (auto It = PhiIndex.find(IncomingPhi); It != PhiIndex.end()) {
+        LoadInst *Load =
+            B.CreateLoad(IncomingPhi->getType(), Slots.lookup(Root(It->second)));
         copyProvenance(*P.Phi, *Load);
         Stored = Load;
       }
-    }
     StoreInst *Store = B.CreateStore(Stored, P.Slot);
     copyProvenance(*P.Phi, *Store);
   }
 
-  for (unsigned I = 0; I != Phis.size(); ++I) {
-    if (!MaterializePhi[I])
-      continue;
-    PHINode *PN = Phis[I];
-    AllocaInst *Slot = Slots.lookup(Root(I));
-    SmallVector<Use *, 8> PhiUsers;
-    for (Use &U : PN->uses())
-      if (auto *UserPhi = dyn_cast<PHINode>(U.getUser())) {
-        auto It = PhiIndex.find(UserPhi);
-        if (It == PhiIndex.end() || MaterializePhi[It->second])
-          continue;
-        PhiUsers.push_back(&U);
-      }
-    for (Use *UP : PhiUsers) {
-      Use &U = *UP;
-      auto *UserPhi = cast<PHINode>(U.getUser());
-      unsigned Incoming = UserPhi->getIncomingValueNumForOperand(U.getOperandNo());
-      BasicBlock *Pred = UserPhi->getIncomingBlock(Incoming);
-      IRBuilder<> B(Pred->getTerminator());
-      LoadInst *Load = B.CreateLoad(PN->getType(), Slot);
-      copyProvenance(*UserPhi, *Load);
-      U.set(Load);
-    }
+  for (PHINode *PN : Phis) {
+    AllocaInst *Slot = Slots.lookup(Root(PhiIndex.lookup(PN)));
+    // Collect first: replacing a use while walking the use list would let the
+    // freshly inserted load's operands perturb the iteration.
     SmallVector<Use *, 16> Uses;
     for (Use &U : PN->uses())
       if (!isa<PHINode>(U.getUser()))
@@ -308,69 +266,16 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
       auto *UserI = dyn_cast<Instruction>(U.getUser());
       if (!UserI)
         continue;
-      IRBuilder<> B(useInsertionPoint(U, *UserI));
+      IRBuilder<> B(UserI);
       LoadInst *Load = B.CreateLoad(PN->getType(), Slot);
       copyProvenance(*UserI, *Load);
       U.set(Load);
     }
   }
   for (PHINode *PN : Phis) {
-    auto It = PhiIndex.find(PN);
-    if (It == PhiIndex.end() || !MaterializePhi[It->second])
-      continue;
     PN->replaceAllUsesWith(UndefValue::get(PN->getType()));
     PN->eraseFromParent();
   }
-  SmallVector<Instruction *, 32> CrossBlockDefs;
-  for (BasicBlock &BB : F)
-    for (Instruction &I : BB) {
-      if (I.getType()->isVoidTy() || I.getType()->isTokenTy() ||
-          I.getType()->isLabelTy() || I.getType()->isMetadataTy() ||
-          isa<AllocaInst>(&I) || I.isTerminator())
-        continue;
-      unsigned Uses = 0;
-      bool CrossesBlock = false;
-      for (Use &U : I.uses()) {
-        if (isa<DbgInfoIntrinsic>(U.getUser()))
-          continue;
-        auto *UserI = dyn_cast<Instruction>(U.getUser());
-        if (!UserI)
-          continue;
-        ++Uses;
-        CrossesBlock |= UserI->getParent() != I.getParent();
-      }
-      if (Uses > 1 && CrossesBlock)
-        CrossBlockDefs.push_back(&I);
-    }
-  for (Instruction *Def : CrossBlockDefs) {
-    SmallVector<Use *, 16> Uses;
-    for (Use &U : Def->uses())
-      if (!isa<DbgInfoIntrinsic>(U.getUser()))
-        Uses.push_back(&U);
-    std::string Name =
-        Def->hasName() ? ("v_" + Def->getName()).str() : "v_tmp";
-    IRBuilder<> AB(firstNonAlloca(Entry));
-    AllocaInst *Slot =
-        AB.CreateAlloca(Def->getType(), nullptr, Name);
-    copyProvenance(*Def, *Slot);
-    Instruction *InsertAfterDef =
-        isa<PHINode>(Def) ? Def->getParent()->getFirstNonPHI()
-                          : Def->getNextNode();
-    IRBuilder<> DB(InsertAfterDef);
-    StoreInst *Store = DB.CreateStore(Def, Slot);
-    copyProvenance(*Def, *Store);
-    for (Use *UP : Uses) {
-      Use &U = *UP;
-      auto *UserI = dyn_cast<Instruction>(U.getUser());
-      if (!UserI)
-        continue;
-      IRBuilder<> B(useInsertionPoint(U, *UserI));
-      LoadInst *Load = B.CreateLoad(Def->getType(), Slot);
-      copyProvenance(*UserI, *Load);
-      U.set(Load);
-    }
-  }
-
   unsigned ArgIndex = 0;
   for (Argument &Arg : F.args()) {
     AllocaInst *Slot = ParamSlots[ArgIndex++];

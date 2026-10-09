@@ -1,9 +1,9 @@
 ; A load feeding a return materializes into a named local; provenance
 ; survives on the new instructions and the opaque call keeps its marker.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-ssaout -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-ssaout -S %s | %FileCheck %s
 
 ; CHECK: alloca i32
-; CHECK: call i64 @revenant.asm.cpuid({{.*}}), !revenant.opaque
+; CHECK: call i64 @revenant.asm.cpuid({{.*}}), !dbg !{{[0-9]+}}, !revenant.opaque
 ; CHECK: ret i32
 
 declare i64 @revenant.asm.cpuid(i64, i64)

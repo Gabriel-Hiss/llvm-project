@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; sdiv-neg5-clang: clang ashr(m,33)+lshr(m,63) wide shape -> sdiv -5.
 define i32 @sdivneg5c(i32 %x) {
 entry:

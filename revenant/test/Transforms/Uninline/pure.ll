@@ -1,7 +1,7 @@
 ; Pure multi-instruction body: the arithmetic callee below (3 instructions)
 ; is spliced into the caller with arguments bound; the pass rebuilds the
 ; call and threads the result to the outer use.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline -S %s | %FileCheck %s
 ; CHECK-LABEL: define internal i32 @callee(
 define internal i32 @callee(i32 %a, i32 %b) {
   %m = mul i32 %a, 3

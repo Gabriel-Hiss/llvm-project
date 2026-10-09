@@ -6,7 +6,7 @@
 ;  - ??0GraphNode ctor: (ptr) -> ptr returned becomes void.
 ;  - ?addNode: (ptr this, i32, float, float) -> i32, lifted widths widened
 ;    to i64/f64, narrowed back.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.Optional = type { i64, i8 }
 %struct.GraphNode = type { i32, i32, float, float }

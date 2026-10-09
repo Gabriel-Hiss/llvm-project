@@ -3,7 +3,7 @@
 ; instructions, so the whole region still collapses to the scalar loop.
 ; Corpus shape: probe built from the clang vectorizer skeleton with a
 ; per-element condition (scalar tail %loop with select).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define i32 @condsum(ptr noundef %p, ptr noundef %q, i32 noundef %n) {
 entry:

@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; minmax: source-level compare/select forms stay visible; no optimizer intrinsics.
 define i32 @minmax(i32 %a, i32 %b) {
 entry:

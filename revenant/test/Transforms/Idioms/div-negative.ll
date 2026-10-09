@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; negative: genuine multiply (wrong shift) stays a multiply.
 define i32 @mulsurvive(i32 %x) {
 entry:

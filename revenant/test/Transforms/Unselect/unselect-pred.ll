@@ -1,7 +1,7 @@
 ; InstCombine canonicalization undo: `samesign` markers and `zext nneg`
 ; churn go back to the plain -O0 spelling. The icmp keeps its predicate,
 ; the zext loses nneg. Other instructions are untouched.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unselect -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unselect -S %s | %FileCheck %s
 
 define i32 @t(i32 %a, i32 %n) {
 ; CHECK-LABEL: define i32 @t(

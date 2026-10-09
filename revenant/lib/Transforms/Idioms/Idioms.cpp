@@ -850,9 +850,26 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
         auto *ResultI = cast<Instruction>(Result);
         copyProvenance(ResultI, &I);
         ResultI->copyMetadata(I);
+        // The flag chain that produced the sign word (sub, the overflow
+        // correction and their compares/extensions) feeds nothing else once
+        // the compare/select replaces its root: collect it so the dead nodes
+        // go away instead of lingering after the last idiom round.
+        SmallVector<WeakTrackingVH, 16> Dead;
+        SmallVector<Value *, 16> Work{I.operands()};
+        SmallPtrSet<Value *, 16> Seen;
+        while (!Work.empty()) {
+          Value *V = Work.pop_back_val();
+          if (!Seen.insert(V).second)
+            continue;
+          Dead.push_back(V);
+          if (auto *Node = dyn_cast<Instruction>(V))
+            for (Value *Operand : Node->operands())
+              Work.push_back(Operand);
+        }
         I.replaceAllUsesWith(Result);
         Result->takeName(&I);
         I.eraseFromParent();
+        RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
         LocalChanged = true;
         continue;
       }

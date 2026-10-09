@@ -2,7 +2,7 @@
 ; __CxxFrameHandler3 passes through unchanged (re-splitting needs the
 ; per-state dtor list from $stateUnwindMap/$ip2state; owner: analysis/lift).
 ; Corpus: cpp-clang-o2 main.post.ll @"?vector_ops@@YAHH@Z" block %56.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uneh -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uneh -S %s | %FileCheck %s
 
 declare i32 @__CxxFrameHandler3(...)
 declare void @vec_dtor(ptr)

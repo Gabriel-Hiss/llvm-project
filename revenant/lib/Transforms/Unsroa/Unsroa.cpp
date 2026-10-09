@@ -1910,7 +1910,7 @@ bool rebuildSplitValues(Function &F, const DataLayout &DL) {
     const Value *DstBase = nullptr;
     for (size_t k = 0; k < Siblings.size(); ++k) {
       unsigned FL = Idx[k];
-      if (FL >= NF || Seen[FL]) {
+      if (FL >= Fields.size() || Seen[FL]) {
         Covers = false;
         break;
       }

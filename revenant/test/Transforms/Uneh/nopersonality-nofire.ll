@@ -1,5 +1,5 @@
 ; No personality, no EH: a plain function is untouched (never invent EH).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uneh -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uneh -S %s | %FileCheck %s
 
 declare void @dtor(ptr)
 

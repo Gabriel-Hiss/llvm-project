@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-types -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-types -S %s | %FileCheck %s
 ;
 ; Unsigned compare votes unsigned on the slot: the alloca local gets a
 ; uint32_t DIBasicType while the argument (never compared) stays int32_t.

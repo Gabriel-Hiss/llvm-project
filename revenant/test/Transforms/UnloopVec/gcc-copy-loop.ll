@@ -1,7 +1,7 @@
 ; Lifted from c-gcc-o3 copy_vec in corpus/src/c/main.c:201-203.
 ; GCC's wide counted-copy loop uses i128 memory operations after lifting.
 ; Split each iteration into two i64 loads followed by two stores.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define void @copy_vec(ptr %dst, ptr %src, i64 %count) {
 entry:

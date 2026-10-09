@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-untaildup -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untaildup -S %s | %FileCheck %s
 ; Loop unswitching undo (single-block copies): one guard branch over two
 ; identical self-loop copies with the same exit. The pass folds them into one
 ; loop and deletes the guard.

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Lookup table (SimplifyCFG SwitchReplacement::LookupTableKind) back to a
 ; switch. Corpus: c-clang-o1..o3/oz main.post.ll @switch_twolevel
 ; (table [100 x5, 200 x5, 300 x5, 400 x5], default -1, range-checked).

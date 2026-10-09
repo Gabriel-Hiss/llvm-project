@@ -2,7 +2,7 @@
 ; `{ptr, len}` slice-iter allocas with an `ult` latch compare; post keeps
 ; only scalar phis and dbg_value fragments. The pass rebuilds a 16-byte
 ; iter frame when an ult-guarded loop branch survives without one.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

@@ -1,7 +1,7 @@
 ; Corpus: c-clang-o1 artifacts/main.post.ll @minmax abs fold
 ; (ir-pre: `a < 0 ? -a : a` ladder in main.pre.ll). llvm.abs expands to
 ; the slt compare plus negate select.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unselect -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unselect -S %s | %FileCheck %s
 
 declare i32 @llvm.abs.i32(i32, i1 immarg)
 

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Linear map (SimplifyCFG SwitchReplacement::LinearMapKind) back to a
 ; switch. Corpus: c-clang-o1..o3/oz main.post.ll @switch_offset
 ; (result = 30 + 10*i for i in [0,10), default -1).

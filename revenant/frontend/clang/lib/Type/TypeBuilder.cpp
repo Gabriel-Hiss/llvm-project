@@ -397,8 +397,21 @@ private:
       return Signed ? A.IntTy : A.UnsignedIntTy;
     case 64:
       return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
-    case 128:
-      return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
+    case 128: {
+      // MSVC does not support __int128. Use target-conditional:
+      // gcc/clang targets get unsigned __int128; MSVC gets u64 pairs
+      // via inline helpers (see TranslationUnit.cpp).
+      clang::ASTContext &A = Ctx.ast();
+      llvm::StringRef Triple = Ctx.module().getTargetTriple().str();
+      bool IsMSVC = Triple.contains("msvc");
+      if (!IsMSVC) {
+        return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
+      }
+      // MSVC: emit as u64 pair (two 64-bit halves)
+      clang::QualType U64Ty = A.UnsignedLongLongTy;
+      return A.getConstantArrayType(U64Ty, llvm::APInt(64, 2), nullptr,
+                                   clang::ArraySizeModifier::Normal, 0);
+    }
     default:
       return uintptrT();
     }

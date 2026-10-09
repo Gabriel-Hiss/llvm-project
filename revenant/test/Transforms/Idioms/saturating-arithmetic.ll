@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Reconstruct plain C compare/select arithmetic from optimizer intrinsics.
 define i8 @usub_sat(i8 %x, i8 %y) {
 entry:

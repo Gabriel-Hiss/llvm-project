@@ -49,6 +49,27 @@ ninja -C <worktree>/build-rv revenant RevenantUnitTests
 Clang is optional: only `frontend/clang` needs it.
 Never reconfigure or rebuild `build-revenant` itself.
 
+## lit suite
+
+One command runs everything under `revenant/test`:
+
+```
+python <llvm-project>/build-revenant/bin/llvm-lit.py -v <worktree>/revenant/test
+```
+
+The root `revenant/test/lit.cfg.py` picks lit's internal shell (llvm-lit on
+this box resolves `bash` to the System32 WSL stub, so the external-shell
+probe fails) and resolves `%opt`, `%FileCheck`, `%revenant-opt` and
+`%{rv-structure-tool}` from a build dir: `$REVENANT_BUILD_DIR` (or
+`$RV_BUILD_DIR`), else the newest `<worktree>/build-rv*` dir, else the
+shared `build-revenant/bin`. Build the tools the suite needs with
+`ninja -C <worktree>/build-rv revenant-opt rv-structure-tool`.
+
+RUN lines all call the static `revenant-opt` (every `revenant-<name>` pass
+linked in, no `-load-pass-plugin`). Per-pass directories keep their tests in
+`revenant/test/Transforms/<Pass>`; `ir-contract` (contract example modules)
+and `meta-mode` (corpus measurement scripts) are excluded from the suite.
+
 ## Lift tests
 
 `RevenantLiftTests` checks function lifting and cleanup verification. Its corpus

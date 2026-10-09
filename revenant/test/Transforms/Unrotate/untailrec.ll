@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -S %s | %FileCheck %s
 
 ; Post-TailCallElim @tail_gcd loop (from c-clang-o2 main.post.ll, renamed):
 ; the latch computes the next values itself, so the pass rebuilds the

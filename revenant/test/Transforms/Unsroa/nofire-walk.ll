@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Veto: a byte GEP chained under a variable-index GEP is a walking
 ; address, not a field. c-clang-o2 @hash_vec walks an i32 window with a

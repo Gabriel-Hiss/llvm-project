@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -S %s | %FileCheck %s
 
 ; Self-loop header (the shape clang -O2 leaves for @tail_gcd): one block,
 ; phis fed by its own body, backedge from its own branch. The pass splits

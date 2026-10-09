@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; ctpop: popcount spelling normalizes to the intrinsic.
 define i32 @usectpop(i8 %x) {
 entry:

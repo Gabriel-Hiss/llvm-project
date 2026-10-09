@@ -2,7 +2,7 @@
 ; `.specialized.N`/`.lto_priv` symbols (see gcc-*.map: `_S_construct...isra.0`,
 ; `pool...constprop.0`) fold back under the base name when no live base
 ; definition exists in the module.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define internal i32 @worker(ptr %p)
 define internal i32 @worker.constprop.0(ptr %p) {

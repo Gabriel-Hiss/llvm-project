@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unhotcold -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unhotcold -S %s | %FileCheck %s
 
 ; Negative tests: the pass must not fire here.
 ;

@@ -370,12 +370,20 @@ bool structDIEnabled() {
   return Value && StringRef(Value) == "1";
 }
 
-/// ir-clean: normalize lifted stack/address/width shapes, then cleanup +
-/// idioms, then the module-level ABI recovery passes plus one cleanup round.
+/// ir-clean: normalize lifted stack/address/width shapes, run cleanup and
+/// the module-level ABI recovery, then idioms as the LAST function pass.
+/// Idioms runs twice on purpose. The early run rewrites verified
+/// multiply-high DAGs into udiv/sdiv and the quotient-times-divisor residual
+/// into urem/srem while the DAG still has its source shape. The second
+/// instcombine round then canonicalizes the surviving results, and
+/// instcombine refolds a source-level three-way compare, min/max, abs or
+/// saturating add/sub into llvm.scmp/llvm.smin/llvm.abs/llvm.uadd.sat, so the
+/// late run converts those optimizer forms back to the compiler's
+/// pre-optimization (source) compare/select shape for the emitter.
 std::string cleanPipeline(bool EnableStructDI) {
   return formatv("function({0},{1}),revenant-lift-abi,"
                  "function(instcombine<no-verify-fixpoint>,early-cse,"
-                 "revenant-lift-normalize){2}",
+                 "revenant-lift-normalize,{1}){2}",
                  CleanupPipeline, IdiomsPipeline,
                  EnableStructDI ? ",revenant-lift-structs" : "")
       .str();
@@ -383,8 +391,8 @@ std::string cleanPipeline(bool EnableStructDI) {
 
 /// ir-final: deoptimization, structuring, type recovery, SSA-out.
 std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
-  return formatv("function({0}{1}{2},revenant-structure,revenant-types,"
-                 "revenant-ssaout)",
+  return formatv("function({0}{1}{2},revenant-unhotcold,revenant-structure,"
+                 "revenant-types,revenant-ssaout)",
                  IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
                  Patterns ? ",revenant-patterns" : "")
       .str();
@@ -798,6 +806,26 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     CleanText = moduleText(*M);
     if (Opts.Emit == EmitKind::IrClean) {
       R.Text = CleanText;
+      break;
+    }
+
+    // ---- ir-pre-like --------------------------------------------------------
+    // Run the deopt pipeline with locals-to-slots as the terminal pass
+    // instead of ssaout. This gives a baseline that matches the compiler's
+    // pre-optimization IR shape (SSA form with allocas, no registers).
+    if (Opts.Emit == EmitKind::IrPreLike) {
+      std::string PreLikePipeline =
+          formatv("function({0},revenant-unloopvec,revenant-structure,"
+                  "revenant-types,revenant-locals-to-slots)",
+                  UnoptPipeline)
+              .str();
+      if (auto E = runPipelineText("ir-pre-like", M, PreLikePipeline,
+                                   R.Stages, uncxxFlavor(Compiler.Producer),
+                                   &UserFunctions))
+        return std::move(E);
+      record(R.Stages, "ir-pre-like", "ok",
+             "deopt + structure + types + locals-to-slots");
+      R.Text = moduleText(*M);
       break;
     }
 

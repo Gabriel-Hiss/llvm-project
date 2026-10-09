@@ -1,6 +1,6 @@
 ; A strlen call is the c::strlen anchor: the pass rewrites it into a
 ; __pat_strlen call with the same argument.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-patterns -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-patterns -S %s | %FileCheck %s
 
 declare i64 @strlen(ptr)
 

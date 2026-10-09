@@ -1,5 +1,5 @@
 ; No-fire cases: selects the pass must leave alone.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unselect -S %s | %FileCheck %s --allow-unused-prefixes
+; RUN: %revenant-opt -passes=revenant-unselect -S %s | %FileCheck %s --allow-unused-prefixes
 
 declare ptr @opaque_callee(i32)
 

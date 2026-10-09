@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Default-block icmp/select merge
 ; (SimplifyCFG tryToSimplifyUncondBranchWithICmpSelectInIt) folded back
 ; into the switch: the default block's `icmp eq %c, 2; select` becomes a

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-unrotate -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrotate -S %s | %FileCheck %s
 
 ; Inverted guard: `if (x >= n) goto X; do { i++ } while (i < n)` still
 ; de-rotates (guard is the predicate inverse of the latch at init).

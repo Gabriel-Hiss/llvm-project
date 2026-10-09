@@ -24,6 +24,16 @@ structure, matching the engine `--patterns` path. Type recovery
 `ir-final`. The fidelity-only `ir-pre-like` stage uses
 `revenant-locals-to-slots` after type recovery instead of SSA-out.
 
+The driver's `ir-clean` stage (`Session::decompileAll`, `cleanPipeline` in
+`lib/CAPI/Stages.cpp`) runs `revenant-idioms` twice: once right after
+`<cleanup>` and once as the last pass of the trailing
+`function(instcombine,early-cse,revenant-lift-normalize)` group. The early
+run rewrites the multiply-high DAGs while the compiler's shape survives;
+the late run undoes what that trailing instcombine round refolded
+(`llvm.scmp`, `llvm.smin`/`smax`/`umin`/`umax`, `llvm.abs`,
+`llvm.uadd.sat`/`usub.sat`) back into the source-level compare/select form,
+so `ir-final` carries the compiler's pre-optimization shape.
+
 | stage | passes | source |
 |---|---|---|
 | cleanup | `sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg<no-switch-to-lookup;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks>,gvn,dse,dce,sroa,instcombine<no-verify-fixpoint>` | `crates/lift/src/pipeline.rs` `CLEANUP_PASSES` |
@@ -32,7 +42,7 @@ structure, matching the engine `--patterns` path. Type recovery
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
-| pre-like locals | `revenant-locals-to-slots` | argument spills, debug-backed/loop-carried PHI webs, return slots, after `revenant-types` |
+| pre-like locals | `revenant-locals-to-slots` | argument spills, one slot per PHI web, return slots, after `revenant-types` |
 | ssaout (post) | `revenant-ssaout` | mem2reg/sroa undo, pre-frontend |
 
 When SSA-out creates a function's first `DISubprogram`, it also gives any
@@ -155,6 +165,30 @@ pipeline.
 
 **revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies, and requires matching operands except for equivalent constant data and trap-only stubs. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
+**revenant-locals-to-slots (owner: LunaLocalsToSlots).** Expects structured,
+type-recovered SSA. Restores the `-O0` storage shape: every parameter gets an
+entry-block `alloca` spilled in signature order, every PHI web coalesces into
+one slot (each incoming value stores at its definition or on the split critical
+edge, each use loads right before it), and a multi-return function stores and
+reloads through a shared `retval` slot. Slot names come from the web's register
+name (`v_<name>`); `retval` is reserved for the return slot. Guarantees one slot
+per non-interfering web, no PHIs left behind, `!revenant.va` copied onto every
+store/load/alloca from the value it replaces. A web whose members interfere
+(one member has a use besides the destination PHI) keeps separate slots rather
+than merging. Runs after `revenant-types` in the fidelity `ir-pre-like` stage,
+replacing `revenant-ssaout`.
+
+Rule selection was measured, not assumed. On all 64 `c-clang-o2` one-to-one
+chunks (per-chunk opcode-multiset Jaccard, the harness headline metric) the
+"every PHI web" rule scores 0.2127 and leaves 318 allocas / 0 PHIs against
+ir-pre's 301 / 3. The "DI-backed + loop + retval" rule scores 0.2061 with
+214 allocas / 125 PHIs, and adding cross-block temporary spills scores 0.2132
+with 613 allocas / 125 PHIs. The three Jaccards sit within 0.007, so the
+structural counts decide: clang `-O0` is pre-mem2reg, so ir-pre has no PHIs,
+and only the all-PHI-web rule reproduces that (0 residual PHIs, allocas 6%
+over instead of 29% under or 104% over). All three beat the `revenant-ssaout`
+baseline (0.1787, 58.9 average instruction delta); the winner sits at 39.0.
+
 ## Robustness
 
 Reroll's affine model accepts signed 64-bit constants only. Lifted i128
@@ -265,3 +299,19 @@ Raw clang LTO emission succeeds with the current driver. Its `ir-final` path
 currently aborts in RerollPass on `sub_140001930` because an APInt exceeds the
 signed 64-bit extraction limit. Normalized `ir-final` scoring remains blocked
 on the separate driver/normalization owners; raw measurement above is complete.
+**revenant-unrust (owner: MuseDeoptRust2).** Expects a module with
+`revenant.lang == "rust"` (any other module is a no-op). Inverts six rustc
+codegen shapings toward the compiler's ir-pre spelling: bounds compares back
+to `icmp ult idx, len` with the panic path recognized by name
+(`panic_bounds_check`, `slice_index_fail`, `slice_error_fail`) or by the
+lifted `call + unreachable` panic-block shape (`ule` spellings also swap the
+branch successors); folded overflow checks back to
+`llvm.*.with.overflow` when the function still panics; Range/slice-iter
+frames rebuilt only when the function holds no alloca at all and the `ult`
+compare tests an induction phi with a constant step; Option/Result niche
+discriminant tests restored from the sentinel-plus-payload ladder; Vec/String
+triple frames rebuilt only when the raw buffer pointer walks through a phi;
+inlined drop glue re-outlined into `drop_glue.unrust` when every operand the
+free arm reads is remappable. Guarantees semantics-preserving rewrites only,
+`!revenant.va` preserved, `!revenant.opaque` untouched. Runs explicitly via
+`-passes=revenant-unrust`, not in the default pipeline.

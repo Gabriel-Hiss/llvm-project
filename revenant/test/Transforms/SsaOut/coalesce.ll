@@ -1,6 +1,6 @@
 ; The phi web s<->s2 and i<->i2 coalesces into two locals; the loop
 ; backedge copies land on the latch edge, not as self-assigns.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-ssaout -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-ssaout -S %s | %FileCheck %s
 
 ; CHECK-NOT: phi i32
 ; CHECK: alloca i32

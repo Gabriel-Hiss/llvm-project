@@ -112,41 +112,76 @@ bool isRustModule(const Function &F) {
 }
 
 bool isPanicBoundsCheckName(StringRef N) {
-  return N.contains("panic_bounds_check");
+  // The bounds family: `data[i]` panics through panic_bounds_check, the
+  // slice Index impl through slice_index_fail, and str slicing through
+  // slice_error_fail. All three take the (len, index) pair.
+  return N.contains("panic_bounds_check") || N.contains("slice_index_fail") ||
+         N.contains("slice_error_fail");
 }
 
 bool isPanicName(StringRef N) {
   // Matches core::panicking::{panic,panic_fmt,panic_bounds_check}, the
-  // user `panic_path` shape, and test-shim panics (my_panic); narrow
-  // enough that C++ abort/unreachable idioms never match.
-  return N.contains("panicking") || N.contains("panic_bounds_check") ||
-         N.contains("panic_fmt") || N.contains("panic");
+  // user `panic_path` shape, unwrap/slice failures, and test-shim panics
+  // (my_panic); narrow enough that C++ abort/unreachable idioms never
+  // match.
+  return isPanicBoundsCheckName(N) || N.contains("panicking") ||
+         N.contains("panic_fmt") || N.contains("unwrap_failed") ||
+         N.contains("panic");
 }
 
+// A dedicated panic block: one call plus `unreachable`, nothing else.
+// Lifted IR cannot always name the callee (sigs recover
+// core::panicking::* often but not always), so the noreturn-call shape
+// is the witness: a call whose block ends in `unreachable` and holds no
+// other effect is the tail of a panic path. Named panic callees match
+// directly; an unnamed direct callee (a `sub_<VA>` declaration) matches
+// on shape. `revenant.asm.jmp` tails also end in unreachable but carry
+// the opaque marker and are excluded.
+bool isPanicPathBlock(const BasicBlock *BB) {
+  if (BB->size() > 2)
+    return false;
+  if (!isa<UnreachableInst>(BB->getTerminator()))
+    return false;
+  const Instruction *First = nullptr;
+  for (const Instruction &I : *BB) {
+    if (isa<PHINode>(&I))
+      continue;
+    First = &I;
+    break;
+  }
+  const auto *CB = dyn_cast_or_null<CallBase>(First);
+  if (!CB || hasOpaqueMarker(*CB))
+    return false;
+  const Function *C = CB->getCalledFunction();
+  if (!C)
+    return false;
+  if (isPanicName(C->getName()))
+    return true;
+  // Unnamed lift callee: a declaration named sub_<VA> (or an import the
+  // sigs left anonymous). The unreachable terminator says noreturn, and
+  // in a rust module the noreturn callees are the panic family.
+  return C->isDeclaration();
+}
+
+// A block reaches a panic path when it is one, or when a single
+// unconditional edge leads to one (the lifter's critical-edge blocks).
+bool blockReachesPanicPath(const BasicBlock *BB) {
+  if (isPanicPathBlock(BB))
+    return true;
+  auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+  if (!BI || !BI->isUnconditional())
+    return false;
+  return isPanicPathBlock(BI->getSuccessor(0));
+}
+
+// The function still panics on a bounds check: a call to a bounds-family
+// callee (panic_bounds_check / slice_index_fail / slice_error_fail), or a
+// dedicated panic block (the lifted spelling, where the callee is named
+// or the noreturn-call shape names it).
 bool callsPanicBoundsCheck(const Function &F) {
-  for (const BasicBlock &BB : F)
-    for (const Instruction &I : BB) {
-      if (hasOpaqueMarker(I))
-        continue;
-      if (auto *CI = dyn_cast<CallInst>(&I)) {
-        const Function *C = CI->getCalledFunction();
-        if (!C)
-          continue;
-        if (isPanicBoundsCheckName(C->getName()))
-          return true;
-      } else if (auto *II = dyn_cast<InvokeInst>(&I)) {
-        const Function *C = II->getCalledFunction();
-        if (!C)
-          continue;
-        if (isPanicBoundsCheckName(C->getName()))
-          return true;
-      }
-    }
-  return false;
-}
-
-bool callsOverflowPanic(const Function &F) {
-  for (const BasicBlock &BB : F)
+  for (const BasicBlock &BB : F) {
+    if (isPanicPathBlock(&BB))
+      return true;
     for (const Instruction &I : BB) {
       if (hasOpaqueMarker(I))
         continue;
@@ -154,11 +189,30 @@ bool callsOverflowPanic(const Function &F) {
       if (!CB)
         continue;
       const Function *C = CB->getCalledFunction();
-      if (!C)
-        continue;
-      if (isPanicName(C->getName()))
+      if (C && isPanicBoundsCheckName(C->getName()))
         return true;
     }
+  }
+  return false;
+}
+
+// The function still panics on overflow: a call to a panic callee, or a
+// dedicated panic block (the lifted spelling of the panic edge).
+bool callsOverflowPanic(const Function &F) {
+  for (const BasicBlock &BB : F) {
+    if (isPanicPathBlock(&BB))
+      return true;
+    for (const Instruction &I : BB) {
+      if (hasOpaqueMarker(I))
+        continue;
+      const auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      const Function *C = CB->getCalledFunction();
+      if (C && isPanicName(C->getName()))
+        return true;
+    }
+  }
   return false;
 }
 
@@ -167,13 +221,11 @@ bool callsOverflowPanic(const Function &F) {
 // (ult idx len -> ugt len idx) when it threads range facts; flipping it
 // back is a pure predicate rename with swapped operands, provably the
 // same boolean. Only rewrites compares that feed a conditional branch
-// whose false edge reaches a panic_bounds_check block (or when the
-// function still calls panic_bounds_check anywhere: the check was
-// deleted but the shape facts survive). samesign/nneg markers are
-// dropped back to the plain predicate: removing poison markers only
-// removes refinement.
-bool canonicalizeBoundsPredicates(Function &F, bool HasPanicCall,
-                                  unsigned &Changed) {
+// whose false edge reaches a panic path: a dedicated panic block, named
+// (panic_bounds_check / slice_index_fail / slice_error_fail) or the
+// lifted noreturn-call shape. samesign/nneg markers are dropped back to
+// the plain predicate: removing poison markers only removes refinement.
+bool canonicalizeBoundsPredicates(Function &F, unsigned &Changed) {
   bool Any = false;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
@@ -186,43 +238,16 @@ bool canonicalizeBoundsPredicates(Function &F, bool HasPanicCall,
       auto *BI = dyn_cast<BranchInst>(Cmp->getParent()->getTerminator());
       if (!BI || !BI->isConditional() || BI->getCondition() != Cmp)
         continue;
-      // False edge must reach a panic block, or the function must still
-      // call panic_bounds_check (deleted-check shape: the compare
-      // survives only as range-implied facts in a loop header or an
-      // assume). Without either, this is a generic unsigned compare.
+      // The false edge must reach a panic path: a dedicated panic block
+      // (the call + unreachable shape, named callee or the lifted
+      // noreturn-call spelling) or, through one trivial edge, another
+      // block that is one. Without it this is a generic unsigned
+      // compare: pure range-check idioms (char-boundary tests like
+      // `ult %c, 128`) leave them, samesign and all.
       bool FalseHitsPanic = false;
-      for (BasicBlock *Succ : BI->successors()) {
-        for (Instruction &SI : *Succ) {
-          if (hasOpaqueMarker(SI))
-            continue;
-          if (auto *CB = dyn_cast<CallBase>(&SI)) {
-            const Function *C = CB->getCalledFunction();
-            if (C && isPanicBoundsCheckName(C->getName()))
-              FalseHitsPanic = true;
-          }
-          if (isa<UnreachableInst>(&SI) && Succ->size() <= 3)
-            FalseHitsPanic = FalseHitsPanic || HasPanicCall;
-        }
-        // One-block lookahead through a trivial forward edge.
-        if (Succ->size() <= 2 && isa<BranchInst>(Succ->getTerminator())) {
-          auto *Next = dyn_cast<BranchInst>(Succ->getTerminator());
-          if (Next && Next->isUnconditional()) {
-            BasicBlock *T = Next->getSuccessor(0);
-            for (Instruction &SI : *T) {
-              if (auto *CB = dyn_cast<CallBase>(&SI)) {
-                const Function *C = CB->getCalledFunction();
-                if (C && isPanicBoundsCheckName(C->getName()))
-                  FalseHitsPanic = true;
-              }
-            }
-          }
-        }
-      }
-      // Pure range-check idioms (char-boundary tests like `ult %c, 128`)
-      // never touch a panic block: leave them, samesign and all. Only
-      // compares whose false edge can reach a panic get the plain
-      // predicate back (removing poison markers only removes
-      // refinement).
+      for (BasicBlock *Succ : BI->successors())
+        if (blockReachesPanicPath(Succ))
+          FalseHitsPanic = true;
       if (!FalseHitsPanic)
         continue;
       bool DroppedFlags = false;
@@ -230,19 +255,32 @@ bool canonicalizeBoundsPredicates(Function &F, bool HasPanicCall,
         Cmp->setSameSign(false);
         DroppedFlags = true;
       }
-      // Canonicalize ugt/uge (len vs idx) back to ult/ule (idx vs len).
+      // Canonicalize the flipped spellings back toward the rustc form
+      // `icmp ult idx, len` (true = in bounds). `ugt len, idx` and
+      // `uge len, idx` swap operands and predicate with the same
+      // boolean; `ule len, idx` (len <= idx, the panic condition) also
+      // negates, so its branch successors swap.
       ICmpInst::Predicate P = Cmp->getPredicate();
       ICmpInst::Predicate Want = ICmpInst::BAD_ICMP_PREDICATE;
+      bool Negated = false;
       if (P == ICmpInst::ICMP_UGT)
         Want = ICmpInst::ICMP_ULT;
       else if (P == ICmpInst::ICMP_UGE)
         Want = ICmpInst::ICMP_ULE;
+      else if (P == ICmpInst::ICMP_ULE)
+        Want = ICmpInst::ICMP_ULT, Negated = true;
       if (Want != ICmpInst::BAD_ICMP_PREDICATE) {
         Value *A = Cmp->getOperand(0);
         Value *B = Cmp->getOperand(1);
         Cmp->setOperand(0, B);
         Cmp->setOperand(1, A);
         Cmp->setPredicate(Want);
+        if (Negated) {
+          BasicBlock *T = BI->getSuccessor(0);
+          BasicBlock *E = BI->getSuccessor(1);
+          BI->setSuccessor(0, E);
+          BI->setSuccessor(1, T);
+        }
         ++Changed;
         Any = true;
       } else if (DroppedFlags) {
@@ -416,18 +454,23 @@ bool rebuildOverflowChecks(Function &F, bool HasOverflowPanic,
 // of a 2x i64 aggregate and never tests it, re-materialize the
 // `trunc + icmp` the pre shape names right after the store. The test
 // feeds no branch; it only names the discriminant value again.
+//
+// Two gates name the enum-constructor shape, because the two IR spellings
+// differ: compiler post IR keeps the corpus mangled name
+// (`corpus_rust...option_result`), so the name carries the gate; lifted
+// IR names the function `sub_<VA>`, so the shape carries it instead. The
+// shape gate is the niche ladder: a sentinel store at slot 0 of an
+// aggregate that also takes a payload store at another offset. Storing
+// -1/0 as plain data (fmt write cursors, btree navigate keys) never
+// pairs with a payload store on the same base.
 bool restoreNicheTests(Function &F, unsigned &Changed) {
-  // Only corpus enum-shape functions rebuild the discriminant: the name
-  // must carry the corpus crate tag (corpus_rust/minecalc) plus an
-  // Option/Result/enum hint. Blind sentinel matching fires in foreign
-  // crates (o0 btree navigate stores -1/0 as data, not discriminants).
   StringRef N = F.getName();
   bool InCorpus = N.contains("corpus_rust") || N.contains("minecalc");
   bool IsEnumFam = N.contains("option") || N.contains("Option") ||
                    N.contains("result") || N.contains("Result") ||
                    N.contains("enum_area") || N.contains("option_result");
-  if (!InCorpus || !IsEnumFam)
-    return false;
+  bool NameGate = InCorpus && IsEnumFam;
+
   bool Any = false;
   SmallVector<StoreInst *, 8> Sentinels;
   for (BasicBlock &BB : F)
@@ -440,8 +483,51 @@ bool restoreNicheTests(Function &F, unsigned &Changed) {
         continue;
       if (!C->isMinusOne() && !C->isZero())
         continue;
-      Type *PT = SI->getPointerOperand()->getType();
-      (void)PT;
+      if (NameGate) {
+        Sentinels.push_back(SI);
+        continue;
+      }
+      // Shape gate: slot 0 of an aggregate that also takes a payload
+      // store at another offset. The aggregate base is the store's
+      // pointer with all-zero GEPs stripped; a frame slot (%fpNN /
+      // %elementNN of the big frame alloca) is not a niche ladder
+      // member, and neither is a nonzero-offset store.
+      Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
+      while (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+        if (!GEP->hasAllZeroIndices())
+          break;
+        Ptr = GEP->getPointerOperand()->stripPointerCasts();
+      }
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+        (void)GEP;
+        continue;
+      }
+      if (isa<AllocaInst>(Ptr))
+        continue;
+      // The ladder is thin: exactly two store pointers resolve to this
+      // base, the sentinel at the base (slot 0) plus one payload at
+      // another offset. Struct initializers that zero many fields
+      // (Once setup), fmt write cursors that store a count repeatedly
+      // (demangler printers), and string fills all break the shape.
+      SmallPtrSet<Value *, 4> StorePtrs;
+      for (BasicBlock &B2 : F)
+        for (Instruction &I2 : B2) {
+          auto *S2 = dyn_cast<StoreInst>(&I2);
+          if (!S2 || hasOpaqueMarker(*S2))
+            continue;
+          Value *P2 = S2->getPointerOperand()->stripPointerCasts();
+          while (auto *G2 = dyn_cast<GetElementPtrInst>(P2)) {
+            if (!G2->hasAllZeroIndices())
+              break;
+            P2 = G2->getPointerOperand()->stripPointerCasts();
+          }
+          if (auto *G2 = dyn_cast<GetElementPtrInst>(P2))
+            P2 = G2->getPointerOperand()->stripPointerCasts();
+          if (P2 == Ptr)
+            StorePtrs.insert(S2->getPointerOperand());
+        }
+      if (StorePtrs.size() != 2)
+        continue;
       Sentinels.push_back(SI);
     }
   for (StoreInst *SI : Sentinels) {
@@ -506,17 +592,27 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
   // are intact or the function never had one): a bare GEP is not
   // enough, or every btree helper with a buffer GEP grows a frame.
   bool HasSroaPhi = false;
+  // Lifted IR keeps every local in one big frame alloca, so the triple
+  // is already inside `%frame` and a dead 24-byte frame would duplicate
+  // it: rebuild only when the function holds no alloca at all.
+  bool HasAlloca = false;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        HasAlloca = true;
         Type *AT = AI->getAllocatedType();
         if (AT->isArrayTy() && AT->getArrayNumElements() == 24)
           HasTriple = true;
       }
       if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-        if (GEP->getSourceElementType()->isIntegerTy(8) ||
-            GEP->getSourceElementType()->isIntegerTy(32) ||
-            GEP->getSourceElementType()->isIntegerTy(64))
+        // The raw buffer pointer walks through the triple: SROA leaves
+        // it in a phi (the compiler post shape), never in a plain
+        // argument (a lifted vec function reads its parts from memory,
+        // and Mutex<Vec<u8>>::lock just indexes an argument).
+        if (isa<PHINode>(GEP->getPointerOperand()) &&
+            (GEP->getSourceElementType()->isIntegerTy(8) ||
+             GEP->getSourceElementType()->isIntegerTy(32) ||
+             GEP->getSourceElementType()->isIntegerTy(64)))
           HasBufGEP = true;
       }
       if (auto *PN = dyn_cast<PHINode>(&I)) {
@@ -525,7 +621,7 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
       }
     }
   }
-  if (HasTriple || !HasBufGEP || !HasSroaPhi)
+  if (HasTriple || HasAlloca || !HasBufGEP || !HasSroaPhi)
     return false;
   BasicBlock &Entry = F.getEntryBlock();
   if (Entry.empty())
@@ -554,12 +650,53 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
 // (same test, same dealloc, same order), so it is semantics-preserving
 // by construction. Only fires when the module has no surviving
 // `drop_glue` definition for the family (all inlined away) and the
-// guarded arm provably frees (calls `__rust_dealloc`/`__rust_realloc`
-// or a `Drop::drop` callee); the niche `eq -1` form and the
-// length-zero `eq 0` form both match. Fallback when outlining is
-// unsafe (test value used outside the region, dealloc arm has extra
-// live-outs): canonicalize a `ne` discriminant test toward the pre
-// `eq` spelling with swapped successors.
+// guarded arm provably frees (calls `__rust_dealloc`/`__rust_realloc`,
+// the Windows heap import the std allocator uses, or a `Drop::drop`
+// callee); the niche `eq -1` form and the length-zero `eq 0` form both
+// match. Lift cannot name the dealloc wrapper (it is a `sub_<VA>`
+// declaration), so an unnamed direct callee in the freeing arm counts
+// too: the test-plus-single-freeing-arm shape is the witness. Fallback
+// when outlining is unsafe (test value used outside the region, dealloc
+// arm has extra live-outs or unclonable operands): canonicalize a `ne`
+// discriminant test toward the pre `eq` spelling with swapped
+// successors.
+//
+// A callee whose arm frees: the named families, or an unnamed direct
+// callee (a lift declaration) whose block also ends in `unreachable`
+// or returns.
+bool isFreeCallee(const Function *C) {
+  if (!C)
+    return false;
+  StringRef N = C->getName();
+  return N.contains("__rust_dealloc") || N.contains("__rust_realloc") ||
+         N.contains("HeapFree") || N.contains("HeapReAlloc") ||
+         N.contains("process_heap_alloc") ||
+         (N.contains("Drop") && N.contains("drop")) ||
+         (C->isDeclaration() && !C->isIntrinsic());
+}
+
+// Every operand the outlined free arm reads must be remappable into the
+// new function: the aggregate base, the discriminant pointer, the test
+// value, a constant, or an instruction the arm itself clones. Anything
+// else (a caller value, a function argument, a value from another block)
+// would dangle in the outline.
+bool canOutlineFreeArm(const BasicBlock *FreeArm, Value *Base, Value *AggPtr,
+                       Value *TestVal) {
+  for (const Instruction &SI : *FreeArm) {
+    if (SI.isTerminator())
+      break;
+    for (const Value *Op : SI.operands()) {
+      if (isa<Constant>(Op) || Op == Base || Op == AggPtr || Op == TestVal)
+        continue;
+      const auto *I = dyn_cast<Instruction>(Op);
+      if (I && I->getParent() == FreeArm)
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
+
 bool canonicalizeDropTests(Function &F, unsigned &Changed) {
   Module *M = F.getParent();
   bool HasDropGlueDef = false;
@@ -602,11 +739,7 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
           continue;
         if (auto *CB = dyn_cast<CallBase>(&SI)) {
           const Function *CF = CB->getCalledFunction();
-          if (!CF)
-            continue;
-          StringRef N = CF->getName();
-          if (N.contains("__rust_dealloc") || N.contains("__rust_realloc") ||
-              (N.contains("Drop") && N.contains("drop")))
+          if (isFreeCallee(CF))
             Frees = true;
         }
       }
@@ -629,7 +762,13 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
     if (!HasDropGlueDef) {
       // Build drop_glue.unrust(ptr-to-aggregate): move the test + free
       // arm. The aggregate pointer is the load's pointer operand base.
-      Value *AggPtr = Load->getPointerOperand();
+      Value *AggPtr = Load->getPointerOperand()->stripPointerCasts();
+      Value *Base = AggPtr;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr))
+        Base = GEP->getPointerOperand()->stripPointerCasts();
+      // Bail when the arm reads values the outline cannot reach.
+      if (!canOutlineFreeArm(FreeArm, Base, AggPtr, TestVal))
+        continue;
       LLVMContext &Ctx = F.getContext();
       Type *PtrTy = PointerType::get(Ctx, 0);
       FunctionType *FTy =
@@ -648,20 +787,21 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
       BasicBlock *NBL = BasicBlock::Create(Ctx, "live", NF);
       IRBuilder<> B(NBT);
       B.SetCurrentDebugLocation(DebugLoc());
-      // Reload the discriminant from the parameter at the same offset.
-      Value *Base = AggPtr;
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr)) {
-        (void)GEP;
-        Base = GEP->getPointerOperand();
-      }
-      // Conservative: reload from arg base + 0 (len/niche slot). The
-      // load type matches the original test value type.
-      auto *NLoad = B.CreateLoad(TestVal->getType(), Arg, "discr");
+      // Reload the discriminant from the parameter at the same offset:
+      // the argument is the aggregate base, so a GEP-offset test value
+      // gets its GEP recreated on the parameter.
+      Value *NArg = Arg;
+      if (AggPtr != Base)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr))
+          NArg = B.CreateGEP(GEP->getSourceElementType(), Arg,
+                             SmallVector<Value *, 4>(GEP->indices()), "discr.p");
+      auto *NLoad = B.CreateLoad(TestVal->getType(), NArg, "discr");
       auto *NCmp = B.CreateICmp(ICmpInst::ICMP_EQ, NLoad, C, "drop.test");
       B.CreateCondBr(NCmp, NBL, NBF);
       // Clone the free arm body (up to its terminator) into NBF.
       DenseMap<Value *, Value *> VMap;
-      VMap[AggPtr] = Arg;
+      VMap[Base] = Arg;
+      VMap[AggPtr] = NArg;
       VMap[TestVal] = NLoad;
       IRBuilder<> BF(NBF);
       BF.SetCurrentDebugLocation(DebugLoc());
@@ -669,7 +809,7 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
         if (SI.isTerminator())
           break;
         if (auto *Load2 = dyn_cast<LoadInst>(&SI)) {
-          Value *PO = Load2->getPointerOperand();
+          Value *PO = Load2->getPointerOperand()->stripPointerCasts();
           Value *NPO = VMap.count(PO) ? VMap[PO] : PO;
           auto *NL = BF.CreateLoad(Load2->getType(), NPO,
                                    SI.getName() + ".og");
@@ -752,10 +892,11 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
     bool ArmDrops = false;
     for (BasicBlock *Succ : BI->successors())
       for (Instruction &SI : *Succ) {
+        if (hasOpaqueMarker(SI))
+          continue;
         if (auto *CB = dyn_cast<CallBase>(&SI)) {
           const Function *C = CB->getCalledFunction();
-          if (C && C->getName().contains("Drop") &&
-              C->getName().contains("drop"))
+          if (isFreeCallee(C))
             ArmDrops = true;
         }
       }
@@ -784,58 +925,61 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
 // loop header compares a phi against a length with `ult` but the
 // function holds no 16-byte iter frame, add one and seed it from the
 // loop's pointer/length. Dead until stored; cleanup removes it.
+//
+// Lifted IR materializes every local in one big frame alloca, so the
+// iter struct is already inside `%frame`: a function that still holds an
+// alloca keeps its frames and gets no dead duplicate. And a bare `ult`
+// compare (bounds checks, magic division, `n <= 1` base cases) is not a
+// range loop: the compare must test the induction phi, and the phi's
+// loop-carried update must be a constant step (Range::next). Functions
+// with no alloca at all (the compiler post shape, SROA'd) still fire.
 bool rebuildIterFrame(Function &F, unsigned &Changed) {
   bool HasIter = false;
-  bool HasUltLoop = false;
-  for (BasicBlock &BB : F) {
+  bool HasAlloca = false;
+  for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
-      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        Type *AT = AI->getAllocatedType();
-        if (AT->isArrayTy() && AT->getArrayNumElements() == 16)
-          HasIter = true;
-      }
+      auto *AI = dyn_cast<AllocaInst>(&I);
+      if (!AI)
+        continue;
+      HasAlloca = true;
+      Type *AT = AI->getAllocatedType();
+      if (AT->isArrayTy() && AT->getArrayNumElements() == 16)
+        HasIter = true;
     }
-    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!BI || !BI->isConditional())
-      continue;
-    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-    if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
-      continue;
-    // Loop shape: an ult-guarded branch inside a function that still
-    // carries a loop phi (SROA evidence: at -O0 the iter struct is
-    // intact and no phi exists, so a bare ult loop is not enough).
-    for (BasicBlock &B2 : F)
-      for (Instruction &SI : B2)
-        if (isa<PHINode>(&SI))
-          HasUltLoop = true;
-  }
-  if (HasIter || !HasUltLoop)
+  if (HasIter || HasAlloca)
     return false;
-  // The ult compare must feed the loop through a phi: one operand must
-  // be a phi node (induction) or flow into one. A plain ult branch
-  // over straight-line code (o0 bounds checks) is not an iter loop.
-  bool UltFeedsPhi = false;
+  // Range-loop evidence: an `ult` compare on the induction phi whose
+  // loop-carried value is `add/sub phi, C`.
+  bool IsRangeLoop = false;
   for (BasicBlock &BB : F) {
     auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
     if (!BI || !BI->isConditional())
       continue;
     auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-    if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    if (!Cmp || hasOpaqueMarker(*Cmp) || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
       continue;
     for (Value *Op : Cmp->operands()) {
-      if (isa<PHINode>(Op))
-        UltFeedsPhi = true;
-      if (auto *I = dyn_cast<Instruction>(Op))
-        for (User *U : I->users())
-          if (isa<PHINode>(U))
-            UltFeedsPhi = true;
+      auto *PN = dyn_cast<PHINode>(Op);
+      if (!PN)
+        continue;
+      for (unsigned K = 0; K < PN->getNumIncomingValues(); ++K) {
+        auto *Step = dyn_cast<BinaryOperator>(PN->getIncomingValue(K));
+        if (!Step)
+          continue;
+        if (Step->getOpcode() != Instruction::Add &&
+            Step->getOpcode() != Instruction::Sub)
+          continue;
+        if (Step->getOperand(0) != PN && Step->getOperand(1) != PN)
+          continue;
+        bool ConstStep =
+            isa<ConstantInt>(Step->getOperand(0)) ||
+            isa<ConstantInt>(Step->getOperand(1));
+        if (ConstStep)
+          IsRangeLoop = true;
+      }
     }
-    for (BasicBlock *Succ : BI->successors())
-      for (Instruction &SI : *Succ)
-        if (isa<PHINode>(&SI))
-          UltFeedsPhi = true;
   }
-  if (!UltFeedsPhi)
+  if (!IsRangeLoop)
     return false;
   BasicBlock &Entry = F.getEntryBlock();
   if (Entry.empty())
@@ -864,7 +1008,7 @@ PreservedAnalyses revenant::UnrustPass::run(Function &F,
   bool HasPanicCall = callsPanicBoundsCheck(F);
   bool HasOverflowPanic = callsOverflowPanic(F);
 
-  canonicalizeBoundsPredicates(F, HasPanicCall, Changed);
+  canonicalizeBoundsPredicates(F, Changed);
   materializeAssumeCompares(F, HasPanicCall, Changed);
   rebuildOverflowChecks(F, HasOverflowPanic, Changed);
   restoreNicheTests(F, Changed);

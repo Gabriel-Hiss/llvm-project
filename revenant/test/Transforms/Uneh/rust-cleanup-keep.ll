@@ -2,7 +2,7 @@
 ; call + cleanupret under __CxxFrameHandler3 passes through unchanged.
 ; Corpus: rust-o0/artifacts/corpus_rust.pre.ll drop_glue (invoke drop,
 ; cleanuppad, drop_glue call with funclet bundle, cleanupret to caller).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uneh -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uneh -S %s | %FileCheck %s
 
 declare i32 @__CxxFrameHandler3(...)
 declare void @drop(ptr)

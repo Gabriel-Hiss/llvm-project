@@ -1,7 +1,7 @@
 ; Corpus shape: miniz-clang-o1 `mz_deflateInit` (ir-pre) is a single-call
 ; wrapper tail-calling `mz_deflateInit2`; ir-post `mz_compress2` inlines
 ; that call. The pass recovers the wrapper call from the bound inner call.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline -S %s | %FileCheck %s
 
 declare i32 @mz_deflateInit2(ptr noundef, i32 noundef, i32 noundef, i32 noundef, i32 noundef, i32 noundef)
 

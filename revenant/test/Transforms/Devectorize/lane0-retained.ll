@@ -1,6 +1,6 @@
 ; Negative: a returned <2 x double> keeps full width. The extract stays a
 ; vector extract; nothing scalarizes. Ports lane0_returned_i128_stays.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 define <2 x double> @lane0_retained(ptr %p0, ptr %q) {
 entry:

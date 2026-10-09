@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Corpus: c-clang-o1, @main. A byte GEP at an array element boundary off a
 ; `[16 x i32]` alloca becomes the array element GEP the ir-pre had.

@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Lifted SIMD masks must not be narrowed to i64 during affine matching.
 ; Equal wide constants remain comparable without computing a difference.
 

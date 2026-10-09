@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; A 4x-unrolled i32 sum loop (step 4, four s += a[i+j] windows) folds to a
 ; single-window loop stepping by 1. Ports crates/unopt reroll_in_loop_fold.
 

@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; The lifted TEST pattern already has the source-level bit-test form in IR.
 define i1 @bit_is_set(i32 %flags) {
 entry:

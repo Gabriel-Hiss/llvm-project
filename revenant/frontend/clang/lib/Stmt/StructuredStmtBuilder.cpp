@@ -431,6 +431,9 @@ Expr *StructuredStmtBuilder::caseValue(const ConstantInt *V, QualType CT) {
     CT = AST->getPromotedIntegerType(CT);
   if (!CT->isIntegerType())
     CT = AST->IntTy;
+  // Promote small int types to int to avoid Ui8/Ui16 suffixes
+  if (CT->isIntegerType() && AST->getTypeSize(CT) < 32)
+    CT = AST->IntTy;
   unsigned W = (unsigned)AST->getIntWidth(CT);
   APInt Raw = V->getValue();
   if (CT->isSignedIntegerType())
@@ -494,10 +497,13 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     if (BI->isUnconditional()) {
       BasicBlock *S = BI->getSuccessor(0);
       if (Rgn && !Rgn->Degraded) {
-        // Rgn is the construct this block is emitted inside, so an edge
-        // to its follow is lexically within it: break is valid. Edges
-        // reaching an outer construct's exit stay gotos (membership does
-        // not prove lexical containment).
+        // A non-latch edge back to the header is a source-level continue;
+        // in a for-loop, Clang routes it through the emitted increment.
+        if (isLoopKind(Rgn->Kind) && S == Rgn->Header &&
+            BB != Rgn->Latch)
+          return new (*AST) ContinueStmt(SourceLocation());
+        // Edges reaching an outer construct's exit stay gotos (membership
+        // does not prove lexical containment).
         if ((isLoopKind(Rgn->Kind) || Rgn->Kind == RegionKind::Switch) &&
             S == Rgn->Follow)
           return new (*AST) BreakStmt(SourceLocation());
@@ -517,6 +523,9 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       if (Rgn && !Rgn->Degraded) {
         // Same rule as the unconditional edge: break only when the arm
         // exits the construct it is lexically emitted inside.
+        if (isLoopKind(Rgn->Kind) && S == Rgn->Header &&
+            BB != Rgn->Latch)
+          return new (*AST) ContinueStmt(SourceLocation());
         if ((isLoopKind(Rgn->Kind) || Rgn->Kind == RegionKind::Switch) &&
             S == Rgn->Follow)
           return new (*AST) BreakStmt(SourceLocation());
@@ -1208,11 +1217,15 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
     return nullptr;
 
   // Personality decides the spelling: __C_specific_handler -> SEH.
+  // For non-MSVC targets (gcc/MinGW), never emit SEH.
   bool IsSEH = false;
   if (Fn && Fn->hasPersonalityFn()) {
-    if (const auto *GV = dyn_cast<GlobalValue>(
-            Fn->getPersonalityFn()->stripPointerCasts()))
-      IsSEH = GV->getName() == "__C_specific_handler";
+    llvm::StringRef Triple = Fn->getParent()->getTargetTriple().str();
+    if (Triple.contains("msvc")) {
+      if (const auto *GV = dyn_cast<GlobalValue>(
+              Fn->getPersonalityFn()->stripPointerCasts()))
+        IsSEH = GV->getName() == "__C_specific_handler";
+    }
   }
 
   // A decoded try-table entry can protect several invoke sites. Gather the

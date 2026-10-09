@@ -3,7 +3,7 @@
 ; optimizer CSEs the two extracts into one value use). The pass leaves
 ; existing with.overflow sites alone and never invents a declare (this
 ; opt build rejects synthesized intrinsic declares at verify).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 target triple = "x86_64-pc-windows-msvc"
 

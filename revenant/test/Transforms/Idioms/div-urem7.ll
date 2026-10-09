@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; urem7: quotient DAG plus q*-7+x -> udiv 7 and urem 7.
 define i32 @urem7(i32 %x) {
 entry:

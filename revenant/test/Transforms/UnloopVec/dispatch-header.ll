@@ -10,7 +10,7 @@
 ; restarts the header at 0 mid-dispatch, and the vector latch's exit
 ; value (IV.next == n.vec) feeds the header resume edge.
 ;
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define void @fill_header(ptr %dst, i32 %value, i32 %n) {
 entry:
