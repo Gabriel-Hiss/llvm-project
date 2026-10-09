@@ -402,7 +402,7 @@ private:
       // gcc/clang targets get unsigned __int128; MSVC gets u64 pairs
       // via inline helpers (see TranslationUnit.cpp).
       clang::ASTContext &A = Ctx.ast();
-      llvm::StringRef Triple = Ctx.module().getTargetTriple();
+      llvm::StringRef Triple = Ctx.module().getTargetTriple().str();
       bool IsMSVC = Triple.contains("msvc");
       if (!IsMSVC) {
         return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
