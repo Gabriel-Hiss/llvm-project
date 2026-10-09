@@ -28,24 +28,22 @@
 //      tiers). No calls except LLVM intrinsics, no inline asm, no
 //      volatile/atomic memory, no ret/unreachable/trap, br-only
 //      terminators.
-//   S: preds are exactly {D} plus R blocks; S is not a loop header; S's
-//      own terminator condition never depends on an S phi (tier routing
-//      stays N-driven, as the vectorizer built it).
+//   S: preds are exactly {D} plus R blocks; S-routing may depend on S
+//      phis only when each is a resume phi (D-incoming constant 0,
+//      R-incomings Bound-derived, so routing is a pure function of N
+//      on the folded path); accumulators still bail.
 //   L: single-block scalar self-loop with preds exactly {S, L}; its IV
 //      starts at an S phi whose D-incoming is constant 0; other L phis
 //      start at S phis or values defined outside R; L's exit bound
-//      derives from the same trip count N as n.vec (through pure ops).
+//      derives from the same trip count N as n.vec, either directly or
+//      as a remainder (N minus a resume phi, the byte-tail shape).
+//      The latch may count a sibling constant-step phi.
 //   Top vector body B in R: IV from constant 0, constant step K >= 2,
 //      exit compares IV-next == n.vec where n.vec is N with low bits
-//      masked (and-form) or N minus N mod K (sub/urem-form), and that
-//      same n.vec value feeds S's resume phi from an R block.
-//   Escape: R definitions are used only inside R, by S phis, by phis of
-//      non-S outsiders through R-block edges (dropped with the edge),
-//      or by debug intrinsics.
-//   FP: an FP-typed accumulator is only collapsed when every FP binop in
-//      R carries reassoc/fast flags (the IR's own license to reassociate,
-//      the same one the vectorizer used); integer reductions always go.
-//
+//      cleared (any mask with K >= 1 low zero bits, not just the exact
+//      ~(step-1)) or N minus N mod K (sub/urem-form), and that same
+//      n.vec value (possibly through casts) feeds a resume phi from an
+//      R block.
 // Why starting the tail at 0 is sound for tiered shapes (wide loop +
 // epilogue vector loop + unrolled scalar tiers, e.g. AVX2 c/avx2 sum):
 // every tier dispatch downstream of S tests the trip count N (N mod
