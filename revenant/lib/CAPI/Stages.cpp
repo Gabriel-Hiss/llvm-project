@@ -324,14 +324,21 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
   return verifyStage(Stage, *M);
 }
 
+/// Enable struct-layout recovery and its associated debug types only when
+/// explicitly requested. Set REVENANT_ENABLE_STRUCT_DI=1 to opt in.
+bool structDIEnabled() {
+  const char *Value = std::getenv("REVENANT_ENABLE_STRUCT_DI");
+  return Value && StringRef(Value) == "1";
+}
+
 /// ir-clean: normalize lifted stack/address/width shapes, then cleanup +
-/// idioms, then the module-level ABI/struct recovery passes plus one
-/// cleanup round to fold the ptrtoint/inttoptr seams they introduce.
-std::string cleanPipeline() {
+/// idioms, then the module-level ABI recovery passes plus one cleanup round.
+std::string cleanPipeline(bool EnableStructDI) {
   return formatv("function({0},{1}),revenant-lift-abi,"
                  "function(instcombine<no-verify-fixpoint>,early-cse,"
-                 "revenant-lift-normalize),revenant-lift-structs",
-                 CleanupPipeline, IdiomsPipeline)
+                 "revenant-lift-normalize){2}",
+                 CleanupPipeline, IdiomsPipeline,
+                 EnableStructDI ? ",revenant-lift-structs" : "")
       .str();
 }
 
@@ -520,7 +527,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-clean ----------------------------------------------------------
-    if (auto E = runPipelineText("ir-clean", M, cleanPipeline(), R.Stages))
+    if (Error E =
+            runPipelineText("ir-clean", M, cleanPipeline(structDIEnabled()),
+                            R.Stages))
       return std::move(E);
     record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
     CleanText = moduleText(*M);

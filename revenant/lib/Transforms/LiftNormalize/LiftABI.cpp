@@ -239,9 +239,10 @@ void rewriteSignature(Function &F, Signature &S) {
     Attrs.push_back(S.Pointers[J] ? AttributeSet() : F.getAttributes().getParamAttrs(J));
   N->setAttributes(AttributeList::get(M.getContext(), F.getAttributes().getFnAttrs(),
       S.PointerReturn ? AttributeSet() : F.getAttributes().getRetAttrs(), Attrs));
-  updateSubprogramType(*N, ArrayRef<bool>(S.Pointers), S.PointerReturn);
+  M.getFunctionList().insert(F.getIterator(), N);
   N->takeName(&F);
   N->splice(N->end(), &F);
+  updateSubprogramType(*N, ArrayRef<bool>(S.Pointers), S.PointerReturn);
   for (Argument &Old : F.args()) {
     Argument *New = N->getArg(Old.getArgNo());
     New->takeName(&Old);

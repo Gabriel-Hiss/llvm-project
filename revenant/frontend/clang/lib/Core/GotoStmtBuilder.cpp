@@ -73,6 +73,18 @@ c::CompoundStmt *GotoStmtBuilder::buildBody(llvm::Function &F,
     } else if (auto *SI = llvm::dyn_cast<llvm::SwitchInst>(T)) {
       c::Expr *Cond = Exprs.cond(SI->getCondition(), Scope);
       c::QualType CT = Cond ? Cond->getType() : AST.IntTy;
+      if (!CT->isIntegerType()) {
+        unsigned Bits =
+            SI->getCondition()->getType()->getIntegerBitWidth();
+        CT = AST.getIntTypeForBitwidth(Bits, false);
+        c::CastKind K = Cond->getType()->isPointerType()
+                            ? c::CK_PointerToIntegral
+                            : c::CK_IntegralCast;
+        Cond = c::CStyleCastExpr::Create(
+            AST, CT, c::VK_PRValue, K, Cond, nullptr, c::FPOptionsOverride(),
+            AST.getTrivialTypeSourceInfo(CT), c::SourceLocation(),
+            c::SourceLocation());
+      }
       // The checker types the switch by the PRINTED condition: an
       // ImplicitCast (lvalue-to-rvalue) prints as its operand, so the
       // declared variable type governs, not the load's type. Widen to
