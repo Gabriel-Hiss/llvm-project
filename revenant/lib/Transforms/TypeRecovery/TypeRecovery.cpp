@@ -363,6 +363,16 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
     Changed = true;
   }
 
+  // The verifier wants a !dbg location on every call in a function that has a
+  // DISubprogram; lifted calls only carry !revenant.va.
+  DILocation *CallLoc = DILocation::get(F.getContext(), 1, 1, SP);
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (isa<CallBase>(I) && !I.getDebugLoc()) {
+        I.setDebugLoc(CallLoc);
+        Changed = true;
+      }
+
   if (!Changed)
     return PreservedAnalyses::all();
   // Only debug metadata changed; code, CFG, and all revenant.* metadata

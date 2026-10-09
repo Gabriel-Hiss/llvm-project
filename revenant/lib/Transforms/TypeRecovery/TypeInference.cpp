@@ -176,6 +176,16 @@ void TypeInference::votePointer(const Value *V) {
   Nodes[find(It->second)].PointerVotes++;
 }
 
+void TypeInference::voteIntOf(const Value *V) {
+  if (!V)
+    return;
+  Type *T = V->getType();
+  if (T->isIntegerTy())
+    voteInt(V, T->getIntegerBitWidth());
+  else if (T->isPointerTy())
+    votePointer(V);
+}
+
 void TypeInference::voteInt(const Value *V, unsigned Bits) {
   if (!V)
     return;
@@ -261,8 +271,8 @@ void TypeInference::collect() {
           voteSigned(CI->getOperand(0));
           voteSigned(CI->getOperand(1));
         }
-        voteInt(CI->getOperand(0), CI->getOperand(0)->getType()->getIntegerBitWidth());
-        voteInt(CI->getOperand(1), CI->getOperand(1)->getType()->getIntegerBitWidth());
+        voteIntOf(CI->getOperand(0));
+        voteIntOf(CI->getOperand(1));
         continue;
       }
       // Unsigned/signed arithmetic votes on the LHS (mirrors the
@@ -271,30 +281,30 @@ void TypeInference::collect() {
           I.getOpcode() == Instruction::URem ||
           I.getOpcode() == Instruction::LShr) {
         voteUnsigned(I.getOperand(0));
-        voteInt(&I, I.getType()->getIntegerBitWidth());
+        voteIntOf(&I);
         continue;
       }
       if (I.getOpcode() == Instruction::AShr ||
           I.getOpcode() == Instruction::SDiv ||
           I.getOpcode() == Instruction::SRem) {
         voteSigned(I.getOperand(0));
-        voteInt(&I, I.getType()->getIntegerBitWidth());
+        voteIntOf(&I);
         continue;
       }
       if (const auto *CI = dyn_cast<CastInst>(&I)) {
         switch (CI->getOpcode()) {
         case Instruction::ZExt:
           voteUnsigned(&I);
-          voteInt(&I, I.getType()->getIntegerBitWidth());
+          voteIntOf(&I);
           break;
         case Instruction::SExt:
           voteSigned(&I);
-          voteInt(&I, I.getType()->getIntegerBitWidth());
+          voteIntOf(&I);
           break;
         case Instruction::Trunc:
           // Keeps the source web (already united when transparent enough);
           // still records width evidence on the result.
-          voteInt(&I, I.getType()->getIntegerBitWidth());
+          voteIntOf(&I);
           break;
         case Instruction::SIToFP:
         case Instruction::FPToSI:
@@ -306,11 +316,10 @@ void TypeInference::collect() {
           break;
         case Instruction::IntToPtr:
           votePointer(&I);
-          voteInt(CI->getOperand(0),
-                  CI->getOperand(0)->getType()->getIntegerBitWidth());
+          voteIntOf(CI->getOperand(0));
           break;
         case Instruction::PtrToInt:
-          voteInt(&I, I.getType()->getIntegerBitWidth());
+          voteIntOf(&I);
           votePointer(CI->getOperand(0));
           break;
         case Instruction::BitCast:

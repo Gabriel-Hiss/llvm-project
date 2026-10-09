@@ -27,10 +27,10 @@ namespace {
 // structure instead of by SSA name.
 struct Expr {
   enum class Kind { Bad, Const, Leaf, Op, Cmp } K = Kind::Bad;
-  // Const: APInt value. Leaf: opaque name. Op: (opcode, operands).
-  // Cmp: (predicate, lhs, rhs).
+  // Const: APInt value. Leaf: the opaque value itself (unnamed values have
+  // no usable name). Op: (opcode, operands). Cmp: (predicate, lhs, rhs).
   APInt ConstVal{64, 0};
-  std::string LeafName;
+  const Value *LeafPtr = nullptr;
   unsigned Opcode = 0; // Instruction opcode for Op, CmpInst::Predicate for Cmp.
   std::vector<Expr> Kids;
 
@@ -43,7 +43,7 @@ struct Expr {
     case Kind::Const:
       return ConstVal == O.ConstVal;
     case Kind::Leaf:
-      return LeafName == O.LeafName;
+      return LeafPtr == O.LeafPtr;
     case Kind::Op:
       return Opcode == O.Opcode && Kids == O.Kids;
     case Kind::Cmp:
@@ -98,7 +98,7 @@ using DefMap = DenseMap<const Value *, const Instruction *>;
 // Fill `Ds` with value-defining instructions of block BB (phi through last).
 void buildDefs(BasicBlock *BB, DefMap &Ds) {
   for (Instruction &I : *BB)
-    if (!I.getType()->isVoidTy() && !I.getName().empty())
+    if (!I.getType()->isVoidTy())
       Ds[&I] = &I;
   // Arguments and constants are leaves: no entry, same as unopt where
   // unknown names stay `Leaf`.
@@ -118,7 +118,7 @@ Expr makeLeaf(const Value *V) {
     return E;
   }
   E.K = Expr::Kind::Leaf;
-  E.LeafName = V->hasName() ? V->getName().str() : "#anon";
+  E.LeafPtr = V;
   return E;
 }
 
@@ -202,20 +202,18 @@ bool substPhiInits(Expr &E, const DefMap &Ds, BasicBlock *Pred,
   if (Depth > MaxDepth)
     return false;
   if (E.K == Expr::Kind::Leaf) {
-    for (auto &P : Ds) {
-      auto *PN = dyn_cast<PHINode>(P.second);
-      if (!PN || PN->getName() != E.LeafName)
-        continue;
-      const Value *Incoming = nullptr;
-      for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
-        if (PN->getIncomingBlock(i) == Pred)
-          Incoming = PN->getIncomingValue(i);
-      if (!Incoming)
-        return false;
-      E = exprOfImpl(Incoming, Ds, 0);
-      return substPhiInits(E, Ds, Pred, Depth + 1);
-    }
-    return true;
+    auto It = Ds.find(E.LeafPtr);
+    auto *PN = It == Ds.end() ? nullptr : dyn_cast<PHINode>(It->second);
+    if (!PN)
+      return true;
+    const Value *Incoming = nullptr;
+    for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
+      if (PN->getIncomingBlock(i) == Pred)
+        Incoming = PN->getIncomingValue(i);
+    if (!Incoming)
+      return false;
+    E = exprOfImpl(Incoming, Ds, 0);
+    return substPhiInits(E, Ds, Pred, Depth + 1);
   }
   for (Expr &K : E.Kids)
     if (!substPhiInits(K, Ds, Pred, Depth + 1))

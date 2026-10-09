@@ -484,10 +484,12 @@ bool rewrite(Function &F, const LoopShape &S) {
     for (Value *Op : I->operands())
       Work.push_back(Op);
   }
-  // Insert moved defs before the first non-phi of L (keep L's own order).
+  // Insert moved defs before the first non-phi of L (keep L's own order); a
+  // latch that held only its terminator is empty now, so they go at the end.
   Instruction *Anchor = L->getFirstNonPHI();
+  BasicBlock::iterator At = Anchor ? Anchor->getIterator() : L->end();
   for (Instruction *I : llvm::reverse(ToMove))
-    I->moveBefore(*L, Anchor->getIterator());
+    I->moveBefore(*L, At);
   // Rewrite L operands: header phis -> entry values, moved originals ->
   // their latch clones.
   SmallVector<Instruction *, 16> Fix;
@@ -524,7 +526,8 @@ bool rewrite(Function &F, const LoopShape &S) {
     if (Guard->getSuccessor(i) == H)
       Guard->setSuccessor(i, L);
   for (PHINode *PN : S.PhiForArg)
-    PN->removeIncomingValue(S.Entry);
+    if (PN->getBasicBlockIndex(S.Entry) >= 0)
+      PN->removeIncomingValue(S.Entry);
 
   // Every remaining use of a header-defined value outside L reads the
   // recursion result: the call returns exactly what the loop would have
@@ -565,7 +568,8 @@ bool rewrite(Function &F, const LoopShape &S) {
     if (&BB == H || &BB == L)
       continue;
     for (PHINode &PN : BB.phis())
-      PN.removeIncomingValue(H);
+      while (PN.getBasicBlockIndex(H) >= 0)
+        PN.removeIncomingValue(H, /*DeletePHIIfEmpty=*/false);
   }
 
   // The header is now unreachable: erase it unconditionally. Any
