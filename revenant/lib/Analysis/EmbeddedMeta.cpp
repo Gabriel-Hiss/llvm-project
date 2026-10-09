@@ -253,7 +253,7 @@ void applyEmbeddedMetadata(Program &P, const PeFile &PE) {
       if (Function != P.Functions.end()) {
         auto Existing = P.Names->find(Symbol.Address);
         if (Existing == P.Names->end() ||
-            Existing->second.starts_with("sub_")) {
+            StringRef(Existing->second).starts_with("sub_")) {
           (*P.Names)[Symbol.Address] = Symbol.Name;
           Function->second.Name = Symbol.Name;
         }
@@ -291,7 +291,8 @@ void applyEmbeddedMetadata(Program &P, const PeFile &PE) {
           if (F) {
             EmbeddedFunctionMetadata &M = P.Embedded[F->Start];
             if ((isPanicMessage(It->second) ||
-                 (!M.SourceFile.empty() && !It->second.ends_with(".rs"))) &&
+                 (!M.SourceFile.empty() &&
+                  !StringRef(It->second).ends_with(".rs"))) &&
                 std::find(M.PanicMessages.begin(), M.PanicMessages.end(),
                           It->second) == M.PanicMessages.end())
               M.PanicMessages.push_back(It->second);
