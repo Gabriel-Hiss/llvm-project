@@ -16,6 +16,7 @@
 
 #include "Lane0.h"
 #include "LoopDevec.h"
+#include "StraightDevec.h"
 
 #include "llvm/IR/Function.h"
 
@@ -29,8 +30,10 @@ PreservedAnalyses DevectorizePass::run(Function &F, FunctionAnalysisManager &) {
   // Phase 1: lane-0 scalarization exposes scalar low-lane accumulators.
   unsigned Changed = lane0::propagate(F);
   // Phase 2: single-block integer reduction loops explode into scalar
-  // acc chains. No CFG change in either phase.
+  // acc chains. Phase 3: straight-line SLP webs explode in place.
+  // No CFG change in any phase.
   Changed += loopdevec::devectorizeLoops(F);
+  Changed += straight::explodeStraight(F);
   if (Changed == 0)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
