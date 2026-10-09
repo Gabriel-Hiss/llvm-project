@@ -9,11 +9,15 @@ add_llvm_library(RevenantAnalysis
   Padding.cpp
   ProgramAnalyze.cpp
   Resolver.cpp
+  Signatures.cpp
   StackPtr.cpp
   Strings.cpp
   Xrefs.cpp
+<<<<<<< HEAD
   Signatures.cpp
   EHTables.cpp
+=======
+>>>>>>> rv/Swe2Sigs
 
   LINK_COMPONENTS
   MC
