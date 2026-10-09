@@ -21,21 +21,40 @@ C:\Users\User\RustroverProjects\Revenant\target\parity-venv\Scripts\python.exe C
 ```
 
 <!-- parity-results:rust-start -->
-Rust parity has not been measured yet.
+Latest Rust scan (`recovered-rust`): 28 binaries, 28 clean; missing=0, conflicts=0, ASM mismatches=0.
+
+| Binary | Status | Missing | Conflicts | Extra | ASM checked | ASM mismatch |
+|---|---:|---:|---:|---:|---:|---:|
+| backupd-o0 | ok | 0 | 0 | 1,393,913 | 7,655,073 | 0 |
+| backupd-o3 | ok | 0 | 0 | 159,033 | 3,250,109 | 0 |
+| minecalc-o0 | ok | 0 | 0 | 4,781 | 47,615 | 0 |
+| minecalc-o1 | ok | 0 | 0 | 3,383 | 43,537 | 0 |
+| minecalc-o2 | ok | 0 | 0 | 3,372 | 43,393 | 0 |
+| minecalc-o3 | ok | 0 | 0 | 3,367 | 43,335 | 0 |
+| minecalc-os | ok | 0 | 0 | 3,285 | 43,306 | 0 |
+| minecalc-oz | ok | 0 | 0 | 3,277 | 43,197 | 0 |
+| opendevin-o0 | ok | 0 | 0 | 213,646 | 1,246,980 | 0 |
+| opendevin-o3 | ok | 0 | 0 | 42,641 | 872,330 | 0 |
+| ripgrep-o0 | ok | 0 | 0 | 214,211 | 1,404,429 | 0 |
+| ripgrep-o1 | ok | 0 | 0 | 39,985 | 648,219 | 0 |
+| ripgrep-o2 | ok | 0 | 0 | 35,787 | 598,731 | 0 |
+| ripgrep-o3 | ok | 0 | 0 | 35,749 | 622,549 | 0 |
+| ripgrep-os | ok | 0 | 0 | 5,001 | 516,462 | 0 |
+| ripgrep-oz | ok | 0 | 0 | 5,017 | 479,470 | 0 |
+| rust-o0 | ok | 0 | 0 | 3,954 | 29,227 | 0 |
+| rust-o1 | ok | 0 | 0 | 2,570 | 24,532 | 0 |
+| rust-o2 | ok | 0 | 0 | 2,516 | 24,536 | 0 |
+| rust-o3 | ok | 0 | 0 | 2,507 | 24,578 | 0 |
+| rust-os | ok | 0 | 0 | 2,245 | 24,410 | 0 |
+| rust-oz | ok | 0 | 0 | 2,244 | 24,389 | 0 |
+| sjson-o0 | ok | 0 | 0 | 18,589 | 115,962 | 0 |
+| sjson-o1 | ok | 0 | 0 | 4,808 | 60,808 | 0 |
+| sjson-o2 | ok | 0 | 0 | 3,854 | 50,404 | 0 |
+| sjson-o3 | ok | 0 | 0 | 3,786 | 50,742 | 0 |
+| sjson-os | ok | 0 | 0 | 2,547 | 53,762 | 0 |
+| sjson-oz | ok | 0 | 0 | 2,552 | 52,958 | 0 |
 <!-- parity-results:rust-end -->
 
-<!-- parity-results:ccpp-start -->
-## Rust corpus
-
-Run all oracle-backed Rust targets, independent of the C/C++ table:
-
-```bat
-C:\Users\User\RustroverProjects\Revenant\target\parity-venv\Scripts\python.exe C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\revenant\tools\revenant\run_parity.py --revenant-dir C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\build-rv\tools\revenant --parity-root C:\Users\User\RustroverProjects\Revenant\target\parity --tag recovered-rust --kinds rust-single rust-cargo --section rust --out C:\Users\User\RustroverProjects\Revenant\target\parity\summary-recovered-rust.json
-```
-
-<!-- parity-results:rust-start -->
-Rust parity has not been measured yet.
-<!-- parity-results:rust-end -->
 
 
 ## Metrics
@@ -379,4 +398,3 @@ Latest C/C++ scan (`recovered-ccpp`): 325 binaries, 325 clean; missing=0, confli
 | zlib-gcc-pie | ok | 0 | 0 | 391 | 16,601 | 0 |
 | zlib-gcc-unroll | ok | 0 | 0 | 375 | 26,872 | 0 |
 <!-- parity-results:ccpp-end -->
-<!-- parity-results:end -->
