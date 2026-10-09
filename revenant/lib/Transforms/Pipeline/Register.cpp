@@ -92,6 +92,9 @@
 #if __has_include("revenant/Transforms/Unswitch/Unswitch.h")
 #include "revenant/Transforms/Unswitch/Unswitch.h"
 #endif
+#if __has_include("revenant/Transforms/Unoutline/Unoutline.h")
+#include "revenant/Transforms/Unoutline/Unoutline.h"
+#endif
 using namespace llvm;
 
 namespace revenant {
@@ -242,6 +245,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Unipo/Unipo.h")
         if (Name == "revenant-unipo") {
           MPM.addPass(UnipoPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unoutline/Unoutline.h")
+        if (Name == "revenant-unoutline") {
+          MPM.addPass(UnoutlinePass());
           return true;
         }
 #endif

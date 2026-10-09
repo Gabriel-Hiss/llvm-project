@@ -172,3 +172,8 @@ produces invalid IR, it restores the previous body, reports the function,
 stage and pass, and continues with the next pass. A returned lift error
 also reports the failed function and continues with the remaining functions.
 Assertions still require fixing their offending pass or lifter operation.
+**revenant-unoutline (owner: Swe2DeoptOutliner).** Module pass that restores
+small shared binary-derived fragments and direct-call thunks at their call
+sites. It requires multiple direct callers and a single straight-line block;
+uncertain functions remain calls. Runs explicitly with
+`-passes=revenant-unoutline`.
