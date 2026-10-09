@@ -115,6 +115,27 @@ static int writeFuncDump(const Program &Prog, StringRef OutDir) {
     }
     Os << "\t" << F.Name << "\n";
   }
+  // One row per block: function, block range, end kind and outgoing edges.
+  SmallString<256> BlockPath(OutDir);
+  sys::path::append(BlockPath, "revenant-blocks.tsv");
+  raw_fd_ostream Bs(BlockPath, Ec, sys::fs::OF_Text);
+  if (Ec) {
+    errs() << "revenant: " << BlockPath << ": " << Ec.message() << "\n";
+    return 1;
+  }
+  Bs << "func\tstart\tend\tkind\tedges\n";
+  const uint64_t Base = Prog.Img->Base.Value;
+  for (const auto &[Start, F] : Prog.Functions) {
+    for (const BlockRec &B : F.Blocks) {
+      Bs << Twine::utohexstr(Start.Value - Base) << "\t"
+         << Twine::utohexstr(B.Start) << "\t" << Twine::utohexstr(B.End)
+         << "\t" << (int)B.EndKind << "\t";
+      for (uint32_t E = B.EdgesBegin; E < B.EdgesEnd; ++E)
+        Bs << Twine::utohexstr(F.edgeTo(*Prog.Img, E).Value - Base) << ":"
+           << (int)F.Edges[E].Kind << " ";
+      Bs << "\n";
+    }
+  }
   return 0;
 }
 
