@@ -12,10 +12,7 @@
 #include "revenant/Object/PeFile.h"
 #include "revenant/Target/TargetHooks.h"
 
-#if __has_include("revenant/Analysis/Analysis.h")
 #include "revenant/Analysis/Analysis.h"
-#define RV_HAVE_ANALYSIS 1
-#endif
 #include <algorithm>
 #include <map>
 #include <set>
@@ -123,9 +120,6 @@ Error Session::setup() {
 }
 
 Error Session::analyze() {
-#if defined(RV_HAVE_ANALYSIS)
-  // Real analysis (Swe2Discovery): .pdata + discovery + jump tables + the
-  // x86 TargetHooks shapes.
   Prog = revenant::analyze(*Pe, *createX86TargetHooks());
   if (!Prog.Resolver)
     Prog.Resolver = std::make_shared<SessionNames>(Prog);
@@ -136,20 +130,6 @@ Error Session::analyze() {
            .str(),
        ""});
   return Error::success();
-#else
-  auto ProgOrErr = fallbackAnalyze(*Pe, *Dis);
-  if (!ProgOrErr)
-    return ProgOrErr.takeError();
-  Prog = std::move(*ProgOrErr);
-  Prog.Resolver = std::make_shared<SessionNames>(Prog);
-  SetupStages.push_back(
-      {"analysis", "stub",
-       formatv("pdata-seeded fallback CFG: {0} functions",
-               Prog.Functions.size())
-           .str(),
-       ""});
-  return Error::success();
-#endif
 }
 
 std::string Session::nameFor(Va Addr) const {
@@ -187,7 +167,7 @@ Expected<Function> Session::materialize(Va Start) const {
         formatv("{0} is not a function start", format_hex(Start.Value, 0))
             .str()
             .c_str());
-  return materializeFunction(*Pe, *Dis, It->second);
+  return revenant::materialize(Prog, It->second);
 }
 
 Expected<std::string> Session::disasmFunction(Va Start) const {

@@ -46,7 +46,10 @@ struct StageReport {
   std::string Note;
   /// Artifact path written for this stage, when one exists.
   std::string Artifact;
+  /// Time spent producing this stage, for CLI profiling.
+  uint64_t ElapsedMicroseconds = 0;
 };
+
 
 /// Which representation --emit / the API asks for.
 enum class EmitKind { Source, Asm, IrRaw, IrClean, IrFinal };

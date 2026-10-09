@@ -5,7 +5,6 @@ add_llvm_library(RevenantCAPI
   CAPI.cpp
   Detect.cpp
   Session.cpp
-  AnalysisFallback.cpp
   Stages.cpp
 
   LINK_COMPONENTS
@@ -19,7 +18,8 @@ add_llvm_library(RevenantCAPI
   RevenantObject
   RevenantDisasm
   RevenantIR
-  )
+)
+target_compile_definitions(RevenantCAPI PRIVATE REVENANT_HAVE_ANALYSIS=1)
 
 # Optional slice libraries: link what is on the tree.
 foreach(_opt
@@ -28,12 +28,8 @@ foreach(_opt
     RevenantLift
     RevenantTransformPipeline
     RevenantTransformIdioms
-    RevenantTransformDevectorize
-    RevenantTransformLane0
     RevenantTransformReroll
-    RevenantTransformUnrotate
     RevenantTransformPatterns
-    RevenantTransformTypeRecovery
     RevenantTransformSsaOut
     RevenantStructure
     RevenantClangCore)

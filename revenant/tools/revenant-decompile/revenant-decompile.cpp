@@ -49,7 +49,7 @@ static cl::opt<bool> ListFuncs("list",
                                cl::desc("list discovered functions and exit"));
 static cl::opt<bool> Patterns("patterns",
                               cl::desc("run the opt-in revenant-patterns pass"));
-
+static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
 static std::optional<EmitKind> emitKind(StringRef S) {
   return StringSwitch<std::optional<EmitKind>>(S)
       .Case("asm", EmitKind::Asm)
@@ -146,9 +146,14 @@ int main(int Argc, char **Argv) {
   const Decompiled &D = *DOrErr;
 
   // Stage report on stderr; the payload goes to stdout/-o.
-  for (const StageReport &St : D.Stages)
+  for (const StageReport &St : D.Stages) {
     errs() << "[" << St.Status << "] " << St.Name
-           << (St.Note.empty() ? "" : ": " + St.Note) << "\n";
+           << (St.Note.empty() ? "" : ": " + St.Note);
+    if (ShowTime)
+      errs() << " (" << formatv("{0:F2}", St.ElapsedMicroseconds / 1000.0)
+             << " ms)";
+    errs() << "\n";
+  }
 
   if (Output.empty()) {
     outs() << D.Text;

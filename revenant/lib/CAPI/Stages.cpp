@@ -24,6 +24,7 @@
 #include "revenant/Object/PeFile.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <map>
 #include <numeric>
@@ -153,9 +154,27 @@ Error writeText(StringRef Path, StringRef Text) {
   return Error::success();
 }
 
+using StageClock = std::chrono::steady_clock;
+thread_local StageClock::time_point LastStageTime;
+thread_local bool StageClockStarted = false;
+
+void resetStageClock() {
+  LastStageTime = StageClock::now();
+  StageClockStarted = true;
+}
+
 void record(std::vector<StageReport> &Stages, StringRef Name, StringRef Status,
             StringRef Note, StringRef Artifact = "") {
-  Stages.push_back({Name.str(), Status.str(), Note.str(), Artifact.str()});
+  StageClock::time_point Now = StageClock::now();
+  StageReport R{Name.str(), Status.str(), Note.str(), Artifact.str()};
+  if (StageClockStarted)
+    R.ElapsedMicroseconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(Now -
+                                                              LastStageTime)
+            .count();
+  LastStageTime = Now;
+  StageClockStarted = true;
+  Stages.push_back(std::move(R));
 }
 
 /// Emit `call <ret> @revenant.asm.<mn>(args)` with !revenant.opaque and
@@ -427,15 +446,8 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if defined(RV_HAVE_REROLL)
   Reg("revenant-reroll", RerollPass());
 #endif
-#if defined(RV_HAVE_UNROTATE)
-  Reg("revenant-unrotate", UnrotatePass());
-  Reg("revenant-untailrec", UntailRecPass());
-#endif
 #if defined(RV_HAVE_PATTERNS)
   Reg("revenant-patterns", PatternsPass());
-#endif
-#if defined(RV_HAVE_TYPES)
-  Reg("revenant-types", TypeRecoveryPass());
 #endif
 #if defined(RV_HAVE_STRUCTURE)
   Reg("revenant-structure", RevenantStructurePass());
@@ -800,7 +812,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                            const DecompileOpts &Opts) {
   Decompiled R;
   R.Stages = SetupStages;
-
+  resetStageClock();
   std::vector<Va> Todo(Targets.begin(), Targets.end());
   if (Todo.empty())
     for (const auto &KV : Prog.Functions)
