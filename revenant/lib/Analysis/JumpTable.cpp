@@ -953,6 +953,41 @@ static IndexTrace traceIndex(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
   return It;
 }
 
+/// Raw bytes of entry I, or nullopt when they are outside the image.
+/// Distinguishes "nothing there" from "bytes that do not decode to a
+/// code pointer" (a candidate table end).
+static std::optional<uint64_t> rawEntry(const JumpTableCtx &Ctx,
+                                        const TableAccess &Access,
+                                        uint64_t I) {
+  Va EntryVa = Access.Table.wrappingAdd(I * Access.EntrySize);
+  if (Access.EntrySize == 8)
+    return Ctx.Img.readU64(EntryVa);
+  if (auto U = Ctx.Img.readU32(EntryVa))
+    return uint64_t(*U);
+  return std::nullopt;
+}
+
+/// MSVC emits 0 for a dead switch case mid-table. A run of raw-zero
+/// entries is internal — not the table's end — when a valid entry
+/// follows it before any referenced boundary, unreadable slot, or
+/// non-zero non-code entry; otherwise the zeros are trailing fill that
+/// `extendFillerTail` already owns.
+static bool zeroRunIsInternal(const JumpTableCtx &Ctx,
+                              const TableAccess &Access, uint64_t I) {
+  for (uint64_t J = I; J < I + 4096; ++J) {
+    Va EntryVa = Access.Table.wrappingAdd(J * Access.EntrySize);
+    if (Ctx.isReferenced(EntryVa))
+      return false;
+    std::optional<uint64_t> Raw = rawEntry(Ctx, Access, J);
+    if (!Raw)
+      return false;
+    if (*Raw == 0)
+      continue;
+    return Access.read(Ctx, J).has_value();
+  }
+  return false;
+}
+
 /// Clip an enumeration of `n` entries at the first entry (index >= 1)
 /// whose address another operand references. A referenced address starts
 /// the next data structure, so a table cannot run past it, whatever the
@@ -979,7 +1014,7 @@ static uint64_t scanCaseTable(const JumpTableCtx &Ctx,
     Va EntryVa = Access.Table.wrappingAdd(I * Access.EntrySize);
     if (I > 0 && Ctx.isReferenced(EntryVa))
       break;
-    if (!Access.read(Ctx, I))
+    if (!Access.read(Ctx, I) && !zeroRunIsInternal(Ctx, Access, I))
       break;
     ++N;
   }
@@ -1114,8 +1149,10 @@ unboundedEntries(const JumpTableCtx &Ctx, const TableAccess &Access,
       if (I > 0 && !IgnoreRefs && Ctx.isReferenced(EntryVa))
         break;
       auto T = Access.read(Ctx, I);
-      if (!T)
+      if (!T && !zeroRunIsInternal(Ctx, Access, I))
         break;
+      if (!T)
+        continue;
       if (!inOwn(*T))
         break;
       Out.emplace_back(I, I, *T);
@@ -1185,8 +1222,10 @@ resolveUnbounded(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
         VaRange{Access.Table, CaseEnd},
         std::optional<VaRange>{VaRange{It.Tr.FirstTable, ByteEnd}});
   } else {
+    // Skipped dead cases (raw-zero entries) still own bytes: bound the
+    // span by the last accepted slot, not the accepted-entry count.
     uint64_t Slots =
-        std::min(scanCaseTable(Ctx, Access), Entries);
+        std::min(scanCaseTable(Ctx, Access), MaxSlot + 1);
     Va End = extendFillerTail(
         Ctx, Ops, Access.Table.wrappingAdd(Slots * Access.EntrySize));
     Res.Spans =
@@ -1271,9 +1310,14 @@ resolveJumpTable(const JumpTableCtx &Ctx, const TargetHooks &Hooks,
       auto T = Access->read(Ctx, I);
       // The first entry that is not a code address ends the table: a
       // guard count borrowed from an unrelated compare must not run the
-      // walk through the next data structure (adjacent tables).
-      if (!T)
+      // walk through the next data structure (adjacent tables). An
+      // all-zero entry followed by more valid entries is a dead case
+      // inside the table, not its end.
+      if (!T) {
+        if (zeroRunIsInternal(Ctx, *Access, I))
+          continue;
         break;
+      }
       Targets[*T].push_back((int64_t)I + Offset);
     }
     // Byte extent by content scan: the guard count bounds valid case
