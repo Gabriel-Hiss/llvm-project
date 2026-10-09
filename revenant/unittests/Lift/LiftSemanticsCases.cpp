@@ -420,6 +420,14 @@ std::vector<Case> cases() {
           .stack({0x4014000000000000ull})
           .xmm(0, 0, 0)
           .xmm(1, 0x1111, 0x2222));
+  add(Case("aesenc", "aesenc xmm0, xmm1")
+          .xmm(0, 0x0011223344556677ull, 0x8899aabbccddeeffull)
+          .xmm(1, 0x0f1e2d3c4b5a6978ull, 0x8796a5b4c3d2e1f0ull));
+  add(Case("aeskeygenassist", "aeskeygenassist xmm0, xmm1, 0x1b")
+          .xmm(1, 0x0011223344556677ull, 0x8899aabbccddeeffull));
+  add(Case("pclmulqdq", "pclmulqdq xmm0, xmm1, 0x11")
+          .xmm(0, 0x0123456789abcdefull, 0xfedcba9876543210ull)
+          .xmm(1, 0x1111222233334444ull, 0xaaaabbbbccccddddull));
   return V;
 }
 

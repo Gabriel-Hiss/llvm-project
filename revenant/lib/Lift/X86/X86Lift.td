@@ -89,6 +89,8 @@ def rv_ffsub   : RVOp;
 def rv_ffmul   : RVOp;
 def rv_ffdiv   : RVOp;
 def rv_fma : RVOp;
+def rv_aes : RVOp;
+def rv_pclmul : RVOp;
 def rv_fneg    : RVOp;
 def rv_fminnum : RVOp;
 def rv_fmaxnum : RVOp;

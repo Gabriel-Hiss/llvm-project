@@ -832,6 +832,30 @@ class RevenantLiftEmitter {
           return "LC.lahfVal()";
       }
 
+      if ((Name == "rv_aes" || Name == "rv_pclmul") &&
+          D->getNumArgs() == 4) {
+        const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
+        if (!Kind)
+          return {};
+        std::string A =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        std::string B =
+            expression(D->getArg(2), Inst, Width, D->getArgNameStr(2));
+        std::string Imm;
+        if (const auto *ID = dyn_cast<IntInit>(D->getArg(3))) {
+          Imm = std::to_string(ID->getValue());
+        } else if (auto N = operandNo(Inst, D->getArgNameStr(3))) {
+          Imm = (Twine("MI.getOperand(") + Twine(*N) + ").getImm()").str();
+        }
+        if (A.empty() || B.empty() || Imm.empty())
+          return {};
+        if (Name == "rv_aes")
+          return (Twine("LC.aesOp(\"") + Kind->getValue() + "\", " + A +
+                  ", " + B + ", " + Imm + ")")
+              .str();
+        return (Twine("LC.pclmulOp(") + A + ", " + B + ", " + Imm + ")")
+            .str();
+      }
       if (Name == "rv_fma" && D->getNumArgs() == 4) {
         const auto *Mode = dyn_cast<StringInit>(D->getArg(0));
         if (!Mode)

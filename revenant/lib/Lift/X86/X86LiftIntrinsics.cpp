@@ -23,7 +23,8 @@ using namespace llvm::revenant;
 namespace {
 
 Intrinsic::ID x86Intrinsic(StringRef Name) {
-  return static_cast<Intrinsic::ID>(Intrinsic::lookupIntrinsicID(Name));
+  std::string FullName = (Twine("llvm.") + Name).str();
+  return static_cast<Intrinsic::ID>(Intrinsic::lookupIntrinsicID(FullName));
 }
 
 } // namespace
@@ -75,12 +76,14 @@ Value *X86LiftContext::aesOp(StringRef Kind, Value *A, Value *Bv,
     N = "x86.aesni.aesimc";
   else { // "keygen"
     Value *R = B.CreateIntrinsic(x86Intrinsic("x86.aesni.aeskeygenassist"),
-                                 {QVT}, {X, constI(Imm, 8)});
+                                 ArrayRef<Type *>(), {X, constI(Imm, 8)});
     return toInt(R, W);
   }
   if (Kind == "imc")
-    return toInt(B.CreateIntrinsic(x86Intrinsic(N), {QVT}, {X}), W);
-  return toInt(B.CreateIntrinsic(x86Intrinsic(N), {QVT}, {X, Y}), W);
+    return toInt(B.CreateIntrinsic(x86Intrinsic(N), ArrayRef<Type *>(), {X}),
+                 W);
+  return toInt(
+      B.CreateIntrinsic(x86Intrinsic(N), ArrayRef<Type *>(), {X, Y}), W);
 }
 
 Value *X86LiftContext::pclmulOp(Value *A, Value *Bv, int64_t Imm) {
@@ -89,9 +92,9 @@ Value *X86LiftContext::pclmulOp(Value *A, Value *Bv, int64_t Imm) {
   StringRef N = W == 128 ? "x86.pclmulqdq"
                 : W == 256 ? "x86.pclmulqdq.256"
                            : "x86.pclmulqdq.512";
-  return toInt(B.CreateIntrinsic(x86Intrinsic(N), {QVT},
-                                 {vcast(A, QVT), vcast(Bv, QVT),
-                                  constI(Imm, 8)}),
+  return toInt(B.CreateIntrinsic(
+                   x86Intrinsic(N), ArrayRef<Type *>(),
+                   {vcast(A, QVT), vcast(Bv, QVT), constI(Imm, 8)}),
                W);
 }
 

@@ -805,3 +805,38 @@ def : RVMatch {
   dag Body = (rv_pcmpistest "istrm", (rv_op 0), (rv_op 1), (rv_op 2));
 }
 
+// AES and carry-less multiply are represented by the same target intrinsics
+// used by clang's x86 builtins.
+def : RVMatch {
+  string Glob = "AESENCrr*";
+  dag Body = (rv_set $dst, (rv_aes "enc", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESENCLASTrr*";
+  dag Body = (rv_set $dst, (rv_aes "enclast", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESDECrr*";
+  dag Body = (rv_set $dst, (rv_aes "dec", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESDECLASTrr*";
+  dag Body = (rv_set $dst, (rv_aes "declast", $src1, $src2, 0));
+}
+def : RVMatch {
+  string Glob = "AESIMCrr";
+  dag Body = (rv_set $dst, (rv_aes "imc", $src1, (rv_imm 0), 0));
+}
+def : RVMatch {
+  string Glob = "AESKEYGENASSISTrri";
+  dag Body = (rv_set $dst,
+    (rv_aes "keygen", $src1, (rv_imm 0), $src2));
+}
+foreach Op = ["PCLMULQDQrri", "VPCLMULQDQrri", "VPCLMULQDQYrri",
+              "VPCLMULQDQZrri", "VPCLMULQDQZ128rri",
+              "VPCLMULQDQZ256rri"] in
+  def : RVMatch {
+    string Glob = Op;
+    dag Body = (rv_setz $dst, (rv_pclmul "clmul", $src1, $src2, $src3));
+  }
+
