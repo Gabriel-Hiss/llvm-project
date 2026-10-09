@@ -474,6 +474,7 @@ struct Candidate {
   // mode records, the post check after the top-body match keeps only
   // resume phis) and the accepted resume set.
   SmallVector<const PHINode *, 4> CondPhis;
+  DenseSet<BasicBlock *> Starts; // zero-start paths into the scalar tail
   DenseSet<const PHINode *> Resume;
 };
 
@@ -485,7 +486,8 @@ struct Candidate {
 // is a pure function of N). Accumulators (fed by reductions) never
 // qualify: routing or bounds depending on them would differ after the
 // restart, so they keep failing the S-condition and bound checks.
-void collectResumePhis(BasicBlock *S, BasicBlock *D,
+void collectResumePhis(BasicBlock *S,
+                       const DenseSet<BasicBlock *> &Starts,
                        const DenseSet<BasicBlock *> &R, Value *Bound,
                        Value *IVNext, const Function &F,
                        DenseSet<const PHINode *> &Out) {
@@ -495,7 +497,7 @@ void collectResumePhis(BasicBlock *S, BasicBlock *D,
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
       BasicBlock *IB = Phi.getIncomingBlock(I);
       Value *Inc = Phi.getIncomingValue(I);
-      if (IB == D) {
+      if (Starts.count(IB)) {
         auto *CZ = dyn_cast<ConstantInt>(Inc);
         if (!CZ || !CZ->isZero())
           OK = false;
@@ -519,29 +521,41 @@ void collectResumePhis(BasicBlock *S, BasicBlock *D,
 // preds exactly {S, L}.
 bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
                     const DenseSet<BasicBlock *> &R, bool StrictPreds) {
-  // S preds: D plus (in strict mode) at least one R block and no
-  // other outsiders. Loose mode only needs the D edge; the strict
-  // check runs after R is collected.
+  // S preds are the primary dispatch, R resume blocks, and optionally
+  // a small-trip guard that also enters S with a zero resume value.
   bool HasD = false, HasR = false;
+  C.Starts.clear();
+  C.Starts.insert(D);
   for (BasicBlock *P : predecessors(S)) {
     if (P == D)
       HasD = true;
     else if (R.count(P))
       HasR = true;
-    else if (StrictPreds)
-      return false;
+    else if (StrictPreds) {
+      auto *PB = dyn_cast<BranchInst>(P->getTerminator());
+      bool StartsAtZero = PB && PB->isConditional() &&
+                          ((PB->getSuccessor(0) == D &&
+                            PB->getSuccessor(1) == S) ||
+                           (PB->getSuccessor(1) == D &&
+                            PB->getSuccessor(0) == S));
+      if (!StartsAtZero)
+        return false;
+      C.Starts.insert(P);
+    }
   }
   if (!HasD || (StrictPreds && !HasR))
     return false;
-  // S phis: every non-D incoming must be fed from an R block (strict
-  // only; loose mode skips phi checks entirely).
+  // Every predecessor that starts at S must feed zero into each phi.
   if (StrictPreds) {
     for (PHINode &Phi : S->phis()) {
       for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
         BasicBlock *IB = Phi.getIncomingBlock(I);
-        if (IB == D)
+        if (R.count(IB))
           continue;
-        if (!R.count(IB))
+        if (!C.Starts.count(IB))
+          return false;
+        auto *CZ = dyn_cast<ConstantInt>(Phi.getIncomingValue(I));
+        if (!CZ || !CZ->isZero())
           return false;
       }
     }
@@ -709,11 +723,11 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   DenseSet<const PHINode *> Local;
   const DenseSet<const PHINode *> *Resume = &C.Resume;
   if (!Secondary) {
-    collectResumePhis(C.S, C.D, C.R, Bound, IVNext, F, C.Resume);
+    collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, C.Resume);
     if (C.Resume.empty())
       return false;
   } else if (C.Resume.empty()) {
-    collectResumePhis(C.S, C.D, C.R, Bound, IVNext, F, Local);
+    collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, Local);
     Resume = &Local;
   }
   if (!matchTierBound(B, V, C, F, Bound, Step, *Resume))
@@ -1006,14 +1020,17 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           ULV_BAIL();
           goto next_pick;
         }
-        if (auto *P = dyn_cast<PHINode>(Inc)) {
+        if (auto *CZ = dyn_cast<ConstantInt>(Inc)) {
+          if (CZ->isZero())
+            IVOK = true;
+        } else if (auto *P = dyn_cast<PHINode>(Inc)) {
           if (P->getParent() != S) {
             ULV_BAIL();
             goto next_pick;
           }
           bool Zero = false;
           for (unsigned J = 0; J < P->getNumIncomingValues(); ++J)
-            if (P->getIncomingBlock(J) == D) {
+            if (Cand.Starts.count(P->getIncomingBlock(J))) {
               if (auto *CZ = dyn_cast<ConstantInt>(P->getIncomingValue(J)))
                 if (CZ->isZero())
                   Zero = true;
@@ -1105,10 +1122,11 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
   return false;
 }
 
-// GCC's O3 fill loop is a counted self-loop whose body writes repeated
-// vector splats, with scalar peel and remainder blocks around it. Expand
-// only splat stores in such loops; arithmetic vector loops need a separate
-// proof and remain unchanged.
+// Counted loops can lower wide copies to i128 load/store pairs, or repeated
+// fills to vector splats. Split only these proven memory shapes. Keep all
+// copy loads before their stores so each chunk retains read-before-write
+// behavior. Arithmetic vector loops remain unchanged until their lane
+// semantics can be established.
 Value *broadcastScalar(Value *V) {
   auto *Shuffle = dyn_cast<ShuffleVectorInst>(V);
   if (!Shuffle)
@@ -1125,8 +1143,9 @@ Value *broadcastScalar(Value *V) {
   return Insert->getOperand(1);
 }
 
-bool scalarizeGCCSplatStores(Function &F) {
+bool scalarizeCountedWideMemory(Function &F) {
   SmallVector<StoreInst *, 8> Stores;
+  SmallVector<std::pair<LoadInst *, StoreInst *>, 8> Copies;
   for (BasicBlock &BB : F) {
     auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
     if (!Br || !Br->isConditional() ||
@@ -1135,11 +1154,21 @@ bool scalarizeGCCSplatStores(Function &F) {
     ScalarLoopInfo Loop;
     if (!matchScalarLoop(&BB, Loop))
       continue;
-    for (Instruction &I : BB)
-      if (auto *Store = dyn_cast<StoreInst>(&I))
-        if (Store->getValueOperand()->getType()->isVectorTy() &&
-            broadcastScalar(Store->getValueOperand()))
-          Stores.push_back(Store);
+    for (Instruction &I : BB) {
+      auto *Store = dyn_cast<StoreInst>(&I);
+      if (!Store)
+        continue;
+      if (Store->getValueOperand()->getType()->isVectorTy() &&
+          broadcastScalar(Store->getValueOperand())) {
+        Stores.push_back(Store);
+        continue;
+      }
+      auto *Load = dyn_cast<LoadInst>(Store->getValueOperand());
+      if (Load && Load->hasOneUse() &&
+          Load->getType()->isIntegerTy(128) &&
+          !Load->isVolatile() && !Store->isVolatile())
+        Copies.push_back({Load, Store});
+    }
   }
   bool Changed = false;
   for (StoreInst *Store : Stores) {
@@ -1167,11 +1196,39 @@ bool scalarizeGCCSplatStores(Function &F) {
       Insert->eraseFromParent();
     Changed = true;
   }
+  for (auto [Load, Store] : Copies) {
+    Type *I64 = Type::getInt64Ty(F.getContext());
+    SmallVector<Value *, 2> Values;
+    IRBuilder<> LB(Load);
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *Ptr = LB.CreateGEP(I64, Load->getPointerOperand(),
+                                LB.getInt32(I));
+      if (auto *GEP = dyn_cast<Instruction>(Ptr))
+        copyVA(Load, GEP);
+      auto *Lane = LB.CreateLoad(I64, Ptr);
+      Lane->setAlignment(Align(1));
+      copyVA(Load, Lane);
+      Values.push_back(Lane);
+    }
+    IRBuilder<> SB(Store);
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *Ptr = SB.CreateGEP(I64, Store->getPointerOperand(),
+                                SB.getInt32(I));
+      if (auto *GEP = dyn_cast<Instruction>(Ptr))
+        copyVA(Store, GEP);
+      auto *LaneStore = SB.CreateStore(Values[I], Ptr);
+      LaneStore->setAlignment(Align(1));
+      copyVA(Store, LaneStore);
+    }
+    Store->eraseFromParent();
+    Load->eraseFromParent();
+    Changed = true;
+  }
   return Changed;
 }
 
 bool runOnFunction(Function &F) {
-  bool Changed = scalarizeGCCSplatStores(F);
+  bool Changed = scalarizeCountedWideMemory(F);
   SmallVector<Candidate, 4> Cands;
   // Collect-then-rewrite: matching never mutates.
   for (BasicBlock &BB : F) {
