@@ -1272,6 +1272,70 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
     Out.Funcs[Start] = std::move(Sig);
   }
 
+// Caller-prefix backfill: when every voting direct caller sets up the
+// same register-argument prefix and the callee inferred fewer integer
+// registers, the missing slots are parameters the body never reads
+// (homed without reload, or folded). Only call sites that are the last
+// call of their block vote: otherwise the setup may belong to a later
+// call in the same block. Varargs callees are excluded: callers
+// legitimately pass more than the fixed parameters.
+for (auto &[Start, Sig] : Out.Funcs) {
+  if (Sig.VarArgs)
+    continue;
+  auto Sit = Sites.find(Start);
+  if (Sit == Sites.end() || Sit->second.empty())
+    continue;
+  unsigned Min = 4, Max = 0;
+  bool AnyVote = false;
+  for (auto [CallerStart, Ii] : Sit->second) {
+    const Function *G = Fns.get(CallerStart);
+    if (!G || Ii >= G->Instrs.size())
+      continue;
+    Va Site = G->Instrs[Ii].Addr;
+    const BasicBlock *B = G->blockContaining(Site);
+    if (!B)
+      continue;
+    bool LaterCall = false;
+    for (size_t J = Ii + 1; J < B->InstrsEnd && J < G->Instrs.size();
+         ++J) {
+      if (G->Instrs[J].Flow == FlowKind::Call) {
+        LaterCall = true;
+        break;
+      }
+    }
+    if (LaterCall)
+      continue;
+    unsigned N = callsiteArgs(*G, T, Site);
+    Min = std::min(Min, N);
+    Max = std::max(Max, N);
+    AnyVote = true;
+  }
+  if (!AnyVote || Min != Max)
+    continue;
+  for (unsigned K = 0; K < Min; ++K) {
+    bool Have = false;
+    for (const Param &Q : Sig.Params)
+      if (Q.Loc.Tag == ParamLoc::Kind::Reg && Q.Loc.Reg == GRP[K])
+        Have = true;
+    if (Have)
+      continue;
+    Param NP;
+    NP.Loc = ParamLoc::reg(GRP[K]);
+    NP.Bits = 64;
+    Sig.Params.push_back(NP);
+  }
+  auto SlotKey = [](const Param &Q) {
+    for (unsigned K = 0; K < 4; ++K)
+      if (Q.Loc.Tag == ParamLoc::Kind::Reg && Q.Loc.Reg == GRP[K])
+        return K;
+    return 4u;
+  };
+  std::stable_sort(Sig.Params.begin(), Sig.Params.end(),
+                   [&](const Param &A, const Param &B) {
+                     return SlotKey(A) < SlotKey(B);
+                   });
+}
+
   // Externs + indirect call-site arg prefixes: observe every call site,
   // then fold in function order (later sites win, as before).
   struct ExternObs {
