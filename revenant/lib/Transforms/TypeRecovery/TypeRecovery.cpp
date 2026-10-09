@@ -8,9 +8,9 @@
 //
 // Implements `revenant-types`: run TypeInference over the function, then
 // emit one DILocalVariable per named alloca/argument plus struct types for
-// multi-offset pointer bases. All DI plumbing goes through RevenantIR
+// multi-offset pointer bases. All DI work goes through RevenantIR
 // (`revenant/IR/Contract.h`); the build fails with #error until that header
-// lands so there is exactly one writer of CU/subprogram helpers.
+// lands so there is exactly one writer of CU/subprogram/variable helpers.
 //
 // Naming: allocas/arguments keep their IR names with the leading `rv.`
 // prefix (if any) stripped; empty names become `v<line>`/`a<index>`.
@@ -30,16 +30,13 @@
 
 #include "TypeInference.h"
 
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Dwarf.h"
-#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 
 using namespace llvm;
@@ -74,8 +71,8 @@ DIType *floatDIType(ir::DIBuilder &DIB, unsigned Bits) {
                              dwarf::DW_ATE_float);
 }
 
-DIType *diTypeForInteger(ir::DIBuilder &DIB, TypeInference &TI, Value *V,
-                         unsigned DefaultBits) {
+DIType *diTypeForInteger(ir::DIBuilder &DIB, TypeInference &TI,
+                         const Value *V, unsigned DefaultBits) {
   unsigned Bits = TI.intBits(V, DefaultBits);
   if (Bits == 0)
     Bits = DefaultBits;
@@ -90,7 +87,7 @@ DIType *diTypeForInteger(ir::DIBuilder &DIB, TypeInference &TI, Value *V,
 // field offsets were observed, else the scalar access type (or an opaque
 // byte when nothing was observed).
 DIType *pointeeForBase(ir::DIBuilder &DIB, DIScope *Scope, DIFile *File,
-                       Function &F, TypeInference &TI, Value *Base,
+                       Function &F, TypeInference &TI, const Value *Base,
                        const TypeInference::FieldAccess *FA) {
   if (!FA || FA->Fields.empty()) {
     // No field evidence: opaque byte pointee (reference Unknown(8)).
@@ -179,8 +176,8 @@ DIType *pointeeForBase(ir::DIBuilder &DIB, DIScope *Scope, DIFile *File,
     }
     DIType *FieldTy = intDIType(DIB, Bits, Unsigned);
     std::string Name = "field_" + utostr(OffBits / 8);
-    DIDerivedType *M = DIB.createMemberType(
-        Scope, Name, File, 1, Bits, Bits, OffBits, DINode::FlagZero, FieldTy);
+    DIDerivedType *M =
+        ir::createMemberType(DIB, Scope, Name, File, Bits, OffBits, FieldTy);
     Members.push_back(M);
   }
   std::string StructName;
@@ -260,13 +257,9 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
         break;
     }
     if (!Attached) {
-      // No spill slot: emit dbg.value at the entry so the name survives.
-      BasicBlock &Entry = F.getEntryBlock();
-      Instruction *Pos = Entry.getFirstNonPHI();
-      const DILocation *DL =
-          Pos ? Pos->getDebugLoc().get()
-              : DILocation::get(M->getContext(), 1, 1, Scope);
-      DIB.insertDbgValueIntrinsic(&A, Var, DIB.createExpression(), DL, Pos);
+      // No spill slot: declare the argument at the entry so the name
+      // survives even without a home alloca.
+      ir::declareLocal(DIB, F, &A, Var);
       Changed = true;
     }
     ++ArgNo;

@@ -46,21 +46,21 @@ public:
     const llvm::DILocation *Loc = nullptr;
   };
   struct FieldAccess {
-    llvm::Value *Base = nullptr;
+    const llvm::Value *Base = nullptr;
     // Offset in bits -> widest access cell.
     llvm::MapVector<uint64_t, FieldCell> Fields;
     uint64_t MaxEndBits = 0;
   };
   const FieldAccess *fieldsFor(const llvm::Value *Base) const;
 
-  const llvm::DenseMap<llvm::Value *, FieldAccess> &bases() const {
+  const llvm::DenseMap<const llvm::Value *, FieldAccess> &bases() const {
     return Bases;
   }
 
 private:
   using Id = uint32_t;
   struct Node {
-    llvm::Value *V = nullptr;
+    const llvm::Value *V = nullptr;
     unsigned UnsignedVotes = 0;
     unsigned SignedVotes = 0;
     unsigned PointerVotes = 0;
@@ -68,25 +68,25 @@ private:
     unsigned FloatVotes = 0;
     unsigned MaxIntBits = 0;
     unsigned MaxFloatBits = 0;
-    explicit Node(llvm::Value *Val = nullptr) : V(Val) {}
+    explicit Node(const llvm::Value *Val = nullptr) : V(Val) {}
   };
 
   llvm::Function &F;
-  llvm::DenseMap<llvm::Value *, Id> Index;
+  llvm::DenseMap<const llvm::Value *, Id> Index;
   std::vector<Node> Nodes;
   mutable std::vector<Id> Parent;
-  llvm::DenseMap<llvm::Value *, FieldAccess> Bases;
+  llvm::DenseMap<const llvm::Value *, FieldAccess> Bases;
 
-  Id ensureValue(llvm::Value *V);
+  Id ensureValue(const llvm::Value *V);
   Id find(Id N) const;
-  void unite(llvm::Value *A, llvm::Value *B);
-  void noteUse(const llvm::Value *V);
-  void voteUnsigned(llvm::Value *V);
-  void voteSigned(llvm::Value *V);
-  void votePointer(llvm::Value *V);
-  void voteInt(llvm::Value *V, unsigned Bits);
-  void voteFloat(llvm::Value *V, unsigned Bits);
-  void recordFieldAccess(llvm::Value *Ptr, uint64_t BaseOffset,
+  void unite(const llvm::Value *A, const llvm::Value *B);
+  void noteUse(llvm::Value *V);
+  void voteUnsigned(const llvm::Value *V);
+  void voteSigned(const llvm::Value *V);
+  void votePointer(const llvm::Value *V);
+  void voteInt(const llvm::Value *V, unsigned Bits);
+  void voteFloat(const llvm::Value *V, unsigned Bits);
+  void recordFieldAccess(const llvm::Value *Ptr, uint64_t BaseOffset,
                          bool DirectMemOp, const llvm::Instruction *I);
 };
 

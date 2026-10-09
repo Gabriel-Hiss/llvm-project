@@ -88,20 +88,20 @@ static const Value *skipCopies(const Value *V) {
   return Cur;
 }
 
-void TypeInference::noteUse(const Value *V) {
-  V = skipCopies(V);
-  if (const auto *A = dyn_cast<Argument>(V)) {
+void TypeInference::noteUse(Value *V) {
+  const Value *K = skipCopies(V);
+  if (const auto *A = dyn_cast<Argument>(K)) {
     if (A->getParent() == &F)
-      ensureValue(const_cast<Value *>(V));
+      ensureValue(V);
     return;
   }
-  if (const auto *I = dyn_cast<Instruction>(V)) {
+  if (const auto *I = dyn_cast<Instruction>(K)) {
     if (I->getParent() && I->getFunction() == &F)
-      ensureValue(const_cast<Value *>(V));
+      ensureValue(V);
   }
 }
 
-TypeInference::Id TypeInference::ensureValue(Value *V) {
+TypeInference::Id TypeInference::ensureValue(const Value *V) {
   auto It = Index.find(V);
   if (It != Index.end())
     return It->second;
@@ -124,7 +124,7 @@ TypeInference::Id TypeInference::find(Id N) const {
   return R;
 }
 
-void TypeInference::unite(Value *A, Value *B) {
+void TypeInference::unite(const Value *A, const Value *B) {
   Id X = find(ensureValue(A));
   Id Y = find(ensureValue(B));
   if (X == Y)
@@ -146,40 +146,40 @@ void TypeInference::unite(Value *A, Value *B) {
     Dst.MaxFloatBits = Src.MaxFloatBits;
 }
 
-void TypeInference::voteUnsigned(Value *V) {
+void TypeInference::voteUnsigned(const Value *V) {
   if (!V)
     return;
-  noteUse(V);
+  noteUse(const_cast<Value *>(V));
   auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return;
   Nodes[find(It->second)].UnsignedVotes++;
 }
 
-void TypeInference::voteSigned(Value *V) {
+void TypeInference::voteSigned(const Value *V) {
   if (!V)
     return;
-  noteUse(V);
+  noteUse(const_cast<Value *>(V));
   auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return;
   Nodes[find(It->second)].SignedVotes++;
 }
 
-void TypeInference::votePointer(Value *V) {
+void TypeInference::votePointer(const Value *V) {
   if (!V || !V->getType()->isPointerTy())
     return;
-  noteUse(V);
+  noteUse(const_cast<Value *>(V));
   auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return;
   Nodes[find(It->second)].PointerVotes++;
 }
 
-void TypeInference::voteInt(Value *V, unsigned Bits) {
+void TypeInference::voteInt(const Value *V, unsigned Bits) {
   if (!V)
     return;
-  noteUse(V);
+  noteUse(const_cast<Value *>(V));
   auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return;
@@ -188,10 +188,10 @@ void TypeInference::voteInt(Value *V, unsigned Bits) {
   N.MaxIntBits = std::max(N.MaxIntBits, Bits);
 }
 
-void TypeInference::voteFloat(Value *V, unsigned Bits) {
+void TypeInference::voteFloat(const Value *V, unsigned Bits) {
   if (!V)
     return;
-  noteUse(V);
+  noteUse(const_cast<Value *>(V));
   auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return;
@@ -234,8 +234,8 @@ void TypeInference::collect() {
       if (isTransparentCopy(&I))
         unite(&I, I.getOperand(0));
       if (const auto *SI = dyn_cast<SelectInst>(&I)) {
-        unite(&I, const_cast<Value *>(SI->getTrueValue()));
-        unite(&I, const_cast<Value *>(SI->getFalseValue()));
+        unite(&I, SI->getTrueValue());
+        unite(&I, SI->getFalseValue());
       }
       if (const auto *PN = dyn_cast<PHINode>(&I)) {
         for (Value *Inc : PN->incoming_values())
@@ -338,9 +338,8 @@ void TypeInference::collect() {
           const DataLayout &DL = F.getParent()->getDataLayout();
           APInt Off(64, 0);
           if (GEP->accumulateConstantOffset(DL, Off))
-            recordFieldAccess(
-                const_cast<Value *>(GEP->getPointerOperand()),
-                Off.getZExtValue(), false, LI);
+            recordFieldAccess(GEP->getPointerOperand(), Off.getZExtValue(),
+                              false, LI);
         }
         continue;
       }
@@ -359,9 +358,8 @@ void TypeInference::collect() {
           const DataLayout &DL = F.getParent()->getDataLayout();
           APInt Off(64, 0);
           if (GEP->accumulateConstantOffset(DL, Off))
-            recordFieldAccess(
-                const_cast<Value *>(GEP->getPointerOperand()),
-                Off.getZExtValue(), false, SI);
+            recordFieldAccess(GEP->getPointerOperand(), Off.getZExtValue(),
+                              false, SI);
         }
         continue;
       }
@@ -404,9 +402,9 @@ void TypeInference::collect() {
   }
 }
 
-void TypeInference::recordFieldAccess(Value *Ptr, uint64_t BaseOffset,
+void TypeInference::recordFieldAccess(const Value *Ptr, uint64_t BaseOffset,
                                       bool DirectMemOp, const Instruction *I) {
-  Value *Base = const_cast<Value *>(skipCopies(Ptr));
+  const Value *Base = skipCopies(Ptr);
   // Walk through a constant GEP to the ultimate base.
   uint64_t GepOff = 0;
   if (const auto *GEP = dyn_cast<GetElementPtrInst>(Base)) {
@@ -414,7 +412,7 @@ void TypeInference::recordFieldAccess(Value *Ptr, uint64_t BaseOffset,
     APInt Off(64, 0);
     if (GEP->accumulateConstantOffset(DL, Off)) {
       GepOff = Off.getZExtValue();
-      Base = const_cast<Value *>(skipCopies(GEP->getPointerOperand()));
+      Base = skipCopies(GEP->getPointerOperand());
     } else {
       // Non-constant GEP: the base is still a pointer, but no field.
       return;
@@ -450,7 +448,7 @@ void TypeInference::recordFieldAccess(Value *Ptr, uint64_t BaseOffset,
 }
 
 bool TypeInference::isUnsigned(const Value *V) const {
-  auto It = Index.find(skipCopies(const_cast<Value *>(V)));
+  auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return false;
   const Node &N = Nodes[find(It->second)];
@@ -461,7 +459,7 @@ bool TypeInference::isUnsigned(const Value *V) const {
 }
 
 bool TypeInference::hasSignedWitness(const Value *V) const {
-  auto It = Index.find(skipCopies(const_cast<Value *>(V)));
+  auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return false;
   return Nodes[find(It->second)].SignedVotes > 0;
@@ -470,7 +468,7 @@ bool TypeInference::hasSignedWitness(const Value *V) const {
 bool TypeInference::isPointer(const Value *V) const {
   if (!V->getType()->isPointerTy())
     return false;
-  auto It = Index.find(skipCopies(const_cast<Value *>(V)));
+  auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return true; // No votes: trust the IR type.
   const Node &N = Nodes[find(It->second)];
@@ -483,7 +481,7 @@ bool TypeInference::isPointer(const Value *V) const {
 }
 
 unsigned TypeInference::intBits(const Value *V, unsigned Default) const {
-  auto It = Index.find(skipCopies(const_cast<Value *>(V)));
+  auto It = Index.find(skipCopies(V));
   if (It == Index.end())
     return Default;
   unsigned W = Nodes[find(It->second)].MaxIntBits;
@@ -492,7 +490,7 @@ unsigned TypeInference::intBits(const Value *V, unsigned Default) const {
 
 const TypeInference::FieldAccess *
 TypeInference::fieldsFor(const Value *Base) const {
-  auto It = Bases.find(skipCopies(const_cast<Value *>(Base)));
+  auto It = Bases.find(skipCopies(Base));
   if (It == Bases.end())
     return nullptr;
   return &It->second;
