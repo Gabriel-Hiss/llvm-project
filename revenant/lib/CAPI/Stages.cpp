@@ -194,10 +194,12 @@ Error verifyStage(StringRef Stage, const Module &M) {
   return Error::success();
 }
 
+SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
+
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
-Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
-                      std::vector<StageReport> &Reports) {
+Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
+                          std::vector<StageReport> &Reports) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -212,8 +214,7 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
   // Verify each function pass independently and retain its last valid body.
   if (!Pipeline.consume_front("function(") || !Pipeline.consume_back(")"))
     return createStringError("expected a function pipeline");
-  SmallVector<StringRef, 16> Passes;
-  Pipeline.split(Passes, ',');
+  auto Passes = pipelineElements(Pipeline);
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
     if (Error E = PB.parsePassPipeline(FPM, Pass))
@@ -252,6 +253,75 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
     }
   }
   return verifyStage(Stage, M);
+}
+
+// Split only between pipeline elements, never inside adaptors or options.
+SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline) {
+  SmallVector<StringRef, 16> Elements;
+  unsigned Depth = 0;
+  size_t Start = 0;
+  for (size_t I = 0; I != Pipeline.size(); ++I) {
+    char C = Pipeline[I];
+    if (C == '(' || C == '<')
+      ++Depth;
+    else if ((C == ')' || C == '>') && Depth)
+      --Depth;
+    else if (C == ',' && !Depth) {
+      Elements.push_back(Pipeline.slice(Start, I));
+      Start = I + 1;
+    }
+  }
+  Elements.push_back(Pipeline.drop_front(Start));
+  return Elements;
+}
+
+Error runModulePass(Module &M, StringRef Pass) {
+  PassBuilder PB;
+  registerRevenantPasses(PB);
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PB.registerLoopAnalyses(LAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerModuleAnalyses(MAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  ModulePassManager MPM;
+  if (Error E = PB.parsePassPipeline(MPM, Pass))
+    return E;
+  MPM.run(M, MAM);
+  return verifyStage(Pass, M);
+}
+
+Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
+                      StringRef Pipeline, std::vector<StageReport> &Reports) {
+  // Validate the whole pipeline first: unknown pass names are configuration
+  // errors, not recoverable failures of a particular function or module.
+  PassBuilder PB;
+  registerRevenantPasses(PB);
+  ModulePassManager Parsed;
+  if (Error E = PB.parsePassPipeline(Parsed, Pipeline))
+    return E;
+  for (StringRef Element : pipelineElements(Pipeline)) {
+    if (Element.starts_with("function(")) {
+      if (Error E = runFunctionPipeline(Stage, *M, Element, Reports))
+        return E;
+      continue;
+    }
+    FunctionStageTrace Trace(Stage, Element, "module");
+    auto Saved = CloneModule(*M);
+    // Analysis managers die inside runModulePass before the module is swapped.
+    if (Error E = runModulePass(*M, Element)) {
+      std::string Message = toString(std::move(E));
+      M.swap(Saved);
+      record(Reports, Stage, "failed",
+             "module: " + Element.str() + ": " + Message);
+      errs() << "[failed] " << Stage << ": module: " << Element << ": "
+             << Message << "\n";
+    }
+  }
+  return verifyStage(Stage, *M);
 }
 
 /// ir-clean: lifter cleanup plus the IR idiom stage.
@@ -444,7 +514,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-clean ----------------------------------------------------------
-    if (auto E = runPipelineText("ir-clean", *M, cleanPipeline(), R.Stages))
+    if (auto E = runPipelineText("ir-clean", M, cleanPipeline(), R.Stages))
       return std::move(E);
     record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
     CleanText = moduleText(*M);
@@ -455,7 +525,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- ir-final ----------------------------------------------------------
     if (auto E =
-            runPipelineText("ir-final", *M, finalPipeline(Opts.Patterns),
+            runPipelineText("ir-final", M, finalPipeline(Opts.Patterns),
                             R.Stages))
       return std::move(E);
     record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");

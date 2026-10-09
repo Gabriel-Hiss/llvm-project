@@ -26,6 +26,9 @@ The verifier runs after lift and after each individual cleanup or final
 function pass. Invalid pass output restores the function's previous valid
 body and records the function, stage and pass. Subsequent passes and source
 emission continue. Assertions are pass bugs, not valid output.
+Mixed pipelines also support module passes. Their cross-function changes
+are verified together and, on verifier failure, the entire module pass is
+rolled back. Function-pass adaptors still retain per-function isolation.
 `--emit asm|ir-raw|ir-clean|ir-final|source` stops after the requested stage.
 
 ## Driver
