@@ -321,6 +321,55 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     PN->replaceAllUsesWith(UndefValue::get(PN->getType()));
     PN->eraseFromParent();
   }
+  SmallVector<Instruction *, 32> CrossBlockDefs;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      if (I.getType()->isVoidTy() || I.getType()->isTokenTy() ||
+          I.getType()->isLabelTy() || I.getType()->isMetadataTy() ||
+          isa<AllocaInst>(&I) || I.isTerminator())
+        continue;
+      unsigned Uses = 0;
+      bool CrossesBlock = false;
+      for (Use &U : I.uses()) {
+        if (isa<DbgInfoIntrinsic>(U.getUser()))
+          continue;
+        auto *UserI = dyn_cast<Instruction>(U.getUser());
+        if (!UserI)
+          continue;
+        ++Uses;
+        CrossesBlock |= UserI->getParent() != I.getParent();
+      }
+      if (Uses > 1 && CrossesBlock)
+        CrossBlockDefs.push_back(&I);
+    }
+  for (Instruction *Def : CrossBlockDefs) {
+    SmallVector<Use *, 16> Uses;
+    for (Use &U : Def->uses())
+      if (!isa<DbgInfoIntrinsic>(U.getUser()))
+        Uses.push_back(&U);
+    std::string Name =
+        Def->hasName() ? ("v_" + Def->getName()).str() : "v_tmp";
+    IRBuilder<> AB(firstNonAlloca(Entry));
+    AllocaInst *Slot =
+        AB.CreateAlloca(Def->getType(), nullptr, Name);
+    copyProvenance(*Def, *Slot);
+    Instruction *InsertAfterDef =
+        isa<PHINode>(Def) ? Def->getParent()->getFirstNonPHI()
+                          : Def->getNextNode();
+    IRBuilder<> DB(InsertAfterDef);
+    StoreInst *Store = DB.CreateStore(Def, Slot);
+    copyProvenance(*Def, *Store);
+    for (Use *UP : Uses) {
+      Use &U = *UP;
+      auto *UserI = dyn_cast<Instruction>(U.getUser());
+      if (!UserI)
+        continue;
+      IRBuilder<> B(useInsertionPoint(U, *UserI));
+      LoadInst *Load = B.CreateLoad(Def->getType(), Slot);
+      copyProvenance(*UserI, *Load);
+      U.set(Load);
+    }
+  }
 
   unsigned ArgIndex = 0;
   for (Argument &Arg : F.args()) {
