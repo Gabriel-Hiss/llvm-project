@@ -500,7 +500,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FNSTSWm;
-  dag Body = (rv_store $dst, (rv_fstsw));
+  dag Body = (rv_store (rv_addr $dst), (rv_fstsw));
 }
 def : RVLift {
   let Insn = FNSTCW16m;
@@ -508,6 +508,183 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FLDCW16m;
-  dag Body = (rv_fldcw $dst);
+  dag Body = (rv_fldcw $src);
 }
 
+// ---- conditional moves ------------------------------------------------------
+// CMOVcc_F: (outs), (ins RSTi:$op), ST(0) = ST(i) when the EFLAGS condition
+// holds. The condition is a literal: the opcode names it.
+
+def : RVLift {
+  let Insn = CMOVB_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "b"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVBE_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "be"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVE_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "e"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVP_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "p"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVNB_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "nb"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVNBE_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "nbe"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVNE_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "ne"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+def : RVLift {
+  let Insn = CMOVNP_F;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_select (rv_cpred "np"), (rv_x87st (rv_x87idx $op)), (rv_x87st 0))));
+}
+
+// ---- stack manipulation -----------------------------------------------------
+
+def : RVLift {
+  let Insn = XCH_F;
+  dag Body = (rv_x87xchg $op);
+}
+def : RVLift {
+  let Insn = FFREE;
+  dag Body = (rv_x87math "free", $reg);
+}
+def : RVLift {
+  let Insn = FFREEP;
+  dag Body = (rv_seq (rv_x87math "free", $reg) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FINCSTP;
+  dag Body = (rv_x87math "incstp");
+}
+def : RVLift {
+  let Insn = FDECSTP;
+  dag Body = (rv_x87math "decstp");
+}
+
+// ---- unary ------------------------------------------------------------------
+// CHS_F/ABS_F/SQRT_F match any stack register form disassembled as a bare
+// mnemonic (the MC opcodes alias all ST(i) spellings); the context applies
+// them to ST(0) like the hardware's implicit-operand forms.
+
+def : RVMatch {
+  let Glob = "CHS_F*";
+  dag Body = (rv_x87stset 0, (rv_x87math "chs", (rv_x87st 0)));
+}
+def : RVMatch {
+  let Glob = "ABS_F*";
+  dag Body = (rv_x87stset 0, (rv_x87math "abs", (rv_x87st 0)));
+}
+def : RVMatch {
+  let Glob = "SQRT_F*";
+  dag Body = (rv_x87stset 0, (rv_x87math "sqrt", (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = TST_F;
+  dag Body = (rv_x87math "tst");
+}
+def : RVLift {
+  let Insn = XAM_F;
+  dag Body = (rv_x87math "exam");
+}
+def : RVLift {
+  let Insn = FRNDINT;
+  dag Body = (rv_x87stset 0, (rv_x87math "rnd", (rv_x87st 0)));
+}
+
+// ---- transcendentals ----------------------------------------------------------
+// Dyadic forms pop like the hardware (fyl2x/fpatan/fscale replace ST(1) with
+// the result and pop). fprem keeps both operands for the caller's loop test.
+
+def : RVLift {
+  let Insn = F2XM1;
+  dag Body = (rv_x87stset 0, (rv_x87math "expm1", (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = FYL2X;
+  dag Body = (rv_seq
+    (rv_x87stset 1, (rv_x87math "yl2x", (rv_x87st 1), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FYL2XP1;
+  dag Body = (rv_seq
+    (rv_x87stset 1, (rv_x87math "yl2xp1", (rv_x87st 1), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FPTAN;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_x87math "tan", (rv_x87st 0)))
+    (rv_x87push (rv_x87fldconst "1")));
+}
+def : RVLift {
+  let Insn = FPATAN;
+  dag Body = (rv_seq
+    (rv_x87stset 1, (rv_x87math "atan", (rv_x87st 1), (rv_x87st 0)))
+    (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FXTRACT;
+  dag Body = (rv_x87math "extract", (rv_x87st 0));
+}
+def : RVLift {
+  let Insn = FPREM;
+  dag Body = (rv_x87stset 0, (rv_x87math "rem", (rv_x87st 0), (rv_x87st 1)));
+}
+def : RVLift {
+  let Insn = FPREM1;
+  dag Body = (rv_x87stset 0, (rv_x87math "prem", (rv_x87st 0), (rv_x87st 1)));
+}
+def : RVLift {
+  let Insn = FSIN;
+  dag Body = (rv_x87stset 0, (rv_x87math "sin", (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = FCOS;
+  dag Body = (rv_x87stset 0, (rv_x87math "cos", (rv_x87st 0)));
+}
+def : RVLift {
+  let Insn = FSINCOS;
+  dag Body = (rv_seq
+    (rv_x87stset 0, (rv_x87math "cos", (rv_x87st 0)))
+    (rv_x87push (rv_x87math "sin", (rv_x87st 1))));
+}
+def : RVLift {
+  let Insn = FSCALE;
+  dag Body = (rv_x87stset 0, (rv_x87math "scale", (rv_x87st 0), (rv_x87st 1)));
+}
+
+// ---- control and opaque -------------------------------------------------------
+
+def : RVLift { let Insn = FNCLEX; dag Body = (rv_fclex); }
+def : RVLift { let Insn = FNOP; dag Body = (rv_nop); }
+def : RVLift { let Insn = WAIT; dag Body = (rv_nop); }
+
+// Byte-exact state images with no IR equivalent: BCD loads/stores, the
+// 28-byte environment, 108-byte save/restore, FXSAVE/FXRSTOR.
+def : RVLift { let Insn = FBLDm; dag Body = (rv_opaque); }
+def : RVLift { let Insn = FBSTPm; dag Body = (rv_opaque); }
+def : RVLift { let Insn = FLDENVm; dag Body = (rv_opaque); }
+def : RVLift { let Insn = FSTENVm; dag Body = (rv_opaque); }
+def : RVLift { let Insn = FRSTORm; dag Body = (rv_opaque); }
+def : RVLift { let Insn = FSAVEm; dag Body = (rv_opaque); }
+def : RVMatch { let Glob = "FXSAVE*"; dag Body = (rv_opaque); }
+def : RVMatch { let Glob = "FXRSTOR*"; dag Body = (rv_opaque); }
