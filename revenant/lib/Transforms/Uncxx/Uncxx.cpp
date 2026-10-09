@@ -216,6 +216,42 @@ LoadInst *singleLoadAt(const DataLayout &DL, Value *Base, int64_t Off) {
 /// argument, a global, or defined outside loops. Used as a cheap guard
 /// against matching temporaries the optimizer materialized mid-block.
 
+/// Accept layout-based recovery only when the same object is also passed to
+/// a function matched by the libdb as an STL member.
+bool hasLibraryMemberEvidence(const DataLayout &DL, Value *Base,
+                              Function &F) {
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      Value *Called = CB->getCalledOperand()->stripPointerCastsAndAliases();
+      const Function *Callee = dyn_cast<Function>(Called);
+      if (!Callee)
+        continue;
+      Attribute A = Callee->getFnAttribute("revenant.lib");
+      if (!A.isStringAttribute())
+        continue;
+      StringRef Name = A.getValueAsString();
+      bool IsSTLMember =
+          (Name.contains("vector") || Name.contains("basic_string")) &&
+          (Name.contains("data") || Name.contains("size") ||
+           Name.contains("push_back") || Name.contains("operator[]") ||
+           Name.contains("_Emplace") || Name.contains("_Change_array") ||
+           Name.contains("begin") || Name.contains("end"));
+      if (!IsSTLMember)
+        continue;
+      for (Value *Arg : CB->args()) {
+        if (stripPtr(Arg) == Base)
+          return true;
+        auto Root = rootOff(DL, Arg);
+        if (Root && Root->first == Base)
+          return true;
+      }
+    }
+  return false;
+}
+
 /// Container kind from the offset set used against `Base` anywhere in
 /// the function: vector touches {0,8,16}, MSVC string touches
 /// {0-or-buf,16,24}. Returns 1 for vector, 2 for string, 0 when
@@ -224,6 +260,8 @@ LoadInst *singleLoadAt(const DataLayout &DL, Value *Base, int64_t Off) {
 /// only become MORE ambiguous as folds proceed, never less, which is
 /// the safe direction (ambiguous => no fold).
 int containerKind(const DataLayout &DL, Value *Base, Function &F) {
+  if (!hasLibraryMemberEvidence(DL, Base, F))
+    return 0;
   bool H0 = false, H8 = false, H16 = false, H24 = false;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
@@ -889,6 +927,11 @@ unsigned runScalarIdioms(Function &F, const DataLayout &DL, CxxFlavor Fl) {
 
 llvm::PreservedAnalyses
 revenant::UncxxPass::run(llvm::Function &F, llvm::FunctionAnalysisManager &) {
+  Attribute User = F.getFnAttribute("revenant.user");
+  if (!User.isStringAttribute() || User.getValueAsString() != "true")
+    return llvm::PreservedAnalyses::all();
+  if (UserFns && !UserFns->contains(&F))
+    return llvm::PreservedAnalyses::all();
   if (Metadata *Language = F.getParent()->getModuleFlag("revenant.lang")) {
     auto *Name = dyn_cast<MDString>(Language);
     if (!Name || Name->getString() != "cpp")

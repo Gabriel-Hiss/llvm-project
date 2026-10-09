@@ -10,9 +10,23 @@ That ranking favors field accessors and destructor paths where the caller may re
 
 ## Conservative field classification
 
-Vector empty detection requires both compared operands to be loads of the same object's +0 and +8 fields. A comparison between an iterator and a vector's +16 end field is a loop-exit test, not `vector.empty()`.
+Vector empty detection requires both compared operands to load the same object's +0 and +8 fields. An iterator-to-end comparison is a loop-exit test, not `vector.empty()`.
 
-For MSVC, a string-size candidate at +16 is accepted only when the same object also has the string capacity field at +24 and lacks the vector middle pointer at +8. The `{first,last,end}` vector evidence therefore blocks misclassification as `string.size`, even if other accesses reach +24. Ambiguous layouts stay unchanged.
+For MSVC, accept a string-size candidate at +16 only when the same object also has string capacity at +24 and lacks the vector middle pointer at +8. Ambiguous layouts stay unchanged.
+## Rewrite eligibility
+
+
+`revenant-uncxx` runs only on functions tagged `"revenant.user"="true"`. A field layout alone is not enough. The pass also requires a call on the same object to a function tagged with a libdb-derived `"revenant.lib"` name. It resolves the target after `stripPointerCastsAndAliases()` and reads the attribute from the callee `Function`, not the call site. These attributes survive every metadata mode.
+
+
+## Template signature database
+
+Header-only STL functions are compiled into the user object, so archive-only libdbs do not name them. `tools/revenant-libdb/generate-stl-db.ps1` compiles `stl-instantiations.cpp` with cl `/O1`, `/O2`, `/Ox`, clang-cl `/O1`, `/O2`, `/O3`, `/Oz`, and MinGW-w64 GCC 13.2 `-O2`, `-O3`, `-Os`. It builds each signature set with `revenant-libdb` and merges them with an existing database. Work products and output stay under `rv-scratch`; pass `-LibdbTool`, `-LLVMBuildBin`, `-BaseDatabase`, `-OutputDatabase`, and `-WorkDirectory`.
+
+`tools/revenant-libdb/stl-signatures-results.json` records the measured database sizes and cpp-o2 match comparison. The run generated 24,015 records across ten compiler/optimization configurations. Merging with the base DB kept 62,452 records after folding 13,959 duplicates. On cpp-o2, the merged DB preserved all 1,161 base matches and added 18, including `std::vector<int>::_Change_array` at `0x140002C20`. Uncxx still emitted zero helpers. `vector_ops` and `sum_vec<int>` have no direct call to a libdb-named STL member on their container object, so the required corroboration is absent in this IR.
+
+The generated-DB decompile also exposed a `revenant-lift-abi` PHI type mismatch (`ptr` versus `i64`) in `sub_140061c81`, before it could produce clean IR. The base-DB run reaches `ir-clean` with a duplicate lift failure at `0x140062f70`; its `ir-final` run then fails verification in `revenant-ssaout` on `nonnull`/`noundef` metadata attached to an alloca and store.
+
 
 ## Regression coverage
 
@@ -34,20 +48,8 @@ remarks compare with 10 `string_dtor` calls. The other ranked comparisons are
 140 vector-empty remarks vs 19 recovered calls and 323 string-size remarks vs
 452 helper calls.
 
-On normalized C IR, the integer-field guard prevents the false `vector.empty`
-rewrite, and a `revenant.lang = "c"` module flag disables Uncxx entirely. Both
-`c-o2` and `c-clang-o2` then produce no helper calls. The current `cpp-o2`
-normalizer output is also tagged `"c"` by the old detector and is gated; the
-C++ detection fix must land before measuring Uncxx on that binary again.
+## Current corpus check
 
-The current normalized `cpp-o2` module is also tagged `"c"` by the old
-detector, so the language gate skips it. Changing only that scratch module
-flag to `"cpp"` yielded one `vector.size` helper in `sub_140001630`; rerun the
-actual decompiler after C++ detection lands.
+The `cpp-o2` image classifies both source functions `vector_ops` and `sum_vec<int>` as user functions. The IR after cleanup retains those user tags and the libdb-derived library tags. Running static `revenant-opt -passes=revenant-uncxx` on that IR produced no helper calls. The user functions contain no direct calls to a libdb-identified vector or string member on their container object, so the pass correctly rejects their layout-only candidates under the evidence rule.
 
-The existing `revenant-decompile` accepts `--emit ir-raw|ir-clean|ir-final`,
-not `--emit ir`. On `cpp-o2.exe`, `--emit ir-final` succeeded, but applying
-`revenant-uncxx` to that lifted IR emitted no helper calls. On `json-cl-o2.exe`,
-the driver failed LLVM verification before writing IR: `Entry block to function
-must not have predecessors! label %bb_140057412`. These are observations from
-the current driver build; they do not establish parity for either target.
+The clean IR measurement is saved under `rv-scratch/LunaUncxxUser/cpp-o2.ir-clean.ll`; the static pass output is `cpp-o2.ir-uncxx.ll`. The full decompiler's `--emit ir-final` run still reports an unrelated `revenant-ssaout` verification failure for nonnull/noundef metadata, after a duplicate lifted-function failure at `0x140062f70`. The `ir-clean` stage and static Uncxx pass complete.

@@ -232,7 +232,8 @@ SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 /// this binary does not know is an error, not a skipped stage.
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
                           std::vector<StageReport> &Reports,
-                          CxxFlavor Flavor) {
+                          CxxFlavor Flavor,
+                          const DenseSet<llvm::Function *> *UserFns) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -251,7 +252,7 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
     if (Pass == "revenant-uncxx")
-      FPM.addPass(UncxxPass(Flavor));
+      FPM.addPass(UncxxPass(Flavor, UserFns));
     else if (Error E = PB.parsePassPipeline(FPM, Pass))
       return createStringError("pipeline '" + Pass.str() +
                                "': " + toString(std::move(E)));
@@ -331,7 +332,8 @@ Error runModulePass(Module &M, StringRef Pass) {
 
 Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
                       StringRef Pipeline, std::vector<StageReport> &Reports,
-                      CxxFlavor Flavor = CxxFlavor::Auto) {
+                      CxxFlavor Flavor = CxxFlavor::Auto,
+                      const DenseSet<llvm::Function *> *UserFns = nullptr) {
   // Validate the whole pipeline first: unknown pass names are configuration
   // errors, not recoverable failures of a particular function or module.
   PassBuilder PB;
@@ -342,7 +344,7 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
   for (StringRef Element : pipelineElements(Pipeline)) {
     if (Element.starts_with("function(")) {
       if (Error E =
-              runFunctionPipeline(Stage, *M, Element, Reports, Flavor))
+              runFunctionPipeline(Stage, *M, Element, Reports, Flavor, UserFns))
         return E;
       continue;
     }
@@ -605,6 +607,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       }
       Funclets[Address] = L->Fn;
     }
+    DenseSet<llvm::Function *> UserFunctions;
     size_t OpaqueSites = 0;
     for (Va T : Todo) {
       if (FuncletAddresses.contains(T.Value))
@@ -630,18 +633,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         errs() << "[failed] lift: " << Note << "\n";
         continue;
       }
-      OpaqueSites += L->AsmFallbacks.size();
-    }
-    for (llvm::Function &F : *M) {
-      auto FunctionVA = ir::getFunctionVA(F);
-      if (!FunctionVA)
-        continue;
-      Va Start(*FunctionVA);
-      if (Classification.UserReachable.count(Start))
-        F.addFnAttr("revenant.user", "true");
-      auto Library = Classification.LibraryNames.find(Start);
+      llvm::Function *F = L->Fn;
+      if (Classification.UserReachable.count(T))
+        F->addFnAttr("revenant.user", "true");
+      auto Library = Classification.LibraryNames.find(T);
       if (Library != Classification.LibraryNames.end())
-        F.addFnAttr("revenant.lib", Library->second);
+        F->addFnAttr("revenant.lib", Library->second);
+      if (Classification.UserReachable.count(T))
+        UserFunctions.insert(F);
+      OpaqueSites += L->AsmFallbacks.size();
     }
     // MSVC catch funclets return their continuation VA in rax.
     auto continuationVA = [](const llvm::Function &F)
@@ -805,7 +805,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     if (auto E =
             runPipelineText("ir-final", M,
                             finalPipeline(Opts.Patterns, Out == Lang::Cpp),
-                            R.Stages, uncxxFlavor(Compiler.Producer)))
+                            R.Stages, uncxxFlavor(Compiler.Producer),
+                            &UserFunctions))
       return std::move(E);
     record(R.Stages, "ir-final", "ok",
            "Uncxx (C++ only) + unopt + structure + types + ssaout");

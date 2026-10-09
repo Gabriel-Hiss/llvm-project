@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "source": "stl-instantiations.cpp",
+  "target": "x86_64-pc-windows-msvc",
+  "toolchains": [
+    {"compiler": "cl", "optimization": "O1", "functions": 3392},
+    {"compiler": "cl", "optimization": "O2", "functions": 3463},
+    {"compiler": "cl", "optimization": "Ox", "functions": 3463},
+    {"compiler": "clang-cl", "optimization": "O1", "functions": 1424},
+    {"compiler": "clang-cl", "optimization": "O2", "functions": 1279},
+    {"compiler": "clang-cl", "optimization": "O3", "functions": 3176},
+    {"compiler": "clang-cl", "optimization": "Oz", "functions": 3176},
+    {"compiler": "MinGW GCC 13.2", "optimization": "O2", "functions": 1506},
+    {"compiler": "MinGW GCC 13.2", "optimization": "O3", "functions": 1453},
+    {"compiler": "MinGW GCC 13.2", "optimization": "Os", "functions": 1683}
+  ],
+  "generated": {
+    "functions": 24015,
+    "distinct_names": 4205,
+    "merged_with_base": 62452,
+    "duplicates_folded": 13959
+  },
+  "cpp_o2_match": {
+    "base_matches": 1161,
+    "merged_matches": 1179,
+    "base_matches_preserved": 1161,
+    "new_matches": 18,
+    "new_vector_member_matches": [
+      {"va": "0x140002BE0", "name": "std::vector<int, class std::allocator<int>>::_Calculate_growth"},
+      {"va": "0x140002C20", "name": "std::vector<int, class std::allocator<int>>::_Change_array"},
+      {"va": "0x140002E30", "name": "std::vector<int, class std::allocator<int>>::_Tidy"}
+    ],
+    "uncxx_helpers_emitted": 0,
+    "expected_user_rewrites": ["vector_ops", "sum_vec<int>"],
+    "unresolved": "Neither expected function contains a direct same-object call to a libdb-identified vector or string member in the generated IR; template signatures therefore do not satisfy Uncxx's current corroboration rule."
+  },
+  "ir_clean_repro": {
+    "base_database": "--meta none --libdb <base-libdb.json> --emit ir-clean",
+    "generated_database": "--meta none --libdb <merged-libdb.json> --emit ir-clean",
+    "note": "The base database clean-IR run completed with a duplicate lift failure at 0x140062f70. The generated database run instead failed in revenant-lift-abi with a PHI pointer/i64 type mismatch at sub_140061c81."
+  }
+}
