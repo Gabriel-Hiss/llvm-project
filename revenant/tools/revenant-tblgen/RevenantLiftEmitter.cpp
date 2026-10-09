@@ -377,16 +377,20 @@ class RevenantLiftEmitter {
                          .str();
       }
       if ((Name == "rv_shufps" || Name == "rv_shufpd" ||
-           Name == "rv_pshufb") &&
-          D->getNumArgs() == (Name == "rv_pshufb" ? 2u : 3u)) {
+           Name == "rv_pshufb" || Name == "rv_pblendvb") &&
+          D->getNumArgs() == (Name == "rv_pshufb" || Name == "rv_pblendvb"
+                                  ? 2u
+                                  : 3u)) {
         std::string A = expression(D->getArg(0), Inst, 128,
                                    D->getArgNameStr(0));
         std::string B = expression(D->getArg(1), Inst, 128,
                                    D->getArgNameStr(1));
         if (A.empty() || B.empty())
           return {};
-        if (Name == "rv_pshufb")
-          return (Twine("LC.vop(\"pshufb\", ") + A + ", " + B + ")").str();
+        if (Name == "rv_pshufb" || Name == "rv_pblendvb")
+          return (Twine("LC.vop(\"") + Name.drop_front(3) + "\", " + A +
+                  ", " + B + ")")
+                  .str();
         std::string Imm = immediateExpr(D->getArg(2), Inst);
         return Imm.empty()
                    ? std::string()

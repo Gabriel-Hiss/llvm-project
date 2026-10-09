@@ -45,6 +45,7 @@ def rv_vshift       : RVOp; // (rv_vshift "psrl"|"psll"|"psra", ebits, vec, cnt)
 def rv_pslldq       : RVOp; // (rv_pslldq x, imm): whole-register shift left
 def rv_psrldq       : RVOp; // (rv_psrldq x, imm): whole-register shift right
 def rv_pmovmskb     : RVOp; // (rv_pmovmskb x): i128 -> i32 sign mask
+def rv_pblendvb      : RVOp; // (rv_pblendvb old, new): per-byte select by XMM0 sign bits
 def rv_movmskps     : RVOp; // (rv_movmskps x): i128 -> i32
 def rv_movmskpd     : RVOp; // (rv_movmskpd x): i128 -> i32
 def rv_ptest        : RVOp; // (rv_ptest a, b): flags-only
@@ -837,15 +838,15 @@ def : RVMatch {
   dag Body = (rv_ptest (rv_op 0), (rv_op 1));
 }
 // pblendvb selects per byte from xmm0's sign bits: dst = (mask & b) | (~mask & a).
+// rv_pmovmskb returns an i32 bitmask, not the vector mask the AND needs, so
+// the blend is a dedicated hook that reads XMM0 itself.
 def : RVMatch {
   string Glob = "PBLENDVBrr0";
-  dag Body = (rv_set $dst, (rv_or (rv_and (rv_pmovmskb (rv_reg "XMM0")), (rv_op 1)),
-                                     (rv_and (rv_not (rv_pmovmskb (rv_reg "XMM0"))), (rv_op 0))));
+  dag Body = (rv_set $dst, (rv_pblendvb (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "PBLENDVBrm0";
-  dag Body = (rv_set $dst, (rv_or (rv_and (rv_pmovmskb (rv_reg "XMM0")), (rv_op 1)),
-                                     (rv_and (rv_not (rv_pmovmskb (rv_reg "XMM0"))), (rv_op 0))));
+  dag Body = (rv_set $dst, (rv_pblendvb (rv_op 0), (rv_op 1)));
 }
 
 // ---- string-search compares (flags only; vector results stay opaque) ------------------

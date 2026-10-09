@@ -961,6 +961,15 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     Value *Signs = B.CreateICmpSLT(Vec, Constant::getNullValue(VT));
     return B.CreateZExt(B.CreateBitCast(Signs, iN(16)), iN(32));
   }
+  if (Name == "pblendvb") {
+    // dst = (xmm0_byte_sign & new) | (~mask & old), per byte.
+    Type *VT = vecTyOf(B, iN(128), 8);
+    Value *Old = As(toInt(A, 128), VT);
+    Value *New = As(toInt(Bv, 128), VT);
+    Value *Mv = As(regRead(X86::XMM0, iN(128)), VT);
+    Value *Cond = B.CreateICmpSLT(Mv, Constant::getNullValue(VT));
+    return B.CreateBitCast(B.CreateSelect(Cond, New, Old), iN(128));
+  }
   if (Name == "movmskps" || Name == "movmskpd") {
     unsigned EB = Name == "movmskps" ? 32 : 64;
     Type *VT = vecTyOf(B, iN(128), EB);
