@@ -70,3 +70,6 @@ revenant --export-parity <pe> <dir>   revenant-items.bin + file-spans.tsv
 
 The parity export runs full program analysis without loading a PDB; the
 per-binary command and results are tracked in `parity.md`.
+
+`revenant-decompile` runs the whole pipeline (PE to C/C++/Rust source); see
+`engine.md`.
