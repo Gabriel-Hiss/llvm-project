@@ -130,6 +130,19 @@ public:
   /// packed shifts. Imm is -1 when unused. Returns nullptr for void ops.
   Value *vop(StringRef Name, Value *A, Value *Bv = nullptr,
              int64_t Imm = -1);
+  // ---- typed vectors (generated from the backend's vector patterns) --------
+  Type *vecTy(Type *Elt, unsigned N);
+  /// Bit-preserving conversion between any two integer, float and vector
+  /// types (zero-extends or truncates when the widths differ).
+  Value *vcast(Value *V, Type *Ty);
+  /// The X86ISD vector nodes with no single IRBuilder spelling: lane compares,
+  /// blends, mask extraction, in-lane and cross-lane shuffles, per-lane shifts,
+  /// saturating packs. Returns null for an unknown Kind. VT is the result type.
+  Value *vecOp(StringRef Kind, Type *VT, ArrayRef<Value *> A, int64_t Imm = 0);
+  /// Element-wise sitofp/fptosi/fpext/fptrunc of the low `Lanes` lanes of A
+  /// into VT's element type; lanes beyond the converted ones are zero.
+  Value *vecConvert(StringRef Kind, Value *A, Type *VT, unsigned Lanes);
+
   /// PTEST: ZF = (a & b) == 0, CF = (~a & b) == 0, OF/SF/AF/PF = 0.
   void ptestOp(Value *A, Value *Bv);
   Value *tzcntOp(Value *V); // width when V==0 (BMI TZCNT)

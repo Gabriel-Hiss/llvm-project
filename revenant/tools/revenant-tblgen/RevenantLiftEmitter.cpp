@@ -25,6 +25,21 @@ class RevenantLiftEmitter {
     return DI ? DI->getDef() : nullptr;
   }
 
+  /// Width of the widest vector register class among the operands, 0 when
+  /// the instruction has none.
+  static unsigned vectorWidthOf(const CodeGenInstruction &I) {
+    unsigned W = 0;
+    for (unsigned K = 0, E = I.Operands.size(); K != E; ++K) {
+      StringRef C = I.Operands[K].Rec->getName();
+      unsigned Bits = C.starts_with("VR512")   ? 512
+                      : C.starts_with("VR256") ? 256
+                      : C.starts_with("VR128") ? 128
+                                               : 0;
+      W = std::max(W, Bits);
+    }
+    return W;
+  }
+
   static unsigned widthFor(const Record &Insn) {
     StringRef Name = Insn.getName();
     if (Name.starts_with("MOVSS") || Name.starts_with("VMOVSS"))
@@ -607,6 +622,26 @@ class RevenantLiftEmitter {
             .str();
       }
 
+      if (Name == "rv_vec" && D->getNumArgs() >= 3) {
+        // (rv_vec "kind", ebits, args...): a typed vecOp over Width-bit
+        // operands viewed as lanes of ebits.
+        const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
+        const auto *EB = dyn_cast<IntInit>(D->getArg(1));
+        if (!Kind || !EB || !EB->getValue() || Width % EB->getValue())
+          return {};
+        std::string Args;
+        for (unsigned I = 2; I < D->getNumArgs(); ++I) {
+          std::string A =
+              expression(D->getArg(I), Inst, Width, D->getArgNameStr(I));
+          if (A.empty())
+            return {};
+          Args += (I > 2 ? ", " : "") + A;
+        }
+        return (Twine("LC.vecOp(\"") + Kind->getValue() +
+                "\", LC.vecTy(LC.iN(" + Twine(EB->getValue()) + "), " +
+                Twine(Width / EB->getValue()) + "), {" + Args + "})")
+            .str();
+      }
       if (Name == "rv_fshift" && D->getNumArgs() == 3) {
         const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
         if (!Kind)
@@ -888,6 +923,387 @@ class RevenantLiftEmitter {
     return false;
   }
 
+
+  //===------------------------------------------------------------------===//
+  // Typed vector patterns
+  //
+  // A pattern whose value has a vector type is inverted with its machine
+  // types kept: every operand is read as the node's vector type, ISD nodes
+  // become IRBuilder calls and the X86ISD nodes with no single IR spelling go
+  // through LC.vecOp. Anything not understood fails the whole pattern, so the
+  // instruction stays opaque instead of lifting wrongly.
+  //===------------------------------------------------------------------===//
+
+  struct VecPat {
+    const CodeGenInstruction &Inst;
+    const TreePatternNode &Dst;
+    bool Failed = false;
+  };
+
+  static bool isRegisterOp(const CGIOperandList::OperandInfo *Op) {
+    return Op && Op->MINumOperands == 1 &&
+           (Op->Rec->isSubClassOf("RegisterClass") ||
+            Op->Rec->isSubClassOf("RegisterOperand"));
+  }
+
+  /// C++ expression for the llvm::Type of a machine type; empty if the type
+  /// has no lifted representation (i1 lanes, unknown sizes).
+  static std::string typeExpr(MVT VT) {
+    if (VT.isVector()) {
+      MVT E = VT.getVectorElementType();
+      if (E == MVT::i1 || VT.isScalableVector())
+        return {};
+      std::string Elt = typeExpr(E);
+      return Elt.empty() ? std::string()
+                         : (Twine("LC.vecTy(") + Elt + ", " +
+                            Twine(VT.getVectorNumElements()) + ")")
+                               .str();
+    }
+    unsigned Bits = VT.getSizeInBits();
+    if (VT.isFloatingPoint())
+      return (Twine("LC.fltTy(") + Twine(Bits) + ")").str();
+    if (VT.isInteger() && VT != MVT::i1)
+      return (Twine("LC.iN(") + Twine(Bits) + ")").str();
+    return {};
+  }
+
+  /// MI operand number a pattern name refers to: the instruction's own
+  /// operand name, or the operand in the same position of the result DAG.
+  static std::optional<unsigned> patOperandNo(VecPat &C, StringRef Name) {
+    if (auto N = operandNo(C.Inst, Name))
+      return N;
+    for (unsigned K = 0, E = C.Dst.getNumChildren(); K != E; ++K) {
+      const TreePatternNode &Ch = C.Dst.getChild(K);
+      if (Ch.hasName() && Ch.getName() == Name)
+        return inputOperandNo(C.Inst, K);
+    }
+    return std::nullopt;
+  }
+
+  static bool hasType(const TreePatternNode &N) {
+    return N.getNumTypes() == 1 && N.hasConcreteType(0);
+  }
+
+  /// The immediate a node supplies as an instruction operand: a literal, a
+  /// named immediate operand, or an unnamed constant whose value the result
+  /// DAG computes through an SDNodeXForm (scaled by `Scale`).
+  static std::string immArg(VecPat &C, const TreePatternNode &N,
+                            unsigned Scale = 1) {
+    if (N.isLeaf() || N.getNumChildren() == 0) {
+      if (N.hasName()) {
+        auto No = patOperandNo(C, N.getName());
+        if (No)
+          return (Twine("MI.getOperand(") + Twine(*No) + ").getImm()").str();
+      }
+      if (N.isLeaf())
+        if (const auto *I = dyn_cast<IntInit>(N.getLeafValue()))
+          return Twine(I->getValue()).str();
+    }
+    for (unsigned K = 0, E = C.Dst.getNumChildren(); K != E; ++K) {
+      const TreePatternNode &Ch = C.Dst.getChild(K);
+      if (!Ch.isLeaf() && Ch.getOperator()->isSubClassOf("SDNodeXForm"))
+        return (Twine("(MI.getOperand(") + Twine(inputOperandNo(C.Inst, K)) +
+                ").getImm() * " + Twine(Scale) + ")")
+            .str();
+    }
+    C.Failed = true;
+    return {};
+  }
+
+  struct VecKind {
+    const char *Node;
+    const char *Kind;
+    unsigned Vals; ///< value operands
+    bool Imm;      ///< trailing immediate
+  };
+
+  static const VecKind *vecKind(StringRef Op) {
+    static const VecKind Table[] = {
+        {"X86pcmpeq", "cmpeq", 2, false},   {"X86pcmpgt", "cmpgt", 2, false},
+        {"X86Blendv", "blendv", 3, false},  {"X86movmsk", "movmsk", 1, false},
+        {"X86Unpckl", "unpckl", 2, false},  {"X86Unpckh", "unpckh", 2, false},
+        {"X86PShufd", "pshufd", 1, true},   {"X86VPermilpi", "pshufd", 1, true},
+        {"X86PShuflw", "pshuflw", 1, true}, {"X86PShufhw", "pshufhw", 1, true},
+        {"X86Shufp", "shufp", 2, true},     {"X86PAlignr", "alignr", 2, true},
+        {"X86VPerm2x128", "perm2x128", 2, true},
+        {"X86VPermi", "permq", 1, true},    {"X86VPermv", "permv", 2, false},
+        {"X86pshufb", "pshufb", 2, false},  {"X86Movss", "movs", 2, false},
+        {"X86Movsd", "movs", 2, false},     {"X86Movlhps", "movlhps", 2, false},
+        {"X86Movhlps", "movhlps", 2, false},
+        {"X86vzmovl", "vzmovl", 1, false},  {"scalar_to_vector", "s2v", 1, false},
+        {"X86VBroadcast", "broadcast", 1, false},
+        {"X86fmin", "fmin", 2, false},      {"X86fmax", "fmax", 2, false},
+        {"X86fand", "bitand", 2, false},    {"X86for", "bitor", 2, false},
+        {"X86fxor", "bitxor", 2, false},    {"X86andnp", "andn", 2, false},
+        {"X86fandn", "andn", 2, false},
+        {"X86vshli", "shli", 1, true},      {"X86vsrli", "srli", 1, true},
+        {"X86vsrai", "srai", 1, true},      {"X86vshl", "shl", 2, false},
+        {"X86vsrl", "srl", 2, false},       {"X86vsra", "sra", 2, false},
+        {"X86vshlv", "shlv", 2, false},     {"X86vsrlv", "srlv", 2, false},
+        {"X86vsrav", "srav", 2, false},     {"zext_invec", "zext_invec", 1, false},
+        {"sext_invec", "sext_invec", 1, false},
+        {"X86cmpp", "cmpp", 2, true},       {"X86pmuludq", "muludq", 2, false},
+        {"X86pmuldq", "muldq", 2, false},   {"avgceilu", "avg", 2, false},
+        {"X86Packss", "packss", 2, false},  {"X86Packus", "packus", 2, false},
+    };
+    for (const VecKind &K : Table)
+      if (Op == K.Node)
+        return &K;
+    return nullptr;
+  }
+
+  /// True when the node or anything below it has a vector type.
+  static bool anyVectorType(const TreePatternNode &N) {
+    if (hasType(N) && N.getSimpleType(0).isVector())
+      return true;
+    if (!N.isLeaf())
+      for (const TreePatternNode &Ch : N.children())
+        if (anyVectorType(Ch))
+          return true;
+    return false;
+  }
+
+  static std::string vecExpr(VecPat &C, const TreePatternNode &N) {
+    if (C.Failed || !hasType(N)) {
+      C.Failed = true;
+      return {};
+    }
+    MVT VT = N.getSimpleType(0);
+    std::string Ty = typeExpr(VT);
+    if (Ty.empty()) {
+      C.Failed = true;
+      return {};
+    }
+    unsigned Bits = VT.getSizeInBits();
+    auto Read = [&](unsigned No) {
+      return (Twine("LC.vcast(LC.readOp(MI, ") + Twine(No) + ", LC.iN(" +
+              Twine(Bits) + ")), " + Ty + ")")
+          .str();
+    };
+    // Leaves and constants.
+    if (N.isLeaf() || (N.getNumChildren() == 0 && N.hasName())) {
+      if (N.hasName()) {
+        auto No = patOperandNo(C, N.getName());
+        if (!No) {
+          C.Failed = true;
+          return {};
+        }
+        const auto *Op = operandAt(C.Inst, *No);
+        if (isMemOperand(C.Inst, *No))
+          return (Twine("LC.memRead(MI, ") + Twine(*No) + ", " + Ty + ")")
+              .str();
+        if (isRegisterOp(Op) || (Op && !VT.isVector()))
+          return Read(*No);
+      }
+      if (N.isLeaf())
+        if (const auto *I = dyn_cast<IntInit>(N.getLeafValue()))
+          if (!VT.isVector())
+            return (Twine("LC.vcast(LC.constI(") + Twine(I->getValue()) + ", " +
+                    Twine(Bits) + "), " + Ty + ")")
+                .str();
+      C.Failed = true;
+      return {};
+    }
+    StringRef Op = N.getOperator()->getName();
+    unsigned NC = N.getNumChildren();
+    auto Child = [&](unsigned I) { return vecExpr(C, N.getChild(I)); };
+
+    if (Op == "undef")
+      return (Twine("UndefValue::get(") + Ty + ")").str();
+    if ((Op == "ld" || Op == "load") && NC == 1) {
+      auto No = patOperandNo(C, firstNamedOperand(N));
+      if (!No || !isMemOperand(C.Inst, *No)) {
+        C.Failed = true;
+        return {};
+      }
+      return (Twine("LC.memRead(MI, ") + Twine(*No) + ", " + Ty + ")").str();
+    }
+    if (Op == "bitconvert" && NC == 1) {
+      std::string A = Child(0);
+      return A.empty() ? A : (Twine("LC.vcast(") + A + ", " + Ty + ")").str();
+    }
+    // Plain IRBuilder spellings.
+    static const std::pair<StringRef, StringRef> Bin[] = {
+        {"add", "CreateAdd"},   {"sub", "CreateSub"},  {"mul", "CreateMul"},
+        {"and", "CreateAnd"},   {"or", "CreateOr"},    {"xor", "CreateXor"},
+        {"shl", "CreateShl"},   {"srl", "CreateLShr"}, {"sra", "CreateAShr"},
+        {"fadd", "CreateFAdd"}, {"fsub", "CreateFSub"},
+        {"fmul", "CreateFMul"}, {"fdiv", "CreateFDiv"}};
+    if (NC == 2)
+      for (const auto &[Node, Builder] : Bin)
+        if (Op == Node) {
+          std::string A = Child(0), B = Child(1);
+          if (A.empty() || B.empty())
+            return {};
+          return (Twine("LC.builder().") + Builder + "(LC.vcast(" + A + ", " +
+                  Ty + "), LC.vcast(" + B + ", " + Ty + "))")
+              .str();
+        }
+    static const std::pair<StringRef, StringRef> Intr[] = {
+        {"smax", "smax"},       {"smin", "smin"},
+        {"umax", "umax"},       {"umin", "umin"},
+        {"uaddsat", "uadd_sat"}, {"saddsat", "sadd_sat"},
+        {"usubsat", "usub_sat"}, {"ssubsat", "ssub_sat"}};
+    if (NC == 2)
+      for (const auto &[Node, Id] : Intr)
+        if (Op == Node) {
+          std::string A = Child(0), B = Child(1);
+          if (A.empty() || B.empty())
+            return {};
+          return (Twine("LC.builder().CreateBinaryIntrinsic(Intrinsic::") + Id +
+                  ", LC.vcast(" + A + ", " + Ty + "), LC.vcast(" + B + ", " +
+                  Ty + "))")
+              .str();
+        }
+    if (NC == 1 && (Op == "fsqrt" || Op == "fabs" || Op == "fneg")) {
+      std::string A = Child(0);
+      if (A.empty())
+        return {};
+      if (Op == "fneg")
+        return (Twine("LC.builder().CreateFNeg(LC.vcast(") + A + ", " + Ty +
+                "))")
+            .str();
+      return (Twine("LC.builder().CreateUnaryIntrinsic(Intrinsic::") +
+              (Op == "fsqrt" ? "sqrt" : "fabs") + ", LC.vcast(" + A + ", " +
+              Ty + "))")
+          .str();
+    }
+    if (Op == "insertelt" && NC == 3) {
+      std::string A = Child(0), S = Child(1);
+      std::string I = immArg(C, N.getChild(2));
+      if (A.empty() || S.empty() || I.empty())
+        return {};
+      return (Twine("LC.builder().CreateInsertElement(") + A +
+              ", LC.vcast(" + S + ", " + typeExpr(VT.getVectorElementType()) +
+              "), (uint64_t)" + I + ")")
+          .str();
+    }
+    if (Op == "extractelt" && NC == 2) {
+      std::string A = Child(0);
+      std::string I = immArg(C, N.getChild(1));
+      if (A.empty() || I.empty())
+        return {};
+      return (Twine("LC.vcast(LC.builder().CreateExtractElement(") + A +
+              ", (uint64_t)" + I + "), " + Ty + ")")
+          .str();
+    }
+    if ((Op == "insert_subvector" && NC == 3) ||
+        (Op == "extract_subvector" && NC == 2)) {
+      bool Ins = Op == "insert_subvector";
+      const TreePatternNode &Sub = N.getChild(Ins ? 1 : 0);
+      if (!hasType(Sub) || !Sub.getSimpleType(0).isVector() ||
+          !(Ins ? true : VT.isVector())) {
+        C.Failed = true;
+        return {};
+      }
+      unsigned SubElts =
+          (Ins ? Sub.getSimpleType(0) : VT).getVectorNumElements();
+      std::string A = Child(0), S = Ins ? Child(1) : std::string();
+      std::string I = immArg(C, N.getChild(Ins ? 2 : 1), SubElts);
+      if (A.empty() || (Ins && S.empty()) || I.empty())
+        return {};
+      return (Twine("LC.vecOp(\"") + (Ins ? "insert_sub" : "extract_sub") +
+              "\", " + Ty + ", {" + A + (Ins ? ", " + S : std::string()) +
+              "}, " + I + ")")
+          .str();
+    }
+    if (Op == "sint_to_fp" || Op == "fp_to_sint" || Op == "fp_extend" ||
+        Op == "fp_round") {
+      const TreePatternNode &Src = N.getChild(0);
+      if (NC != 1 || !hasType(Src) || !VT.isVector() ||
+          !Src.getSimpleType(0).isVector()) {
+        C.Failed = true;
+        return {};
+      }
+      MVT ST = Src.getSimpleType(0);
+      std::string A = Child(0);
+      if (A.empty())
+        return {};
+      // Convert the overlapping low lanes; a narrowing result is zero-padded.
+      unsigned Lanes = std::min(ST.getVectorNumElements(),
+                                VT.getVectorNumElements());
+      const char *Cast = Op == "sint_to_fp"   ? "sitofp"
+                         : Op == "fp_to_sint" ? "fptosi"
+                         : Op == "fp_extend"  ? "fpext"
+                                              : "fptrunc";
+      return (Twine("LC.vecConvert(\"") + Cast + "\", " + A + ", " + Ty + ", " +
+              Twine(Lanes) + ")")
+          .str();
+    }
+    if (const VecKind *K = vecKind(Op)) {
+      if (NC != K->Vals + (K->Imm ? 1 : 0)) {
+        C.Failed = true;
+        return {};
+      }
+      std::string Args;
+      for (unsigned I = 0; I < K->Vals; ++I) {
+        std::string A = Child(I);
+        if (A.empty())
+          return {};
+        Args += (I ? ", " : "") + A;
+      }
+      std::string Imm = "0";
+      if (K->Imm) {
+        Imm = immArg(C, N.getChild(K->Vals));
+        if (Imm.empty())
+          return {};
+      }
+      return (Twine("LC.vecOp(\"") + K->Kind + "\", " + Ty + ", {" + Args +
+              "}, " + Imm + ")")
+          .str();
+    }
+    C.Failed = true;
+    return {};
+  }
+
+  /// Body for a pattern whose value is a vector; empty when the pattern is
+  /// not a vector one (`IsVector` false) or cannot be inverted.
+  static std::string vectorPatternBody(const PatternToMatch &P,
+                                       const CodeGenInstruction &Inst,
+                                       bool &IsVector) {
+    IsVector = false;
+    const TreePatternNode &Dst = P.getDstPattern();
+    const TreePatternNode &Src = P.getSrcPattern();
+    const TreePatternNode *Expr = &Src;
+    if (!Src.isLeaf() && Src.getOperator()->getName() == "set" &&
+        Src.getNumChildren() == 2)
+      Expr = &Src.getChild(1);
+    StringRef SrcOp =
+        Expr->isLeaf() ? StringRef() : Expr->getOperator()->getName();
+    bool IsStore = SrcOp == "st" || SrcOp == "store";
+    const TreePatternNode &Val = IsStore && Expr->getNumChildren() == 2
+                                     ? Expr->getChild(0)
+                                     : *Expr;
+    if (!hasType(Val) || !anyVectorType(Val))
+      return {};
+    IsVector = true;
+    // Mask registers and implicit state belong to the DSL.
+    for (unsigned K = 0, E = Inst.Operands.size(); K != E; ++K)
+      if (Inst.Operands[K].Rec->getName().starts_with("VK"))
+        return {};
+    VecPat C{Inst, Dst};
+    std::string V = vecExpr(C, Val);
+    if (C.Failed || V.empty())
+      return {};
+    if (IsStore) {
+      auto Mem = patOperandNo(C, firstNamedOperand(Expr->getChild(1)));
+      if (Inst.Operands.NumDefs != 0 || !Mem || !isMemOperand(Inst, *Mem))
+        return {};
+      return (Twine("    LC.writeOp(MI, ") + Twine(*Mem) + ", " + V + ");\n")
+          .str();
+    }
+    if (Inst.Operands.NumDefs != 1)
+      return {};
+    MVT RootVT = Val.getSimpleType(0);
+    bool Vex = Inst.TheDef->getName().starts_with("V");
+    // VEX.128 writes clear the upper ymm lane; a scalar result (movmsk,
+    // extract) goes to a general register.
+    bool Zero = Vex && RootVT.isVector() && RootVT.getSizeInBits() <= 128;
+    return (Twine("    LC.") + (Zero ? "writeOpZ" : "writeOp") +
+            "(MI, 0, " + V + ");\n")
+        .str();
+  }
+
   static std::string patternBody(const PatternToMatch &P,
                                 const CodeGenInstruction &Inst,
                                 unsigned Width) {
@@ -895,6 +1311,10 @@ class RevenantLiftEmitter {
     if (Dst.isLeaf() || Dst.getOperator() != Inst.TheDef ||
         hasNestedInst(Dst) || !Inst.ImplicitDefs.empty())
       return {};
+    bool IsVector = false;
+    std::string VecBody = vectorPatternBody(P, Inst, IsVector);
+    if (IsVector)
+      return VecBody;
     const TreePatternNode &Src = P.getSrcPattern();
     const TreePatternNode *Expr = &Src;
     if (!Src.isLeaf() && Src.getOperator()->getName() == "set" &&
@@ -1512,13 +1932,19 @@ public:
       if (Instructions.count(Insn))
         Semantics[Insn] = bodyOf(*R);
     }
-    for (const Record *R : Records.getAllDerivedDefinitions("RVMatch")) {
-      StringRef Glob = R->getValueAsString("Glob");
-      const DagInit *Body = bodyOf(*R);
-      for (const auto &I : Instructions)
-        if (!Semantics.count(I.first) && globMatches(Glob, I.first->getName()))
-          Semantics[I.first] = Body;
-    }
+    // An exact name beats a wildcard, so `MOV*rm` (the general-register
+    // moves) cannot capture MOVSDrm and friends.
+    for (bool Wild : {false, true})
+      for (const Record *R : Records.getAllDerivedDefinitions("RVMatch")) {
+        StringRef Glob = R->getValueAsString("Glob");
+        if (Glob.contains('*') != Wild)
+          continue;
+        const DagInit *Body = bodyOf(*R);
+        for (const auto &I : Instructions)
+          if (!Semantics.count(I.first) &&
+              globMatches(Glob, I.first->getName()))
+            Semantics[I.first] = Body;
+      }
     std::map<const Record *, std::string> PatternBodies;
     for (const PatternToMatch &P : Patterns.ptms()) {
       const TreePatternNode &Dst = P.getDstPattern();
@@ -1537,9 +1963,11 @@ public:
     }
 
 
+
     OS << "// Generated by revenant-tblgen. Do not edit.\n"
           "#include \"X86MCTargetDesc.h\"\n"
           "#include \"revenant/Lift/X86LiftContext.h\"\n"
+          "#include \"llvm/IR/Intrinsics.h\"\n"
           "namespace llvm { namespace revenant {\n"
           "bool liftX86Inst(X86LiftContext &LC, const MCInst &MI, "
           "uint64_t VA, uint64_t Size) {\n"
@@ -1558,7 +1986,8 @@ public:
       const CodeGenInstruction &Inst = *Instructions[R];
       std::string Buffer;
       raw_string_ostream BodyOS(Buffer);
-      bool Emits = emitBody(BodyOS, *Body, Inst, widthFor(*R));
+      unsigned VW = vectorWidthOf(Inst);
+      bool Emits = emitBody(BodyOS, *Body, Inst, VW ? VW : widthFor(*R));
       BodyOS.flush();
       if (Emits && !operandRefsValid(Buffer, Inst)) {
         Rejected.push_back(R->getName().str());

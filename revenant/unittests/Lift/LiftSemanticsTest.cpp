@@ -40,7 +40,11 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Memory.h"
+#include "llvm/IR/CallingConv.h"
 #include "llvm/Support/Program.h"
+#include "llvm/TargetParser/Host.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/Support/TargetSelect.h"
 
 namespace {
@@ -231,19 +235,48 @@ static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
     return false;
   }
   std::string Name = Lifted->Fn->getName().str();
-  if (std::getenv("REVENANT_SEM_IR"))
-    M->print(llvm::errs(), nullptr);
-  auto Jit = llvm::orc::LLJITBuilder().create();
+  // COFF constant-pool symbols (__ymm@...) do not link in the JIT, so compile
+  // the lifted module as ELF for the host CPU. One JIT serves every case,
+  // each in its own dylib, because a JIT per case exhausts the host.
+  static llvm::Triple JitTriple("x86_64-unknown-linux-gnu");
+  static std::unique_ptr<llvm::orc::LLJIT> Jit;
+  static unsigned Serial = 0;
   if (!Jit) {
-    Err = llvm::toString(Jit.takeError());
+    llvm::orc::JITTargetMachineBuilder JTMB(JitTriple);
+    JTMB.setCPU(llvm::sys::getHostCPUName().str());
+    for (auto &F : llvm::sys::getHostCPUFeatures())
+      JTMB.addFeatures(
+          {(std::string(F.second ? "+" : "-") + F.first().str())});
+    auto J = llvm::orc::LLJITBuilder()
+                 .setJITTargetMachineBuilder(std::move(JTMB))
+                 .create();
+    if (!J) {
+      Err = llvm::toString(J.takeError());
+      return false;
+    }
+    Jit = std::move(*J);
+  }
+  // No unwind tables: the JIT cannot register .eh_frame on this host.
+  // The test calls the function with the Windows convention.
+  for (llvm::Function &Fn : *M) {
+    Fn.addFnAttr(llvm::Attribute::NoUnwind);
+    Fn.setCallingConv(llvm::CallingConv::Win64);
+  }
+  M->setTargetTriple(JitTriple);
+  M->setDataLayout(Jit->getDataLayout());
+  auto JD = Jit->createJITDylib("case" + std::to_string(Serial++));
+  if (!JD) {
+    Err = llvm::toString(JD.takeError());
     return false;
   }
-  if (auto E = (*Jit)->addIRModule(
-          llvm::orc::ThreadSafeModule(std::move(M), std::move(Ctx)))) {
+  if (std::getenv("REVENANT_SEM_IR"))
+    M->print(llvm::errs(), nullptr);
+  if (auto E = Jit->addIRModule(
+          *JD, llvm::orc::ThreadSafeModule(std::move(M), std::move(Ctx)))) {
     Err = llvm::toString(std::move(E));
     return false;
   }
-  auto Sym = (*Jit)->lookup(Name);
+  auto Sym = Jit->lookup(*JD, Name);
   if (!Sym) {
     Err = llvm::toString(Sym.takeError());
     return false;

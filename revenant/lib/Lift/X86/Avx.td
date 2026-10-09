@@ -164,19 +164,19 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VCVTTSS2SIrr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "VCVTTSS2SI64rr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "VCVTTSD2SIrr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "VCVTTSD2SI64rr_Int";
-  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "VCVTSS2SDrr_Int";
@@ -268,94 +268,8 @@ def : RVMatch {
 }
 
 // ---- VEX-128 packed integer ops ----------------------------------------------------------
-def : RVMatch {
-  string Glob = "VPADDBr*";
-  dag Body = (rv_setz $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPADDWr*";
-  dag Body = (rv_setz $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPADDD*r";
-  dag Body = (rv_setz $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPADDQr*";
-  dag Body = (rv_setz $dst, (rv_add (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPSUBBr*";
-  dag Body = (rv_setz $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPSUBWr*";
-  dag Body = (rv_setz $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPSUBDr*";
-  dag Body = (rv_setz $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPSUBQr*";
-  dag Body = (rv_setz $dst, (rv_sub (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPMULLDr*";
-  dag Body = (rv_setz $dst, (rv_mul (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPMULUDQr*";
-  dag Body = (rv_setz $dst, (rv_mul (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPANDr*";
-  dag Body = (rv_setz $dst, (rv_and (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPANDNr*";
-  dag Body = (rv_setz $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPORr*";
-  dag Body = (rv_setz $dst, (rv_or (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPXORr*";
-  dag Body = (rv_setz $dst, (rv_xor (rv_op 0), (rv_op 1)));
-}
-def : RVMatch {
-  string Glob = "VPCMPEQBr*";
-  dag Body = (rv_setz $dst, (rv_sext 8, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPEQWr*";
-  dag Body = (rv_setz $dst, (rv_sext 16, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPEQDr*";
-  dag Body = (rv_setz $dst, (rv_sext 32, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPEQQr*";
-  dag Body = (rv_setz $dst, (rv_sext 64, (rv_icmp "eq", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPGTBr*";
-  dag Body = (rv_setz $dst, (rv_sext 8, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPGTWr*";
-  dag Body = (rv_setz $dst, (rv_sext 16, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPGTDr*";
-  dag Body = (rv_setz $dst, (rv_sext 32, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
-def : RVMatch {
-  string Glob = "VPCMPGTQr*";
-  dag Body = (rv_setz $dst, (rv_sext 64, (rv_icmp "sgt", (rv_op 0), (rv_op 1))));
-}
+// Lane-wise integer arithmetic, bitwise ops and compares: typed pattern
+// inversion (X86LiftVector.cpp).
 def : RVMatch {
   string Glob = "VPUNPCKLBWr*";
   dag Body = (rv_setz $dst, (rv_punpckl 8, (rv_op 0), (rv_op 1)));
@@ -392,10 +306,6 @@ def : RVMatch {
 // ---- low-128 AVX extras ----------------------------------------------------------------------
 // vbroadcast low byte splat; vcvtdq2pd converts the low 2xi32 to 2xf64.
 def : RVMatch {
-  string Glob = "VPBROADCASTBr*";
-  dag Body = (rv_setz $dst, (rv_vbroadcastb (rv_trunc 8, (rv_op 1))));
-}
-def : RVMatch {
   string Glob = "VCVTDQ2PDrr";
   dag Body = (rv_setz $dst, (rv_vcvtdq2pd (rv_op 0)));
 }
@@ -407,3 +317,17 @@ def : RVMatch {
   string Glob = "VBROADCASTI128rm";
   dag Body = (rv_setz $dst, (rv_op 0));
 }
+
+// ---- full-vector moves (xmm and ymm) ------------------------------------------
+// No backend pattern selects these: loads, stores and register copies are
+// plain bit copies of the whole vector. VEX forms clear the bits above.
+foreach M = ["VMOVDQU", "VMOVDQA", "VMOVAPS", "VMOVAPD", "VMOVUPS", "VMOVUPD"] in {
+  foreach W = ["", "Y"] in {
+    def : RVMatch { string Glob = M # W # "rm"; dag Body = (rv_setz $dst, (rv_op 0)); }
+    def : RVMatch { string Glob = M # W # "mr"; dag Body = (rv_store (rv_addr $dst), (rv_op 1)); }
+    def : RVMatch { string Glob = M # W # "rr*"; dag Body = (rv_setz $dst, (rv_op 0)); }
+  }
+}
+foreach M = ["VMOVNTDQ", "VMOVNTPS", "VMOVNTPD"] in
+  foreach W = ["", "Y"] in
+    def : RVMatch { string Glob = M # W # "mr"; dag Body = (rv_store (rv_addr $dst), (rv_op 1)); }
