@@ -23,9 +23,14 @@ call-count difference. The CSV marks these ambiguities explicitly.
 with inline optimization records enabled, in an isolated scratch directory.
 It never executes the recipe's move commands or links a binary. Rust uses the
 artifact generator's edition, crate name, target, optimization and debug flags.
-The capture index checks the resulting IR against the existing ir-post file,
-ignoring only the ModuleID comment. Records from a different IR must not be
-presented as evidence of what happened to the original corpus module.
+The capture index first compares the resulting IR against the existing
+ir-post file, ignoring only the ModuleID comment. Clang optimization records
+enable line-table debug info even for an otherwise debug-free build. The
+measurement reader therefore also compares both modules after LLVM's
+`strip-debug` pass. Exact equality of that normalized IR is required, and both
+normalized hashes are retained in `verified-index.json`. Differences in code,
+attributes or semantic metadata reject the records rather than treating a
+recompile as evidence about a different corpus module.
 
 The initial candidate classifier uses these definitions:
 
@@ -104,3 +109,8 @@ values. A multiblock callee needs actual branching or at least three ordinary
 instructions. An outlined call plus an unconditional continuation is not new
 evidence for another callee, which prevents replacement calls from turning
 into chains of unrelated forwarding functions during the same module run.
+
+Return range checking follows PHI and select arms, with pessimistic memoization
+for cycles. It accepts ranges proved by constants or instruction metadata and
+rejects an unproved return contract. `cfg-contracts.ll` checks that both input
+contracts and load range metadata are present before rebuilding a call.

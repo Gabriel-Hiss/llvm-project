@@ -1,6 +1,30 @@
 // Exact CFG matching deliberately does not undo jump threading or folding.
 // Entry may have a caller prefix; the unique return block may have a caller
 // suffix. All other blocks, edges, PHIs and operations must match exactly.
+// Metadata/constant ranges do not recursively inspect PHI incoming values.
+// Prove each arm instead; pessimistic memoization rejects cycles without
+// exponential traversal of shared PHI/select graphs.
+bool provesReturnRange(Value *V, const ConstantRange &Expected,
+                       DenseMap<const Value *, bool> &Cache) {
+  auto It = Cache.find(V);
+  if (It != Cache.end())
+    return It->second;
+  Cache[V] = false;
+  bool Proved = Expected.contains(computeConstantRange(V, false));
+  if (!Proved) {
+    if (auto *Phi = dyn_cast<PHINode>(V)) {
+      Proved = true;
+      for (Value *Incoming : Phi->incoming_values())
+        Proved &= provesReturnRange(Incoming, Expected, Cache);
+    } else if (auto *Select = dyn_cast<SelectInst>(V)) {
+      Proved = provesReturnRange(Select->getTrueValue(), Expected, Cache) &&
+               provesReturnRange(Select->getFalseValue(), Expected, Cache);
+    }
+  }
+  Cache[V] = Proved;
+  return Proved;
+}
+
 struct CFGBody {
   Function *Fn;
   SmallVector<const ReturnInst *, 4> Returns;
@@ -285,10 +309,11 @@ bool matchCFG(const CFGBody &B, Instruction &Start, CFGRegion &R) {
       if (Kind == Attribute::NoUndef &&
           !isGuaranteedNotToBeUndefOrPoison(V, nullptr, Context, &DT))
         return false;
-      if (Kind == Attribute::Range &&
-          !Attr.getValueAsConstantRange().contains(
-              computeConstantRange(V, false, true, nullptr, Context, &DT)))
-        return false;
+      if (Kind == Attribute::Range) {
+        DenseMap<const Value *, bool> Cache;
+        if (!provesReturnRange(V, Attr.getValueAsConstantRange(), Cache))
+          return false;
+      }
     }
   }
   for (auto Item : R.ExitValues)
