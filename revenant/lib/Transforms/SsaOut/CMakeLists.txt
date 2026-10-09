@@ -1,6 +1,3 @@
-cmake_minimum_required(VERSION 3.20)
-project(RevenantSsaOut CXX)
-
 # Standalone slice build. Configured directly on this directory from a
 # vcvars64 shell:
 #   cmake -G Ninja -S <worktree>/revenant/lib/Transforms/SsaOut
@@ -14,6 +11,10 @@ project(RevenantSsaOut CXX)
 # then `ninja -j4`. The top-level `revenant/` superbuild (owner: RvSkeleton)
 # and `revenant-opt` (owner: MuseTxPipeline) pick this directory up with
 # add_subdirectory; keep this file self-sufficient for both uses.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+cmake_minimum_required(VERSION 3.20)
+project(RevenantSsaOut CXX)
+
 find_package(LLVM REQUIRED CONFIG
   PATHS "C:/Users/User/RustroverProjects/llvm-project/build-revenant/lib/cmake/llvm"
   NO_DEFAULT_PATH)
@@ -28,6 +29,7 @@ if(MSVC)
   add_compile_options(/GR- /EHs-c-)
 else()
   add_compile_options(-fno-exceptions -fno-rtti)
+endif()
 endif()
 
 add_library(RevenantTransformSsaOut MODULE
