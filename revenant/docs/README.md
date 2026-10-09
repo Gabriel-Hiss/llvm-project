@@ -45,8 +45,10 @@ Never reconfigure or rebuild `build-revenant` itself.
 ## Lift tests
 
 `RevenantLiftTests` checks function lifting and cleanup verification. Its corpus
-sample test lifts the first 12 decodable `.pdata` functions from `c-o0.exe`,
-`c-o2.exe`, and `cpp-o2.exe` and verifies each resulting LLVM module.
+test runs full analysis and CFG lifting for every discovered function in
+`c-o0.exe`, `c-o2.exe`, `cpp-o2.exe`, `c-clang-o2.exe`, and `c-gcc-o2.exe`.
+It reports verification totals, failure categories, and opaque fallback
+mnemonic counts for each binary.
 
 ## Adding a slice
 
