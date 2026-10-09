@@ -5,7 +5,7 @@
 ; plain op: same value, the flag becomes a testable extractvalue. Lifted
 ; IR also keeps intact checked sites (RawVec capacity, i64 parse); those
 ; are left alone.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

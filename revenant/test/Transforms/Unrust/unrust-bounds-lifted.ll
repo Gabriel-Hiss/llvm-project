@@ -5,7 +5,7 @@
 ; `core__slice__index__slice_index_fail` (the slice Index panic, in the
 ; bounds family). The pass flips the compare back to the rustc ir-pre
 ; spelling `icmp ult idx, len`, true = in bounds.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

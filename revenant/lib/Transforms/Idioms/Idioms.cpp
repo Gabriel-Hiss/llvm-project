@@ -778,6 +778,8 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
           B.SetInsertPoint(Call);
         Function *Callee = Call->getCalledFunction();
         if (Callee && Callee->isIntrinsic()) {
+          if (Call->arg_size() < 2)
+            continue;
           Intrinsic::ID ID = Callee->getIntrinsicID();
           Value *A = Call->getArgOperand(0);
           Value *R = nullptr;

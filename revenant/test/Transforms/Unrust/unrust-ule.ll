@@ -3,7 +3,7 @@
 ; panic edge on the true side. That spelling negates the rustc form, so
 ; the pass swaps the compare to `icmp ult idx, len` AND the branch
 ; successors, keeping the same boolean on the same edges.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shape from lifted c-clang-o2 `sum_vec` scalar tail (VA 0x140001680). The
 ; tail merges three entries: the direct entry (index 0), the vector-main-loop

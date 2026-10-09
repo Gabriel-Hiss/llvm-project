@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shape from lifted c-clang-o2 `break_continue` (VA 0x140001150). Three
 ; indvars artifacts at once: the exit compares the already-narrow `%n`
