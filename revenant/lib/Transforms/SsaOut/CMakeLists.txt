@@ -31,28 +31,40 @@ else()
   add_compile_options(-fno-exceptions -fno-rtti)
 endif()
 endif()
-add_library(RevenantTransformSsaOut MODULE
-  SsaOut.cpp
-)
-if(WIN32)
-  target_sources(RevenantTransformSsaOut PRIVATE SsaOut.def)
+if(COMMAND add_llvm_library)
+  add_llvm_library(RevenantTransformSsaOut STATIC
+    SsaOut.cpp
+    LINK_COMPONENTS
+    Core
+    Support
+    Analysis
+    TransformUtils
+    )
+else()
+  add_library(RevenantTransformSsaOut MODULE
+    SsaOut.cpp
+    )
+  if(WIN32)
+    target_sources(RevenantTransformSsaOut PRIVATE SsaOut.def)
+  endif()
+  target_compile_definitions(RevenantTransformSsaOut PRIVATE
+    REVENANT_BUILD_PLUGIN)
+  set_target_properties(RevenantTransformSsaOut PROPERTIES
+    OUTPUT_NAME "RevenantTransformSsaOut"
+    PREFIX ""
+    SUFFIX ".dll"
+    )
+  llvm_map_components_to_libnames(LLVM_LIBS
+    Core
+    Support
+    Analysis
+    TransformUtils
+    )
+  target_link_libraries(RevenantTransformSsaOut PRIVATE ${LLVM_LIBS})
+  target_include_directories(RevenantTransformSsaOut PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
+    )
 endif()
-target_compile_definitions(RevenantTransformSsaOut PRIVATE REVENANT_BUILD_PLUGIN)
-set_target_properties(RevenantTransformSsaOut PROPERTIES
-  OUTPUT_NAME "RevenantTransformSsaOut"
-  PREFIX ""
-  SUFFIX ".dll"
-)
-llvm_map_components_to_libnames(LLVM_LIBS
-  Core
-  Support
-  Analysis
-  TransformUtils
-)
-target_link_libraries(RevenantTransformSsaOut PRIVATE ${LLVM_LIBS})
-target_include_directories(RevenantTransformSsaOut PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
-)
 set_property(TARGET RevenantTransformSsaOut PROPERTY CXX_STANDARD 17)
 set_property(TARGET RevenantTransformSsaOut PROPERTY CXX_STANDARD_REQUIRED ON)

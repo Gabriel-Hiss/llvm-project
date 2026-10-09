@@ -15,6 +15,7 @@ set(UNROTATE_SOURCES Unrotate.cpp UntailRec.cpp)
 
 if(COMMAND add_llvm_library)
   add_llvm_library(RevenantTransformUnrotate STATIC ${UNROTATE_SOURCES}
+    PARTIAL_SOURCES_INTENDED
     LINK_LIBS LLVMCore LLVMSupport LLVMAnalysis
     )
 else()

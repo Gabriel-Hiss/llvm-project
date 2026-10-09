@@ -1,10 +1,18 @@
 add_llvm_library(RevenantAnalysis
-  Padding.cpp
-  Noreturn.cpp
-  Xrefs.cpp
-  Strings.cpp
-  Resolver.cpp
+  Analysis.cpp
+  Builder.cpp
+  Candidates.cpp
   JumpTable.cpp
+  Noreturn.cpp
+  Orphan.cpp
+  Overlaps.cpp
+  Padding.cpp
+  ProgramAnalyze.cpp
+  Resolver.cpp
+  StackPtr.cpp
+  Strings.cpp
+  Xrefs.cpp
+  Signatures.cpp
   EHTables.cpp
 
   LINK_COMPONENTS
@@ -17,3 +25,7 @@ add_llvm_library(RevenantAnalysis
   LINK_LIBS
   RevenantDisasm
 )
+target_include_directories(RevenantAnalysis PRIVATE
+  ${PROJECT_SOURCE_DIR}/../llvm/lib/Target/X86/MCTargetDesc
+  ${LLVM_BINARY_DIR}/lib/Target/X86
+  )

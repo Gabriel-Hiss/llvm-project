@@ -46,8 +46,7 @@ enum class Prec : unsigned {
   Atom = 18,
 };
 
-/// Concrete ExprBuilder. Owns the per-function ExprScope bookkeeping plus
-/// the temp-VarDecl emission StmtBuilder consumes through PendingTemps.
+/// Concrete ExprBuilder; Core consumes its pending temporary declarations.
 class ExprBuilderImpl final : public ExprBuilder {
 public:
   ExprBuilderImpl(FrontendContext &Ctx, TypeBuilder &Types)

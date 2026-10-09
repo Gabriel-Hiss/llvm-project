@@ -1,10 +1,15 @@
 revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
-  PaddingTest.cpp
-  NoreturnTest.cpp
-  XrefsTest.cpp
-  StringsTest.cpp
-  ResolverTest.cpp
+  CandidatesTest.cpp
   JumpTableTest.cpp
+  NoreturnTest.cpp
+  OrphanTest.cpp
+  OverlapsTest.cpp
+  PaddingTest.cpp
+  ResolverTest.cpp
+  StackPtrTest.cpp
+  StringsTest.cpp
+  XrefsTest.cpp
+  SignaturesTest.cpp
   EHTablesTest.cpp
 )
 
