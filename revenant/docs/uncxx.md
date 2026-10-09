@@ -35,9 +35,10 @@ remarks compare with 10 `string_dtor` calls. The other ranked comparisons are
 452 helper calls.
 
 On normalized C IR, the integer-field guard prevents the false `vector.empty`
-rewrite. `c-o2` and `c-clang-o2` then produce no Uncxx helper calls. The
-module currently lacks compiler-language metadata, so whole-pass C++ gating
-still depends on language detection being available in the pipeline.
+rewrite, and a `revenant.lang = "c"` module flag disables Uncxx entirely. Both
+`c-o2` and `c-clang-o2` then produce no helper calls. The current `cpp-o2`
+normalizer output is also tagged `"c"` by the old detector and is gated; the
+C++ detection fix must land before measuring Uncxx on that binary again.
 
 The existing `revenant-decompile` accepts `--emit ir-raw|ir-clean|ir-final`,
 not `--emit ir`. On `cpp-o2.exe`, `--emit ir-final` succeeded, but applying
