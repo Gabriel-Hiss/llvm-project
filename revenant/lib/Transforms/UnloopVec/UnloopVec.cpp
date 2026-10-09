@@ -1986,6 +1986,79 @@ static bool matchIndexPlus(Value *V, const PHINode *IP, int64_t &Offset,
     return false;
   }
 }
+// The horizontal lane fold GCC emits for a packed integer reduction:
+// repeated (bitcast to the double width, shift the high half down,
+// bitcast back, add) until one lane remains, then extractelement 0.
+// Every step is wrapping integer arithmetic, so the fold equals the
+// sequential scalar sum.
+static Value *matchLaneFold(Value *V, unsigned VF, unsigned ElemBits,
+                            const BasicBlock *M) {
+  auto *VT = dyn_cast<FixedVectorType>(V->getType());
+  if (!VT || VT->getNumElements() != VF)
+    return nullptr;
+  unsigned Width = VF * ElemBits;
+  if (Width % 2 != 0)
+    return nullptr;
+  for (unsigned Shift = Width / 2; Shift >= ElemBits; Shift /= 2) {
+    BitCastInst *BC1 = nullptr;
+    for (User *U : V->users()) {
+      auto *BC = dyn_cast<BitCastInst>(U);
+      if (BC && BC->getParent() == M && BC->getOperand(0) == V &&
+          BC->getType()->isIntegerTy(Width))
+        BC1 = BC;
+    }
+    if (!BC1)
+      return nullptr;
+    BinaryOperator *Shr = nullptr;
+    for (User *U : BC1->users()) {
+      auto *BO = dyn_cast<BinaryOperator>(U);
+      if (BO && BO->getOpcode() == Instruction::LShr && BO->getParent() == M &&
+          BO->getOperand(0) == BC1)
+        Shr = BO;
+    }
+    if (!Shr)
+      return nullptr;
+    auto *C = dyn_cast<ConstantInt>(Shr->getOperand(1));
+    if (!C || C->getZExtValue() != Shift)
+      return nullptr;
+    BitCastInst *BC2 = nullptr;
+    for (User *U : Shr->users()) {
+      auto *BC = dyn_cast<BitCastInst>(U);
+      if (BC && BC->getParent() == M && BC->getOperand(0) == Shr &&
+          BC->getType() == VT)
+        BC2 = BC;
+    }
+    if (!BC2)
+      return nullptr;
+    BinaryOperator *Add = nullptr;
+    for (User *U : V->users()) {
+      auto *BO = dyn_cast<BinaryOperator>(U);
+      if (BO && BO->getOpcode() == Instruction::Add && BO->getParent() == M &&
+          BO->getType() == VT &&
+          ((BO->getOperand(0) == V && BO->getOperand(1) == BC2) ||
+           (BO->getOperand(1) == V && BO->getOperand(0) == BC2)))
+        Add = BO;
+    }
+    if (!Add)
+      return nullptr;
+    if (cast<OverflowingBinaryOperator>(Add)->hasNoSignedWrap() ||
+        cast<OverflowingBinaryOperator>(Add)->hasNoUnsignedWrap())
+      return nullptr;
+    V = Add;
+  }
+  ExtractElementInst *EE = nullptr;
+  for (User *U : V->users()) {
+    auto *E = dyn_cast<ExtractElementInst>(U);
+    if (E && E->getParent() == M && E->getOperand(0) == V)
+      EE = E;
+  }
+  if (!EE)
+    return nullptr;
+  auto *Idx = dyn_cast<ConstantInt>(EE->getOperand(1));
+  if (!Idx || !Idx->isZero())
+    return nullptr;
+  return EE;
+}
 // Counted loops can lower wide copies to i128 load/store pairs, or repeated
 // fills to vector splats. Split only these proven memory shapes. Keep all
 // copy loads before their stores so each chunk retains read-before-write
