@@ -45,6 +45,12 @@ struct UnrotatePass : llvm::PassInfoMixin<UnrotatePass> {
   static bool isRequired() { return true; }
 };
 
+struct UntailRecPass : llvm::PassInfoMixin<UntailRecPass> {
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
+
 } // namespace revenant
 
 #endif
