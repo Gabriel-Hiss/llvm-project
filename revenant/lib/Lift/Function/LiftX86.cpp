@@ -291,10 +291,10 @@ Value *GenContext::flagsLogic(Value *R) {
 }
 
 Value *GenContext::flagsNeg(Value *A) {
+  // NEG is 0 - A, so the flags are those of that subtraction.
+  Value *Zero = ConstantInt::get(A->getType(), 0);
   Value *R = B.CreateNeg(A);
-  LS.produce(FlagProd{FlagProd::Arith, A, nullptr, R, 'n'});
-  // NEG sets CF when the operand is non-zero.
-  LS.flagWrite("cf", B.CreateICmpNE(A, ConstantInt::get(A->getType(), 0)));
+  LS.produce(FlagProd{FlagProd::Arith, Zero, A, R, 's'});
   return R;
 }
 
@@ -339,7 +339,7 @@ void GenContext::leaveOp() {
     Slot = LS.framePtrOff(*Off);
   else
     Slot = B.CreateIntToPtr(LS.regRead(X86::RBP), LS.ptrTy());
-  LS.regWrite(X86::RBP, B.CreateLoad(iN(64), Slot));
+  LS.regWrite(X86::RBP, B.CreateAlignedLoad(iN(64), Slot, Align(1)));
 }
 
 } // namespace revenant::lift

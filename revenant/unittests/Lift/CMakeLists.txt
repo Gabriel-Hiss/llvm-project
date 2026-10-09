@@ -1,5 +1,6 @@
 revenant_add_unittest(RevenantUnitTests RevenantLiftTests
   LiftTest.cpp
+  PARTIAL_SOURCES_INTENDED
   )
 
 target_link_libraries(RevenantLiftTests PRIVATE
@@ -18,6 +19,31 @@ target_compile_definitions(RevenantLiftTests PRIVATE
   REVENANT_TEST_C_GCC_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-gcc-o2/c-gcc-o2.exe")
 
 target_include_directories(RevenantLiftTests PRIVATE
+  "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86"
+  "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86/MCTargetDesc"
+  "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86"
+)
+
+# Differential test: lifted IR, compiled by the JIT, against native x86-64
+# execution of the same bytes (assembled with the build tree's llvm-mc).
+set(LLVM_LINK_COMPONENTS OrcJIT native Support)
+revenant_add_unittest(RevenantUnitTests RevenantLiftSemanticsTests
+  LiftSemanticsTest.cpp
+  LiftSemanticsCases.cpp
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS)
+
+target_link_libraries(RevenantLiftSemanticsTests PRIVATE
+  RevenantLift
+  RevenantDisasm
+  RevenantObject
+  RevenantIR)
+
+target_compile_definitions(RevenantLiftSemanticsTests PRIVATE
+  REVENANT_TEST_LLVM_MC="${LLVM_BUILD_BINARY_DIR}/bin/llvm-mc.exe")
+
+target_include_directories(RevenantLiftSemanticsTests PRIVATE
   "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86"
   "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86/MCTargetDesc"
   "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86"

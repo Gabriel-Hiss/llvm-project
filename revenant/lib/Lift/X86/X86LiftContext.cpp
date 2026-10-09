@@ -400,8 +400,9 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
   Res = B.CreateSelect(Is0, V, Res);
 
   Value *Zero = constI(0, W);
-  flagWrite(ZF, B.CreateSelect(Is0, flagRead(ZF), B.CreateICmpEQ(Res, Zero)));
-  if (Name != "rol" && Name != "ror") {
+  bool IsRotate = Name == "rol" || Name == "ror";
+  if (!IsRotate) {
+    flagWrite(ZF, B.CreateSelect(Is0, flagRead(ZF), B.CreateICmpEQ(Res, Zero)));
     flagWrite(SF,
               B.CreateSelect(Is0, flagRead(SF), B.CreateICmpSLT(Res, Zero)));
     flagWrite(PF, B.CreateSelect(Is0, flagRead(PF), parityOf(Res)));
@@ -430,7 +431,13 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
   } else { // ror
     Cfc = lowBit(B, Res, W - 1);
   }
-  flagWrite(CF, B.CreateSelect(InRange, Cfc, UndefValue::get(iN(1))));
+  // A zero (masked) count leaves every flag alone. Shl/shr leave CF
+  // undefined past the operand width; sar and the rotates define it for
+  // any non-zero count.
+  Value *CfNew = Cfc;
+  if (Name == "shl" || Name == "shr")
+    CfNew = B.CreateSelect(InRange, Cfc, UndefValue::get(iN(1)));
+  flagWrite(CF, B.CreateSelect(Is0, flagRead(CF), CfNew));
 
   // OF defined only for count == 1.
   Value *Of1;
@@ -444,8 +451,9 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
     Of1 = B.CreateXor(lowBit(B, Res, W - 1), B.CreateTrunc(Res, iN(1)));
   else
     Of1 = B.CreateXor(lowBit(B, Res, W - 1), lowBit(B, Res, W - 2));
-  flagWrite(OF, B.CreateSelect(B.CreateICmpEQ(C8, constI(1, 64)), Of1,
-                               UndefValue::get(iN(1))));
+  Value *OfNew = B.CreateSelect(B.CreateICmpEQ(C8, constI(1, 64)), Of1,
+                                UndefValue::get(iN(1)));
+  flagWrite(OF, B.CreateSelect(Is0, flagRead(OF), OfNew));
   return Res;
 }
 
@@ -1199,7 +1207,7 @@ Value *X86LiftContext::atomicRMW(StringRef Name, Value *Addr, Value *Val) {
   else
     Op = AtomicRMWInst::Xchg;
   return B.CreateAtomicRMW(Op, B.CreateIntToPtr(Addr, ptrTy()), Val,
-                           MaybeAlign(1),
+                           MaybeAlign(),
                            AtomicOrdering::SequentiallyConsistent);
 }
 

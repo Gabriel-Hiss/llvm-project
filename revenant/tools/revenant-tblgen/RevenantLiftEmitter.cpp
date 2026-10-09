@@ -58,6 +58,21 @@ class RevenantLiftEmitter {
     return 64;
   }
 
+  /// Source width of a MOVSX/MOVZX/MOVSXD form: the digits that end the
+  /// opcode name (MOVSX64rm8 -> 8, MOVSXD64rr32 -> 32); 0 for anything else.
+  static unsigned extensionSourceBits(const CodeGenInstruction &I) {
+    StringRef Name = I.TheDef->getName();
+    if (!Name.starts_with("MOVSX") && !Name.starts_with("MOVZX"))
+      return 0;
+    size_t Begin = Name.size();
+    while (Begin > 0 && isDigit(Name[Begin - 1]))
+      --Begin;
+    unsigned Bits = 0;
+    if (Begin == Name.size() || Name.substr(Begin).getAsInteger(10, Bits))
+      return 0;
+    return Bits;
+  }
+
   /// MI operand index of the N-th input (`rv_op N`). An address group is one
   /// input but five MI operands, so the index is not NumDefs + N.
   static unsigned inputOperandNo(const CodeGenInstruction &I, unsigned N) {
@@ -637,7 +652,6 @@ class RevenantLiftEmitter {
       }
       if (Name == "rv_zext" || Name == "rv_sext" || Name == "rv_trunc") {
         unsigned W = Width;
-        const Init *ValueInit = D->getArg(D->getNumArgs() - 1);
         if (D->getNumArgs() == 2) {
           const auto *Bits = dyn_cast<IntInit>(D->getArg(0));
           if (!Bits)
@@ -646,8 +660,14 @@ class RevenantLiftEmitter {
         } else if (D->getNumArgs() != 1) {
           return {};
         }
+        // MOVSX/MOVZX read the narrow source (the trailing digits of the
+        // opcode name), not a destination-wide value.
+        unsigned ReadW = Width;
+        if (D->getNumArgs() == 1 && Name != "rv_trunc")
+          if (unsigned Src = extensionSourceBits(Inst))
+            ReadW = Src;
         std::string V =
-            expression(D->getArg(D->getNumArgs() - 1), Inst, Width,
+            expression(D->getArg(D->getNumArgs() - 1), Inst, ReadW,
                        D->getArgNameStr(D->getNumArgs() - 1));
         if (V.empty())
           return {};
@@ -1273,7 +1293,10 @@ class RevenantLiftEmitter {
       if (!W)
         return false;
       int64_t Value = W->getValue();
-      unsigned Width = Value < 0 ? static_cast<unsigned>(-Value) : Value;
+      // sextAcc takes 100 + W for the CWD/CDQ/CQO family that fills the
+      // high half.
+      unsigned Width = Value < 0 ? 100 + static_cast<unsigned>(-Value)
+                                 : static_cast<unsigned>(Value);
       OS << "    LC.sextAcc(" << Width << ");\n";
       return true;
     }
