@@ -36,6 +36,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -117,9 +118,8 @@ lift::Signature convertSig(const revenant::Signature &S) {
   lift::Signature Out;
   for (const revenant::Param &P : S.Params) {
     lift::Param LP;
-    LP.Loc = P.Loc.isStack()
-                 ? lift::ParamLoc::stack(P.Loc.Off)
-                 : lift::ParamLoc::reg(llvm::MCRegister(P.Loc.Reg));
+    LP.Loc = P.Loc.isStack() ? lift::ParamLoc::stack(P.Loc.Off)
+                             : lift::ParamLoc::reg(llvm::MCRegister(P.Loc.Reg));
     LP.Bits = P.Bits;
     LP.Float = P.Float;
     Out.Params.push_back(std::move(LP));
@@ -141,8 +141,8 @@ lift::Signature convertSig(const revenant::Signature &S) {
   return Out;
 }
 
-std::shared_ptr<const lift::Signatures>
-recoverSignatures(const Program &Prog, const Disasm &Dis) {
+std::shared_ptr<const lift::Signatures> recoverSignatures(const Program &Prog,
+                                                          const Disasm &Dis) {
   revenant::Signatures A = revenant::analyzeSignatures(Prog, Dis);
   auto Out = std::make_shared<lift::Signatures>();
   for (const auto &[At, S] : A.Funcs)
@@ -160,9 +160,20 @@ recoverSignatures(const Program &Prog, const Disasm &Dis) {
 // Pass pipeline
 //==--------------------------------------------------------------------==//
 
-/// Parse and run `Pipeline` over M. A pass name this binary does not know is
-/// an error, not a skipped stage.
-Error runPipelineText(Module &M, StringRef Pipeline) {
+/// Fail with the verifier's message when `Stage` left M malformed: a pass bug
+/// then names its stage here instead of crashing a frontend later.
+Error verifyStage(StringRef Stage, const Module &M) {
+  std::string Msg;
+  raw_string_ostream OS(Msg);
+  if (verifyModule(M, &OS))
+    return createStringError("IR verifier failed after " + Stage.str() + ": " +
+                             Msg);
+  return Error::success();
+}
+
+/// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
+/// this binary does not know is an error, not a skipped stage.
+Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -179,7 +190,7 @@ Error runPipelineText(Module &M, StringRef Pipeline) {
     return createStringError("pipeline '" + Pipeline.str() +
                              "': " + toString(std::move(E)));
   MPM.run(M, MAM);
-  return Error::success();
+  return verifyStage(Stage, M);
 }
 
 /// ir-clean: lifter cleanup plus the IR idiom stage.
@@ -305,72 +316,88 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         R.LineVas.push_back(
             {static_cast<uint32_t>(R.LineVas.size() + 1), {I.Addr}});
   }
-  record(R.Stages, "asm", "ok",
-         formatv("{0} instructions across {1} functions", InstrCount,
-                 Todo.size())
-             .str());
+  record(
+      R.Stages, "asm", "ok",
+      formatv("{0} instructions across {1} functions", InstrCount, Todo.size())
+          .str());
   if (Opts.Emit == EmitKind::Asm)
     R.Text = AsmText;
 
-  // ---- signatures ------------------------------------------------------
-  // Interprocedural over the whole program, so it runs once per session.
-  if (!Sigs)
-    Sigs = recoverSignatures(Prog, *Dis);
-  record(R.Stages, "sigs", "ok",
-         formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
-                 Sigs->Externs.size())
-             .str());
+  // Each stage below runs only when a later artifact was asked for: `break`
+  // leaves the block once the requested emit kind is produced.
+  std::string RawText, CleanText, FinalText;
+  do {
+    if (Opts.Emit == EmitKind::Asm)
+      break;
+    // ---- signatures ------------------------------------------------------
+    // Interprocedural over the whole program, so it runs once per session.
+    if (!Sigs)
+      Sigs = recoverSignatures(Prog, *Dis);
+    record(R.Stages, "sigs", "ok",
+           formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
+                   Sigs->Externs.size())
+               .str());
 
-  // ---- lift -> ir-raw ----------------------------------------------------
-  LLVMContext Ctx;
-  auto M = moduleFor(Ctx, Out);
-  size_t OpaqueSites = 0;
-  for (Va T : Todo) {
-    auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
-                                Sigs.get(), /*TM=*/nullptr,
-                                /*RunPasses=*/false);
-    if (!L)
-      return L.takeError();
-    OpaqueSites += L->AsmFallbacks.size();
-  }
-  record(R.Stages, "lift", "ok",
-         formatv("revenant::lift::liftFunction, {0} opaque sites",
-                 OpaqueSites)
-             .str());
-  std::string RawText = moduleText(*M);
-  if (Opts.Emit == EmitKind::IrRaw)
-    R.Text = RawText;
+    // ---- lift -> ir-raw ----------------------------------------------------
+    LLVMContext Ctx;
+    auto M = moduleFor(Ctx, Out);
+    size_t OpaqueSites = 0;
+    for (Va T : Todo) {
+      auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
+                                  Sigs.get(), /*TM=*/nullptr,
+                                  /*RunPasses=*/false);
+      if (!L)
+        return L.takeError();
+      OpaqueSites += L->AsmFallbacks.size();
+    }
+    if (Error E = verifyStage("lift", *M))
+      return E;
+    record(
+        R.Stages, "lift", "ok",
+        formatv("revenant::lift::liftFunction, {0} opaque sites", OpaqueSites)
+            .str());
+    RawText = moduleText(*M);
+    if (Opts.Emit == EmitKind::IrRaw) {
+      R.Text = RawText;
+      break;
+    }
 
-  // ---- ir-clean ----------------------------------------------------------
-  if (auto E = runPipelineText(*M, cleanPipeline()))
-    return std::move(E);
-  record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
-  std::string CleanText = moduleText(*M);
-  if (Opts.Emit == EmitKind::IrClean)
-    R.Text = CleanText;
+    // ---- ir-clean ----------------------------------------------------------
+    if (auto E = runPipelineText("ir-clean", *M, cleanPipeline()))
+      return std::move(E);
+    record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
+    CleanText = moduleText(*M);
+    if (Opts.Emit == EmitKind::IrClean) {
+      R.Text = CleanText;
+      break;
+    }
 
-  // ---- ir-final ----------------------------------------------------------
-  if (auto E = runPipelineText(*M, finalPipeline(Opts.Patterns)))
-    return std::move(E);
-  record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");
-  std::string FinalText = moduleText(*M);
-  if (Opts.Emit == EmitKind::IrFinal)
-    R.Text = FinalText;
+    // ---- ir-final ----------------------------------------------------------
+    if (auto E =
+            runPipelineText("ir-final", *M, finalPipeline(Opts.Patterns)))
+      return std::move(E);
+    record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");
+    FinalText = moduleText(*M);
+    if (Opts.Emit == EmitKind::IrFinal) {
+      R.Text = FinalText;
+      break;
+    }
 
-  // ---- source ------------------------------------------------------------
-  if (Opts.Emit == EmitKind::Source) {
-    Expected<EmitResult> Em = Out == Lang::Rust
-                                  ? emitRustcSource(FinalText)
-                                  : emitClangSource(*M, Out == Lang::Cpp);
-    if (!Em)
-      return Em.takeError();
-    record(R.Stages, "source", "ok",
-           Out == Lang::Rust  ? "rustc fork"
-           : Out == Lang::Cpp ? "Clang frontend (C++)"
-                              : "Clang frontend (C)");
-    R.Text = std::move(Em->Text);
-    R.LineVas = std::move(Em->LineVas);
-  }
+    // ---- source ------------------------------------------------------------
+    if (Opts.Emit == EmitKind::Source) {
+      Expected<EmitResult> Em = Out == Lang::Rust
+                                    ? emitRustcSource(FinalText)
+                                    : emitClangSource(*M, Out == Lang::Cpp);
+      if (!Em)
+        return Em.takeError();
+      record(R.Stages, "source", "ok",
+             Out == Lang::Rust  ? "rustc fork"
+             : Out == Lang::Cpp ? "Clang frontend (C++)"
+                                : "Clang frontend (C)");
+      R.Text = std::move(Em->Text);
+      R.LineVas = std::move(Em->LineVas);
+    }
+  } while (false);
 
   // ---- artifacts -----------------------------------------------------------
   if (!Opts.ArtifactBase.empty()) {

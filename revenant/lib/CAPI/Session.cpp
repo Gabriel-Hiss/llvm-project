@@ -118,8 +118,7 @@ Error Session::setup() {
   for (const auto &[Start, Rec] : Prog.Functions)
     SymNames.push_back(Rec.Name);
   llvm::sort(SymNames);
-  SymNames.erase(std::unique(SymNames.begin(), SymNames.end()),
-                 SymNames.end());
+  SymNames.erase(std::unique(SymNames.begin(), SymNames.end()), SymNames.end());
 
   auto DetectStart = std::chrono::steady_clock::now();
   Compiler = detectProducer(*Pe, SymNames, *Pe->Img);
@@ -141,8 +140,7 @@ Error Session::analyze() {
     Prog.Resolver = std::make_shared<SessionNames>(Prog);
   SetupStages.push_back(
       {"analysis", "ok",
-       formatv("RevenantAnalysis: {0} functions", Prog.Functions.size())
-           .str(),
+       formatv("RevenantAnalysis: {0} functions", Prog.Functions.size()).str(),
        "", microsSince(Start)});
   return Error::success();
 }
@@ -203,8 +201,7 @@ Expected<std::string> Session::disasmFunction(Va Start) const {
   return Out;
 }
 
-std::vector<std::pair<uint32_t, Va>>
-Session::firstVaPerLine(
+std::vector<std::pair<uint32_t, Va>> Session::firstVaPerLine(
     const std::vector<std::pair<uint32_t, std::vector<Va>>> &In) {
   std::vector<std::pair<uint32_t, Va>> Out;
   Out.reserve(In.size());
