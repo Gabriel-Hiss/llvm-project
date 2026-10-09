@@ -9,6 +9,7 @@ add_llvm_library(RevenantAnalysis
   Overlaps.cpp
   StackPtr.cpp
   Signatures.cpp
+  Orphan.cpp
 
   LINK_COMPONENTS
   MC

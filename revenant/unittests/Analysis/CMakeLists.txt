@@ -9,6 +9,7 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   OverlapsTest.cpp
   StackPtrTest.cpp
   SignaturesTest.cpp
+  OrphanTest.cpp
 )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
