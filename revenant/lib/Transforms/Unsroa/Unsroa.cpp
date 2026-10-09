@@ -690,11 +690,20 @@ bool rebuildTypedGeps(Function &F, const DataLayout &DL, unsigned Skip) {
       Prints.push_back({Root, Total, K, B});
     }
 
-  // GEPs erased as chain links of an earlier fold stay in the worklist:
-  // skip them by pointer (never dereference first).
-  SmallPtrSet<GetElementPtrInst *, 16> DeadGeps;
-  for (GetElementPtrInst *GEP : Geps) {
-    if (DeadGeps.contains(GEP))
+  // Erased GEPs are tracked by index into the fixed worklist. Pointer-keyed
+  // sets become stale after eraseFromParent and can collide with recycled
+  // instruction addresses.
+  SmallVector<bool, 16> DeadIdx(Geps.size(), false);
+  auto isChainDead = [&](GetElementPtrInst *C) {
+    for (size_t i = 0, e = Geps.size(); i < e; ++i)
+      if (DeadIdx[i] && Geps[i] == C)
+        return true;
+    return false;
+  };
+  for (size_t GI = 0, GE = Geps.size(); GI < GE; ++GI) {
+    GetElementPtrInst *GEP = Geps[GI];
+    // Never dereference a dead entry: eraseFromParent frees the object.
+    if (DeadIdx[GI])
       continue;
     // Peel a chain of single-use byte GEPs: `%39 = gep i8, (%38 = gep
     // i8, base, 4), 0` addresses base+4, and the inner GEP dies with the
@@ -805,13 +814,13 @@ bool rebuildTypedGeps(Function &F, const DataLayout &DL, unsigned Skip) {
         }
         if (GEP->use_empty()) {
           GEP->eraseFromParent();
-          DeadGeps.insert(GEP);
-          // Drop peeled inner links that died with the fold,
-          // outermost first so uses cascade.
+          DeadIdx[GI] = true;
           for (GetElementPtrInst *C : Chain)
-            if (C->use_empty()) {
+            if (!isChainDead(C) && C->use_empty()) {
               C->eraseFromParent();
-              DeadGeps.insert(C);
+              for (size_t i = 0, e = Geps.size(); i < e; ++i)
+                if (Geps[i] == C)
+                  DeadIdx[i] = true;
             }
           Changed = true;
         }
@@ -903,7 +912,6 @@ bool rebuildTypedGeps(Function &F, const DataLayout &DL, unsigned Skip) {
     }
     if (Skip & 32)
       continue;
-    // Emit the typed field GEP in front of the byte GEP.
     IRBuilder<> B(GEP);
     Value *Base = EffBase;
     Value *Zero = B.getInt32(0);
@@ -924,11 +932,13 @@ bool rebuildTypedGeps(Function &F, const DataLayout &DL, unsigned Skip) {
     // peeled inner links that died with the fold.
     if (GEP->use_empty()) {
       GEP->eraseFromParent();
-      DeadGeps.insert(GEP);
+      DeadIdx[GI] = true;
       for (GetElementPtrInst *C : Chain)
-        if (C->use_empty()) {
+        if (!isChainDead(C) && C->use_empty()) {
           C->eraseFromParent();
-          DeadGeps.insert(C);
+          for (size_t i = 0, e = Geps.size(); i < e; ++i)
+            if (Geps[i] == C)
+              DeadIdx[i] = true;
         }
       Changed = true;
     }
@@ -971,11 +981,14 @@ bool rebuildSplitValues(Function &F, const DataLayout &DL) {
     }
 
   SmallPtrSet<Value *, 8> Done;
-  // Stores erased as siblings of an earlier fold stay in the worklist:
-  // skip them by pointer before dereferencing.
-  SmallPtrSet<StoreInst *, 16> DeadStores;
-  for (StoreInst *SI : CandStores) {
-    if (DeadStores.contains(SI))
+  // Stores erased as siblings of an earlier fold stay in the worklist.
+  // Tracked by index: eraseFromParent frees the object and LLVM recycles
+  // the memory, so a freed pointer must never sit in a pointer-keyed set
+  // (DenseMap "Key already in new map" on address reuse).
+  SmallVector<bool, 16> DeadStoreIdx(CandStores.size(), false);
+  for (size_t SIi = 0, SIE = CandStores.size(); SIi < SIE; ++SIi) {
+    StoreInst *SI = CandStores[SIi];
+    if (DeadStoreIdx[SIi])
       continue;
     auto *EI = dyn_cast<ExtractValueInst>(SI->getValueOperand());
     if (!EI)
@@ -1074,11 +1087,12 @@ bool rebuildSplitValues(Function &F, const DataLayout &DL) {
     for (StoreInst *S2 : Siblings) {
       auto *E2 = cast<ExtractValueInst>(S2->getValueOperand());
       S2->eraseFromParent();
-      DeadStores.insert(S2);
+      for (size_t i = 0, e = CandStores.size(); i < e; ++i)
+        if (CandStores[i] == S2)
+          DeadStoreIdx[i] = true;
       if (E2->use_empty())
         E2->eraseFromParent();
     }
-    Changed = true;
   }
   return Changed;
 }

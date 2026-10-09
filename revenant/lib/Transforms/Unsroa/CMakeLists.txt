@@ -14,6 +14,7 @@ set(UNSROA_SOURCES Unsroa.cpp)
 
 if(COMMAND add_llvm_library)
   add_llvm_library(RevenantTransformUnsroa STATIC ${UNSROA_SOURCES}
+    PARTIAL_SOURCES_INTENDED
     LINK_LIBS LLVMCore LLVMSupport LLVMAnalysis
     )
   target_include_directories(RevenantTransformUnsroa PRIVATE
