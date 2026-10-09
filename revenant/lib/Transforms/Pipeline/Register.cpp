@@ -1,0 +1,128 @@
+//===- Register.cpp - revenant-<name> pass registration ---------------===//
+//
+// Part of the Revenant project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// Single registration site for every Revenant transform pass. Each pass is
+// a FunctionPassManager pass named `revenant-<name>`, declared in its own
+// header under revenant/include/revenant/Transforms/<Name>/ and defined in
+// its own library RevenantTransform<Name> (both owned by the pass agent).
+// This file only wires names to classes so agents never conflict.
+//
+// A pass directory that does not exist yet (its agent has not landed) is
+// skipped: the corresponding __has_include guard leaves the name
+// unregistered, and revenant-opt reports the stock "unknown function pass"
+// error for it. Landing the pass library + rebuilding revenant-opt is all
+// it takes to enable the name; nothing here changes.
+//
+//===----------------------------------------------------------------------===//
+
+#include "revenant/Transforms/Pipeline/Pipeline.h"
+
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+
+// Per-pass headers. One include per pass, guarded so this file builds before
+// the pass agent lands.
+#if __has_include("revenant/Transforms/Lane0/Lane0.h")
+#include "revenant/Transforms/Lane0/Lane0.h"
+#endif
+#if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
+#include "revenant/Transforms/Devectorize/Devectorize.h"
+#endif
+#if __has_include("revenant/Transforms/Reroll/Reroll.h")
+#include "revenant/Transforms/Reroll/Reroll.h"
+#endif
+#if __has_include("revenant/Transforms/Unrotate/Unrotate.h")
+#include "revenant/Transforms/Unrotate/Unrotate.h"
+#endif
+#if __has_include("revenant/Transforms/Idioms/Idioms.h")
+#include "revenant/Transforms/Idioms/Idioms.h"
+#endif
+#if __has_include("revenant/Transforms/Patterns/Patterns.h")
+#include "revenant/Transforms/Patterns/Patterns.h"
+#endif
+#if __has_include("revenant/Transforms/Structure/Structure.h")
+#include "revenant/Transforms/Structure/Structure.h"
+#endif
+#if __has_include("revenant/Transforms/TypeRecovery/TypeRecovery.h")
+#include "revenant/Transforms/TypeRecovery/TypeRecovery.h"
+#endif
+#if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
+#include "revenant/Transforms/SsaOut/SsaOut.h"
+#endif
+
+using namespace llvm;
+
+namespace revenant {
+
+void registerRevenantPasses(PassBuilder &PB) {
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, FunctionPassManager &FPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+#if __has_include("revenant/Transforms/Lane0/Lane0.h")
+        if (Name == "revenant-lane0") {
+          FPM.addPass(Lane0Pass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
+        if (Name == "revenant-devectorize") {
+          FPM.addPass(DevectorizePass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Reroll/Reroll.h")
+        if (Name == "revenant-reroll") {
+          FPM.addPass(RerollPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unrotate/Unrotate.h")
+        if (Name == "revenant-unrotate") {
+          FPM.addPass(UnrotatePass());
+          return true;
+        }
+        if (Name == "revenant-untailrec") {
+          FPM.addPass(UntailRecPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Idioms/Idioms.h")
+        if (Name == "revenant-idioms") {
+          FPM.addPass(IdiomsPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Patterns/Patterns.h")
+        if (Name == "revenant-patterns") {
+          FPM.addPass(PatternsPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Structure/Structure.h")
+        if (Name == "revenant-structure") {
+          FPM.addPass(StructurePass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/TypeRecovery/TypeRecovery.h")
+        if (Name == "revenant-types") {
+          FPM.addPass(TypeRecoveryPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
+        if (Name == "revenant-ssaout") {
+          FPM.addPass(SsaOutPass());
+          return true;
+        }
+#endif
+        return false;
+      });
+}
+
+} // namespace revenant

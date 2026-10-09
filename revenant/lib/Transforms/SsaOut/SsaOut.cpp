@@ -8,8 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "SsaOut.h"
-
+#include "revenant/Transforms/SsaOut/SsaOut.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"

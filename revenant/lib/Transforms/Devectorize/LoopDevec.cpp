@@ -1,0 +1,685 @@
+//===- LoopDevec.cpp - explode vector reduction loops --------------------===//
+//
+// Part of the Revenant LLVM fork. See LoopDevec.h.
+//
+// v1 scope: self-loop single-block headers, integer reduction PHIs sharing
+// one opcode/element type, splat-constant inits, 128-bit vectors. The loop
+// in `cpp-clang-o2` `sum_vec` (two `<4 x i32>` acc PHIs, vector loads,
+// lane-wise adds, exit `llvm.vector.reduce.add`) is the reference shape.
+//
+// Two-pass structure (no half-mutated loops): validate the whole header
+// plus outside uses first, then emit. New values are created with
+// PHINode::Create / new LoadInst / BinaryOperator::Create /
+// GetElementPtrInst directly into their block; IRBuilder is not used here.
+// Float lane zeros use UndefValue: ConstantFP::get on plugin-loaded
+// contexts faults the APFloat printer in this build config.
+//
+//===----------------------------------------------------------------------===//
+
+#include "LoopDevec.h"
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Metadata.h"
+
+namespace revenant {
+namespace loopdevec {
+
+using namespace llvm;
+
+namespace {
+
+constexpr char VA_MD[] = "revenant.va";
+constexpr char REGION_MD[] = "revenant.region";
+constexpr char OPAQUE_MD[] = "revenant.opaque";
+
+void inheritMeta(const Instruction *Src, Instruction *Dst) {
+  if (MDNode *N = Src->getMetadata(VA_MD))
+    Dst->setMetadata(VA_MD, N);
+  if (MDNode *N = Src->getMetadata(REGION_MD))
+    Dst->setMetadata(REGION_MD, N);
+  if (MDNode *N = Src->getMetadata(OPAQUE_MD))
+    Dst->setMetadata(OPAQUE_MD, N);
+  Dst->setDebugLoc(Src->getDebugLoc());
+}
+
+bool isIntVec128(Type *T, unsigned &Lanes, Type *&Elem) {
+  auto *VT = dyn_cast<FixedVectorType>(T);
+  if (!VT || !VT->getElementType()->isIntegerTy())
+    return false;
+  if (VT->getPrimitiveSizeInBits() != 128)
+    return false;
+  Lanes = VT->getNumElements();
+  Elem = VT->getElementType();
+  return true;
+}
+
+// Reduction opcodes with a lane-wise scalar form and a matching
+// llvm.vector.reduce.* intrinsic (reference `red_op`: no sub).
+Intrinsic::ID reduceIntrinsic(unsigned Opcode) {
+  switch (Opcode) {
+  case Instruction::Add:
+    return Intrinsic::vector_reduce_add;
+  case Instruction::Mul:
+    return Intrinsic::vector_reduce_mul;
+  case Instruction::And:
+    return Intrinsic::vector_reduce_and;
+  case Instruction::Or:
+    return Intrinsic::vector_reduce_or;
+  case Instruction::Xor:
+    return Intrinsic::vector_reduce_xor;
+  default:
+    return Intrinsic::not_intrinsic;
+  }
+}
+
+bool isLaneBinop(unsigned Opcode) {
+  switch (Opcode) {
+  case Instruction::Add:
+  case Instruction::Sub:
+  case Instruction::Mul:
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor:
+  case Instruction::Shl:
+  case Instruction::LShr:
+  case Instruction::AShr:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// One lane of an integer splat-ish constant as an Elem-typed scalar.
+// Splat vectors and zeroinitializer fold; per-lane constants of a
+// non-splat ConstantVector fold per lane.
+Value *laneConst(Constant *C, Type *Elem, unsigned Lane) {
+  if (isa<UndefValue>(C))
+    return UndefValue::get(Elem);
+  if (isa<ConstantAggregateZero>(C))
+    return ConstantInt::get(Elem, 0);
+  if (auto *CV = dyn_cast<ConstantVector>(C)) {
+    if (Constant *Splat = CV->getSplatValue())
+      C = Splat;
+    else {
+      auto *CI = dyn_cast<ConstantInt>(CV->getOperand(Lane));
+      if (!CI)
+        return nullptr;
+      APInt V = CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits());
+      return ConstantInt::get(Elem, V);
+    }
+  }
+  if (auto *CI = dyn_cast<ConstantInt>(C)) {
+    APInt V = CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits());
+    return ConstantInt::get(Elem, V);
+  }
+  return nullptr;
+}
+
+// Splat init shared by every lane (reference `splat_init`).
+Value *splatInit(Value *Init, Type *Elem, unsigned Lanes) {
+  auto *C = dyn_cast<Constant>(Init);
+  if (!C)
+    return nullptr;
+  Value *L0 = laneConst(C, Elem, 0);
+  if (!L0)
+    return nullptr;
+  for (unsigned j = 1; j < Lanes; ++j) {
+    Value *Lj = laneConst(C, Elem, j);
+    if (Lj != L0)
+      return nullptr;
+  }
+  return L0;
+}
+
+struct AccPhi {
+  PHINode *Phi = nullptr;
+  Value *Init = nullptr;
+  BasicBlock *InitBB = nullptr;
+  Instruction *Back = nullptr; // update binop in H
+  Value *Stream = nullptr;     // other operand of Back
+};
+
+} // namespace
+
+static unsigned tryLoop(Function &F, BasicBlock *H);
+
+unsigned devectorizeLoops(Function &F) {
+  unsigned Changed = 0;
+  SmallVector<BasicBlock *, 16> Blocks;
+  for (BasicBlock &BB : F)
+    Blocks.push_back(&BB);
+  for (BasicBlock *H : Blocks)
+    Changed += tryLoop(F, H);
+  return Changed;
+}
+
+static unsigned tryLoop(Function &F, BasicBlock *H) {
+  // v1: self-loop single-block header only.
+  auto *Br = dyn_cast<BranchInst>(H->getTerminator());
+  if (!Br || !Br->isConditional())
+    return 0;
+  bool Self = false;
+  for (BasicBlock *S : Br->successors())
+    if (S == H)
+      Self = true;
+  if (!Self)
+    return 0;
+
+  // Classify vector PHIs.
+  SmallVector<AccPhi, 4> Accs;
+  for (PHINode &P : H->phis()) {
+    unsigned Lanes = 0;
+    Type *Elem = nullptr;
+    if (!isIntVec128(P.getType(), Lanes, Elem))
+      continue;
+    if (P.getNumIncomingValues() != 2)
+      return 0;
+    AccPhi A;
+    A.Phi = &P;
+    for (unsigned i = 0; i < 2; ++i) {
+      if (P.getIncomingBlock(i) == H)
+        A.Back = dyn_cast<Instruction>(P.getIncomingValue(i));
+      else {
+        A.Init = P.getIncomingValue(i);
+        A.InitBB = P.getIncomingBlock(i);
+      }
+    }
+    if (!A.Back || !A.Init || !A.InitBB)
+      return 0;
+    if (A.Back->getParent() != H)
+      return 0;
+    auto *BO = dyn_cast<BinaryOperator>(A.Back);
+    if (!BO || reduceIntrinsic(BO->getOpcode()) == Intrinsic::not_intrinsic ||
+        BO->getType() != P.getType())
+      return 0;
+    if (BO->getOperand(0) == &P)
+      A.Stream = BO->getOperand(1);
+    else if (BO->getOperand(1) == &P)
+      A.Stream = BO->getOperand(0);
+    else
+      return 0;
+    Accs.push_back(A);
+  }
+  if (Accs.empty())
+    return 0;
+
+  // One shared (opcode, lanes, elem type); one shared init block.
+  unsigned Opcode = cast<BinaryOperator>(Accs[0].Back)->getOpcode();
+  unsigned Lanes = 0;
+  Type *Elem = nullptr;
+  {
+    unsigned L = 0;
+    Type *E = nullptr;
+    if (!isIntVec128(Accs[0].Phi->getType(), L, E))
+      return 0;
+    Lanes = L;
+    Elem = E;
+  }
+  BasicBlock *InitBB = Accs[0].InitBB;
+  for (auto &A : Accs) {
+    auto *BO = cast<BinaryOperator>(A.Back);
+    unsigned L = 0;
+    Type *E = nullptr;
+    if (BO->getOpcode() != Opcode || A.InitBB != InitBB ||
+        !isIntVec128(A.Phi->getType(), L, E) || L != Lanes || E != Elem)
+      return 0;
+  }
+
+  // Merged scalar init: fold lane-0 splat inits with the reduction op.
+  Value *MergedInit = nullptr;
+  {
+    Value *Fold = nullptr;
+    for (auto &A : Accs) {
+      Value *L0 = splatInit(A.Init, Elem, Lanes);
+      if (!L0)
+        return 0;
+      auto *LC = dyn_cast<Constant>(L0);
+      auto *FC = Fold ? dyn_cast<Constant>(Fold) : nullptr;
+      if (Fold && (!LC || !FC))
+        return 0;
+      if (!Fold) {
+        Fold = L0;
+        continue;
+      }
+      auto *LCa = cast<ConstantInt>(LC);
+      auto *FCa = cast<ConstantInt>(FC);
+      APInt R = FCa->getValue();
+      APInt V = LCa->getValue();
+      switch (Opcode) {
+      case Instruction::Add:
+        R = R + V;
+        break;
+      case Instruction::Mul:
+        R = R * V;
+        break;
+      case Instruction::And:
+        R = R & V;
+        break;
+      case Instruction::Or:
+        R = R | V;
+        break;
+      case Instruction::Xor:
+        R = R ^ V;
+        break;
+      default:
+        return 0;
+      }
+      Fold = ConstantInt::get(Elem, R);
+    }
+    MergedInit = Fold;
+  }
+
+  // Outside-use precheck: every outside use of an acc phi, backedge, or
+  // other vector def in H must feed a matching reduce (directly or
+  // through one lane-wise add combining acc backs).
+  DenseSet<const Value *> AccVals;
+  for (auto &A : Accs) {
+    AccVals.insert(A.Phi);
+    AccVals.insert(A.Back);
+  }
+  DenseSet<const Value *> VecDefs;
+  for (Instruction &I : *H)
+    if (isa<FixedVectorType>(I.getType()))
+      VecDefs.insert(&I);
+  SmallVector<Instruction *, 4> Reduces;
+  // Exit-block combine: the two acc backs merge through one lane-wise add
+  // before the reduce (reference LoopCx merges acc next-vals the same way).
+  SmallVector<BinaryOperator *, 2> Combines;
+  std::function<bool(Value *, unsigned)> AccTree = [&](Value *V,
+                                                       unsigned Depth) {
+    if (AccVals.contains(V))
+      return true;
+    if (Depth >= 1)
+      return false;
+    auto *BO = dyn_cast<BinaryOperator>(V);
+    if (!BO || BO->getOpcode() != Instruction::Add || BO->getParent() == H)
+      return false;
+    unsigned L = 0;
+    Type *E = nullptr;
+    if (!isIntVec128(BO->getType(), L, E) || L != Lanes || E != Elem)
+      return false;
+    return AccTree(BO->getOperand(0), Depth + 1) &&
+           AccTree(BO->getOperand(1), Depth + 1);
+  };
+  for (const Value *V : VecDefs) {
+    for (const User *U : V->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() == H)
+        continue;
+      auto *CI = dyn_cast<CallInst>(const_cast<Instruction *>(UI));
+      auto *II = CI ? dyn_cast<IntrinsicInst>(CI) : nullptr;
+      if (II && II->getIntrinsicID() == reduceIntrinsic(Opcode) &&
+          AccTree(II->getOperand(0), 0)) {
+        Reduces.push_back(CI);
+        continue;
+      }
+      // One lane-wise add combining acc backs in the exit block is part
+      // of the reduction (merged_val in the reference); record it for
+      // erasure after aliasing, still no other outside uses allowed.
+      auto *BO = dyn_cast<BinaryOperator>(const_cast<Instruction *>(UI));
+      unsigned CL = 0;
+      Type *CE = nullptr;
+      if (BO && BO->getOpcode() == Instruction::Add &&
+          isIntVec128(BO->getType(), CL, CE) && CL == Lanes && CE == Elem &&
+          AccTree(BO->getOperand(0), 0) && AccTree(BO->getOperand(1), 0)) {
+        Combines.push_back(BO);
+        continue;
+      }
+      return 0;
+    }
+  }
+  // Vector-typed exit PHIs fed from H also block.
+  for (BasicBlock *S : Br->successors()) {
+    if (S == H)
+      continue;
+    for (PHINode &P : S->phis()) {
+      if (!isa<FixedVectorType>(P.getType()))
+        continue;
+      for (Value *Inc : P.incoming_values())
+        if (VecDefs.contains(Inc))
+          return 0;
+    }
+  }
+
+  // Header body precheck (no mutation yet).
+  DenseSet<const Instruction *> AccBacks;
+  for (auto &A : Accs)
+    AccBacks.insert(A.Back);
+  for (Instruction &I : *H) {
+    if (isa<PHINode>(&I)) {
+      unsigned L = 0;
+      Type *E = nullptr;
+      if (isIntVec128(I.getType(), L, E)) {
+        bool IsAcc = false;
+        for (auto &A : Accs)
+          if (A.Phi == &I)
+            IsAcc = true;
+        if (!IsAcc)
+          return 0;
+      }
+      continue;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      unsigned L = 0;
+      Type *E = nullptr;
+      if (!isIntVec128(LI->getType(), L, E) || L != Lanes || E != Elem)
+        return 0;
+      if (LI->isVolatile() || !LI->isSimple())
+        return 0;
+      continue;
+    }
+    if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (isa<FixedVectorType>(SI->getValueOperand()->getType()))
+        return 0;
+      continue;
+    }
+    if (AccBacks.contains(&I))
+      continue;
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      unsigned L = 0;
+      Type *E = nullptr;
+      if (!isIntVec128(BO->getType(), L, E))
+        continue; // scalar body op
+      if (L != Lanes || E != Elem || !isLaneBinop(BO->getOpcode()))
+        return 0;
+      continue;
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(&I)) {
+      if (isa<FixedVectorType>(BI->getSrcTy())) {
+        if (BI->getDestTy() != BI->getSrcTy())
+          return 0;
+        continue;
+      }
+      continue;
+    }
+    if (auto *EI = dyn_cast<ExtractElementInst>(&I)) {
+      auto *Idx = dyn_cast<ConstantInt>(EI->getIndexOperand());
+      if (!Idx || Idx->getZExtValue() >= Lanes)
+        return 0;
+      // v1: only lane-0 extracts of acc phis (partial sums stay vector).
+      bool OfAcc = false;
+      for (auto &A : Accs)
+        if (EI->getVectorOperand() == A.Phi && Idx->isZero())
+          OfAcc = true;
+      if (!OfAcc)
+        return 0;
+      continue;
+    }
+    if (isa<FixedVectorType>(I.getType()))
+      return 0;
+    // Kept scalar instruction: vector operands must be pass-C consumers
+    // of acc phis (handled below) or none at all.
+    for (Value *Op : I.operands()) {
+      if (!isa<FixedVectorType>(Op->getType()))
+        continue;
+      auto *OI = dyn_cast<Instruction>(Op);
+      bool Consumer = isa<ExtractElementInst>(&I) || isa<TruncInst>(&I) ||
+                      isa<BitCastInst>(&I);
+      if (!Consumer || !OI)
+        return 0;
+      bool OfAcc = false;
+      for (auto &A : Accs)
+        if (Op == A.Phi)
+          OfAcc = true;
+      if (!OfAcc)
+        return 0;
+    }
+  }
+
+  // Emit: scalar acc phi first (init edge only; backedge closes below).
+  LLVMContext &Ctx = F.getContext();
+  Type *I8 = Type::getInt8Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  unsigned Esz = Elem->getScalarSizeInBits() / 8;
+  PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
+  S->addIncoming(MergedInit, InitBB);
+  // Provenance: the merged acc represents every vector acc phi. Copy
+  // from the first acc in classification order (= header phi order).
+  inheritMeta(Accs[0].Phi, S);
+
+  DenseMap<const Value *, Value *> Subs;
+  DenseMap<const Value *, SmallVector<Value *, 4>> LaneMemo;
+  SmallVector<Instruction *, 16> Kill;
+  auto Resolve = [&](Value *V) {
+    unsigned Steps = 0;
+    while (Value *N = Subs.lookup(V)) {
+      V = N;
+      if (++Steps > 32)
+        break;
+    }
+    return V;
+  };
+  std::function<SmallVector<Value *, 4> *(Value *)> Explode = nullptr;
+  SmallVector<Value *, 4> Empty;
+  // Recursive explosion via explicit memo lookup (no std::function
+  // re-entrancy hazards: depth is bounded by the def chain).
+  std::function<SmallVector<Value *, 4> *(Value *)> Ex =
+      [&](Value *V) -> SmallVector<Value *, 4> * {
+    auto Hit = LaneMemo.find(V);
+    if (Hit != LaneMemo.end())
+      return &Hit->second;
+    SmallVector<Value *, 4> Ls;
+    bool Ok = false;
+    if (auto *C = dyn_cast<Constant>(V)) {
+      Ok = true;
+      for (unsigned j = 0; j < Lanes; ++j) {
+        Value *Lj = laneConst(C, Elem, j);
+        if (!Lj) {
+          Ok = false;
+          break;
+        }
+        Ls.push_back(Lj);
+      }
+    } else if (isa<UndefValue>(V)) {
+      Ok = true;
+      for (unsigned j = 0; j < Lanes; ++j)
+        Ls.push_back(UndefValue::get(Elem));
+    } else if (auto *LI = dyn_cast<LoadInst>(V)) {
+      if (LI->getParent() == H) {
+        Ok = true;
+        for (unsigned j = 0; j < Lanes && Ok; ++j) {
+          auto *Off = ConstantInt::get(I64, (uint64_t)(j * Esz));
+          auto *G = GetElementPtrInst::Create(
+              I8, const_cast<Value *>(LI->getPointerOperand()), Off,
+              LI->getName() + ".p", LI->getIterator());
+          inheritMeta(LI, G);
+          auto *L = new LoadInst(Elem, G, LI->getName() + ".l",
+                                 LI->isVolatile(), LI->getIterator());
+          inheritMeta(LI, L);
+          Ls.push_back(L);
+        }
+      }
+    } else if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getParent() == H && isLaneBinop(BO->getOpcode())) {
+        auto *A = Ex(BO->getOperand(0));
+        auto *B = Ex(BO->getOperand(1));
+        if (A && B && A->size() == Lanes && B->size() == Lanes) {
+          Ok = true;
+          for (unsigned j = 0; j < Lanes; ++j) {
+            auto *N = BinaryOperator::Create(
+                BO->getOpcode(), (*A)[j], (*B)[j], BO->getName() + ".s",
+                BO->getIterator());
+            inheritMeta(BO, N);
+            Ls.push_back(N);
+          }
+        }
+      }
+    } else if (auto *BI = dyn_cast<BitCastInst>(V)) {
+      if (BI->getDestTy() == BI->getSrcTy()) {
+        auto *A = Ex(BI->getOperand(0));
+        if (A && A->size() == Lanes) {
+          Ls = *A;
+          Ok = true;
+        }
+      }
+    }
+    if (!Ok)
+      return nullptr;
+    LaneMemo[V] = Ls;
+    return &LaneMemo.find(V)->second;
+  };
+  (void)Explode;
+  (void)Empty;
+
+  // Subs for acc phis (scalar phi) and valid lane-0 acc extracts.
+  for (auto &A : Accs)
+    Subs[A.Phi] = S;
+  for (Instruction &I : *H) {
+    auto *EI = dyn_cast<ExtractElementInst>(&I);
+    if (!EI)
+      continue;
+    for (auto &A : Accs)
+      if (EI->getVectorOperand() == A.Phi) {
+        Subs[&I] = S;
+        Kill.push_back(&I);
+      }
+  }
+
+  // Walk in order: explode streams, extend the scalar chain at acc
+  // updates. Chain operations append before the update instruction so
+  // intra-block SSA order holds.
+  Value *Chain = S;
+  SmallVector<Instruction *, 16> Walk;
+  for (Instruction &I : *H)
+    Walk.push_back(&I);
+  for (Instruction *IP : Walk) {
+    Instruction &I = *IP;
+    if (isa<PHINode>(&I))
+      continue;
+    if (AccBacks.contains(&I)) {
+      // Acc update: explode the stream side, fold lanes into the chain.
+      // The vector update itself dies: sever its phi edge FIRST so the
+      // old acc phi no longer references it (else phi<->update pin each
+      // other live and neither erases).
+      for (auto &A : Accs)
+        if (A.Back == &I)
+          for (unsigned k = 0, KN = A.Phi->getNumIncomingValues(); k < KN; ++k)
+            if (A.Phi->getIncomingBlock(k) == H)
+              A.Phi->setIncomingValue(
+                  k, llvm::UndefValue::get(A.Phi->getType()));
+      Value *Stream = nullptr;
+      for (auto &A : Accs)
+        if (A.Back == &I)
+          Stream = A.Stream;
+      auto *Ls = Ex(Resolve(Stream));
+      if (!Ls)
+        return 0; // precheck promised success; defensive, no partial emit
+      for (unsigned j = 0; j < Lanes; ++j) {
+        auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
+                                         Chain, (*Ls)[j],
+                                         "s.unopt.n", I.getIterator());
+        inheritMeta(&I, N);
+        Chain = N;
+      }
+      Subs[&I] = Chain;
+      Kill.push_back(&I);
+      continue;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (!isa<FixedVectorType>(LI->getType()))
+        continue;
+      if (!Ex(&I))
+        return 0;
+      Kill.push_back(&I);
+      continue;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (!isa<FixedVectorType>(BO->getType()))
+        continue;
+      if (!Ex(&I))
+        return 0;
+      Kill.push_back(&I);
+      continue;
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(&I)) {
+      if (!isa<FixedVectorType>(BI->getDestTy()))
+        continue;
+      auto *Ls = Ex(BI->getOperand(0));
+      if (!Ls || Ls->size() != Lanes)
+        return 0;
+      LaneMemo[&I] = *Ls;
+      Kill.push_back(&I);
+      continue;
+    }
+  }
+
+  // Close the scalar backedge. The old vector acc phis keep their own
+  // (vector-typed) backedge slots untouched: they die by erasure below
+  // once use-free, never by type-breaking slot rewrite.
+  S->addIncoming(Chain, H);
+  for (auto &A : Accs)
+    Subs[A.Back] = Chain;
+  unsigned NReduce = 0;
+  for (Instruction *R : Reduces) {
+    R->replaceAllUsesWith(Chain);
+    if (R->use_empty()) {
+      R->eraseFromParent();
+      ++NReduce;
+    }
+  }
+  for (BinaryOperator *C : Combines) {
+    if (C->use_empty())
+      continue;
+    // Uses were rewired to Chain above (the combine fed only reduces).
+    // Anything still using it blocks erasure; leave it.
+    if (C->use_empty()) {
+      C->eraseFromParent();
+      ++NReduce;
+    }
+  }
+
+  // Rewrite kept scalar operands through Subs (type-guarded).
+  for (Instruction &I : *H) {
+    if (isa<FixedVectorType>(I.getType()))
+      continue;
+    for (unsigned o = 0, N = I.getNumOperands(); o < N; ++o) {
+      Value *Op = I.getOperand(o);
+      if (!isa<FixedVectorType>(Op->getType()))
+        continue;
+      Value *R = Resolve(Op);
+      if (R == Op || R->getType() != Elem)
+        continue;
+      I.setOperand(o, R);
+    }
+  }
+  for (auto &KV : Subs) {
+    Value *Old = const_cast<Value *>(KV.first);
+    if (Old == KV.second || Old->getType() != KV.second->getType())
+      continue;
+    Old->replaceAllUsesWith(KV.second);
+  }
+  // Erase dead vector body. Kill order is emission order (loads before
+  // their lane consumers); erase in reverse so consumers die first, then
+  // repeat to fixpoint for chains the first sweep exposes. The old acc
+  // updates (in Kill via Subs) die with the body; the old acc phis erase
+  // last, once use-free.
+  bool Progress = true;
+  while (Progress) {
+    Progress = false;
+    for (auto It = Kill.rbegin(); It != Kill.rend(); ++It) {
+      Instruction *K = *It;
+      if (K->getParent() == nullptr || !K->use_empty())
+        continue;
+      K->eraseFromParent();
+      Progress = true;
+    }
+  }
+  for (auto &A : Accs) {
+    if (A.Phi->getParent() != nullptr && A.Phi->use_empty())
+      A.Phi->eraseFromParent();
+  }
+
+  return 1 + NReduce;
+}
+
+} // namespace loopdevec
+} // namespace revenant
+
+// Nested namespace + TU-local using: keep ADL names (std::, llvm::) out of
+// the revenant::loopdevec scope so LLVM headers resolve cleanly.

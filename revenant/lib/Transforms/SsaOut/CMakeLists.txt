@@ -1,3 +1,4 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 cmake_minimum_required(VERSION 3.20)
 project(RevenantSsaOut CXX)
 
@@ -29,7 +30,7 @@ if(MSVC)
 else()
   add_compile_options(-fno-exceptions -fno-rtti)
 endif()
-
+endif()
 add_library(RevenantTransformSsaOut MODULE
   SsaOut.cpp
 )
@@ -51,6 +52,7 @@ llvm_map_components_to_libnames(LLVM_LIBS
 target_link_libraries(RevenantTransformSsaOut PRIVATE ${LLVM_LIBS})
 target_include_directories(RevenantTransformSsaOut PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
 )
 set_property(TARGET RevenantTransformSsaOut PROPERTY CXX_STANDARD 17)
 set_property(TARGET RevenantTransformSsaOut PROPERTY CXX_STANDARD_REQUIRED ON)

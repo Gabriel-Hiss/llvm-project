@@ -235,6 +235,7 @@ public:
         bool First = true;
         for (DIType *T : Sig->getTypeArray()) {
           if (First) {
+            First = false;
             if (T)
               Ret = mapDIOrFallback(T);
             continue;
