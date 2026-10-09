@@ -1,7 +1,6 @@
-; Dead-arg restore via debug records: rust-o3 `dot4` post shape keeps
-; `!{!3, !4, !4}` (ret + 2 ptr formals) on the DISubprogram while
-; the IR is `()`, with `llvm.dbg.value(ptr poison)` markers for the lost
-; formals. The pass re-adds the trailing formals; call sites pass poison.
+; Dead-arg restore via explicit debug-value markers: rust-o3 `dot4` keeps
+; `llvm.dbg.value(ptr poison, !DILocalVariable(arg: N))` for the lost formals.
+; DISubprogram arity alone is deliberately not evidence.
 ; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define internal i32 @dot4_like(ptr %ipa0, ptr %ipa1)
@@ -21,6 +20,13 @@ entry:
   %r = call i32 @dot4_like()
   ret i32 %r
 }
+; A stale DISubprogram arity without an optimized-out dbg.value must not add
+; an argument to a function with no marker for that formal.
+; CHECK-LABEL: define i32 @stale_di(i32 %live)
+define i32 @stale_di(i32 %live) !dbg !20 {
+  ret i32 %live
+}
+
 
 declare void @llvm.dbg.value(metadata, metadata, metadata) #0
 
@@ -39,4 +45,7 @@ declare void @llvm.dbg.value(metadata, metadata, metadata) #0
 !15 = !DILocation(line: 0, scope: !10)
 !16 = !DILocation(line: 239, scope: !10)
 
+!20 = distinct !DISubprogram(name: "stale_di", scope: !1, file: !2, line: 240, type: !21, scopeLine: 240, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !1)
+!21 = !DISubroutineType(types: !22)
+!22 = !{!3, !3, !3}
 attributes #0 = { nounwind readnone speculatable willreturn }
