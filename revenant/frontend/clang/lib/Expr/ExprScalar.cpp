@@ -301,6 +301,15 @@ Expr *ExprBuilderImpl::buildCast(llvm::CastInst &I, ExprScope &Scope) {
     break;
   case llvm::Instruction::SExt:
     K = CK_IntegralCast;
+    // For sext, cast through the signed narrow type first so the
+    // compiler sign-extends: (long long)(int)a1, not (unsigned long long)a1.
+    if (SrcTy->isIntegerType() && DstTy->isIntegerType() &&
+        SrcTy->getIntegerBitWidth() < DstTy->getIntegerBitWidth()) {
+      QualType SignedNarrow = AST->getCorrespondingSignedType(
+          Types.typeOf(SrcTy, nullptr));
+      if (!SignedNarrow.isNull() && SignedNarrow != Op->getType())
+        Op = makeCStyleCast(SignedNarrow, CK_IntegralCast, Op);
+    }
     break;
   case llvm::Instruction::FPTrunc:
   case llvm::Instruction::FPExt:
