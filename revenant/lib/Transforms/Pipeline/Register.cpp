@@ -86,6 +86,9 @@
 #if __has_include("revenant/Transforms/Uncxx/Uncxx.h")
 #include "revenant/Transforms/Uncxx/Uncxx.h"
 #endif
+#if __has_include("revenant/Transforms/Univ/Univ.h")
+#include "revenant/Transforms/Univ/Univ.h"
+#endif
 using namespace llvm;
 
 namespace revenant {
@@ -197,6 +200,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Uncxx/Uncxx.h")
         if (Name == "revenant-uncxx") {
           FPM.addPass(UncxxPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Univ/Univ.h")
+        if (Name == "revenant-univ") {
+          FPM.addPass(UnivPass());
           return true;
         }
 #endif
