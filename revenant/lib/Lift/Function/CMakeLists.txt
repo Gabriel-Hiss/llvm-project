@@ -3,6 +3,7 @@ add_llvm_library(RevenantLift
   LiftState.cpp
   LiftCalls.cpp
   LiftCore.cpp
+  LiftEH.cpp
 
   LINK_COMPONENTS
   Analysis
