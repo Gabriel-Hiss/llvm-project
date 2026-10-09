@@ -1219,8 +1219,11 @@ resolveJumpTable(const JumpTableCtx &Ctx, const TargetHooks &Hooks,
                         Access->Table, Access->EntrySize);
     for (uint64_t I = 0; I < N; ++I) {
       auto T = Access->read(Ctx, I);
+      // The first entry that is not a code address ends the table: a
+      // guard count borrowed from an unrelated compare must not run the
+      // walk through the next data structure (adjacent tables).
       if (!T)
-        continue;
+        break;
       Targets[*T].push_back((int64_t)I + Offset);
     }
     // Byte extent by content scan: the guard count bounds valid case
