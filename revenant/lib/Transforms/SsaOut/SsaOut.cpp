@@ -318,7 +318,21 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
           U.set(LD);
       }
     }
-    IRBuilder<> B(I->getNextNode());
+    Instruction *InsertBefore = I->getNextNode();
+    if (auto *II = dyn_cast<InvokeInst>(I)) {
+      BasicBlock *NormalDest = II->getNormalDest();
+      if (pred_size(NormalDest) > 1) {
+        if (BasicBlock *Edge =
+                SplitCriticalEdge(II->getParent(), NormalDest)) {
+          // `!revenant.region` operands use block-list indices.
+          Edge->moveAfter(&F.back());
+          NormalDest = Edge;
+          Changed = true;
+        }
+      }
+      InsertBefore = NormalDest->getFirstNonPHI();
+    }
+    IRBuilder<> B(InsertBefore);
     B.SetCurrentDebugLocation(I->getDebugLoc());
     StoreInst *ST = B.CreateStore(I, AI);
     copyProvenance(I, ST);
@@ -368,7 +382,10 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   // its own edge. Region annotations ride along to the new terminator.
   for (BasicBlock &BB : F) {
     SmallVector<BasicBlock *, 4> Succs(succ_begin(&BB), succ_end(&BB));
-    if (Succs.size() < 2 || BB.isEHPad())
+    Instruction *PredTerm = BB.getTerminator();
+    if (Succs.size() < 2 || BB.isEHPad() ||
+        isa<CatchSwitchInst>(PredTerm) || isa<CatchReturnInst>(PredTerm) ||
+        isa<CleanupReturnInst>(PredTerm))
       continue;
     for (BasicBlock *Succ : Succs) {
       if (Succ->phis().empty() || Succ->isEHPad())
@@ -458,7 +475,20 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         }
       }
       Instruction *Term = Pred->getTerminator();
-      IRBuilder<> B(Term);
+      // A catchswitch must be the first non-PHI instruction in its block.
+      // Its handler choice also makes a pre-switch copy incorrect for all
+      // but one handler. The handler pad has a single catchswitch predecessor,
+      // so materialize its phi copies immediately after the pad instead.
+      Instruction *InsertBefore = Term;
+      if (Succ.isEHPad() && isa<CatchSwitchInst>(Term)) {
+        Instruction *Pad = Succ.getFirstNonPHI();
+        if (!Pad)
+          continue;
+        InsertBefore = Pad->getNextNode();
+        if (!InsertBefore)
+          continue;
+      }
+      IRBuilder<> B(InsertBefore);
       for (auto &C : Ordered) {
         Value *V = C.second;
         // An incoming value that was itself materialized (non-phi def)
