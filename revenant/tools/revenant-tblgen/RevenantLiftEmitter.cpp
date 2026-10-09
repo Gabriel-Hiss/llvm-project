@@ -150,6 +150,37 @@ class RevenantLiftEmitter {
     return std::nullopt;
   }
 
+  /// Declared bit width of the operand a leaf names ($name or (rv_op N)):
+  /// the trailing digits of the operand record (GR64/i64mem -> 64). 0 when
+  /// the argument is not a bare operand or the record has no width digits.
+  static unsigned declaredBits(const CodeGenInstruction &I, const Init *Arg,
+                               StringRef Name) {
+    std::optional<unsigned> No;
+    if (!Name.empty())
+      No = operandNo(I, Name);
+    else if (const auto *D = dyn_cast<DagInit>(Arg)) {
+      const Record *Op = opOf(*D);
+      const auto *N = Op && Op->getName() == "rv_op" && D->getNumArgs() == 1
+                          ? dyn_cast<IntInit>(D->getArg(0))
+                          : nullptr;
+      if (N)
+        No = inputOperandNo(I, N->getValue());
+    }
+    if (!No)
+      return 0;
+    const auto *Info = operandAt(I, *No);
+    if (!Info)
+      return 0;
+    StringRef R = Info->Rec->getName();
+    size_t End = R.size();
+    while (End > 0 && isDigit(R[End - 1]))
+      --End;
+    unsigned B = 0;
+    if (End == R.size() || R.substr(End).getAsInteger(10, B))
+      return 0;
+    return B;
+  }
+
   static std::string operandValue(const CodeGenInstruction &I, StringRef Name,
                                   unsigned Width) {
     auto N = operandNo(I, Name);
@@ -331,6 +362,13 @@ class RevenantLiftEmitter {
         unsigned W = Name.ends_with("f32") ? 32
                      : Name.ends_with("f64") ? 64
                                               : Width;
+        // sitofp must read the source at its declared width: GR64/i64mem
+        // sources are 64-bit even under rv_sitofpf32 (VCVTSI642SS would
+        // otherwise truncate the operand before converting).
+        if (Name == "rv_sitofpf32" || Name == "rv_sitofpf64")
+          if (unsigned B =
+                  declaredBits(Inst, D->getArg(0), D->getArgNameStr(0)))
+            W = B;
         std::string A = expression(D->getArg(0), Inst, W,
                                    D->getArgNameStr(0));
         if (A.empty())
@@ -794,6 +832,41 @@ class RevenantLiftEmitter {
           return "LC.lahfVal()";
       }
 
+      if (Name == "rv_fma" && D->getNumArgs() == 4) {
+        const auto *Mode = dyn_cast<StringInit>(D->getArg(0));
+        if (!Mode)
+          return {};
+        std::string A =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        std::string B =
+            expression(D->getArg(2), Inst, Width, D->getArgNameStr(2));
+        std::string C =
+            expression(D->getArg(3), Inst, Width, D->getArgNameStr(3));
+        if (A.empty() || B.empty() || C.empty())
+          return {};
+        StringRef OpMode = Mode->getValue();
+        bool NegProduct = OpMode.starts_with("n");
+        bool NegAddend = OpMode.contains("sub");
+        StringRef Opcode = Inst.TheDef->getName();
+        bool Scalar = Opcode.contains("SS") || Opcode.contains("SD");
+        unsigned EltBits = Opcode.contains("SD") || Opcode.contains("PD")
+                               ? 64
+                               : 32;
+        if (OpMode.ends_with("132") || OpMode.ends_with("213"))
+          std::swap(B, C);
+        else if (OpMode.ends_with("231")) {
+          std::string First = B;
+          B = C;
+          C = A;
+          A = std::move(First);
+        }
+        return (Twine("LC.fmaOp(") + A + ", " + B + ", " + C +
+                ", LC.readOp(MI, 0, LC.iN(" + Twine(Width) + ")), " +
+                (NegProduct ? "true" : "false") + ", " +
+                (NegAddend ? "true" : "false") + ", " +
+                Twine(EltBits) + ", " + (Scalar ? "true" : "false") + ")")
+            .str();
+      }
       if (Name == "rv_icmp" && D->getNumArgs() == 3) {
         const auto *Pred = dyn_cast<StringInit>(D->getArg(0));
         if (!Pred)
@@ -1912,6 +1985,19 @@ class RevenantLiftEmitter {
       if (Addr.empty() || Value.empty())
         return false;
       OS << "    LC.memWriteAddr(" << Addr << ", " << Value << ");\n";
+      return true;
+    }
+    // (rv_int N | (rv_op K) | $op): the imm8 interrupt vector, a literal or
+    // the instruction's immediate operand.
+    if (Name == "rv_int" && Body.getNumArgs() == 1) {
+      std::string Imm;
+      if (auto OpNo = operandNo(Inst, Body.getArgNameStr(0)))
+        Imm = (Twine("MI.getOperand(") + Twine(*OpNo) + ").getImm()").str();
+      else
+        Imm = immediateExpr(Body.getArg(0), Inst);
+      if (Imm.empty())
+        return false;
+      OS << "    LC.intTrap(" << Imm << ");\n";
       return true;
     }
     if (Name == "rv_opaque") {
