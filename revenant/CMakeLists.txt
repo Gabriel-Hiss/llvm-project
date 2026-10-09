@@ -49,6 +49,11 @@ if(Clang_FOUND)
 endif()
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# Target backend generated headers (X86Gen*.inc) live in the LLVM build tree.
+if(EXISTS "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86/X86GenInstrInfo.inc")
+  set(REVENANT_X86_GEN_DIR "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86")
+  set(REVENANT_X86_SRC_DIR "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86")
+endif()
 
 # Match the prebuilt Release LLVM libraries' MSVC iterator ABI.
 if(WIN32 AND MSVC)
@@ -58,12 +63,13 @@ add_definitions(${LLVM_DEFINITIONS})
 
 # Every slice adds its own CMakeLists under lib/<Area>, tools/<tool>,
 # frontend/<tool>, unittests/<Area>. Directories land independently, so
-# guard each one.
+# guard each one. The lifter generator must be registered before lib/Lift.
 set(REVENANT_AREA_DIRS
     lib/Core
     lib/Object
     lib/Disasm
     lib/Analysis
+    tools/revenant-tblgen
     lib/Lift
     lib/Transforms
     lib/Structure
@@ -72,7 +78,6 @@ set(REVENANT_AREA_DIRS
     lib/IR
     lib/Target/X86
     tools/revenant
-    tools/revenant-tblgen
     tools/revenant-ir-verify
     frontend/clang
     unittests)
