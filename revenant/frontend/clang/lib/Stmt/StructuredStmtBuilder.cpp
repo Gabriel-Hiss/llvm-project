@@ -1000,18 +1000,27 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
     Region *Parent = enclosingRegion(BB);
     if (Parent && !Parent->Degraded)
       continue; // emitted inside a structured region
-    // Unstructured or degraded block: label + statements + terminator
-    // control flow.
+    // A region follow is emitted linearly after the structured construct;
+    // it needs a label only when a real goto targets it.
+    bool IsRegionFollow = false;
+    for (const auto &KV : Regions)
+      if (KV.second->Follow == BB && !KV.second->Degraded) {
+        IsRegionFollow = true;
+        break;
+      }
     SmallVector<Stmt *, 8> BS;
     emitBlockStmts(BB, BS);
     if (Stmt *T = emitTerminator(BB, Parent && Parent->Degraded ? Parent
                                                                 : nullptr))
       BS.push_back(T);
     CompoundStmt *Inner = CompoundStmt::Create(*AST, BS, FPOptionsOverride(),
-                                             SourceLocation(),
-                                             SourceLocation());
-    Stmts.push_back(new (*AST)
-                        LabelStmt(SourceLocation(), labelFor(BB), Inner));
+                                               SourceLocation(),
+                                               SourceLocation());
+    if (IsRegionFollow && !NeededLabels.contains(BB))
+      Stmts.push_back(Inner);
+    else
+      Stmts.push_back(new (*AST)
+                          LabelStmt(SourceLocation(), labelFor(BB), Inner));
   }
   return CompoundStmt::Create(*AST, Stmts, FPOptionsOverride(),
                               SourceLocation(), SourceLocation());
