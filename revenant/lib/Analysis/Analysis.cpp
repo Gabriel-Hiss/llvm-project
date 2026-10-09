@@ -124,7 +124,31 @@ void insertFunction(Program &P, Function F) {
   R.ExtraRoots = std::move(F.ExtraRoots);
   R.Orphan = F.Orphan;
   R.IsNoreturn = F.IsNoreturn;
-  P.Functions.insert_or_assign(R.Start, std::move(R));
+  auto [It, Inserted] = P.Functions.try_emplace(R.Start, std::move(R));
+  if (!Inserted) {
+    // Merge blocks from the second discovery into the existing record.
+    FuncRecord &Existing = It->second;
+    for (const BlockRec &BR : R.Blocks)
+      if (std::find_if(Existing.Blocks.begin(), Existing.Blocks.end(),
+                       [&](const BlockRec &B) {
+                         return B.Start == BR.Start && B.End == BR.End;
+                       }) == Existing.Blocks.end())
+        Existing.Blocks.push_back(BR);
+    for (const EdgeRec &ER : R.Edges)
+      Existing.Edges.push_back(ER);
+    for (const auto &C : R.Chunks)
+      Existing.Chunks.push_back(C);
+    Existing.NoreturnCalls.insert(Existing.NoreturnCalls.end(),
+                                  R.NoreturnCalls.begin(),
+                                  R.NoreturnCalls.end());
+    Existing.CallTargets.insert(Existing.CallTargets.end(),
+                                R.CallTargets.begin(),
+                                R.CallTargets.end());
+    Existing.ExtraRoots.insert(Existing.ExtraRoots.end(),
+                               R.ExtraRoots.begin(),
+                               R.ExtraRoots.end());
+    Existing.IsNoreturn |= R.IsNoreturn;
+  }
 }
 
 Function materialize(const Program &P, const FuncRecord &R) {
