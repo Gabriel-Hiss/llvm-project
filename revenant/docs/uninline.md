@@ -53,3 +53,24 @@ python revenant/test/Transforms/Uninline/measure.py \
   --plugin build-rv-uninline/RevenantTransformUninline.dll \
   --output meas/before
 ```
+
+## Exact multi-block regions
+
+The CFG matcher binds blocks by successor position, then binds instruction
+definitions before comparing operands. This permits loop-carried PHIs and
+forward references. PHIs compare incoming block identity, not textual order.
+All opcodes, types, constants and instruction flags must agree.
+
+The entry may keep a caller prefix. A unique return block may keep a caller
+suffix. Every other instruction and edge belongs to the matched region.
+Internal blocks reject outside predecessors; the entry rejects backedges.
+Only the returned definition may escape, and every reconstructed argument
+must dominate the replacement call and come from outside the region.
+
+The rewrite splits off the exit suffix, builds the call at the original entry,
+redirects the entry to that suffix, replaces outside return-value uses, clears
+cyclic references and deletes the internal blocks. LLVM's split operation
+repairs successor PHIs. The new call and branch retain available virtual
+addresses and debug locations. Opaque and structured-region annotations cause
+rejection rather than losing their meaning. Allocation, EH, atomics, marker
+intrinsics and ABI-changing attributes are outside the current proof.
