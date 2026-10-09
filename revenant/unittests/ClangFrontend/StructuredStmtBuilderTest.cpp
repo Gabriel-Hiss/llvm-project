@@ -63,9 +63,7 @@ std::string printFunction(llvm::Module &M, llvm::Function &F) {
   std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(FCtx, Types);
   fillTranslationUnit(**T, M, Types, *Stmts, *Exprs);
 
-  clang::FunctionDecl *FD = FCtx.functionDecl(F, [&](llvm::Type *Ty, const llvm::DIType *DI) {
-    return Types.typeOf(Ty, DI);
-  });
+  clang::FunctionDecl *FD = FCtx.functionDecl(F, Types);
   std::string Out;
   raw_string_ostream OS(Out);
   FD->print(OS, (*T)->ast().getPrintingPolicy());
