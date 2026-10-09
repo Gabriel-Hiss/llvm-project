@@ -1,5 +1,6 @@
 revenant_add_unittest(RevenantUnitTests RevenantLiftTests
   LiftTest.cpp
+  LiftEHTest.cpp
   PARTIAL_SOURCES_INTENDED
   )
 
@@ -20,6 +21,7 @@ target_compile_definitions(RevenantLiftTests PRIVATE
 
 target_include_directories(RevenantLiftTests PRIVATE
   "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../lib/Lift/Function"
   "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86/MCTargetDesc"
   "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86"
 )

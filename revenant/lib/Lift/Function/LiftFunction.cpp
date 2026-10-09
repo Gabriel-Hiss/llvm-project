@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LiftState.h"
+#include "LiftEH.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 
@@ -276,7 +277,7 @@ static llvm::Error emitSwitch(LiftState &LS, const FuncRecord &F,
 llvm::Expected<LiftedFunction>
 liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
              const Disasm &D, const Signatures *Sigs, llvm::TargetMachine *TM,
-             bool RunPasses) {
+             bool RunPasses, const FunctionEH *EH) {
   if (TM) {
     if (M.getTargetTriple().empty())
       M.setTargetTriple(TM->getTargetTriple());
@@ -535,6 +536,11 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     }
   }
   LS.tagProvenance();
+  // Exception regions from the EH tables: calls inside try ranges become
+  // invokes with native LLVM pads (owner: EH slice). Runs before verify
+  // so malformed pads fail the lift instead of escaping downstream.
+  if (EH)
+    liftEH(*Fn, *EH);
   if (llvm::verifyFunction(*Fn, &llvm::errs())) {
     Fn->deleteBody();
     return llvm::createStringError(llvm::inconvertibleErrorCode(),

@@ -261,4 +261,82 @@ TEST(StructuredStmtBuilderTest, GotoFallback) {
   EXPECT_NE(S.find("L_bb_7000"), std::string::npos);
 }
 
+TEST(StructuredStmtBuilderTest, TryCatch) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_try", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  auto *Ptr = llvm::PointerType::getUnqual(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "may_throw", M);
+  llvm::Function *Pers = llvm::Function::Create(
+      llvm::FunctionType::get(I32, true), llvm::GlobalValue::ExternalLinkage,
+      "__CxxFrameHandler3", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_try", M);
+  F->setPersonalityFn(Pers);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_8000", F);
+  llvm::BasicBlock *Normal = BasicBlock::Create(C, "bb_8010", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_8020", F);
+  llvm::BasicBlock *Catch = BasicBlock::Create(C, "bb_8030", F);
+  llvm::BasicBlock *Ret = BasicBlock::Create(C, "bb_8040", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateInvoke(Callee->getFunctionType(), Callee, Normal, Dispatch, {X});
+  B.SetInsertPoint(Normal);
+  B.CreateBr(Ret);
+  B.SetInsertPoint(Dispatch);
+  auto *SW = B.CreateCatchSwitch(llvm::ConstantTokenNone::get(C), nullptr, 1);
+  SW->addHandler(Catch);
+  B.SetInsertPoint(Catch);
+  llvm::Value *NullPtr = llvm::ConstantPointerNull::get(Ptr);
+  auto *Pad = B.CreateCatchPad(SW, {NullPtr, llvm::ConstantInt::get(I32, 0),
+                                    NullPtr});
+  B.CreateCatchRet(Pad, Ret);
+  B.SetInsertPoint(Ret);
+  B.CreateRet(llvm::ConstantInt::get(I32, 0));
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("try"), std::string::npos);
+  EXPECT_NE(S.find("catch"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, SehTryExcept) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_seh", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  auto *Ptr = llvm::PointerType::getUnqual(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "may_throw_seh", M);
+  llvm::Function *Pers = llvm::Function::Create(
+      llvm::FunctionType::get(I32, true), llvm::GlobalValue::ExternalLinkage,
+      "__C_specific_handler", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_seh", M);
+  F->setPersonalityFn(Pers);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_9000", F);
+  llvm::BasicBlock *Normal = BasicBlock::Create(C, "bb_9010", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_9020", F);
+  llvm::BasicBlock *Except = BasicBlock::Create(C, "bb_9030", F);
+  llvm::BasicBlock *Ret = BasicBlock::Create(C, "bb_9040", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateInvoke(Callee->getFunctionType(), Callee, Normal, Dispatch, {});
+  B.SetInsertPoint(Normal);
+  B.CreateBr(Ret);
+  B.SetInsertPoint(Dispatch);
+  auto *SW = B.CreateCatchSwitch(llvm::ConstantTokenNone::get(C), nullptr, 1);
+  SW->addHandler(Except);
+  B.SetInsertPoint(Except);
+  llvm::Value *NullPtr = llvm::ConstantPointerNull::get(Ptr);
+  auto *Pad = B.CreateCatchPad(SW, {NullPtr});
+  B.CreateCatchRet(Pad, Ret);
+  B.SetInsertPoint(Ret);
+  B.CreateRet(llvm::ConstantInt::get(I32, 0));
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("__try"), std::string::npos);
+  EXPECT_NE(S.find("__except"), std::string::npos);
+}
+
 } // namespace

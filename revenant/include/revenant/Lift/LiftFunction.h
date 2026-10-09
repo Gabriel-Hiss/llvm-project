@@ -22,6 +22,7 @@
 #ifndef REVENANT_LIFT_FUNCTION_H
 #define REVENANT_LIFT_FUNCTION_H
 
+#include "revenant/Analysis/EHTables.h"
 #include "revenant/Core/Program.h"
 #include "revenant/Core/Va.h"
 
@@ -123,7 +124,9 @@ struct LiftedFunction {
 /// (callers get the conservative default signature, void functions). `TM`
 /// only fills module triple/datalayout when the caller did not already set
 /// them. `RunPasses` runs the lift-cleanup pipeline (`liftCleanupPasses()`)
-/// on the module when true.
+/// on the module when true. `EH` may point at the decoded EH entry for
+/// this function (see revenant/Analysis/EHTables.h): when non-null, calls
+/// inside its try ranges become `invoke`s with native LLVM EH pads.
 ///
 /// Errors: stack-delta inconsistency (joins disagree on rsp depth), decode
 /// failure inside a block, or a broken operand shape. The function is left
@@ -131,7 +134,8 @@ struct LiftedFunction {
 llvm::Expected<LiftedFunction>
 liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
              const Disasm &D, const Signatures *Sigs = nullptr,
-             llvm::TargetMachine *TM = nullptr, bool RunPasses = true);
+             llvm::TargetMachine *TM = nullptr, bool RunPasses = true,
+             const FunctionEH *EH = nullptr);
 
 /// The cleanup pipeline string, mirroring crates/lift CLEANUP_PASSES. Runs
 /// via PassBuilder::parsePassPipeline; `sroa,mem2reg` dissolve the register
