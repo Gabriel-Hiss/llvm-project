@@ -64,6 +64,7 @@ set(REVENANT_AREA_DIRS
     lib/Object
     lib/Disasm
     lib/Analysis
+    lib/Compiler
     lib/Lift
     lib/Transforms
     lib/Structure
