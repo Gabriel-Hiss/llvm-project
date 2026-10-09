@@ -1803,6 +1803,189 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
 }
 
 
+//===----------------------------------------------------------------------===//
+// Packed integer reduction (GCC -O3 sum_vec): a <VF x iE> accumulate
+// loop, a lane fold, and a fully unrolled guarded remainder. GCC does
+// not emit a scalar fallback loop for this shape: the small-N guard
+// jumps straight into the unrolled remainder with the start values
+// (0, 0), which is only enough for the at most VF-1 leftover elements.
+//===----------------------------------------------------------------------===//
+
+struct PackedReduction {
+  BasicBlock *D = nullptr;       // small-N guard (ult i32 N, K)
+  BasicBlock *Pre = nullptr;     // vector preheader (bound derivation)
+  BasicBlock *Body = nullptr;   // vector accumulate loop
+  BasicBlock *Reduce = nullptr;  // lane fold + remainder start index
+  BasicBlock *Exit = nullptr;   // accumulator merge (kept)
+  SmallVector<BasicBlock *, 4> Chain;       // unrolled remainder blocks
+  SmallVector<BasicBlock *, 2> SmallRelays; // guard -> chain relays
+  SmallVector<BasicBlock *, 2> VecRelays;   // guard -> preheader relays
+  PHINode *ExitPhi = nullptr;    // exit merge phi (rewired)
+  PHINode *IdxPhi = nullptr;     // remainder index phi (kept only in shape)
+  Value *N32 = nullptr;          // i32 element count
+  Value *PtrArg = nullptr;       // base pointer argument
+  Type *ElemTy = nullptr;
+  unsigned VF = 0;
+  unsigned LogVF = 0;
+  // Provenance donors for the synthesized loop.
+  Instruction *VALoad = nullptr;
+  Instruction *VAAdd = nullptr;
+  Instruction *VAGep = nullptr;
+  Instruction *VAStep = nullptr;
+  Instruction *VABound = nullptr;
+  Instruction *VATerm = nullptr;
+};
+
+// Predecessor count without CFG.h.
+static unsigned predCount(const BasicBlock *BB) {
+  unsigned N = 0;
+  for (const BasicBlock *P : predecessors(BB)) {
+    (void)P;
+    ++N;
+  }
+  return N;
+}
+
+// True for instructions the dead sweep below may drop once the fold
+// orphaned them: pure value arithmetic only, no metadata the frontend
+// still needs.
+static bool isSweepableDead(const Instruction &I) {
+  if (I.isTerminator() || I.mayHaveSideEffects() || isa<PHINode>(&I) ||
+      isa<DbgInfoIntrinsic>(&I))
+    return false;
+  if (I.getMetadata("revenant.opaque") || I.getMetadata("revenant.region"))
+    return false;
+  switch (I.getOpcode()) {
+  case Instruction::Add:
+  case Instruction::Sub:
+  case Instruction::Mul:
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor:
+  case Instruction::Shl:
+  case Instruction::LShr:
+  case Instruction::AShr:
+  case Instruction::Trunc:
+  case Instruction::ZExt:
+  case Instruction::SExt:
+  case Instruction::ICmp:
+  case Instruction::BitCast:
+  case Instruction::IntToPtr:
+  case Instruction::PtrToInt:
+  case Instruction::GetElementPtr:
+  case Instruction::ExtractElement:
+  case Instruction::InsertElement:
+  case Instruction::ShuffleVector:
+  case Instruction::Select:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// V is a pure function of the phi P: its def chain reaches P and
+// constants through side-effect-free integer ops only. Rejects loads,
+// calls, other phis and memory ops.
+static bool isPureFuncOfPhi(Value *V, const PHINode *P,
+                            DenseSet<const Value *> &Seen, unsigned Depth = 12) {
+  if (isa<Constant>(V))
+    return true;
+  if (V == P)
+    return true;
+  if (!Seen.insert(V).second)
+    return true;
+  if (Depth == 0)
+    return false;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || I->isTerminator() || isa<PHINode>(I) || I->mayHaveSideEffects())
+    return false;
+  for (Value *Op : I->operands())
+    if (!isPureFuncOfPhi(Op, P, Seen, Depth - 1))
+      return false;
+  return true;
+}
+
+// Walk a chain load's pointer expression back to the base pointer and
+// return the constant element offset relative to the index phi. The
+// offset must be IP scaled by exact elements (pointer GEPs and
+// byte-scaled forms both count) plus a whole number of elements.
+static bool matchChainElemOffset(Value *Ptr, Value *Base, PHINode *IP,
+                                 const DataLayout &DL, uint64_t ElemBytes,
+                                 int64_t &ElemOffset) {
+  int64_t PerIP = 0;
+  int64_t ConstBytes = 0;
+  unsigned Steps = 0;
+  while (Ptr != Base) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+    if (!GEP || GEP->getNumIndices() != 1 || ++Steps > 4)
+      return false;
+    Type *ET = GEP->getSourceElementType();
+    if (!ET->isSized())
+      return false;
+    uint64_t S = DL.getTypeStoreSize(ET).getFixedValue();
+    Value *Idx = GEP->getOperand(1);
+    if (auto *C = dyn_cast<ConstantInt>(Idx)) {
+      ConstBytes += C->getSExtValue() * static_cast<int64_t>(S);
+    } else if (Idx == IP) {
+      PerIP += static_cast<int64_t>(S);
+    } else if (auto *Shl = dyn_cast<BinaryOperator>(Idx)) {
+      // IP scaled to a byte count for a byte GEP (shl IP, K contributes
+      // (1 << K) bytes per IP unit through this GEP's element size).
+      auto *C = dyn_cast<ConstantInt>(Shl->getOperand(1));
+      if (Shl->getOpcode() != Instruction::Shl || !C ||
+          Shl->getOperand(0) != IP || C->getZExtValue() >= 16)
+        return false;
+      PerIP += static_cast<int64_t>((1ULL << C->getZExtValue()) * S);
+    } else {
+      return false;
+    }
+    Ptr = GEP->getPointerOperand();
+  }
+  if (PerIP != static_cast<int64_t>(ElemBytes) ||
+      ConstBytes % static_cast<int64_t>(ElemBytes) != 0)
+    return false;
+  ElemOffset = ConstBytes / static_cast<int64_t>(ElemBytes);
+  return true;
+}
+
+// V == IP + Offset in element units, through casts, add/sub and the
+// or-with-constant form GCC emits for an index whose low bits are
+// known zero (the remainder start is a multiple of VF).
+static bool matchIndexPlus(Value *V, const PHINode *IP, int64_t &Offset,
+                           unsigned Depth = 8) {
+  if (V == IP) {
+    Offset = 0;
+    return true;
+  }
+  if (Depth == 0)
+    return false;
+  if (auto *Cast = dyn_cast<CastInst>(V)) {
+    if (!Cast->isIntegerCast())
+      return false;
+    return matchIndexPlus(Cast->getOperand(0), IP, Offset, Depth - 1);
+  }
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO)
+    return false;
+  int64_t Sub = 0;
+  if (!matchIndexPlus(BO->getOperand(0), IP, Sub, Depth - 1))
+    return false;
+  auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+  if (!C)
+    return false;
+  int64_t K = C->getSExtValue();
+  switch (BO->getOpcode()) {
+  case Instruction::Add:
+  case Instruction::Or:
+    Offset = Sub + K;
+    return true;
+  case Instruction::Sub:
+    Offset = Sub - K;
+    return true;
+  default:
+    return false;
+  }
+}
 // Counted loops can lower wide copies to i128 load/store pairs, or repeated
 // fills to vector splats. Split only these proven memory shapes. Keep all
 // copy loads before their stores so each chunk retains read-before-write
@@ -2061,6 +2244,10 @@ bool eraseDeadValues(Function &F) {
 bool runOnFunction(Function &F) {
   bool Changed = scalarizeCountedWideMemory(F);
   Changed |= lowerUniformStoreUnroll(F);
+  DenseSet<BasicBlock *> Taken;
+  Changed |= foldPackedReduction(F, Taken);
+  DenseSet<BasicBlock *> Taken;
+  Changed |= foldPackedReduction(F, Taken);
   SmallVector<Candidate, 4> Cands;
   // Collect-then-rewrite: matching never mutates.
   for (BasicBlock &BB : F) {
@@ -2073,11 +2260,12 @@ bool runOnFunction(Function &F) {
     if (matchDispatch(&BB, F, C))
       Cands.push_back(std::move(C));
   }
-  DenseSet<BasicBlock *> Taken;
   SmallVector<Candidate, 4> Work;
   for (Candidate &C : Cands) {
     bool Overlap = Taken.count(C.D) || Taken.count(C.S) || Taken.count(C.L);
     for (BasicBlock *BB : C.R)
+      Overlap = Overlap || Taken.count(BB);
+    for (BasicBlock *BB : C.Chain)
       Overlap = Overlap || Taken.count(BB);
     if (Overlap)
       continue;
