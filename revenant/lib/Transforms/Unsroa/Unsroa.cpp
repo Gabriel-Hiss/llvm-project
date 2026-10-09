@@ -1478,24 +1478,82 @@ bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
     // aggregate; only touch fields in the chosen run.
     if (isa<AllocaInst>(Root)) {
       size_t BestStart = 0, BestEnd = 0;
+      auto ConfirmsRun = [&](size_t Start, size_t End) {
+        for (BasicBlock &CallBB : F)
+          for (Instruction &CallI : CallBB) {
+            auto *CB = dyn_cast<CallBase>(&CallI);
+            Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+            if (!Callee || Callee->isDeclaration())
+              continue;
+            for (unsigned AI = 0; AI < CB->arg_size(); ++AI) {
+              uint64_t CallOff = 0;
+              if (resolveFootprintBase(skipCopies(CB->getArgOperand(AI)),
+                                       DL, CallOff) != Root ||
+                  CallOff != Fields[Start].Off || AI >= Callee->arg_size())
+                continue;
+              Argument *CA = Callee->getArg(AI);
+              bool AllSeen = true;
+              for (size_t FI = Start; FI < End; ++FI) {
+                const Field &Fd = Fields[FI];
+                bool Seen = false;
+                for (BasicBlock &CBB : *Callee)
+                  for (Instruction &CI : CBB) {
+                    Value *Ptr = nullptr;
+                    Type *AT = nullptr;
+                    if (auto *LI = dyn_cast<LoadInst>(&CI)) {
+                      Ptr = LI->getPointerOperand();
+                      AT = LI->getType();
+                    } else if (auto *SI = dyn_cast<StoreInst>(&CI)) {
+                      Ptr = SI->getPointerOperand();
+                      AT = SI->getValueOperand()->getType();
+                    }
+                    if (!Ptr || !AT)
+                      continue;
+                    bool SameStorage =
+                        AT == Fd.Ty ||
+                        (DL.getTypeStoreSize(AT) == Fd.Width &&
+                         DL.getTypeStoreSize(Fd.Ty) == Fd.Width &&
+                         ((AT->isPointerTy() && Fd.Ty->isIntegerTy(64)) ||
+                          (Fd.Ty->isPointerTy() &&
+                           AT->isIntegerTy(64))));
+                    if (!SameStorage)
+                      continue;
+                    uint64_t AccessOff = 0;
+                    if (resolveFootprintBase(skipCopies(Ptr), DL,
+                                             AccessOff) == CA &&
+                        AccessOff == Fd.Off - Fields[Start].Off) {
+                      Seen = true;
+                      if (AT->isPointerTy())
+                        Fields[FI].Ty = AT;
+                    }
+                  }
+                AllSeen &= Seen;
+              }
+              if (AllSeen)
+                return true;
+            }
+          }
+        return false;
+      };
       for (size_t Start = 0; Start < Fields.size();) {
         size_t End = Start + 1;
         while (End < Fields.size() &&
                Fields[End].Off - (Fields[End - 1].Off +
                                    Fields[End - 1].Width) <= 16)
           ++End;
-        if (End - Start > BestEnd - BestStart) {
+        if (End - Start > BestEnd - BestStart &&
+            ConfirmsRun(Start, End)) {
           BestStart = Start;
           BestEnd = End;
         }
         Start = End;
       }
-      if (BestEnd > BestStart && BestEnd - BestStart < Fields.size()) {
-        SmallVector<Field, 8> Local;
-        for (size_t I = BestStart; I < BestEnd; ++I)
-          Local.push_back(std::move(Fields[I]));
-        Fields = std::move(Local);
-      }
+      if (BestEnd == BestStart)
+        continue;
+      SmallVector<Field, 8> Local;
+      for (size_t I = BestStart; I < BestEnd; ++I)
+        Local.push_back(std::move(Fields[I]));
+      Fields = std::move(Local);
     }
     Lo = Fields.front().Off;
     Hi = Fields.back().Off + Fields.back().Width;
@@ -1545,6 +1603,53 @@ bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
           }
         }
       if (!CalleeConfirms)
+        continue;
+    }
+    if (!isa<AllocaInst>(Root)) {
+      auto *RA = dyn_cast<Argument>(Root);
+      if (!RA)
+        continue;
+      unsigned ConfirmingCallers = 0;
+      for (Function &Caller : *M)
+        if (!Caller.isDeclaration())
+          for (BasicBlock &CallerBB : Caller)
+            for (Instruction &CI : CallerBB) {
+              auto *CB = dyn_cast<CallBase>(&CI);
+              if (!CB || CB->getCalledFunction() != &F ||
+                  RA->getArgNo() >= CB->arg_size())
+                continue;
+              uint64_t BaseOff = 0;
+              const Value *Base = resolveFootprintBase(
+                  skipCopies(CB->getArgOperand(RA->getArgNo())), DL, BaseOff);
+              if (!Base)
+                continue;
+              bool AllSeen = true;
+              for (const Field &Fd : Fields) {
+                bool Seen = false;
+                for (BasicBlock &CallerBlock : Caller)
+                  for (Instruction &AccessI : CallerBlock) {
+                    Value *Ptr = nullptr;
+                    Type *AccessTy = nullptr;
+                    if (auto *LI = dyn_cast<LoadInst>(&AccessI)) {
+                      Ptr = LI->getPointerOperand();
+                      AccessTy = LI->getType();
+                    } else if (auto *SI = dyn_cast<StoreInst>(&AccessI)) {
+                      Ptr = SI->getPointerOperand();
+                      AccessTy = SI->getValueOperand()->getType();
+                    }
+                    if (!Ptr || AccessTy != Fd.Ty)
+                      continue;
+                    uint64_t Off = 0;
+                    if (resolveFootprintBase(skipCopies(Ptr), DL, Off) ==
+                            Base &&
+                        Off == BaseOff + Fd.Off - Lo)
+                      Seen = true;
+                  }
+                AllSeen &= Seen;
+              }
+              ConfirmingCallers += AllSeen;
+            }
+      if (ConfirmingCallers < 1)
         continue;
     }
     // Struct-likeness: veto a dense uniform run of >=3 offsets (an

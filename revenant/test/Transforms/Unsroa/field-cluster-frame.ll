@@ -9,7 +9,14 @@
 
 target datalayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 
-declare i32 @callee(i64)
+define i32 @callee(ptr %p) {
+  %p1 = getelementptr i8, ptr %p, i64 4
+  %x = load i32, ptr %p
+  %y = load i32, ptr %p1
+  %p2 = getelementptr i8, ptr %p, i64 8
+  %tag = load i64, ptr %p2
+  ret i32 %x
+}
 
 ; CHECK: %struct.agg.f.0 = type { i32, i32, i64 }
 define i32 @f(i32 %0) {
@@ -35,6 +42,6 @@ bb:
 ; CHECK: getelementptr inbounds nuw %struct.agg.f.0, ptr %rv.agg.base, i32 0, i32 0
 ; CHECK: getelementptr inbounds nuw %struct.agg.f.0, ptr %rv.agg.base, i32 0, i32 1
 ; CHECK: %{{.*}} = load i8, ptr %fp696, align 1
-  %c = call i32 @callee(i64 %4)
+  %c = call i32 @callee(ptr %fp47)
   ret i32 %c
 }
