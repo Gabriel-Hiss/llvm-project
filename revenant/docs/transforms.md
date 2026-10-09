@@ -128,3 +128,9 @@ Guarantees region annotations and provenance survive; types only refine.
 **revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
 structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the
 frontends. Guarantees stable `bb_<va>` names and intact annotations.
+
+**revenant-unabi (owner: MuseDeoptAbi).** Module pass (not function): rewrites
+function signatures, snapshotting the function list first so erasure is safe.
+Runs explicitly via `-passes=revenant-unabi`, not in the default pipeline.
+Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
+22 parseable output.

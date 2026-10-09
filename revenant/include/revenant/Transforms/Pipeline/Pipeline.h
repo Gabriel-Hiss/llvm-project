@@ -8,9 +8,11 @@
 // revenant/include/revenant/Transforms/<Name>/.
 //
 // Every Revenant pass is a FunctionPassManager pass registered under
-// `revenant-<name>` via registerPipelineParsingCallback (see Register.cpp).
-// revenant-opt links all RevenantTransform* libs statically, so
-// `revenant-opt -passes=revenant-<name> in.ll` works with no plugin flags.
+// `revenant-<name>` via registerPipelineParsingCallback (see Register.cpp),
+// except `revenant-unabi`, which rewrites function signatures and runs as
+// a ModulePassManager pass. revenant-opt links all RevenantTransform*
+// libs statically, so `revenant-opt -passes=revenant-<name> in.ll` works
+// with no plugin flags.
 //
 //===----------------------------------------------------------------------===//
 
