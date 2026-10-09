@@ -43,7 +43,8 @@ void LiftContext::emitOpaque(const MCInst &MI, StringRef Name) {
 }
 
 AllocaInst *LiftContext::regSlot(StringRef Name, Type *Ty) {
-  IRBuilder<> EB(&*Fn->getEntryBlock().getFirstInsertionPt());
+  BasicBlock &Entry = Fn->getEntryBlock();
+  IRBuilder<> EB(&Entry, Entry.getFirstInsertionPt());
   return EB.CreateAlloca(Ty, nullptr, Name);
 }
 
@@ -57,12 +58,16 @@ Value *LiftContext::readImmOp(const MCInst &MI, unsigned MIOpNo, Type *Ty) {
                 cast<IntegerType>(Ty)->getBitWidth());
 }
 
+Value *LiftContext::addrToPtr(Value *AddrI64) {
+  return B.CreateIntToPtr(AddrI64, ptrTy());
+}
+
 Value *LiftContext::memReadAddr(Value *AddrI64, Type *Ty) {
-  return B.CreateLoad(Ty, B.CreateIntToPtr(AddrI64, ptrTy()));
+  return B.CreateLoad(Ty, addrToPtr(AddrI64));
 }
 
 void LiftContext::memWriteAddr(Value *AddrI64, Value *V) {
-  B.CreateStore(V, B.CreateIntToPtr(AddrI64, ptrTy()));
+  B.CreateStore(V, addrToPtr(AddrI64));
 }
 
 Value *LiftContext::memRead(const MCInst &MI, unsigned MIOpNo, Type *Ty) {

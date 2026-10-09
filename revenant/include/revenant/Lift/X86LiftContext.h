@@ -44,29 +44,27 @@ public:
   Value *memAddr(const MCInst &MI, unsigned MIOpNo) override;
   Value *regRead(MCRegister Reg, Type *Ty) override;
   void regWrite(MCRegister Reg, Value *V) override;
-  Value *resolveVA(uint64_t VA) override;
-  Value *resolveVAI64(uint64_t VA) override;
   void jumpToVA(Value *Target) override;
   void condJump(Value *Pred, Value *Target) override;
   void callOp(const MCInst &MI, unsigned MIOpNo) override;
   void retOp() override;
 
   // ---- flags -------------------------------------------------------------
-  Value *flagRead(FlagId F);
-  void flagWrite(FlagId F, Value *I1);
+  virtual Value *flagRead(FlagId F);
+  virtual void flagWrite(FlagId F, Value *I1);
   /// Undef i32 standing in for the SDAG-level EFLAGS operand of flag nodes.
   Value *eflagsIn();
 
   // ---- flag-setting arithmetic (result value, flags as side effect) ------
-  Value *flagsAdd(Value *A, Value *B);
-  Value *flagsSub(Value *A, Value *B);
-  Value *flagsLogic(Value *R);          // and/or/xor/test: CF=OF=0, AF=undef
+  virtual Value *flagsAdd(Value *A, Value *B);
+  virtual Value *flagsSub(Value *A, Value *B);
+  virtual Value *flagsLogic(Value *R);  // and/or/xor/test: CF=OF=0, AF=undef
   Value *flagsAdc(Value *A, Value *B);  // A + B + CF
   Value *flagsSbb(Value *A, Value *B);  // A - B - CF
-  Value *flagsNeg(Value *A);            // 0 - A; CF = (A != 0)
-  Value *flagsInc(Value *A);            // add semantics, CF preserved
-  Value *flagsDec(Value *A);            // sub semantics, CF preserved
-  Value *flagsCmp(Value *A, Value *B);  // sub flags, discards result
+  virtual Value *flagsNeg(Value *A);    // 0 - A; CF = (A != 0)
+  virtual Value *flagsInc(Value *A);    // add semantics, CF preserved
+  virtual Value *flagsDec(Value *A);    // sub semantics, CF preserved
+  virtual Value *flagsCmp(Value *A, Value *B); // sub flags, discards result
   Value *flagsSMul(Value *A, Value *B); // low result; CF=OF=(high != sext)
   Value *flagsUMul(Value *A, Value *B); // low result; CF=OF=(high != 0)
 
@@ -79,7 +77,7 @@ public:
 
   // ---- condition codes -----------------------------------------------------
   /// i1 predicate from the current flags. CC is X86::CondCode (O=0..G=15).
-  Value *condPred(unsigned CC);
+  virtual Value *condPred(unsigned CC);
   /// condPred read from an operand carrying the immediate CondCode.
   Value *condPredOp(const MCInst &MI, unsigned MIOpNo);
   /// zext(condPred) to i8.
@@ -97,11 +95,11 @@ public:
   void retAdjOp(const MCInst &MI, unsigned AdjOpNo);
 
   // ---- stack ---------------------------------------------------------------
-  void pushVal(Value *V);            // rsp -= size; store V
-  Value *popVal(unsigned Width);     // load; rsp += size; yield value
+  virtual void pushVal(Value *V);        // rsp -= size; store V
+  virtual Value *popVal(unsigned Width); // load; rsp += size; yield value
   void pushFlagsVal();               // push packed rflags image (i16)
   void popFlagsVal();                // pop into flag slots
-  void leaveOp();                    // rsp = rbp; rbp = pop
+  virtual void leaveOp(); // rsp = rbp; rbp = pop
 
   // ---- moves / exchange ----------------------------------------------------
   void xchgOps(const MCInst &MI, unsigned AOp, unsigned BOp);
@@ -122,7 +120,7 @@ public:
   /// Write a reg/mem operand, zero-extending the value to the root register
   /// width instead of merging (VEX 128-bit write semantics).
   void writeOpZ(const MCInst &MI, unsigned MIOpNo, Value *V);
-  void regWriteZ(MCRegister Reg, Value *V);
+  virtual void regWriteZ(MCRegister Reg, Value *V);
 
   /// float/double/x86_fp80 by bit count for typed memory loads.
   Type *fltTy(unsigned Bits);
@@ -218,7 +216,7 @@ public:
   void x87Xchg(unsigned I);
 
 
-private:
+protected:
   enum RepKind { NoRep, Rep, RepE, RepNE };
 
   const MCInstrInfo &MCII;

@@ -21,10 +21,7 @@ const char *FlagNames[] = {"cf", "zf", "sf", "of", "pf", "af", "df"};
 X86LiftContext::X86LiftContext(LLVMContext &C, Module &M, Function &F,
                                const MCInstrInfo &MCII,
                                const MCRegisterInfo &TRI)
-    : LiftContext(C, M, F), MCII(MCII), TRI(TRI) {
-  for (int I = 0; I < NUM_FLAGS; ++I)
-    Flags[I] = regSlot(FlagNames[I], iN(1));
-}
+    : LiftContext(C, M, F), MCII(MCII), TRI(TRI) {}
 
 // ---- registers -------------------------------------------------------------
 
@@ -205,10 +202,14 @@ Value *X86LiftContext::memAddr(const MCInst &MI, unsigned MIOpNo) {
 // ---- flags -------------------------------------------------------------------
 
 Value *X86LiftContext::flagRead(FlagId F) {
+  if (!Flags[F])
+    Flags[F] = regSlot(FlagNames[F], iN(1));
   return B.CreateLoad(iN(1), Flags[F]);
 }
 
 void X86LiftContext::flagWrite(FlagId F, Value *I1) {
+  if (!Flags[F])
+    Flags[F] = regSlot(FlagNames[F], iN(1));
   B.CreateStore(B.CreateZExtOrTrunc(I1, iN(1)), Flags[F]);
 }
 
