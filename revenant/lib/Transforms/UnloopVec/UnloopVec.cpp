@@ -62,7 +62,6 @@
 #include "llvm/IR/IRBuilder.h"
 #include <algorithm>
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -971,7 +970,7 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 #define DEBUG_TYPE "unloopvec"
 #define ULV_BAIL()                                                           \
   do {                                                                       \
-    LLVM_DEBUG(::llvm::dbgs() << "unloopvec bail " << __LINE__ << " in "     \
+    LLVM_DEBUG(::llvm::dbgs() << "unloopvec bail " << __LINE__ << " in "      \
                               << F.getName() << "\n");                       \
   } while (0)
 
@@ -1696,28 +1695,157 @@ Value *broadcastScalar(Value *V) {
   return Insert->getOperand(1);
 }
 
+bool lowerUniformStoreUnroll(Function &F) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    ScalarLoopInfo Loop;
+    if (!matchScalarLoop(&BB, Loop))
+      continue;
+    auto *Step = dyn_cast<ConstantInt>(Loop.Step);
+    if (!Step || Step->isZero() || Step->getValue().getActiveBits() > 63)
+      continue;
+    uint64_t ByteStep = Step->getZExtValue();
+    PHINode *PtrPhi = nullptr;
+    GetElementPtrInst *PtrNext = nullptr;
+    for (PHINode &Phi : BB.phis()) {
+      if (!Phi.getType()->isPointerTy())
+        continue;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+        if (Phi.getIncomingBlock(I) != &BB)
+          continue;
+        auto *GEP = dyn_cast<GetElementPtrInst>(Phi.getIncomingValue(I));
+        if (!GEP || GEP->getPointerOperand() != &Phi)
+          continue;
+        APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+        if (!GEP->accumulateConstantOffset(DL, Offset) ||
+            Offset.getActiveBits() > 63 || Offset.getZExtValue() != ByteStep)
+          continue;
+        PtrPhi = &Phi;
+        PtrNext = GEP;
+        break;
+      }
+      if (PtrPhi)
+        break;
+    }
+    if (!PtrPhi)
+      continue;
+
+    SmallVector<std::pair<StoreInst *, int64_t>, 8> Stores;
+    Value *StoredValue = nullptr;
+    uint64_t ElemBytes = 0;
+    bool SafeBody = true;
+    for (Instruction &I : BB) {
+      if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        if (Store->isVolatile() || Store->isAtomic() ||
+            !Store->getValueOperand()->getType()->isSized()) {
+          SafeBody = false;
+          break;
+        }
+        TypeSize Size = DL.getTypeStoreSize(Store->getValueOperand()->getType());
+        if (Size.isScalable()) {
+          SafeBody = false;
+          break;
+        }
+        uint64_t EB = Size.getFixedValue();
+        if (!EB || (ElemBytes && ElemBytes != EB) ||
+            (StoredValue && StoredValue != Store->getValueOperand())) {
+          SafeBody = false;
+          break;
+        }
+        ElemBytes = EB;
+        StoredValue = Store->getValueOperand();
+        Value *Ptr = Store->getPointerOperand();
+        APInt Total(DL.getIndexTypeSizeInBits(PtrPhi->getType()), 0);
+        while (Ptr != PtrPhi) {
+          auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+          if (!GEP) {
+            SafeBody = false;
+            break;
+          }
+          APInt Part(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+          if (!GEP->accumulateConstantOffset(DL, Part) ||
+              Part.getBitWidth() != Total.getBitWidth()) {
+            SafeBody = false;
+            break;
+          }
+          Total += Part;
+          Ptr = GEP->getPointerOperand();
+        }
+        if (!SafeBody || Total.getActiveBits() > 63) {
+          SafeBody = false;
+          break;
+        }
+        Stores.push_back({Store, Total.getSExtValue()});
+        continue;
+      }
+      if (isa<PHINode>(&I) || isa<BranchInst>(&I) ||
+          isa<GetElementPtrInst>(&I) || isa<ICmpInst>(&I) ||
+          isa<CastInst>(&I))
+        continue;
+      auto *BO = dyn_cast<BinaryOperator>(&I);
+      if (!BO || BO->getOpcode() != Instruction::Add) {
+        SafeBody = false;
+        break;
+      }
+    }
+    if (!SafeBody || Stores.size() < 2 || !ElemBytes ||
+        ByteStep % ElemBytes || Stores.size() != ByteStep / ElemBytes)
+      continue;
+    std::sort(Stores.begin(), Stores.end(),
+              [](const auto &A, const auto &B) {
+                return A.second < B.second;
+              });
+    bool LanesMatch = true;
+    for (unsigned I = 0; I < Stores.size(); ++I)
+      if (Stores[I].second != static_cast<int64_t>(I * ElemBytes))
+        LanesMatch = false;
+    if (!LanesMatch)
+      continue;
+
+    auto *StepUpdate =
+        dyn_cast<BinaryOperator>(Loop.IV->getIncomingValueForBlock(&BB));
+    if (!StepUpdate)
+      continue;
+    unsigned StepOperand = StepUpdate->getOperand(0) == Step ? 0 : 1;
+    if (StepUpdate->getOperand(StepOperand) != Step)
+      continue;
+    for (unsigned I = 1; I < Stores.size(); ++I)
+      Stores[I].first->eraseFromParent();
+    StepUpdate->setOperand(
+        StepOperand,
+        ConstantInt::get(Step->getType(), ByteStep / Stores.size()));
+    APInt NextOffset(DL.getIndexTypeSizeInBits(PtrNext->getType()),
+                     ByteStep / Stores.size());
+    PtrNext->setOperand(
+        PtrNext->getNumOperands() - 1,
+        ConstantInt::get(F.getContext(), NextOffset));
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool scalarizeCountedWideMemory(Function &F) {
   SmallVector<StoreInst *, 8> Stores;
   SmallVector<std::pair<LoadInst *, StoreInst *>, 8> Copies;
   for (BasicBlock &BB : F) {
     auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!Br || !Br->isConditional() ||
-        (Br->getSuccessor(0) != &BB && Br->getSuccessor(1) != &BB))
-      continue;
     ScalarLoopInfo Loop;
-    if (!matchScalarLoop(&BB, Loop))
-      continue;
+    bool CountedLoop = Br && Br->isConditional() &&
+                       (Br->getSuccessor(0) == &BB ||
+                        Br->getSuccessor(1) == &BB) &&
+                       matchScalarLoop(&BB, Loop);
     for (Instruction &I : BB) {
       auto *Store = dyn_cast<StoreInst>(&I);
-      if (!Store)
-        continue;
-      if (Store->isVolatile() || Store->isAtomic())
+      if (!Store || Store->isVolatile() || Store->isAtomic())
         continue;
       if (isa<FixedVectorType>(Store->getValueOperand()->getType()) &&
           broadcastScalar(Store->getValueOperand())) {
         Stores.push_back(Store);
         continue;
       }
+      if (!CountedLoop)
+        continue;
       auto *Load = dyn_cast<LoadInst>(Store->getValueOperand());
       if (Load && Load->hasOneUse() &&
           Load->getType()->isIntegerTy(128) &&
@@ -1782,8 +1910,28 @@ bool scalarizeCountedWideMemory(Function &F) {
   return Changed;
 }
 
+bool eraseDeadValues(Function &F) {
+  bool Changed = false;
+  SmallVector<Instruction *, 16> Dead;
+  do {
+    Dead.clear();
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if ((isVectorTyped(I.getType()) || isa<GetElementPtrInst>(&I)) &&
+            I.use_empty() && !I.mayHaveSideEffects() &&
+            !I.getMetadata("revenant.opaque") &&
+            !I.getMetadata("revenant.region"))
+          Dead.push_back(&I);
+    for (Instruction *I : Dead)
+      I->eraseFromParent();
+    Changed |= !Dead.empty();
+  } while (!Dead.empty());
+  return Changed;
+}
+
 bool runOnFunction(Function &F) {
   bool Changed = scalarizeCountedWideMemory(F);
+  Changed |= lowerUniformStoreUnroll(F);
   SmallVector<Candidate, 4> Cands;
   // Collect-then-rewrite: matching never mutates.
   for (BasicBlock &BB : F) {
@@ -1961,6 +2109,8 @@ bool runOnFunction(Function &F) {
       BB->eraseFromParent();
     Changed = true;
   }
+  if (Changed)
+    Changed |= eraseDeadValues(F);
   return Changed;
 }
 
