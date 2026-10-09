@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Plain C multiplication stays multiplication in decompiler-form IR.
 define i32 @mulpow2(i32 %x) {
 entry:

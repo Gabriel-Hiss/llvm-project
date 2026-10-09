@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Source-level rotate shift/or shapes stay as plain arithmetic operations.
 define i32 @rotr32(i32 %x, i32 %c) {
 entry:

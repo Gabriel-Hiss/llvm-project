@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Real c-clang-o2 lift, corpus src/c/main.c:cmp_signed, VA 0x140001070.
 ; The subtraction flags reduce to the source-level signed compares/selects.
 define i32 @cmp_signed(i32 %a, i32 %b) {

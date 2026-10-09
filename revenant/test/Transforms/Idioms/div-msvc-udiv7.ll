@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; div7: MSVC udiv7 shape with (x-hi)/2+hi round-up fixup -> udiv 7.
 define i32 @div7(i32 %x) {
 entry:

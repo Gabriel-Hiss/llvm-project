@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; umin/umax: source-level unsigned compare/select forms remain visible.
 define i32 @uminmax(i32 %a, i32 %b) {
 entry:

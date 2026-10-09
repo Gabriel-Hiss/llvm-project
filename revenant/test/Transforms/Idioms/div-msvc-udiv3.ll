@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; div3: MSVC udiv3 shape (mul by magic, lshr 33, trunc) -> udiv 3.
 define i32 @div3(i32 %x) {
 entry:
