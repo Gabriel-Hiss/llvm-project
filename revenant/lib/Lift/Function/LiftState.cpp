@@ -189,8 +189,17 @@ bool lift::isHigh8(MCRegister R) {
 std::string lift::sanitizeName(StringRef Name) {
   std::string S;
   S.reserve(Name.size());
-  for (char C : Name)
-    S.push_back((isAlnum(C) || C == '_' || C == '.') ? C : '_');
+  for (char C : Name) {
+    if (isAlnum(C) || C == '_' || C == '.') {
+      S.push_back(C);
+    } else {
+      // Encode special chars as _XX hex to avoid collisions
+      // (e.g. operator== vs operator!= both become operator__).
+      char Buf[4];
+      snprintf(Buf, sizeof(Buf), "_%02x", (unsigned char)C);
+      S += Buf;
+    }
+  }
   if (S.empty())
     S = "f";
   return S;
