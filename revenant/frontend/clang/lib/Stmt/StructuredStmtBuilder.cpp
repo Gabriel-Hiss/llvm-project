@@ -494,10 +494,13 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     if (BI->isUnconditional()) {
       BasicBlock *S = BI->getSuccessor(0);
       if (Rgn && !Rgn->Degraded) {
-        // Rgn is the construct this block is emitted inside, so an edge
-        // to its follow is lexically within it: break is valid. Edges
-        // reaching an outer construct's exit stay gotos (membership does
-        // not prove lexical containment).
+        // A non-latch edge back to the header is a source-level continue;
+        // in a for-loop, Clang routes it through the emitted increment.
+        if (isLoopKind(Rgn->Kind) && S == Rgn->Header &&
+            BB != Rgn->Latch)
+          return new (*AST) ContinueStmt(SourceLocation());
+        // Edges reaching an outer construct's exit stay gotos (membership
+        // does not prove lexical containment).
         if ((isLoopKind(Rgn->Kind) || Rgn->Kind == RegionKind::Switch) &&
             S == Rgn->Follow)
           return new (*AST) BreakStmt(SourceLocation());
@@ -517,6 +520,9 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       if (Rgn && !Rgn->Degraded) {
         // Same rule as the unconditional edge: break only when the arm
         // exits the construct it is lexically emitted inside.
+        if (isLoopKind(Rgn->Kind) && S == Rgn->Header &&
+            BB != Rgn->Latch)
+          return new (*AST) ContinueStmt(SourceLocation());
         if ((isLoopKind(Rgn->Kind) || Rgn->Kind == RegionKind::Switch) &&
             S == Rgn->Follow)
           return new (*AST) BreakStmt(SourceLocation());

@@ -200,7 +200,8 @@ TEST(StructuredStmtBuilderTest, ForShape) {
   llvm::Value *Lv = B.CreateLoad(I32, I);
   B.CreateCondBr(B.CreateICmpSLT(Lv, N), Body, Exit);
   B.SetInsertPoint(Body);
-  B.CreateBr(Latch);
+  B.CreateCondBr(B.CreateICmpEQ(N, llvm::ConstantInt::get(I32, 0)), Head,
+                 Latch);
   B.SetInsertPoint(Latch);
   B.CreateStore(B.CreateAdd(B.CreateLoad(I32, I), llvm::ConstantInt::get(I32, 1)),
                 I);
@@ -211,6 +212,7 @@ TEST(StructuredStmtBuilderTest, ForShape) {
             {indexOf(*F, Head), indexOf(*F, Latch), indexOf(*F, Exit)});
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("for"), std::string::npos);
+  EXPECT_NE(S.find("continue"), std::string::npos);
 }
 
 TEST(StructuredStmtBuilderTest, Switch) {

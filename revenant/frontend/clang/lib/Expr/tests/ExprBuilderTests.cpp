@@ -283,10 +283,51 @@ TEST_F(ExprTest,icmpSignednessFromDI) {
   Exprs->beginFunction(*H.F, H.FD, Scope);
   llvm::IRBuilder<> B(H.BB);
   llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "cmp");
-  // Unsigned compare of signed-typed operands inserts casts.
-  clang::Expr *E = Exprs->value(Cmp, Scope);
-  std::string S = print(E);
-  EXPECT_TRUE(S.find("<") != std::string::npos);
+  std::string S = print(Exprs->value(Cmp, Scope));
+  EXPECT_NE(S.find("(unsigned int)a < (unsigned int)b"),
+            std::string::npos);
+}
+TEST_F(ExprTest, SignedArithmeticCastsUnsignedOperands) {
+  FuncHost H = makeFunc();
+  llvm::DIBuilder DIB(*M);
+  llvm::DIFile *File = DIB.createFile("signedness.c", "revenant");
+  DIB.createCompileUnit(llvm::dwarf::DW_LANG_C, File, "revenant", false, "",
+                        0);
+  llvm::DIType *U32 =
+      DIB.createBasicType("unsigned int", 32, llvm::dwarf::DW_ATE_unsigned);
+  llvm::DISubroutineType *SubTy =
+      DIB.createSubroutineType(DIB.getOrCreateTypeArray({U32, U32, U32}));
+  llvm::DISubprogram *SP =
+      DIB.createFunction(nullptr, "test", "test", File, 1, SubTy, 1,
+                         llvm::DINode::FlagZero,
+                         llvm::DISubprogram::SPFlagDefinition);
+  llvm::DILocalVariable *A =
+      DIB.createParameterVariable(SP, "a", 1, File, 1, U32, true);
+  llvm::DILocalVariable *B =
+      DIB.createParameterVariable(SP, "b", 2, File, 1, U32, true);
+  SP->replaceRetainedNodes(DIB.getOrCreateArray({A, B}));
+  H.F->setSubprogram(SP);
+  H.FD->getParamDecl(0)->setType(ACtx->UnsignedIntTy);
+  H.FD->getParamDecl(1)->setType(ACtx->UnsignedIntTy);
+  DIB.finalize();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> Builder(H.BB);
+  llvm::Value *Div = Builder.CreateSDiv(H.A, H.B, "div");
+  EXPECT_NE(print(Exprs->value(Div, Scope)).find("(int)a / (int)b"),
+            std::string::npos);
+  llvm::Value *Rem = Builder.CreateSRem(H.A, H.B, "rem");
+  EXPECT_NE(print(Exprs->value(Rem, Scope)).find("(int)a % (int)b"),
+            std::string::npos);
+  llvm::Value *Shift =
+      Builder.CreateAShr(H.A, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx),
+                                                     1),
+                         "shift");
+  EXPECT_NE(print(Exprs->value(Shift, Scope)).find("(int)a >>"),
+            std::string::npos);
+  llvm::Value *Cmp = Builder.CreateICmpSGE(H.A, H.B, "cmp");
+  EXPECT_NE(print(Exprs->value(Cmp, Scope)).find("(int)a >= (int)b"),
+            std::string::npos);
 }
 
 TEST_F(ExprTest, TruncIsCast) {

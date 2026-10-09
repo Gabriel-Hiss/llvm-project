@@ -196,7 +196,6 @@ Value *X86LiftContext::fmaAddSubOp(Value *A, Value *Bv, Value *C, unsigned W,
                                                    x86Intrinsic(Name));
   return toInt(B.CreateCall(Fn, {X, Y, Z}), W);
 }
-
 // ---- scalar compare ---------------------------------------------------------------
 
 Value *X86LiftContext::cmpScalar(bool IsSD, Value *Merge, Value *A,
