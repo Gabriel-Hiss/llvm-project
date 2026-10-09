@@ -6,8 +6,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Disasm/Disasm.h"
-
 #include "X86BaseInfo.h"
+
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
@@ -143,9 +143,44 @@ static std::optional<Instr> decodeAt(const MCDisassembler &Dis,
   return Out;
 }
 
+/// LLVM's X86 decoder exposes a few legacy prefix bytes as standalone
+/// MCInsts. Fold them into the following instruction so the reported
+/// address/size and Intel printer output match the encoded instruction.
+static std::optional<Instr>
+decodeWithPrefixes(const MCDisassembler &Dis, const MCInstrAnalysis &MIA,
+                   const MCInstrInfo &MII, const MCSubtargetInfo &STI,
+  std::optional<Instr> Prefix = decodeAt(Dis, MIA, MII, STI, Addr, Bytes);
+  if (!Prefix)
+    return std::nullopt;
+
+  unsigned Flag = 0;
+  StringRef Name = MII.getName(Prefix->Inst.getOpcode());
+  if (Name == "LOCK_PREFIX")
+    Flag = X86::IP_HAS_LOCK;
+  else if (Name == "REP_PREFIX")
+    Flag = X86::IP_HAS_REPEAT;
+  else if (Name == "REPNE_PREFIX")
+    Flag = X86::IP_HAS_REPEAT_NE;
+  else if (Name == "DATA16_PREFIX")
+    Flag = X86::IP_HAS_OP_SIZE;
+  else if (Name == "REX64_PREFIX")
+    Flag = X86::IP_USE_REX;
+  if (Flag == 0 || Prefix->Size >= Bytes.size())
+    return Prefix;
+
+  auto Body = decodeWithPrefixes(Dis, MIA, MII, STI,
+                                 Addr.wrappingAdd(Prefix->Size),
+                                 Bytes.drop_front(Prefix->Size));
+  if (!Body)
+    return Prefix;
+  Body->Addr = Addr;
+  Body->Size += Prefix->Size;
+  Body->Inst.setFlags(Body->Inst.getFlags() | Flag);
+  return Body;
+}
 std::optional<Instr> Disasm::decodeOne(Va Addr) const {
   ArrayRef<uint8_t> Bytes = Img->dataAt(Addr, 16);
-  return decodeAt(*Dis, *MIA, *MII, *STI, Addr, Bytes);
+  return decodeWithPrefixes(*Dis, *MIA, *MII, *STI, Addr, Bytes);
 }
 
 std::vector<Instr> Disasm::decodeRange(Va Start, Va End) const {
@@ -158,7 +193,7 @@ std::vector<Instr> Disasm::decodeRange(Va Start, Va End) const {
   size_t Off = 0;
   while (Off < Bytes.size() && Ip < End) {
     auto One =
-        decodeAt(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
+        decodeWithPrefixes(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
     if (!One)
       break;
     Off += One->Size;
@@ -175,7 +210,7 @@ std::vector<Instr> Disasm::decodeSlice(Va Addr,
   size_t Off = 0;
   while (Off < Bytes.size()) {
     auto One =
-        decodeAt(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
+        decodeWithPrefixes(*Dis, *MIA, *MII, *STI, Ip, Bytes.drop_front(Off));
     if (!One)
       break;
     Off += One->Size;
