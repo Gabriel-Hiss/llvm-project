@@ -13,6 +13,11 @@ by the driver, then compares recovered parameter counts with LLVM CodeView
 procedure and member-function records. It writes per-function results to CSV.
 Entries without a matching type record are left blank.
 
+When a static-library database is supplied, exact relocation-masked matches
+replace inferred names and prototypes. MSVC member prototypes include an
+explicit leading `this` pointer, matching the parameter counts stored in PDB
+member-function records.
+
 Varargs detection requires all four Win64 register-home spills plus evidence
 that a pointer to the home area is consumed through a `va_list`, such as an
 indirect read or use as a register or stack argument to a call. Ordinary

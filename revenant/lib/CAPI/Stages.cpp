@@ -17,6 +17,7 @@
 
 #include "revenant/Engine/Session.h"
 
+#include "revenant/Analysis/LibMatch.h"
 #include "revenant/Analysis/Signatures.h"
 #include "revenant/Clang/ClangFrontend.h"
 #include "revenant/Clang/ExprBuilder.h"
@@ -145,6 +146,8 @@ lift::Signature convertSig(const revenant::Signature &S) {
                              : lift::ParamLoc::reg(llvm::MCRegister(P.Loc.Reg));
     LP.Bits = P.Bits;
     LP.Float = P.Float;
+    if (!P.Name.empty())
+      LP.Name = P.Name;
     Out.Params.push_back(std::move(LP));
   }
   if (S.HasRet)
@@ -157,6 +160,9 @@ lift::Signature convertSig(const revenant::Signature &S) {
   case revenant::Signature::Source::Inferred:
     Out.Source = lift::SigSource::Inferred;
     break;
+  case revenant::Signature::Source::Library:
+    Out.Source = lift::SigSource::Library;
+    break;
   case revenant::Signature::Source::Default:
     Out.Source = lift::SigSource::Default;
     break;
@@ -164,9 +170,16 @@ lift::Signature convertSig(const revenant::Signature &S) {
   return Out;
 }
 
-std::shared_ptr<const lift::Signatures> recoverSignatures(const Program &Prog,
-                                                          const Disasm &Dis) {
+Expected<std::shared_ptr<const lift::Signatures>>
+recoverSignatures(Program &Prog, const Disasm &Dis, StringRef LibraryDBPath) {
   revenant::Signatures A = revenant::analyzeSignatures(Prog, Dis);
+  if (!LibraryDBPath.empty()) {
+    auto DB = LibraryDatabase::load(LibraryDBPath);
+    if (!DB)
+      return DB.takeError();
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DB);
+    applyLibraryMatches(Prog, A, Matches, *DB);
+  }
   auto Out = std::make_shared<lift::Signatures>();
   for (const auto &[At, S] : A.Funcs)
     Out->Funcs.emplace(At, convertSig(S));
@@ -176,7 +189,7 @@ std::shared_ptr<const lift::Signatures> recoverSignatures(const Program &Prog,
     Out->IndirectArgs.emplace(At, N);
   for (const auto &[At, N] : A.CallsiteArgs)
     Out->CallsiteArgs.emplace(At, N);
-  return Out;
+  return std::shared_ptr<const lift::Signatures>(std::move(Out));
 }
 
 //==--------------------------------------------------------------------==//
@@ -488,8 +501,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       break;
     // ---- signatures ------------------------------------------------------
     // Interprocedural over the whole program, so it runs once per session.
-    if (!Sigs)
-      Sigs = recoverSignatures(Prog, *Dis);
+    if (!Sigs) {
+      auto Recovered =
+          recoverSignatures(Prog, *Dis, Opts.LibraryDBPath);
+      if (!Recovered)
+        return Recovered.takeError();
+      Sigs = std::move(*Recovered);
+    }
     record(R.Stages, "sigs", "ok",
            formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
                    Sigs->Externs.size())

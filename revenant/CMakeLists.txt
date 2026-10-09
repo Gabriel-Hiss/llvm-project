@@ -108,6 +108,7 @@ set(REVENANT_AREA_DIRS
     tools/revenant-ir-verify
     tools/revenant-opt
     tools/revenant-sigs-check
+    tools/revenant-libdb
     tools/revenant-decompile
     unittests)
 foreach(dir ${REVENANT_AREA_DIRS})
