@@ -636,9 +636,11 @@ void readLSDA(const Image &I, FunctionEH &F, Va Data) {
             int64_t EntryOffset = -static_cast<int64_t>(*Filter) *
                                   ((Form == 0 || Form == 4) ? 8 : 4);
             Va TypeField(TypeTable + EntryOffset);
-            if (auto Type = encoded(I, TypeField, TypeEnc, F.Function))
+            if (auto Type = encoded(I, TypeField, TypeEnc, F.Function)) {
+              F.Handlers.back().TypeDescriptor = Va(*Type);
               if (auto Name = itaniumTypeName(I, Va(*Type)))
                 F.Handlers.back().TypeName = *Name;
+            }
           }
           if (!*Next) break;
           A = NextField.wrappingAdd(static_cast<uint64_t>(*Next));

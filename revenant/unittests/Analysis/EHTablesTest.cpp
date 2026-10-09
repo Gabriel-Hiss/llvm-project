@@ -185,6 +185,16 @@ TEST(EHTablesTest, DecodesExceptionMetadataFromCorpus) {
       ASSERT_EQ(Exceptions->Handlers[1].Continuations.size(), 1u);
       EXPECT_EQ(Exceptions->Handlers[1].Continuations[0], Va(0x14000320f));
     }
+    if (llvm::StringRef(Path) == REVENANT_TEST_CPP_GCC_O2) {
+      bool HasTypedItaniumCatch = false;
+      for (const FunctionEH &F : EH)
+        if (F.Model == EHModel::Itanium)
+          for (const EHHandler &H : F.Handlers)
+            HasTypedItaniumCatch |= H.Kind == HandlerKind::Catch &&
+                                    H.TypeDescriptor.has_value() &&
+                                    !H.TypeName.empty();
+      EXPECT_TRUE(HasTypedItaniumCatch);
+    }
     EXPECT_FALSE(EH.empty()) << Path;
     size_t WithContent = 0;
     for (const FunctionEH &F : EH) {
