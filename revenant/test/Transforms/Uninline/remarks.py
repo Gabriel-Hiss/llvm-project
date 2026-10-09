@@ -117,3 +117,65 @@ def verified_index(path, opt, corpus):
     validated.write_text(json.dumps(validation + [i for i in rejected
                           if i not in validation], indent=2) + '\n')
     return result, rejected
+
+
+def canon_value_names(line):
+    counter = [0]
+    mapping = {}
+
+    def renamed(match):
+        name = match.group(0)
+        if name not in mapping:
+            mapping[name] = "%v" + str(counter[0])
+            counter[0] += 1
+        return mapping[name]
+    return re.sub(r"%([0-9]+|\.not[0-9]*)", renamed, line)
+
+
+def canon_preds(line):
+    def sort_preds(match):
+        items = [p.strip() for p in match.group(1).split(",")]
+        return "; preds = " + ", ".join(sorted(items))
+    return re.sub(r"; preds = (.*)$", sort_preds, line)
+
+
+def canon_body_line(line):
+    line = re.sub(r", !dbg !\d+", "", line)
+    line = canon_preds(mask_ids(line))
+    return canon_value_names(line)
+
+
+def roundtrip_lines(text):
+    """Canonical body lines for re-inline round-trip comparison.
+
+    Beyond body_lines: drops !dbg attachments, sorts phi predecessor
+    comments, and renames numbered values by order of first appearance.
+    Re-running the optimizer renumbers values and reorders predecessor
+    lists without changing meaning; this comparison ignores exactly that.
+    """
+    return [canon_body_line(line) for line in text.splitlines()
+            if not line.startswith(("!", "attributes #", ";"))]
+
+
+def opcode_seq(text):
+    """Opcode + operand-kind sequence, ignoring value naming entirely.
+
+    Re-running the optimizer spots different CSE/GVN dedup opportunities,
+    so even order-of-appearance renaming diverges on shared names. This
+    abstracts every local name and callee symbol away while keeping
+    opcodes, types, constants and block structure: enough to tell
+    specialization (different folds) from faithful reproduction.
+    """
+    seq = []
+    for line in text.splitlines():
+        if line.startswith(("!", "attributes #", ";")) or not line.strip():
+            continue
+        head = line.split(";", 1)[0].rstrip()
+        head = re.sub(r", !dbg !\d+", "", head)
+        head = re.sub(r"^[\w.$-]+\s*:$", "BB:", head)
+        head = re.sub(r"%[\w.$-]+", "%v", head)
+        head = re.sub(r"@[\"-a-zA-Z$._0-9?]+", "@F", head)
+        head = re.sub(r"label %v", "label %B", head)
+        head = re.sub(r"!\d+", "!?", head)
+        seq.append(head.strip())
+    return seq
