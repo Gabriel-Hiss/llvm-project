@@ -15,6 +15,11 @@ add_llvm_library(RevenantTransformPipeline
   Passes
   Support
 
+  # Pass libs must build STATIC in the superbuild so revenant-opt links
+  # them statically. A pass that builds MODULE/SHARED (plugin DLL) puts
+  # the DLL path on the link line and lld-link rejects it; the fix is on
+  # the pass side (BUILD_SHARED_LIBS OFF / STATIC). This stanza only
+  # lists targets that exist at configure time.
   LINK_LIBS
   $<$<TARGET_EXISTS:RevenantTransformLane0>:RevenantTransformLane0>
   $<$<TARGET_EXISTS:RevenantTransformDevectorize>:RevenantTransformDevectorize>
@@ -27,4 +32,5 @@ add_llvm_library(RevenantTransformPipeline
   $<$<TARGET_EXISTS:RevenantTransformSsaOut>:RevenantTransformSsaOut>
   $<$<TARGET_EXISTS:RevenantTransformUnabi>:RevenantTransformUnabi>
   $<$<TARGET_EXISTS:RevenantTransformUnhoist>:RevenantTransformUnhoist>
+  $<$<TARGET_EXISTS:RevenantTransformUnloopVec>:RevenantTransformUnloopVec>
   )

@@ -58,6 +58,9 @@
 #if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
 #include "revenant/Transforms/Unhoist/Unhoist.h"
 #endif
+#if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
+#include "revenant/Transforms/UnloopVec/UnloopVec.h"
+#endif
 
 using namespace llvm;
 
@@ -128,6 +131,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
         if (Name == "revenant-unhoist") {
           FPM.addPass(UnhoistPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
+        if (Name == "revenant-unloopvec") {
+          FPM.addPass(UnloopVecPass());
           return true;
         }
 #endif

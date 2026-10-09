@@ -134,3 +134,9 @@ function signatures, snapshotting the function list first so erasure is safe.
 Runs explicitly via `-passes=revenant-unabi`, not in the default pipeline.
 Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
 22 parseable output.
+
+**revenant-unloopvec (owner: MuseDeoptVecLoops).** Expects devectorize output
+(or raw vectorizer skeletons). Collapses vector body + scalar remainder +
+runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
+leaving the CFG untouched when unsure. Runs explicitly, not in the default
+pipeline.

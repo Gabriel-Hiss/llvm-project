@@ -42,5 +42,8 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Unhoist/CMakeLists.txt)
   add_subdirectory(Unhoist)
 endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/UnloopVec/CMakeLists.txt)
+  add_subdirectory(UnloopVec)
+endif()
 
 add_subdirectory(Pipeline)
