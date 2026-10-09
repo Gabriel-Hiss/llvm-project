@@ -58,21 +58,82 @@ class RevenantLiftEmitter {
     return 64;
   }
 
+  /// MI operand index of the N-th input (`rv_op N`). An address group is one
+  /// input but five MI operands, so the index is not NumDefs + N.
+  static unsigned inputOperandNo(const CodeGenInstruction &I, unsigned N) {
+    unsigned K = I.Operands.NumDefs + N;
+    return K < I.Operands.size() ? I.Operands[K].MIOperandNo : K;
+  }
+
+  static const CGIOperandList::OperandInfo *
+  operandAt(const CodeGenInstruction &I, unsigned MIOpNo) {
+    for (unsigned K = 0, E = I.Operands.size(); K != E; ++K)
+      if (I.Operands[K].MIOperandNo == MIOpNo)
+        return &I.Operands[K];
+    return nullptr;
+  }
+
+  /// True for a five-operand x86 address group.
+  static bool isMemOperand(const CodeGenInstruction &I, unsigned MIOpNo) {
+    const auto *Op = operandAt(I, MIOpNo);
+    return Op && Op->MINumOperands == 5;
+  }
+
+  static bool isRegisterOperand(const CodeGenInstruction &I, unsigned MIOpNo) {
+    const auto *Op = operandAt(I, MIOpNo);
+    return Op && Op->Rec->isSubClassOf("RegisterClass");
+  }
+
+  /// MI operand index of logical operand `L`: the operands in order with
+  /// tied inputs merged into their defs, the iced-like view the DSL's
+  /// `$dst` and `$src` roles refer to.
+  static std::optional<unsigned> logicalOperandNo(const CodeGenInstruction &I,
+                                                  unsigned L) {
+    unsigned Seen = 0;
+    for (unsigned K = 0, E = I.Operands.size(); K != E; ++K) {
+      if (K >= I.Operands.NumDefs && I.Operands[K].getTiedRegister() != -1)
+        continue;
+      if (Seen++ == L)
+        return I.Operands[K].MIOperandNo;
+    }
+    return std::nullopt;
+  }
+
+  /// MI operand index for a DSL operand name. TableGen names differ per
+  /// form ($src1 vs $dst on RMW memory forms, $src vs $src1 on unary
+  /// ops), so a name the instruction does not declare resolves by role:
+  /// `$dst` is the first logical operand and `$src` the second.
   static std::optional<unsigned> operandNo(const CodeGenInstruction &I,
                                            StringRef Name) {
     if (Name.empty())
       return std::nullopt;
-    auto N = I.Operands.findOperandNamed(Name);
-    if (!N)
-      return std::nullopt;
-    return I.Operands[*N].MIOperandNo;
+    if (auto N = I.Operands.findOperandNamed(Name))
+      return I.Operands[*N].MIOperandNo;
+    if (auto Sub = I.Operands.findSubOperandAlias(Name)) {
+      const auto &[OpIdx, SubIdx] = *Sub;
+      return I.Operands[OpIdx].MIOperandNo + SubIdx;
+    }
+    if (Name == "dst")
+      return logicalOperandNo(I, 0);
+    if (Name == "src")
+      return logicalOperandNo(I, 1);
+    return std::nullopt;
   }
 
   static std::string operandValue(const CodeGenInstruction &I, StringRef Name,
                                   unsigned Width) {
     auto N = operandNo(I, Name);
-    if (!N)
+    if (!N) {
+      // Shift and double-shift counts for the rCL/mCL forms live in the
+      // implicit CL use, not in an operand.
+      if (Name == "src2" || Name == "src3" || Name == "cnt")
+        for (const Record *Use : I.ImplicitUses)
+          if (Use->getName() == "CL")
+            return (Twine("LC.regRead(X86::CL, LC.iN(") + Twine(Width) +
+                    "))")
+                .str();
       return {};
+    }
     return (Twine("LC.readOp(MI, ") + Twine(*N) +
             ", LC.iN(" + Twine(Width) + "))")
         .str();
@@ -137,7 +198,7 @@ class RevenantLiftEmitter {
     if (!N)
       return {};
     return (Twine("MI.getOperand(") +
-            Twine(Inst.Operands.NumDefs + N->getValue()) + ").getImm()")
+            Twine(inputOperandNo(Inst, N->getValue())) + ").getImm()")
         .str();
   }
 
@@ -404,19 +465,30 @@ class RevenantLiftEmitter {
       if (Name == "rv_bt" && D->getNumArgs() == 3) {
         const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
         auto BaseOp = operandNo(Inst, D->getArgNameStr(1));
+        auto OffOp = operandNo(Inst, D->getArgNameStr(2));
         std::string Base =
             expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
         std::string Off =
             expression(D->getArg(2), Inst, 64, D->getArgNameStr(2));
-        if (!Kind || !BaseOp || Base.empty() || Off.empty())
+        if (!Kind || !BaseOp || !OffOp || Base.empty() || Off.empty())
           return {};
+        // A register offset into a memory base addresses a bit string
+        // across elements and the helper stores the modified element
+        // itself. An immediate offset wraps inside the loaded operand and
+        // the caller writes the result back.
+        bool BitString = isMemOperand(Inst, *BaseOp) &&
+                         !isMemOperand(Inst, *OffOp) &&
+                         isRegisterOperand(Inst, *OffOp);
+        if (BitString)
+          Off = (Twine("LC.builder().CreateSExt(LC.readOp(MI, ") +
+                 Twine(*OffOp) + ", LC.iN(" + Twine(Width) + ")), LC.iN(64))")
+                    .str();
         return (Twine("LC.bitTestOp(\"") + Kind->getValue() + "\", " + Base +
-                ", " + Off +
-                ", LC.opKind(MI, " + Twine(*BaseOp) +
-                ") == LiftContext::OpKind::Mem, "
-                "(LC.opKind(MI, " + Twine(*BaseOp) +
-                ") == LiftContext::OpKind::Mem ? LC.memAddr(MI, " +
-                Twine(*BaseOp) + ") : nullptr), " + Twine(Width) + ")")
+                ", " + Off + ", " + (BitString ? "true" : "false") + ", " +
+                (BitString ? (Twine("LC.memAddr(MI, ") + Twine(*BaseOp) + ")")
+                                 .str()
+                           : std::string("nullptr")) +
+                ", " + Twine(Width) + ")")
             .str();
       }
       if (Name == "rv_flagread" && D->getNumArgs() == 1) {
@@ -476,7 +548,7 @@ class RevenantLiftEmitter {
           return {};
         unsigned Index = N->getValue();
         if (Name == "rv_op")
-          Index += Inst.Operands.NumDefs;
+          Index = inputOperandNo(Inst, Index);
         return (Twine("LC.readOp(MI, ") + Twine(Index) +
                 ", LC.iN(" + Twine(Width) + "))")
             .str();
@@ -725,6 +797,19 @@ class RevenantLiftEmitter {
   }
 
 
+  static StringRef firstNamedOperand(const TreePatternNode &N) {
+    if (N.hasName())
+      return N.getName();
+    if (N.isLeaf())
+      return {};
+    for (const TreePatternNode &Child : N.children()) {
+      StringRef Name = firstNamedOperand(Child);
+      if (!Name.empty())
+        return Name;
+    }
+    return {};
+  }
+
   static std::string treeExpression(const TreePatternNode &N,
                                     const CodeGenInstruction &Inst,
                                     unsigned Width) {
@@ -738,6 +823,15 @@ class RevenantLiftEmitter {
       return {};
     }
     StringRef Op = N.getOperator()->getName();
+    if (Op == "ld" || Op == "load") {
+      StringRef Name = firstNamedOperand(N);
+      auto OpNo = operandNo(Inst, Name);
+      return OpNo ? (Twine("LC.readOp(MI, ") + Twine(*OpNo) +
+                      ", LC.iN(" + Twine(Width) + "))")
+                         .str()
+                   : std::string();
+    }
+
     if (Op == "set" && N.getNumChildren() == 2)
       return treeExpression(N.getChild(1), Inst, Width);
     if (N.getNumChildren() != 2)
@@ -779,14 +873,28 @@ class RevenantLiftEmitter {
                                 unsigned Width) {
     const TreePatternNode &Dst = P.getDstPattern();
     if (Dst.isLeaf() || Dst.getOperator() != Inst.TheDef ||
-        hasNestedInst(Dst) || Inst.Operands.NumDefs != 1 ||
-        !Inst.ImplicitDefs.empty())
+        hasNestedInst(Dst) || !Inst.ImplicitDefs.empty())
       return {};
     const TreePatternNode &Src = P.getSrcPattern();
     const TreePatternNode *Expr = &Src;
     if (!Src.isLeaf() && Src.getOperator()->getName() == "set" &&
         Src.getNumChildren() == 2)
       Expr = &Src.getChild(1);
+    StringRef SrcOp =
+        Expr->isLeaf() ? StringRef() : Expr->getOperator()->getName();
+    if (SrcOp == "st" || SrcOp == "store" || SrcOp == "atomic_store") {
+      if (Inst.Operands.NumDefs != 0 || Expr->getNumChildren() != 2)
+        return {};
+      std::string Value = treeExpression(Expr->getChild(0), Inst, Width);
+      auto Mem = operandNo(Inst, firstNamedOperand(Expr->getChild(1)));
+      return Value.empty() || !Mem
+                 ? std::string()
+                 : (Twine("    LC.writeOp(MI, ") + Twine(*Mem) + ", " +
+                    Value + ");\n")
+                       .str();
+    }
+    if (Inst.Operands.NumDefs != 1)
+      return {};
     std::string Value = treeExpression(*Expr, Inst, Width);
     if (Value.empty())
       return {};
@@ -1073,6 +1181,20 @@ class RevenantLiftEmitter {
       auto Src = operandNo(Inst, Body.getArgNameStr(1));
       if (!Dst || !Src)
         return false;
+      if (isMemOperand(Inst, *Dst)) {
+        // The register receives the old memory value; with LOCK the add is
+        // one atomicrmw and the flags come from old + val.
+        OS << "    Value *XAddAddr = LC.memAddr(MI, " << *Dst << ");\n"
+           << "    Value *XAddVal = LC.readOp(MI, " << *Src << ", LC.iN("
+           << Width << "));\n"
+           << "    Value *XAddOld = LC.hasLock() ? LC.atomicRMW(\"add\", "
+              "XAddAddr, XAddVal) : LC.memReadAddr(XAddAddr, LC.iN("
+           << Width << "));\n"
+           << "    Value *XAddSum = LC.flagsAdd(XAddOld, XAddVal);\n"
+           << "    if (!LC.hasLock()) LC.memWriteAddr(XAddAddr, XAddSum);\n"
+           << "    LC.writeOp(MI, " << *Src << ", XAddOld);\n";
+        return true;
+      }
       OS << "    Value *XAddA = LC.readOp(MI, " << *Dst << ", LC.iN("
          << Width << "));\n"
          << "    Value *XAddB = LC.readOp(MI, " << *Src << ", LC.iN("
@@ -1157,14 +1279,10 @@ class RevenantLiftEmitter {
     }
     if (Name == "rv_frmw" && Body.getNumArgs() == 3) {
       const auto *OpName = dyn_cast<StringInit>(Body.getArg(0));
-      if (!OpName)
-        return false;
       auto Mem = operandNo(Inst, Body.getArgNameStr(1));
-      if (!Mem)
-        return false;
       std::string Src =
           expression(Body.getArg(2), Inst, Width, Body.getArgNameStr(2));
-      if (Src.empty())
+      if (!OpName || !Mem || Src.empty())
         return false;
       StringRef OpText = OpName->getValue();
       if (OpText == "neg") {
@@ -1298,6 +1416,54 @@ class RevenantLiftEmitter {
     return false;
   }
 
+  /// Every `MI, N` and `MI.getOperand(N)` in a generated body must name the
+  /// first MCInst operand of one of the instruction's operands, and the
+  /// memory accessors must name a five-operand address group. A DSL glob
+  /// written for the register form that also matches the memory form fails
+  /// this check; the case then falls back to a pattern or the opaque path
+  /// instead of reading a base register or scale as data.
+  static bool operandRefsValid(StringRef Code, const CodeGenInstruction &Inst) {
+    if (Inst.Operands.isVariadic)
+      return true;
+    auto Start = [&](unsigned N, bool NeedMem) {
+      for (unsigned I = 0, E = Inst.Operands.size(); I != E; ++I) {
+        const auto &Op = Inst.Operands[I];
+        if (Op.MIOperandNo == N)
+          return !NeedMem || Op.MINumOperands == 5;
+      }
+      return false;
+    };
+    auto Number = [&](size_t Pos, unsigned &N) {
+      size_t End = Pos;
+      while (End < Code.size() && isDigit(Code[End]))
+        ++End;
+      return End != Pos &&
+             !Code.substr(Pos, End - Pos).getAsInteger(10, N);
+    };
+    for (size_t Pos = Code.find("(MI, "); Pos != StringRef::npos;
+         Pos = Code.find("(MI, ", Pos + 1)) {
+      size_t NameEnd = Pos;
+      size_t NameBegin = NameEnd;
+      while (NameBegin > 0 &&
+             (isAlnum(Code[NameBegin - 1]) || Code[NameBegin - 1] == '_'))
+        --NameBegin;
+      StringRef Fn = Code.substr(NameBegin, NameEnd - NameBegin);
+      unsigned N;
+      if (!Number(Pos + 5, N))
+        continue;
+      bool NeedMem = Fn == "memRead" || Fn == "memWrite" || Fn == "memAddr";
+      if (!Start(N, NeedMem))
+        return false;
+    }
+    for (size_t Pos = Code.find("MI.getOperand("); Pos != StringRef::npos;
+         Pos = Code.find("MI.getOperand(", Pos + 1)) {
+      unsigned N;
+      if (Number(Pos + 14, N) && !Start(N, false))
+        return false;
+    }
+    return true;
+  }
+
   static bool globMatches(StringRef Pattern, StringRef Name) {
     size_t Star = Pattern.find('*');
     if (Star == StringRef::npos)
@@ -1340,7 +1506,7 @@ public:
       if (It == Instructions.end())
         continue;
       const CodeGenInstruction &Inst = *It->second;
-      if (!Inst.ImplicitDefs.empty() || Inst.Operands.NumDefs != 1)
+      if (!Inst.ImplicitDefs.empty())
         continue;
       std::string Body = patternBody(P, Inst, widthFor(*Insn));
       if (!Body.empty())
@@ -1358,6 +1524,8 @@ public:
           "  switch (MI.getOpcode()) {\n";
 
     std::set<const Record *> Emitted;
+    std::vector<std::string> Rejected;
+    std::vector<std::string> Failed;
     unsigned DSLCount = 0;
     unsigned PatternCount = 0;
 
@@ -1367,8 +1535,13 @@ public:
       const CodeGenInstruction &Inst = *Instructions[R];
       std::string Buffer;
       raw_string_ostream BodyOS(Buffer);
-      if (emitBody(BodyOS, *Body, Inst, widthFor(*R))) {
-        BodyOS.flush();
+      bool Emits = emitBody(BodyOS, *Body, Inst, widthFor(*R));
+      BodyOS.flush();
+      if (Emits && !operandRefsValid(Buffer, Inst)) {
+        Rejected.push_back(R->getName().str());
+        Emits = false;
+      }
+      if (Emits) {
         OS << "  case X86::" << R->getName() << ": {\n" << Buffer
            << "    return true;\n  }\n";
         Emitted.insert(R);
@@ -1376,8 +1549,10 @@ public:
         continue;
       }
       auto Pattern = PatternBodies.find(R);
-      if (Pattern == PatternBodies.end())
+      if (Pattern == PatternBodies.end()) {
+        Failed.push_back(R->getName().str());
         continue;
+      }
       OS << "  case X86::" << R->getName() << ": {\n" << Pattern->second
          << "    return true;\n  }\n";
       Emitted.insert(R);
@@ -1403,6 +1578,14 @@ public:
     OS << "// Lift coverage: " << Emitted.size() << "/" << Instructions.size()
        << " instructions handled, " << DSLCount << " DSL, " << PatternCount
        << " direct patterns, " << OpaqueCount << " opaque.\n";
+    OS << "// Rejected for operand references that miss an operand start: "
+       << Rejected.size() << "\n";
+    for (const std::string &Name : Rejected)
+      OS << "//   " << Name << "\n";
+    OS << "// DSL cases the emitter could not lower: " << Failed.size()
+       << "\n";
+    for (const std::string &Name : Failed)
+      OS << "//   " << Name << "\n";
 
 
     OS << "  default: return false;\n"

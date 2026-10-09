@@ -738,9 +738,17 @@ foreach I = [BT16rr, BT32rr, BT64rr,
     let Insn = I;
     dag Body = (rv_bt "bt", $src1, $src2);
   }
+// Memory base with a register offset is a bit string: bitTestOp stores the
+// modified element itself, so these forms are statements. Register bases and
+// memory bases with an imm8 wrap inside the operand and write it back.
+foreach I = [BTS16mr, BTS32mr, BTS64mr] in
+  def : RVLift { let Insn = I; dag Body = (rv_bt "bts", $src1, $src2); }
+foreach I = [BTR16mr, BTR32mr, BTR64mr] in
+  def : RVLift { let Insn = I; dag Body = (rv_bt "btr", $src1, $src2); }
+foreach I = [BTC16mr, BTC32mr, BTC64mr] in
+  def : RVLift { let Insn = I; dag Body = (rv_bt "btc", $src1, $src2); }
 foreach I = [BTS16rr, BTS32rr, BTS64rr,
              BTS16ri8, BTS32ri8, BTS64ri8,
-             BTS16mr, BTS32mr, BTS64mr,
              BTS16mi8, BTS32mi8, BTS64mi8] in
   def : RVLift {
     let Insn = I;
@@ -748,7 +756,6 @@ foreach I = [BTS16rr, BTS32rr, BTS64rr,
   }
 foreach I = [BTR16rr, BTR32rr, BTR64rr,
              BTR16ri8, BTR32ri8, BTR64ri8,
-             BTR16mr, BTR32mr, BTR64mr,
              BTR16mi8, BTR32mi8, BTR64mi8] in
   def : RVLift {
     let Insn = I;
@@ -756,7 +763,6 @@ foreach I = [BTR16rr, BTR32rr, BTR64rr,
   }
 foreach I = [BTC16rr, BTC32rr, BTC64rr,
              BTC16ri8, BTC32ri8, BTC64ri8,
-             BTC16mr, BTC32mr, BTC64mr,
              BTC16mi8, BTC32mi8, BTC64mi8] in
   def : RVLift {
     let Insn = I;
@@ -795,7 +801,7 @@ foreach I = [POPCNT16rr, POPCNT32rr, POPCNT64rr,
 foreach I = [BSWAP32r, BSWAP64r] in
   def : RVLift {
     let Insn = I;
-    dag Body = (rv_set (rv_out 0), (rv_bswap (rv_op 0)));
+    dag Body = (rv_set $dst, (rv_bswap $src));
   }
 
 // ---- exchange / cmpxchg (reg forms) -----------------------------------------------------
