@@ -78,6 +78,7 @@ set(REVENANT_AREA_DIRS
     tools/revenant
     tools/revenant-tblgen
     tools/revenant-ir-verify
+    tools/revenant-opt
     frontend/clang
     unittests)
 foreach(dir ${REVENANT_AREA_DIRS})
