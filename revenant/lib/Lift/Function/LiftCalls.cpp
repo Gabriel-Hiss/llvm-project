@@ -135,7 +135,7 @@ void LiftState::coerceArgs(llvm::Function *F,
 llvm::Value *LiftState::readCallerArg(int64_t Off) {
   // Incoming stack args live above entry rsp: frame offset Off counts from
   // entry rsp, and Sp0 sits at entry rsp inside the frame.
-  return B.CreateLoad(i64(), framePtrOff(Off), "sa");
+  return B.CreateAlignedLoad(i64(), framePtrOff(Off), llvm::Align(1), "sa");
 }
 
 void LiftState::emitCall(const Instr &I) {

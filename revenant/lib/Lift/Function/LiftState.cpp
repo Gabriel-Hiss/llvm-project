@@ -867,7 +867,7 @@ Value *LiftState::memRead(const Instr &I, unsigned L, unsigned Bits,
   if (M.Seg != X86::NoRegister)
     return UndefValue::get(Ty);
   Value *P = memPtr(I, L);
-  return B.CreateLoad(Ty, P, "m");
+  return B.CreateAlignedLoad(Ty, P, Align(1), "m");
 }
 
 void LiftState::memWrite(const Instr &I, unsigned L, Value *V) {
@@ -875,18 +875,18 @@ void LiftState::memWrite(const Instr &I, unsigned L, Value *V) {
   if (M.Seg != X86::NoRegister)
     return;
   Value *P = memPtr(I, L);
-  B.CreateStore(V, P);
+  B.CreateAlignedStore(V, P, Align(1));
 }
 
 void LiftState::pushVal(Value *V, const Instr &I) {
   // New rsp = old - 8 -> frame offset at delta+8.
   int64_t Off = -(Stack.deltaAt(I.Addr) + 8);
-  B.CreateStore(extTo(V, 64), framePtrOff(Off));
+  B.CreateAlignedStore(extTo(V, 64), framePtrOff(Off), Align(1));
 }
 
 Value *LiftState::popVal(const Instr &I) {
   int64_t Off = -Stack.deltaAt(I.Addr);
-  return B.CreateLoad(i64(), framePtrOff(Off), "pv");
+  return B.CreateAlignedLoad(i64(), framePtrOff(Off), Align(1), "pv");
 }
 
 void LiftState::emitDynAlloca(const Instr &I) {
@@ -1112,7 +1112,7 @@ Value *LiftState::evalCmpOperand(const CmpOperand &Loc, Va At) {
     Addr = B.CreateAdd(Addr, ci(Loc.Disp), "d");
     P = B.CreateIntToPtr(Addr, ptrTy(), "p");
   }
-  return B.CreateLoad(i64(), P, "sv");
+  return B.CreateAlignedLoad(i64(), P, Align(1), "sv");
 }
 
 void LiftState::clobberFlags() {

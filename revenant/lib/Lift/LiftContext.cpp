@@ -62,12 +62,14 @@ Value *LiftContext::addrToPtr(Value *AddrI64) {
   return B.CreateIntToPtr(AddrI64, ptrTy());
 }
 
+// Guest memory carries no alignment guarantee: x86 loads and stores are
+// legal at any address, so the IR must not claim the type's natural one.
 Value *LiftContext::memReadAddr(Value *AddrI64, Type *Ty) {
-  return B.CreateLoad(Ty, addrToPtr(AddrI64));
+  return B.CreateAlignedLoad(Ty, addrToPtr(AddrI64), Align(1));
 }
 
 void LiftContext::memWriteAddr(Value *AddrI64, Value *V) {
-  B.CreateStore(V, addrToPtr(AddrI64));
+  B.CreateAlignedStore(V, addrToPtr(AddrI64), Align(1));
 }
 
 Value *LiftContext::memRead(const MCInst &MI, unsigned MIOpNo, Type *Ty) {

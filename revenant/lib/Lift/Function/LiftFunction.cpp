@@ -381,7 +381,8 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
         break;
       llvm::Argument &A = *(Fn->arg_begin() + K++);
       if (Pm.Loc.IsStack) {
-        LS.B.CreateStore(&A, LS.framePtrOff(Pm.Loc.StackOff));
+        LS.B.CreateAlignedStore(&A, LS.framePtrOff(Pm.Loc.StackOff),
+                                llvm::Align(1));
       } else if (Pm.Float) {
         auto It = LS.Xmm.find(Pm.Loc.Reg == llvm::X86::XMM0   ? 0u
                               : Pm.Loc.Reg == llvm::X86::XMM1 ? 1u

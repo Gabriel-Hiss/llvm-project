@@ -149,7 +149,7 @@ def rv_xchg  : RVOp;  // (rv_xchg $a, $b): exchange; args may be rv_reg too
 def rv_xadd  : RVOp;  // (rv_xadd $dst, $src): full statement, both writes+flags
 def rv_mulpair : RVOp;  // (rv_mulpair "u|s", W, $src): rdx:rax = acc*src
 def rv_divpair : RVOp;  // (rv_divpair "u|s", W, $src)
-def rv_sextacc : RVOp;  // (rv_sextacc W): cbw=16,cwde=32,cdqe=64; cwd/cdq/cqo=+100
+def rv_sextacc : RVOp;  // (rv_sextacc W): cbw=16,cwde=32,cdqe=64; cwd/cdq/cqo=-16/-32/-64
 def rv_bt    : RVOp;  // (rv_bt "bt|bts|btr|btc", $base, $off)
 def rv_bsf   : RVOp;
 def rv_bsr   : RVOp;
@@ -487,6 +487,28 @@ foreach I = [ROR8r1, ROR16r1, ROR32r1, ROR64r1] in
     let Insn = I;
     dag Body = (rv_set $dst, (rv_fshift "ror", $src1, 1));
   }
+foreach I = [ROL8mi, ROL16mi, ROL32mi, ROL64mi,
+             ROL8mCL, ROL16mCL, ROL32mCL, ROL64mCL] in
+  def : RVLift {
+    let Insn = I;
+    dag Body = (rv_set $src1, (rv_fshift "rol", $src1, $src2));
+  }
+foreach I = [ROL8m1, ROL16m1, ROL32m1, ROL64m1] in
+  def : RVLift {
+    let Insn = I;
+    dag Body = (rv_set $src1, (rv_fshift "rol", $src1, 1));
+  }
+foreach I = [ROR8mi, ROR16mi, ROR32mi, ROR64mi,
+             ROR8mCL, ROR16mCL, ROR32mCL, ROR64mCL] in
+  def : RVLift {
+    let Insn = I;
+    dag Body = (rv_set $src1, (rv_fshift "ror", $src1, $src2));
+  }
+foreach I = [ROR8m1, ROR16m1, ROR32m1, ROR64m1] in
+  def : RVLift {
+    let Insn = I;
+    dag Body = (rv_set $src1, (rv_fshift "ror", $src1, 1));
+  }
 // RCL/RCR through carry: opaque until needed (rare in corpus).
 def : RVMatch { let Glob = "RCL*"; dag Body = (rv_opaque); }
 def : RVMatch { let Glob = "RCR*"; dag Body = (rv_opaque); }
@@ -720,13 +742,7 @@ foreach I = [IDIV32r, IDIV32m] in
   def : RVLift { let Insn = I; dag Body = (rv_divpair "s", 32, $src1); }
 foreach I = [IDIV64r, IDIV64m] in
   def : RVLift { let Insn = I; dag Body = (rv_divpair "s", 64, $src1); }
-// Accumulator extends.
-def : RVLift { let Insn = CBW;  dag Body = (rv_sextacc 16); }
-def : RVLift { let Insn = CWDE; dag Body = (rv_sextacc 32); }
-def : RVLift { let Insn = CDQE; dag Body = (rv_sextacc 64); }
-def : RVLift { let Insn = CWD;  dag Body = (rv_sextacc 116); }
-def : RVLift { let Insn = CDQ;  dag Body = (rv_sextacc 132); }
-def : RVLift { let Insn = CQO;  dag Body = (rv_sextacc 164); }
+// Accumulator extends (CBW/CWDE/CDQE/CWD/CDQ/CQO) live in System.td.
 
 // ---- bit ops ---------------------------------------------------------------------------
 
