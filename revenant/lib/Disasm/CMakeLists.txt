@@ -15,3 +15,8 @@ add_llvm_library(RevenantDisasm
 
   LINK_LIBS
   )
+
+target_include_directories(RevenantDisasm PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../llvm/lib/Target/X86"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../llvm/lib/Target/X86/MCTargetDesc"
+  "${LLVM_BINARY_DIR}/lib/Target/X86")
