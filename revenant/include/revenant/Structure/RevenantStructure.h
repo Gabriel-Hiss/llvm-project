@@ -27,6 +27,8 @@ namespace revenant {
 /// Result of structuring one function. Counts are informational; the
 /// annotations carry the real payload.
 struct StructureResult {
+  /// Irreducible edges still represented with a "goto" descriptor.
+  unsigned Gotos = 0;
   /// Irreducible edges or regions that could not be represented structurally.
   unsigned Irreducible = 0;
   /// True when recursion, depth, or visit limits force flat labels + goto;

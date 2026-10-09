@@ -224,6 +224,7 @@ private:
     for (BasicBlock &BB : F)
       if (Instruction *T = BB.getTerminator())
         T->setMetadata("revenant.region", nullptr);
+    Result.Gotos = 0;
     Result.Irreducible++;
   }
 
