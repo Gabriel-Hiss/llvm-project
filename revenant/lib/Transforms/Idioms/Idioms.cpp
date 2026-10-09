@@ -865,39 +865,42 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
             } else
               Leaves.push_back(V);
           }
-          unsigned W = I.getType()->getIntegerBitWidth();
-          if (Leaves.size() * 8 == W && (W == 16 || W == 32 || W == 64)) {
-            Value *Base = nullptr;
-            bool Ok = true;
-            for (Value *L : Leaves) {
-              Value *Shifted = L;
-              if (!match(L, m_And(m_Value(Shifted), m_ConstantInt())))
-                Shifted = L;
-              Value *SX = nullptr, *SAmt = nullptr;
-              if (match(Shifted, m_Shl(m_Value(SX), m_Value(SAmt))) ||
-                  match(Shifted, m_LShr(m_Value(SX), m_Value(SAmt)))) {
-                if (!Base)
-                  Base = SX;
-                else if (Base != SX)
+          if (auto *IntTy = dyn_cast<IntegerType>(I.getType())) {
+            unsigned W = IntTy->getBitWidth();
+            if (Leaves.size() * 8 == W &&
+                (W == 16 || W == 32 || W == 64)) {
+              Value *Base = nullptr;
+              bool Ok = true;
+              for (Value *L : Leaves) {
+                Value *Shifted = L;
+                if (!match(L, m_And(m_Value(Shifted), m_ConstantInt())))
+                  Shifted = L;
+                Value *SX = nullptr, *SAmt = nullptr;
+                if (match(Shifted, m_Shl(m_Value(SX), m_Value(SAmt))) ||
+                    match(Shifted, m_LShr(m_Value(SX), m_Value(SAmt)))) {
+                  if (!Base)
+                    Base = SX;
+                  else if (Base != SX)
+                    Ok = false;
+                } else {
                   Ok = false;
-              } else {
-                Ok = false;
-                break;
+                  break;
+                }
               }
-            }
-            if (Ok && Base) {
-              B.SetInsertPoint(BO);
-              Function *Bswap = Intrinsic::getOrInsertDeclaration(
-                  F.getParent(), Intrinsic::bswap, {I.getType()});
-              Value *Call = B.CreateCall(Bswap, {Base});
-              auto *CI = cast<Instruction>(Call);
-              copyProvenance(CI, BO);
-              CI->copyMetadata(*BO);
-              BO->replaceAllUsesWith(Call);
-              Call->takeName(BO);
-              BO->eraseFromParent();
-              LocalChanged = true;
-              continue;
+              if (Ok && Base) {
+                B.SetInsertPoint(BO);
+                Function *Bswap = Intrinsic::getOrInsertDeclaration(
+                    F.getParent(), Intrinsic::bswap, {I.getType()});
+                Value *Call = B.CreateCall(Bswap, {Base});
+                auto *CI = cast<Instruction>(Call);
+                copyProvenance(CI, BO);
+                CI->copyMetadata(*BO);
+                BO->replaceAllUsesWith(Call);
+                Call->takeName(BO);
+                BO->eraseFromParent();
+                LocalChanged = true;
+                continue;
+              }
             }
           }
         }

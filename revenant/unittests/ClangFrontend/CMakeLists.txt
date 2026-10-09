@@ -1,5 +1,6 @@
 revenant_add_unittest(RevenantUnitTests StructuredStmtBuilderTests
   StructuredStmtBuilderTest.cpp
+  TranslationUnitTest.cpp
   )
 
 target_link_libraries(StructuredStmtBuilderTests PRIVATE RevenantClangCore)
