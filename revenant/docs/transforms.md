@@ -33,6 +33,10 @@ pre-emission; they are not in the default text, pass them explicitly.
 | types (post) | `revenant-types` | type recovery, pre-emission |
 | ssaout (post) | `revenant-ssaout` | mem2reg/sroa undo, pre-frontend |
 
+When SSA-out creates a function's first `DISubprogram`, it also gives any
+call without `!dbg` a `DILocation`. The line uses the low 32 bits of
+`!revenant.va`, or 0 when the instruction has no VA metadata.
+
 ## Registration convention
 
 One library per transform, `RevenantTransform<Name>` under
