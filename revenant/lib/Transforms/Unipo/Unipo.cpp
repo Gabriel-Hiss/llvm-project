@@ -6,76 +6,15 @@
 // FunctionPassManager pass cannot erase safely mid-iteration (LLVM's own
 // ArgPromotion and DeadArgElim are module passes for the same reason).
 //
-// What the optimizer does to a function (read off clang ir-pre vs ir-post
-// pairs on the corpus; MSVC has no IR but shows the same binary shapes):
+// Structural.cpp proves general/specialized body equivalence on normalized
+// copies before redirecting calls. This file restores signature evidence:
+// dead return values, DI formal records, and unanimous extra ABI register
+// constants at lifted calls. Clone-only recovery keeps the stripped function
+// name and replaces scalar constant uses by the newly restored formal.
 //
-// 1. Return elimination (DeadArgElim on the return value). `errfile`
-//    (lua-clang-o1/lauxlib: i32 -> void), `pushmode` (lbaselib: i32 ->
-//    void), `luaK_codek` (lcode: i32 -> void), `g_iofile` (liolib: i32 ->
-//    void), `TIXML_SNPRINTF` (tinyxml2-*: i32 -> void, vararg),
-//    `xml_buffered_writer::flush` (pugi-clang-oz: i64 -> void),
-//    `xpath_parser::error_oom` (pugi-clang-oz: ptr -> void): the body
-//    ends `ret i32 C` / `ret i64 0` / `ret ptr P` with C/P dead at every
-//    caller, so the optimizer deletes the value and returns void.
-//    The lifted binary still computes the value (the CPU really moves it
-//    into eax/rax), so the undo is to put the computed value back on the
-//    return: every `ret void` becomes `ret <ty> <dead value>` and the
-//    signature returns `<ty>`.
-//
-// 2. Dead argument removal (DeadArgElim on parameters).
-//    `md_free_attribute` (md4c-*: (ptr, ptr) -> (ptr)),
-//    `findfile` (lua-clang-o1/loadlib: 4 -> 3), `dot4`/`vec_ops`
-//    (rust-o3: fully specialized to () with the constant folded in).
-//    On lifted IR the dropped parameter slot is observable only when the
-//    callee kept a trace: the pre-specialization value survives either
-//    as a `ret <ty> C` constant (then rule 1 restores the data flow and
-//    rule 3 rebinds it as an argument) or as `llvm.dbg.value(ptr
-//    poison)` / DISubprogram formal-parameter records pointing at a
-//    missing formal (then the parameter is re-added with `poison` at
-//    the call sites, which refines to the constant where known).
-//
-// 3. IPSCCP / function-specialization clones. GCC emits
-//    `f.constprop.N` / `f.isra.N` symbols (see the gcc-*.map link maps:
-//    `_S_construct...isra.0`, `pool...constprop.0`); LLVM's
-//    FunctionSpecialization pass emits `f.specialized.N`, LTO emits
-//    `f.lto_priv` / `f.llvm.N`. The clone is the base function with one
-//    formal replaced by a constant at every call site. The undo folds
-//    the clone back: rename `base.suffix` to `base` when `base` is
-//    absent, re-add the missing formal (typed from the constant), pass
-//    the constant at each call site, and replace the in-body constant
-//    uses with the formal.
-//
-// 4. Argument promotion (by-value struct split into scalars). The
-//    `parse_function` shape (pugi: a struct formal exploded into
-//    ptr/ptr/i64/ptr/ptr) is detected when consecutive scalar formals
-//    reconstruct one pointer load each from a common base at entry; the
-//    undo reintroduces the pointer formal and materializes the loads.
-//    (Not yet implemented: no corpus pair isolates a pure promotion
-//    without interleaved scalarrepl, so the detector would fire on
-//    hand-written scalar code. Tracked below.)
-//
-// Trust model: every rewrite is semantics-preserving on its own, with
-// no annotation to trust:
-//
-// - Return restore: the restored value is the body's own dead value,
-//   so callers observing it see exactly what the binary computes. When
-//   the value differs per return block, or any return already carries
-//   a value, the function is left alone.
-// - Dead-arg re-add: the new formal is unused in the body, and call
-//   sites pass `poison` (or the clone's proven constant), so the
-//   program means the same by construction. `musttail`/`callbr`/
-//   indirect calls, intrinsics, opaque stubs, and sret/byval forms
-//   bail the function out, as in revenant-unabi.
-// - Clone fold-back: renaming a clone to an absent base name and
-//   threading the constant through is an alpha-rename plus constant
-//   propagation, both equivalences; when the base name is present the
-//   clone is left alone (merging two live definitions is the
-//   inliner's job, revenant-uninline).
-//
-// Provenance: every created instruction copies !revenant.va from the
-// instruction it replaces; !revenant.opaque is never created, moved, or
-// dropped (functions calling opaque stubs bail); debug locations ride
-// along the same way. Output stays parseable by LLVM 22.
+// Named suffix recovery is retained for modules that have actual symbols,
+// but structural detection and ABI restoration never consult oracle names.
+// Calls copied during signature changes retain instruction metadata and VAs.
 //
 //===----------------------------------------------------------------------===//
 
@@ -287,21 +226,25 @@ bool stripCloneSuffix(StringRef Name, StringRef &Base) {
   return false;
 }
 
-// Replace every non-return use of the restored constant with the new
-// formal: the constprop clone had folded the parameter into the body.
+// Rebind only operands that permit runtime values. Switch cases, struct GEP
+// indices, intrinsic immargs and other constant-only operands stay constant.
 void rebindConstantToArg(Function &NewF, Constant *C, Argument *A) {
   if (!C || !A || C->getType() != A->getType())
     return;
-  SmallVector<User *, 8> Uses;
-  for (User *U : C->users()) {
-    if (auto *I = dyn_cast<Instruction>(U)) {
-      if (I->getParent() && I->getParent()->getParent() == &NewF &&
-          !isa<ReturnInst>(I))
-        Uses.push_back(U);
+  for (BasicBlock &BB : NewF)
+    for (Instruction &I : BB) {
+      if (!isa<BinaryOperator>(I) && !isa<CmpInst>(I) &&
+          !isa<SelectInst>(I) && !isa<CastInst>(I) && !isa<PHINode>(I) &&
+          !isa<ReturnInst>(I) && !isa<FreezeInst>(I))
+        continue;
+      for (unsigned N = 0; N < I.getNumOperands(); ++N) {
+        auto *Old = dyn_cast<ConstantInt>(I.getOperand(N));
+        auto *Value = dyn_cast<ConstantInt>(C);
+        if (Old && Value && Old->getType() == Value->getType() &&
+            Old->getValue() == Value->getValue())
+          I.setOperand(N, A);
+      }
     }
-  }
-  for (User *U : Uses)
-    U->replaceUsesOfWith(C, A);
 }
 
 // Core signature rewrite: build NewF with NewRet/NewParams, splice the
@@ -465,6 +408,8 @@ bool rewriteSignature(Module &M, Function &F, Type *NewRet,
         NI->setName(II->getName());
       NewCB = NI;
     }
+    if (CB->getType() == NewCB->getType())
+      NewCB->setAttributes(CB->getAttributes());
     copyVA(CB, NewCB);
     if (CB->getDebugLoc())
       NewCB->setDebugLoc(CB->getDebugLoc());
@@ -631,8 +576,71 @@ bool tryFoldClone(Module &M, Function &F) {
                           Base);
 }
 
+// Read a locally reaching Win64 ABI register constant. Calls and unknown
+// writes are barriers; no predecessor guessing or stale register inference.
+Constant *extraRegisterConstant(CallInst &Call, StringRef Register) {
+  for (auto It = Call.getIterator(); It != Call.getParent()->begin();) {
+    Instruction &I = *--It;
+    if (isa<CallBase>(I))
+      return nullptr;
+    if (auto *S = dyn_cast<StoreInst>(&I)) {
+      auto *Slot = dyn_cast<AllocaInst>(S->getPointerOperand());
+      if (!Slot)
+        return nullptr;
+      if (Slot->getName() != Register)
+        continue;
+      if (S->isVolatile() || S->isAtomic())
+        return nullptr;
+      auto *C = dyn_cast<ConstantInt>(S->getValueOperand());
+      return C && C->getType()->isIntegerTy(64) ? C : nullptr;
+    }
+    if (I.mayWriteToMemory())
+      return nullptr;
+  }
+  return nullptr;
+}
+
+bool restoreABIExtra(Module &M, Function &F) {
+  static const char *Registers[] = {"rcx", "rdx", "r8", "r9"};
+  if (!M.getTargetTriple().isOSWindows() ||
+      !M.getTargetTriple().isArch64Bit() || F.isVarArg() ||
+      F.arg_size() >= 4 || F.use_empty() || hasBadCallSite(F) ||
+      F.hasDLLExportStorageClass())
+    return false;
+  Constant *Common = nullptr;
+  for (User *U : F.users()) {
+    auto *Call = dyn_cast<CallInst>(U);
+    if (!Call || Call->hasOperandBundles())
+      return false;
+    Constant *C = extraRegisterConstant(*Call, Registers[F.arg_size()]);
+    if (!C || (Common && Common != C))
+      return false;
+    Common = C;
+  }
+  SmallVector<Type *, 8> Params;
+  SmallVector<int64_t, 8> Forward;
+  for (Argument &A : F.args()) {
+    Params.push_back(A.getType());
+    Forward.push_back(A.getArgNo());
+  }
+  Params.push_back(Common->getType());
+  Forward.push_back(-1);
+  // All known callers supply Common, so replacing scalar occurrences by the
+  // added formal is equivalent even when no general definition survived IPO.
+  // This proves the restored call behavior, not the original source signature.
+  return rewriteSignature(M, F, F.getReturnType(), Params, Forward,
+                          Common, F.arg_size(), "");
+}
+
 bool runOnModule(Module &M) {
   bool Changed = revenant::foldStructuralIPO(M);
+  SmallVector<std::string, 16> Names;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Names.push_back(F.getName().str());
+  for (const std::string &Name : Names)
+    while (restoreABIExtra(M, *M.getFunction(Name)))
+      Changed = true;
   SmallVector<Function *, 16> Work;
   for (Function &F : M) {
     if (F.isDeclaration() || F.isIntrinsic())
