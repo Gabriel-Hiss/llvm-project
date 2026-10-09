@@ -93,14 +93,11 @@ int main(int argc, char **argv) {
 
   // 4. Register the vtable global (Core's job in production), then slot 0
   // must dispatch to the method named by the vtable initializer.
-  // Downcast: RealTypeBuilder exposes addVTable; reach it via the known
-  // factory type through a local dynamic_cast on the interface.
-  // Register the vtable global the way Core will: match the
-  // ??_7Klass@@6B@ MSVC vtable spelling to its class.
+  // This smoke target links the concrete TypeBuilder factory, so the
+  // downcast is static. RTTI is disabled for LLVM builds.
   if (auto *VTB = dyn_cast<GlobalVariable>(
           M->getNamedValue("??_7Klass@@6B@"))) {
-    if (auto *R = dynamic_cast<RealTypeBuilder *>(Types.get()))
-      R->addVTable("Klass", VTB);
+    static_cast<RealTypeBuilder *>(Types.get())->addVTable("Klass", VTB);
   }
   const DISubprogram *Slot0 = Types->virtualMethod(Klass, 0);
   outs() << "slot0: " << (Slot0 ? Slot0->getName() : StringRef("<unknown>"))
