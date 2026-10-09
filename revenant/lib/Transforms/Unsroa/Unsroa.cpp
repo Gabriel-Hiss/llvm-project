@@ -1536,17 +1536,18 @@ bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
         return false;
       };
       for (size_t Start = 0; Start < Fields.size();) {
-        size_t End = Start + 1;
-        while (End < Fields.size() &&
-               Fields[End].Off - (Fields[End - 1].Off +
-                                   Fields[End - 1].Width) <= 16)
-          ++End;
-        if (End - Start > BestEnd - BestStart &&
-            ConfirmsRun(Start, End)) {
-          BestStart = Start;
-          BestEnd = End;
-        }
-        Start = End;
+        size_t GroupEnd = Start + 1;
+        while (GroupEnd < Fields.size() &&
+               Fields[GroupEnd].Off - (Fields[GroupEnd - 1].Off +
+                                       Fields[GroupEnd - 1].Width) <= 16)
+          ++GroupEnd;
+        for (size_t End = Start + 1; End <= GroupEnd; ++End)
+          if (End - Start > BestEnd - BestStart &&
+              ConfirmsRun(Start, End)) {
+            BestStart = Start;
+            BestEnd = End;
+          }
+        Start = GroupEnd;
       }
       if (BestEnd == BestStart)
         continue;
