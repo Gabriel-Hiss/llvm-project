@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shape from lifted c-gcc-o2 `copy_vec`/`add_vec` (VA 0x140001D00/0x140001D60):
 ; one i64 IV counts bytes, addresses both arrays through `getelementptr i8`,
