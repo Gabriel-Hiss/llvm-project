@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/Pipeline/Pipeline.h"
+#include "revenant/Transforms/LiftNormalize/LiftNormalize.h"
 
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -103,6 +104,10 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, FunctionPassManager &FPM,
          ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "revenant-lift-normalize") {
+          FPM.addPass(LiftNormalizePass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
         if (Name == "revenant-devectorize") {
           FPM.addPass(DevectorizePass());
@@ -230,6 +235,10 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, ModulePassManager &MPM,
          ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "revenant-lift-abi") {
+          MPM.addPass(LiftABIPass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());
