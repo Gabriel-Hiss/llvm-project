@@ -35,15 +35,41 @@ rolled back. Function-pass adaptors still retain per-function isolation.
 
 ```text
 revenant-decompile <pe> [--func <va|name>]... [--lang c|cpp|rust]
+                        [--meta none|embedded|pdb]
                         [--emit asm|ir-raw|ir-clean|ir-final|source]
                         [-o <base>] [--patterns] [--list] [--time]
 ```
+
+
+`--meta` defaults to `embedded`. `none` keeps imported symbols for linking
+and uses generic names for functions and data. `pdb` is accepted but reports
+`not implemented yet`.
+`embedded` keeps exports, retained COFF symbols and RTTI names. It attaches
+source locations, panic messages, EH catch types, assertion/file/function
+strings, and RTTI class/vtable data to IR as `!rev.source`, `!rev.panic`,
+`!rev.eh.types`, `!rev.class`, `!rev.strings`, and `!rev.types`. `none` drops
+those records and referenced strings while preserving import names.
+
 
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
 (only the stages that ran). `--time` prints the elapsed time of each stage.
 Without `--func` every discovered function is decompiled; a Windows command
 line holds a few hundred `--func` arguments, so chunk large sets.
+
+`test/meta-mode/invariant.py` compares normalized final IR for `c-o2`,
+`cpp-o2`, `rust-o2` and `cpp-gcc-o2` in `none` and `embedded` modes. It keeps
+instructions and terminators intact while neutralizing identifiers and
+debug metadata.
+
+`test/meta-mode/recovery-report.py` compares names from `--list` with oracle
+symbols. It needs `--pdbutil` for the C and C++ PDBs; Rust and GCC names come
+from their link maps. Oracle files are read only after the decompiler runs.
+
+```text
+python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity>
+python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe>
+```
 
 ## Rust path
 

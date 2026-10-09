@@ -53,6 +53,9 @@ struct StageReport {
 };
 
 
+/// Metadata policy for a decompile session.
+enum class MetaMode { None, Embedded, Pdb };
+
 /// Which representation --emit / the API asks for.
 enum class EmitKind { Source, Asm, IrRaw, IrClean, IrFinal };
 
@@ -104,6 +107,10 @@ public:
 
   /// All known symbol names (imports, exports, function names).
   const std::vector<std::string> &symbolNames() const { return SymNames; }
+  /// Apply a presentation metadata policy after discovery. None retains
+  /// imported symbols for linking and restores generic names elsewhere.
+  void setMetaMode(MetaMode Mode);
+
 
   /// Resolve `va` to a display name: externs, then the name table, then
   /// `sub_<hex>` for function starts.
