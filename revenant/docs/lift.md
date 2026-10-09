@@ -13,3 +13,25 @@ cmake --build build-rv --target revenant-lift-test -j4
 ```
 
 The test creates IR instructions before and after changing the VA, then clears it and checks `!revenant.va` metadata.
+
+## Exception handling
+
+The PE EH decoder associates MSVC FuncInfo3/4, SEH scope-table, and Itanium
+LSDA data with the owning runtime-function record. MSVC try ranges come from
+contiguous IP-to-state runs, not the full function extent.
+
+During lifting, throwing calls in a decoded try range become invokes with
+native LLVM EH pads. Out-of-line handler functions are associated through
+their owning `Program` code ranges, lifted with the MSVC frame pointer in
+`rdx`, and inlined into catch or cleanup pads. A catch funclet's constant
+`rax` continuation selects the parent block when the lifted body exposes one.
+The Clang frontend turns the native pads into C++ try/catch or SEH constructs.
+Invokes from the same decoded try-table region carry a shared
+`!revenant.eh.region` ID. The Clang frontend groups them into one source
+`try` statement with a shared handler set.
+
+For Itanium LSDA call sites, positive action filters retain their RTTI
+descriptor and decoded type name. Lifting emits those descriptors as landingpad
+catch clauses and consumes matched exceptions with the `__cxa_begin_catch` /
+`__cxa_end_catch` sequence; the C++ frontend uses the recovered Itanium type
+name when spelling the catch declaration.

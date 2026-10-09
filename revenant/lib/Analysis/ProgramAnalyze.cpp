@@ -11,6 +11,9 @@
 #include "llvm/Support/Error.h"
 
 #include <algorithm>
+#include <iterator>
+#include <optional>
+#include <tuple>
 #include <map>
 #include <set>
 #include <string>
@@ -33,19 +36,6 @@ std::optional<Va> pdataPrimary(const PdataMap &Pdata, Va Address) {
                                      : std::nullopt;
 }
 
-std::vector<Range> mergeRanges(std::vector<Range> Ranges) {
-  llvm::sort(Ranges);
-  std::vector<Range> Out;
-  Out.reserve(Ranges.size());
-  for (const Range &R : Ranges) {
-    if (!Out.empty() && R.first <= Out.back().second)
-      Out.back().second = std::max(Out.back().second, R.second);
-    else
-      Out.push_back(R);
-  }
-  return Out;
-}
-
 void addClaim(std::map<Va, Va> &Claims, Va Start, Va End) {
   auto It = Claims.lower_bound(Start);
   if (It != Claims.begin()) {
@@ -63,6 +53,14 @@ void addClaim(std::map<Va, Va> &Claims, Va Start, Va End) {
   Claims.emplace(Start, End);
 }
 
+bool claimedAt(const std::map<Va, Va> &Claims, Va V) {
+  auto It = Claims.upper_bound(V);
+  if (It == Claims.begin())
+    return false;
+  --It;
+  return V < It->second;
+}
+
 bool claimsOverlap(const std::map<Va, Va> &Claims, const Range &R) {
   auto It = Claims.lower_bound(R.first);
   if (It != Claims.begin()) {
@@ -71,14 +69,6 @@ bool claimsOverlap(const std::map<Va, Va> &Claims, const Range &R) {
       return true;
   }
   return It != Claims.end() && It->first < R.second;
-}
-
-std::vector<Range> claimVector(const std::map<Va, Va> &Claims) {
-  std::vector<Range> Out;
-  Out.reserve(Claims.size());
-  for (const auto &R : Claims)
-    Out.push_back(R);
-  return Out;
 }
 
 std::string defaultName(Va Start) {
@@ -112,6 +102,8 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
   P.Names = std::make_shared<std::map<Va, std::string>>();
   P.Externs = std::make_shared<std::map<Va, Extern>>();
   P.Strings = std::make_shared<std::map<Va, std::string>>();
+  P.GuardCFCheckPtr = Pe.GuardCFCheckPtr;
+  P.GuardCFDispatchPtr = Pe.GuardCFDispatchPtr;
   if (!P.Img)
     return P;
 
@@ -176,6 +168,7 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
   // accepted. The sorted worklist makes output independent of thread order.
   while (!Worklist.empty()) {
     std::vector<Va> Calls;
+    std::vector<Va> RipBatch;
     for (Va Start : Worklist) {
       if (!P.Img->isExecutable(Start))
         continue;
@@ -190,8 +183,10 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
                    Result.F.CallTargets.end());
       Weak.insert(Result.LeaTargets.begin(), Result.LeaTargets.end());
       Weak.insert(Result.ForeignTargets.begin(), Result.ForeignTargets.end());
-      SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
+      RipBatch.insert(RipBatch.end(), Result.RipRefs.begin(),
+                      Result.RipRefs.end());
     }
+    SharedRipRefs.insert(RipBatch.begin(), RipBatch.end());
     Worklist.clear();
     for (Va Seed : Seeds)
       enqueueStrong(Seed, Starts, Worklist);
@@ -199,254 +194,388 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
       enqueueStrong(Call, Starts, Worklist);
   }
 
+  // ---- full descent, weak candidates, orphan sweep ------------------------
+  // Mirrors the `analyze_with` iteration in crates/analysis/src/lib.rs:
+  // strong starts build first, weak candidates (relocation targets, lea and
+  // foreign edge targets) are accepted only into unclaimed bytes, the orphan
+  // sweep runs once, and call targets found along the way promote to strong
+  // starts for the next round.
+  std::set<Va> StrongStarts = Starts;
   std::map<Va, Function> Built;
-  for (unsigned Iteration = 0; Iteration < 8; ++Iteration) {
-    Built.clear();
-    std::vector<Va> Calls;
-    for (Va Start : Starts) {
-      analysis_detail::BuildResult Result = analysis_detail::buildFunction(
-          *P.Img, Dis, Hooks, Start, Starts, Pdata, Groups, SharedRipRefs,
-          IsNoreturn);
-      setFunctionName(Result.F, *P.Names);
-      Calls.insert(Calls.end(), Result.F.CallTargets.begin(),
-                   Result.F.CallTargets.end());
-      Weak.insert(Result.LeaTargets.begin(), Result.LeaTargets.end());
-      Weak.insert(Result.ForeignTargets.begin(), Result.ForeignTargets.end());
-      SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
-      Built.insert_or_assign(Start, std::move(Result.F));
-    }
-    std::vector<Va> NewStarts;
-    for (Va Call : Calls)
-      enqueueStrong(Call, Starts, NewStarts);
-    if (NewStarts.empty() || Iteration == 7)
-      break;
-  }
+  std::set<Va> Processed;
+  bool OrphanDone = false;
+  std::vector<Function> Functions;
+  constexpr size_t BatchSize = 64;
 
-  std::set<Va> Pending = std::move(Weak);
-  std::set<Va> AcceptedWeak;
-  std::set<Va> Rejected;
-  std::map<Va, Va> Claims;
-  for (const auto &[Start, F] : Built) {
-    (void)Start;
-    appendFunctionClaims(Claims, F);
-  }
-  std::vector<Range> DataClaims;
-  for (const auto &[Start, F] : Built) {
-    (void)Start;
-    DataClaims.insert(DataClaims.end(), F.DataRanges.begin(), F.DataRanges.end());
-  }
-  DataClaims = mergeRanges(std::move(DataClaims));
-  auto processWeak = [&] {
-  while (!Pending.empty()) {
-    std::set<Va> Batch;
-    for (unsigned I = 0; I < 4 && !Pending.empty(); ++I) {
-      Va Candidate = *Pending.begin();
-      Pending.erase(Pending.begin());
-      if (auto Head = fillerHead(Dis, Candidate)) {
-        if (*Head < Candidate) {
-          Range Span{*Head, Candidate};
-          if (claimsOverlap(Claims, Span) ||
-              std::any_of(DataClaims.begin(), DataClaims.end(),
-                          [&](const Range &R) {
-                            return R.first < Span.second && R.second > Span.first;
-                          }))
-            continue;
-          Candidate = *Head;
+  auto promotableCall = [&](Va Target) -> std::optional<Va> {
+    if (auto Head = fillerHead(Dis, Target))
+      Target = *Head;
+    if (!P.Img->isExecutable(Target))
+      return std::nullopt;
+    auto Primary = pdataPrimary(Pdata, Target);
+    if (Primary && *Primary != Target)
+      return std::nullopt;
+    return Target;
+  };
+  auto chunksAllZero = [&](const Function &F) {
+    return std::all_of(F.Chunks.begin(), F.Chunks.end(), [&](const Range &C) {
+      llvm::ArrayRef<uint8_t> Bytes =
+          P.Img->dataAt(C.first, (size_t)(C.second - C.first));
+      return std::all_of(Bytes.begin(), Bytes.end(),
+                         [](uint8_t B) { return B == 0; });
+    });
+  };
+
+  // One bounded speculative descent per candidate in a gap between claimed
+  // bytes; a probe is kept only when it decodes cleanly and every path ends.
+  auto orphanProbe = [&](Va Lo, Va Hi, std::map<Va, Va> &Claimed,
+                         std::vector<Function> &Out) {
+    Va Cur = Lo;
+    while (Cur < Hi) {
+      if (auto End = analysis_detail::pointerTableEnd(*P.Img, Cur)) {
+        Cur = *End;
+        continue;
+      }
+      if (uint64_t Pad = padLen(Dis, *P.Img, Cur)) {
+        Cur = Cur.wrappingAdd(Pad);
+        continue;
+      }
+      auto Containing = Claimed.upper_bound(Cur);
+      if (Containing != Claimed.begin()) {
+        --Containing;
+        if (Cur < Containing->second) {
+          Cur = std::max(Containing->second, Cur.wrappingAdd(1));
+          continue;
         }
       }
-      if (Built.count(Candidate) || Rejected.count(Candidate) ||
-          analysis_detail::rejectWeakCandidate(*P.Img, Dis, Hooks, Pdata,
-                                                claimVector(Claims), Candidate)) {
-        Rejected.insert(Candidate);
-        continue;
-      }
-      if (std::any_of(DataClaims.begin(), DataClaims.end(),
-                      [&](const Range &R) {
-                        return Candidate >= R.first && Candidate < R.second;
-                      }))
-        continue;
-      Batch.insert(Candidate);
-    }
-    const std::map<Va, Va> ClaimsBefore = Claims;
-    std::vector<Va> Overlapping;
-    for (Va Candidate : Batch) {
+      auto NextClaim = Claimed.lower_bound(Cur.wrappingAdd(1));
+      const Va BoundEnd =
+          NextClaim == Claimed.end() ? Hi : std::min(NextClaim->first, Hi);
+      const std::vector<Range> Bound{{Cur, BoundEnd}};
       analysis_detail::BuildResult Result = analysis_detail::buildFunction(
-          *P.Img, Dis, Hooks, Candidate, Starts, Pdata, Groups, SharedRipRefs,
-          IsNoreturn, false, &Claims);
-      if (Result.F.Instrs.empty() ||
-          analysis_detail::rejectWeakFunction(*P.Img, Hooks, Result.F)) {
-        Rejected.insert(Candidate);
-        continue;
-      }
-      if (std::any_of(Result.F.Chunks.begin(), Result.F.Chunks.end(),
-                      [&](const Range &R) { return claimsOverlap(Claims, R); })) {
-        Overlapping.push_back(Candidate);
-        continue;
-      }
-      setFunctionName(Result.F, *P.Names);
-      Pending.insert(Result.LeaTargets.begin(), Result.LeaTargets.end());
-      Pending.insert(Result.ForeignTargets.begin(), Result.ForeignTargets.end());
+          *P.Img, Dis, Hooks, Cur, Starts, Pdata, Groups, SharedRipRefs,
+          IsNoreturn, false, nullptr, Bound);
       SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
-      appendFunctionClaims(Claims, Result.F);
-      DataClaims.insert(DataClaims.end(), Result.F.DataRanges.begin(),
-                        Result.F.DataRanges.end());
-      DataClaims = mergeRanges(std::move(DataClaims));
-      Built.insert_or_assign(Candidate, std::move(Result.F));
-      AcceptedWeak.insert(Candidate);
+      Function &F = Result.F;
+      // A probe whose bytes are all zeros decoded padding or a pointer table
+      // as `add [rax],al`, never real code.
+      if (!F.Instrs.empty() && chunksAllZero(F))
+        F.Instrs.clear();
+      if (analysis_detail::orphanFunctionOk(*P.Img, F, BoundEnd, Hooks)) {
+        F.Orphan = true;
+        Starts.insert(Cur);
+        for (const Range &R : F.Chunks)
+          Claimed[R.first] = R.second;
+        for (const Range &R : F.DataRanges)
+          Claimed[R.first] = R.second;
+        const Va End = F.Chunks.empty() ? Cur : F.Chunks.back().second;
+        Out.push_back(std::move(F));
+        Cur = std::max(End, Cur.wrappingAdd(1));
+      } else {
+        Cur = Va((Cur.Value + 16) & ~uint64_t(15));
+      }
     }
-    if (Claims != ClaimsBefore)
-      Pending.insert(Overlapping.begin(), Overlapping.end());
-    else
-      Rejected.insert(Overlapping.begin(), Overlapping.end());
-  }
   };
-  processWeak();
-  for (unsigned Promotion = 0; Promotion < 8; ++Promotion) {
-    std::vector<Va> NewStarts;
+
+  for (unsigned Iteration = 1; Iteration <= 8; ++Iteration) {
+    std::vector<Va> NewStrong;
+    std::set_difference(StrongStarts.begin(), StrongStarts.end(),
+                        Processed.begin(), Processed.end(),
+                        std::back_inserter(NewStrong));
+
+    // Weak owners whose bytes a new strong start lands in are reconsidered
+    // after strong code claims them.
+    struct ChunkOwner {
+      Va A, B, Owner;
+    };
+    std::vector<ChunkOwner> Chunks;
+    for (const auto &[Start, F] : Built)
+      for (const Range &R : F.Chunks)
+        Chunks.push_back({R.first, R.second, Start});
+    llvm::sort(Chunks, [](const ChunkOwner &L, const ChunkOwner &R) {
+      return std::tie(L.A, L.B, L.Owner) < std::tie(R.A, R.B, R.Owner);
+    });
+    std::vector<Va> PrefixEnd;
+    PrefixEnd.reserve(Chunks.size());
+    Va RunningEnd(0);
+    for (const ChunkOwner &C : Chunks) {
+      RunningEnd = std::max(RunningEnd, C.B);
+      PrefixEnd.push_back(RunningEnd);
+    }
+    std::set<Va> Dirty;
+    for (Va Start : NewStrong) {
+      size_t I = std::partition_point(Chunks.begin(), Chunks.end(),
+                                      [&](const ChunkOwner &C) {
+                                        return C.A <= Start;
+                                      }) -
+                 Chunks.begin();
+      while (I > 0 && PrefixEnd[I - 1] > Start) {
+        --I;
+        const ChunkOwner &C = Chunks[I];
+        if (C.A <= Start && Start < C.B && C.Owner != Start)
+          Dirty.insert(C.Owner);
+      }
+    }
+    std::set<Va> Rebuild(NewStrong.begin(), NewStrong.end());
+    for (Va Owner : Dirty) {
+      if (StrongStarts.count(Owner)) {
+        Rebuild.insert(Owner);
+      } else {
+        Built.erase(Owner);
+        Weak.insert(Owner);
+      }
+    }
+
+    {
+      std::vector<analysis_detail::BuildResult> Results;
+      Results.reserve(Rebuild.size());
+      for (Va Start : Rebuild)
+        Results.push_back(analysis_detail::buildFunction(
+            *P.Img, Dis, Hooks, Start, StrongStarts, Pdata, Groups,
+            SharedRipRefs, IsNoreturn));
+      for (analysis_detail::BuildResult &Result : Results) {
+        Weak.insert(Result.LeaTargets.begin(), Result.LeaTargets.end());
+        Weak.insert(Result.ForeignTargets.begin(), Result.ForeignTargets.end());
+        SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
+        const Va Start = Result.F.Start;
+        Built.insert_or_assign(Start, std::move(Result.F));
+      }
+    }
+    Processed.insert(NewStrong.begin(), NewStrong.end());
+
+    std::map<Va, Va> StrongClaims;
+    for (const auto &[Start, F] : Built)
+      if (StrongStarts.count(Start))
+        appendFunctionClaims(StrongClaims, F);
+    for (auto It = Built.begin(); It != Built.end();) {
+      if (!StrongStarts.count(It->first) && claimedAt(StrongClaims, It->first))
+        It = Built.erase(It);
+      else
+        ++It;
+    }
+
+    std::set<Va> Pending = std::move(Weak);
+    Weak.clear();
+    std::set<Va> Rejected;
+    std::map<Va, Va> Claims;
+    std::map<Va, Va> DataClaims;
+    for (const auto &[Start, F] : Built) {
+      (void)Start;
+      appendFunctionClaims(Claims, F);
+      for (const Range &R : F.DataRanges)
+        addClaim(DataClaims, R.first, R.second);
+    }
+    while (!Pending.empty()) {
+      std::vector<Va> Candidates;
+      while (Candidates.size() < BatchSize && !Pending.empty()) {
+        Va S = *Pending.begin();
+        Pending.erase(Pending.begin());
+        // An entry inside a filler instruction is a thunk start mid-nop;
+        // build at the run's head instead unless the head is already
+        // claimed, held by another pending candidate, or inside known data.
+        if (auto Head = fillerHead(Dis, S); Head && *Head < S) {
+          auto NextPending = Pending.lower_bound(*Head);
+          if (claimedAt(Claims, *Head) || claimedAt(DataClaims, *Head) ||
+              claimsOverlap(Claims, {*Head, S}) ||
+              (NextPending != Pending.end() && *NextPending < S))
+            continue;
+          S = *Head;
+        }
+        // A weak candidate starting with a zero byte is data, not code.
+        if (auto B = P.Img->read(S, 1); B && !B->empty() && (*B)[0] == 0x00) {
+          Rejected.insert(S);
+          continue;
+        }
+        // `.ctors`/`.refptr` pointer tables parked in `.text`.
+        if (analysis_detail::pointerTableEnd(*P.Img, S)) {
+          Rejected.insert(S);
+          continue;
+        }
+        auto Primary = pdataPrimary(Pdata, S);
+        if (Built.count(S) || Rejected.count(S) || !P.Img->isExecutable(S) ||
+            !P.Img->isBacked(S) || P.Img->inInlineData(S) ||
+            (Primary && *Primary != S) || claimedAt(Claims, S) ||
+            claimedAt(DataClaims, S) || !Dis.decodeOne(S))
+          continue;
+        Candidates.push_back(S);
+      }
+      if (Candidates.empty())
+        break;
+      std::vector<analysis_detail::BuildResult> Results;
+      Results.reserve(Candidates.size());
+      for (Va S : Candidates)
+        Results.push_back(analysis_detail::buildFunction(
+            *P.Img, Dis, Hooks, S, StrongStarts, Pdata, Groups, SharedRipRefs,
+            IsNoreturn, false, &Claims));
+      for (analysis_detail::BuildResult &Result : Results) {
+        Function &F = Result.F;
+        if (claimedAt(Claims, F.Start)) {
+          Rejected.insert(F.Start);
+          continue;
+        }
+        if (std::any_of(F.Chunks.begin(), F.Chunks.end(),
+                        [&](const Range &R) { return claimsOverlap(Claims, R); })) {
+          Pending.insert(F.Start);
+          continue;
+        }
+        if (F.Instrs.empty() ||
+            analysis_detail::rejectWeakFunction(*P.Img, Hooks, F)) {
+          Rejected.insert(F.Start);
+          continue;
+        }
+        Pending.insert(Result.LeaTargets.begin(), Result.LeaTargets.end());
+        Pending.insert(Result.ForeignTargets.begin(),
+                       Result.ForeignTargets.end());
+        SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
+        for (const Range &R : F.Chunks)
+          addClaim(Claims, R.first, R.second);
+        const Va Start = F.Start;
+        Built.insert_or_assign(Start, std::move(F));
+      }
+    }
+
+    const size_t StrongBefore = StrongStarts.size();
     for (const auto &[Start, F] : Built) {
       (void)Start;
       for (Va Call : F.CallTargets)
-        enqueueStrong(Call, Starts, NewStarts);
+        if (auto Target = promotableCall(Call))
+          StrongStarts.insert(*Target);
     }
-    if (NewStarts.empty())
-      break;
+    if (StrongStarts.size() > StrongBefore && Iteration < 8)
+      continue;
 
-    std::map<Va, Function> WeakFunctions;
-    for (Va Start : AcceptedWeak) {
-      auto Node = Built.extract(Start);
-      if (!Node.empty())
-        WeakFunctions.insert(std::move(Node));
+    Starts.clear();
+    Functions.clear();
+    for (auto &[Start, F] : Built) {
+      Starts.insert(Start);
+      Functions.push_back(std::move(F));
     }
     Built.clear();
-    Claims.clear();
-    std::vector<Va> Calls;
-    for (Va Start : Starts) {
-      analysis_detail::BuildResult Result = analysis_detail::buildFunction(
-          *P.Img, Dis, Hooks, Start, Starts, Pdata, Groups, SharedRipRefs,
-          IsNoreturn);
-      setFunctionName(Result.F, *P.Names);
-      Calls.insert(Calls.end(), Result.F.CallTargets.begin(),
-                   Result.F.CallTargets.end());
-      Pending.insert(Result.LeaTargets.begin(), Result.LeaTargets.end());
-      Pending.insert(Result.ForeignTargets.begin(), Result.ForeignTargets.end());
-      SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
-      appendFunctionClaims(Claims, Result.F);
-      Built.insert_or_assign(Start, std::move(Result.F));
-    }
-    std::vector<Va> NewlyDiscovered;
-    for (Va Call : Calls)
-      enqueueStrong(Call, Starts, NewlyDiscovered);
 
-    for (auto &[Start, F] : WeakFunctions) {
-      const bool Claimed = Starts.count(Start) ||
-          std::any_of(F.Chunks.begin(), F.Chunks.end(),
-                      [&](const Range &R) { return claimsOverlap(Claims, R); });
-      if (Claimed) {
-        AcceptedWeak.erase(Start);
-        continue;
+    if (!OrphanDone) {
+      // Code outside every `.pdata` range and chunk: leaf helpers with no
+      // unwind data and no caller. Two passes, because arbitration inside
+      // each function's run can free bytes that open new orphan runs.
+      for (unsigned Pass = 0; Pass < 2; ++Pass) {
+        analysis_detail::OrphanSweep Plan =
+            analysis_detail::planOrphanSweep(Pe, Functions);
+        for (const Range &Gap : Plan.Gaps)
+          orphanProbe(Gap.first, Gap.second, Plan.Claimed, Functions);
+        llvm::sort(Functions, [](const Function &A, const Function &B) {
+          return A.Start < B.Start;
+        });
       }
-      appendFunctionClaims(Claims, F);
-      Built.insert_or_assign(Start, std::move(F));
+      OrphanDone = true;
     }
-    if (NewlyDiscovered.empty())
-      break;
-  }
 
-  processWeak();
-  DataClaims.clear();
-  for (const auto &[Start, F] : Built) {
-    (void)Start;
-    DataClaims.insert(DataClaims.end(), F.DataRanges.begin(), F.DataRanges.end());
-  }
-  DataClaims = mergeRanges(std::move(DataClaims));
-  std::vector<Function> Functions;
-  Functions.reserve(Built.size());
-  for (auto &[Start, F] : Built) {
-    (void)Start;
-    Functions.push_back(std::move(F));
+    // Seeds that landed inside another function's claimed code (lea /
+    // reloc false positives) claim those bytes a second time. Keep a
+    // no-pdata function only when something outside another function's
+    // chunks remains.
+    {
+      struct ChunkOwner {
+        Va A, B, Owner;
+      };
+      std::vector<ChunkOwner> All;
+      for (const Function &F : Functions)
+        for (const Range &R : F.Chunks)
+          All.push_back({R.first, R.second, F.Start});
+      llvm::sort(All, [](const ChunkOwner &L, const ChunkOwner &R) {
+        return std::tie(L.A, L.B, L.Owner) < std::tie(R.A, R.B, R.Owner);
+      });
+      std::vector<Va> PrefixMax;
+      PrefixMax.reserve(All.size());
+      Va Running(0);
+      for (const ChunkOwner &C : All) {
+        Running = std::max(Running, C.B);
+        PrefixMax.push_back(Running);
+      }
+      auto coveredChunk = [&](Va A, Va B, Va Own) {
+        const ptrdiff_t I = std::partition_point(All.begin(), All.end(),
+                                                 [&](const ChunkOwner &C) {
+                                                   return C.A <= A;
+                                                 }) -
+                            All.begin();
+        for (ptrdiff_t J = I - 1; J >= 0 && PrefixMax[J] >= B; --J)
+          if (All[J].B >= B && All[J].Owner != Own)
+            return true;
+        return false;
+      };
+      llvm::erase_if(Functions, [&](const Function &F) {
+        return !(F.HasPdata || F.Chunks.empty() ||
+                 !std::all_of(F.Chunks.begin(), F.Chunks.end(),
+                              [&](const Range &R) {
+                                return coveredChunk(R.first, R.second,
+                                                    F.Start);
+                              }));
+      });
+    }
+
+    const size_t BeforeOrphanCalls = StrongStarts.size();
+    for (const Function &F : Functions)
+      for (Va Call : F.CallTargets)
+        if (auto Target = promotableCall(Call))
+          StrongStarts.insert(*Target);
+    if (StrongStarts.size() > BeforeOrphanCalls && Iteration < 8) {
+      for (Function &F : Functions) {
+        const Va Start = F.Start;
+        Built.insert_or_assign(Start, std::move(F));
+      }
+      Functions.clear();
+      continue;
+    }
+
+    // Noreturn fixpoint, then re-descent for callers whose block still has a
+    // path continuing past a noreturn call.
+    for (Function &F : Functions)
+      setFunctionName(F, *P.Names);
+    std::set<Va> NoreturnStarts =
+        propagateNoreturn(Functions, *P.Externs, *P.Names, Hooks);
+    for (unsigned Pass = 0; Pass < 4; ++Pass) {
+      auto IsNoreturn2 = [&](Va Target) {
+        return IsNoreturn(Target) || NoreturnStarts.count(Target) != 0;
+      };
+      std::set<Va> DirtyCallers;
+      for (const Function &F : Functions) {
+        for (const Instr &I : F.Instrs) {
+          auto Target = callSiteTarget(I);
+          if (!Target || !IsNoreturn2(*Target))
+            continue;
+          const BasicBlock *B = F.blockContaining(I.Addr);
+          if (!B || B->EndKind == BlockEnd::Noreturn ||
+              B->InstrsEnd == B->InstrsBegin)
+            continue;
+          if (I.Addr != F.Instrs[B->InstrsEnd - 1].Addr)
+            DirtyCallers.insert(F.Start);
+        }
+      }
+      if (DirtyCallers.empty())
+        break;
+      for (Va Start : DirtyCallers) {
+        analysis_detail::BuildResult Result = analysis_detail::buildFunction(
+            *P.Img, Dis, Hooks, Start, StrongStarts, Pdata, Groups,
+            SharedRipRefs, IsNoreturn2);
+        setFunctionName(Result.F, *P.Names);
+        auto It = std::find_if(Functions.begin(), Functions.end(),
+                               [&](const Function &F) {
+                                 return F.Start == Start;
+                               });
+        if (It != Functions.end())
+          *It = std::move(Result.F);
+        SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
+      }
+      NoreturnStarts =
+          propagateNoreturn(Functions, *P.Externs, *P.Names, Hooks);
+    }
+    break;
   }
   llvm::sort(Functions, [](const Function &A, const Function &B) {
     return A.Start < B.Start;
   });
-  std::map<Va, Va> OrphanClaims = Claims;
-  for (unsigned Pass = 0; Pass < 2; ++Pass) {
-    const std::vector<Range> ProbeRanges =
-        analysis_detail::orphanProbeRanges(Pe, Functions);
-    for (const Range &Probe : ProbeRanges) {
-      Va Cursor = Probe.first;
-      while (Cursor < Probe.second) {
-        const uint64_t Pad = padLen(Dis, *P.Img, Cursor);
-        if (Pad) {
-          Cursor = Cursor.wrappingAdd(Pad);
-          continue;
-        }
-        if (auto Head = fillerHead(Dis, Cursor); Head && *Head < Cursor) {
-          Cursor = Cursor.wrappingAdd(1);
-          continue;
-        }
-        if (auto InlineEnd = P.Img->inlineDataEnd(Cursor)) {
-          Cursor = std::min(*InlineEnd, Probe.second);
-          continue;
-        }
-        if (analysis_detail::rejectWeakCandidate(
-                *P.Img, Dis, Hooks, Pdata, claimVector(OrphanClaims), Cursor)) {
-          Cursor = Cursor.wrappingAdd(1);
-          continue;
-        }
-        if (std::any_of(DataClaims.begin(), DataClaims.end(),
-                        [&](const Range &R) {
-                          return Cursor >= R.first && Cursor < R.second;
-                        })) {
-          Cursor = Cursor.wrappingAdd(1);
-          continue;
-        }
-        if (!P.Img->isBacked(Cursor)) {
-          Cursor = Cursor.wrappingAdd(1);
-          continue;
-        }
-        auto Containing = OrphanClaims.upper_bound(Cursor);
-        if (Containing != OrphanClaims.begin()) {
-          --Containing;
-          if (Cursor < Containing->second) {
-            Cursor = std::min(Containing->second, Probe.second);
-            continue;
-          }
-        }
-        auto NextClaim = OrphanClaims.upper_bound(Cursor);
-        const Va BoundEnd = NextClaim == OrphanClaims.end()
-                                ? Probe.second
-                                : std::min(NextClaim->first, Probe.second);
-        const std::vector<Range> Bound{{Cursor, BoundEnd}};
-        analysis_detail::BuildResult Result = analysis_detail::buildFunction(
-            *P.Img, Dis, Hooks, Cursor, Starts, Pdata, Groups, SharedRipRefs,
-            IsNoreturn, false, &OrphanClaims, Bound);
-        SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
-        if (analysis_detail::orphanFunctionOk(*P.Img, Result.F, BoundEnd,
-                                              Hooks)) {
-          setFunctionName(Result.F, *P.Names);
-          Result.F.Orphan = true;
-          Starts.insert(Cursor);
-          for (const Range &R : Result.F.Chunks)
-            addClaim(OrphanClaims, R.first, R.second);
-          for (const Range &R : Result.F.DataRanges)
-            addClaim(OrphanClaims, R.first, R.second);
-          DataClaims.insert(DataClaims.end(), Result.F.DataRanges.begin(),
-                            Result.F.DataRanges.end());
-          DataClaims = mergeRanges(std::move(DataClaims));
-          Va End = Result.F.Chunks.empty() ? Cursor
-                                           : Result.F.Chunks.back().second;
-          Functions.push_back(std::move(Result.F));
-          Cursor = std::max(End, Cursor.wrappingAdd(1));
-        } else {
-          Cursor = Va((Cursor.Value + 16) & ~uint64_t(15));
-        }
-      }
-    }
-    llvm::sort(Functions, [](const Function &A, const Function &B) {
-      return A.Start < B.Start;
-    });
+  for (Function &F : Functions) {
+    setFunctionName(F, *P.Names);
+    P.Names->insert_or_assign(F.Start, F.Name);
   }
-  propagateNoreturn(Functions, *P.Externs, *P.Names, Hooks);
   P.Xr = collectXrefs(*P.Img, Functions, Dis);
   *P.Strings = collectStrings(*P.Img, P.Xr);
 
@@ -456,6 +585,8 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
     AllChunks.insert(AllChunks.end(), F.Chunks.begin(), F.Chunks.end());
     AllData.insert(AllData.end(), F.DataRanges.begin(), F.DataRanges.end());
   }
+  llvm::sort(AllData);
+  AllData.erase(std::unique(AllData.begin(), AllData.end()), AllData.end());
   P.Padding = decodePadding(Pe, AllChunks, AllData);
   for (Function &F : Functions)
     insertFunction(P, std::move(F));

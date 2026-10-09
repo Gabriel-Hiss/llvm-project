@@ -713,7 +713,7 @@ void StmtPrinter::PrintRawSEHFinallyStmt(SEHFinallyStmt *Node) {
 
 void StmtPrinter::PrintRawSEHExceptHandler(SEHExceptStmt *Node) {
   OS << "__except (";
-  VisitExpr(Node->getFilterExpr());
+  Visit(Node->getFilterExpr());
   OS << ")" << NL;
   PrintRawCompoundStmt(Node->getBlock());
   OS << NL;

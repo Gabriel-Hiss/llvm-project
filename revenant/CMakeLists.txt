@@ -21,8 +21,12 @@ find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}: ${LLVM_DIR}")
 # Clang is only needed by frontend/clang and slices that link it; it may
 # not be in the build tree yet, so keep it optional.
+if(DEFINED Clang_DIR AND NOT Clang_DIR STREQUAL "Clang_DIR-NOTFOUND")
+  list(APPEND CMAKE_MODULE_PATH "${Clang_DIR}")
+endif()
 find_package(Clang CONFIG QUIET)
 if(Clang_FOUND)
+  include(AddClang)
   message(STATUS "Found Clang: ${Clang_DIR}")
 else()
   message(STATUS "Clang not found; clang-dependent targets are skipped")
@@ -33,8 +37,16 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(AddLLVM)
 include(HandleLLVMOptions)
+if(Clang_FOUND)
+  if(EXISTS "${CLANG_CMAKE_DIR}/AddClang.cmake")
+    list(APPEND CMAKE_MODULE_PATH "${CLANG_CMAKE_DIR}")
+  endif()
+  include(AddClang)
+endif()
 include(Revenant)
-
+if(EXISTS "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86/X86GenInstrInfo.inc")
+  set(REVENANT_X86_SRC_DIR "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86")
+endif()
 # Match the LLVM build's ABI flags (no EH, no RTTI unless enabled there).
 if(NOT LLVM_ENABLE_RTTI)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLVM_CXXFLAGS_RTTI_DISABLE}")
@@ -61,6 +73,19 @@ if(WIN32 AND MSVC)
 endif()
 add_definitions(${LLVM_DEFINITIONS})
 
+# Target backend generated headers (X86Gen*.inc) live in the build tree;
+# revenant-tblgen and lib/Lift consume them.
+if(EXISTS "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86/X86GenInstrInfo.inc")
+  set(REVENANT_X86_GEN_DIR "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86")
+  set(REVENANT_X86_SRC_DIR "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86")
+endif()
+
+# revenant-tblgen generates code consumed by lib/Lift, so it must be
+# added before the Lift directory below.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/revenant-tblgen/CMakeLists.txt")
+  add_subdirectory(tools/revenant-tblgen)
+endif()
+
 # Every slice adds its own CMakeLists under lib/<Area>, tools/<tool>,
 # frontend/<tool>, unittests/<Area>. Directories land independently, so
 # guard each one. The lifter generator must be registered before lib/Lift.
@@ -68,18 +93,23 @@ set(REVENANT_AREA_DIRS
     lib/Core
     lib/Object
     lib/Disasm
+    lib/IR
     lib/Analysis
-    tools/revenant-tblgen
+    lib/Compiler
     lib/Lift
     lib/Transforms
     lib/Structure
     lib/Export
-    lib/CAPI
-    lib/IR
     lib/Target/X86
-    tools/revenant
-    tools/revenant-ir-verify
     frontend/clang
+    lib/CAPI
+    tools/revenant
+    tools/revenant-detect
+    tools/revenant-ir-verify
+    tools/revenant-opt
+    tools/revenant-sigs-check
+    tools/revenant-libdb
+    tools/revenant-decompile
     unittests)
 foreach(dir ${REVENANT_AREA_DIRS})
   if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${dir} AND

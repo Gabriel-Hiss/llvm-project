@@ -1,0 +1,3 @@
+LIBRARY RevenantTransformUnipo
+EXPORTS
+  llvmGetPassPluginInfo

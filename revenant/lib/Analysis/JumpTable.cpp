@@ -213,6 +213,31 @@ static std::optional<uint64_t> loadedValue(const JtInsnOps &Ops,
   return std::nullopt;
 }
 
+/// `loadedValue` with last-write semantics: the nearest earlier write to
+/// `Reg` decides. An opaque producer (`mov r10,[r11]`, arithmetic) hides
+/// every older constant, so the register is not a known table base.
+static std::optional<uint64_t> strictLoadedValue(const JtInsnOps &Ops,
+                                                 ArrayRef<Instr> Instrs,
+                                                 size_t Lo, size_t Hi,
+                                                 unsigned Reg) {
+  for (size_t I = Hi; I-- > Lo;) {
+    JtInsn Ins = Ops.operands(Instrs[I]);
+    if (Ins.Op0 != JtOpKind::Reg || full(Ops, Ins.Reg0) != Reg)
+      continue;
+    if (Ins.Mn == JtMnemonic::Lea || Ins.Mn == JtMnemonic::Mov) {
+      if (Ins.Op1 == JtOpKind::Mem && Ins.MemIpRel)
+        return Ins.MemDisp;
+      if (Ins.Op1 == JtOpKind::Mem && full(Ops, Ins.MemBase) == 0 &&
+          full(Ops, Ins.MemIndex) == 0)
+        return Ins.MemDisp;
+      if (Ins.Op1 == JtOpKind::Imm && Ins.ImmForm == JtImmForm::I64)
+        return (uint64_t)Ins.Imm;
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 /// The VA-highest `lea`/`mov imm` writing `reg` that sits before `va`:
 /// the load of a callee-saved table base from an earlier block. Using VA
 /// order rather than decode order avoids grabbing an unrelated block's
@@ -503,6 +528,11 @@ setupInWindow(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
       AddI = I;
       break;
     }
+    // Any other write to the jump register ends the search: a virtual-call
+    // tail (`mov rax,[rax+18h]; jmp rax`) must not borrow the table setup
+    // of an earlier switch that left its value in the same register.
+    if (Ins.Op0 == JtOpKind::Reg && full(Ops, Ins.Reg0) == JmpReg)
+      return std::nullopt;
   }
   if (!AddI)
     return std::nullopt;
@@ -628,7 +658,10 @@ describeTable(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
   for (const BasicBlock &B : Blocks) {
     if (B.Start == Block.Start)
       continue;
-    bool Reaches = B.End == Block.Start;
+    // Address adjacency only counts when the block actually falls through:
+    // a block ending in its own `jmp reg` does not run into its neighbour.
+    bool Reaches =
+        B.End == Block.Start && B.EndKind == BlockEnd::Fallthrough;
     if (!Reaches)
       for (const Edge &E : B.Edges)
         if (E.To == Block.Start &&
@@ -802,10 +835,27 @@ static IndexTrace traceIndex(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
       if (Ins.Mn == JtMnemonic::Movzx && !FirstTable &&
           Ins.Op1 == JtOpKind::Mem && Ins.MemIndex != 0 &&
           Ins.MemScale == 1) {
-        uint64_t Ft =
-            loadedValue(Ops, Instrs, 0, Pos, full(Ops, Ins.MemBase))
-                .value_or(Ctx.Img.Base.Value) +
-            Ins.MemDisp;
+        // The base must be a constant written near the load (the guard and
+        // dispatch window) or the image base itself, hoisted anywhere
+        // earlier. A constant from far away in decode order belongs to some
+        // other switch while this register holds a runtime pointer (a text
+        // buffer, a struct field).
+        const unsigned BaseReg = full(Ops, Ins.MemBase);
+        std::optional<uint64_t> BaseVal =
+            strictLoadedValue(Ops, Instrs, Lo, Pos, BaseReg);
+        if (!BaseVal) {
+          BaseVal = strictLoadedValue(Ops, Instrs, 0, Pos, BaseReg);
+          if (BaseVal && *BaseVal != Ctx.Img.Base.Value)
+            BaseVal = std::nullopt;
+        }
+        // No constant base: only an RVA-shaped displacement (the base
+        // register then holds the image base) can still name a table. A
+        // zero displacement is a runtime pointer, such as a text buffer.
+        if (!BaseVal && Ins.MemDisp == 0) {
+          StopScan = true;
+          break;
+        }
+        uint64_t Ft = BaseVal.value_or(Ctx.Img.Base.Value) + Ins.MemDisp;
         if (!Ctx.Img.read(Va(Ft), 1)) {
           StopScan = true;
           break;
@@ -903,6 +953,41 @@ static IndexTrace traceIndex(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
   return It;
 }
 
+/// Raw bytes of entry I, or nullopt when they are outside the image.
+/// Distinguishes "nothing there" from "bytes that do not decode to a
+/// code pointer" (a candidate table end).
+static std::optional<uint64_t> rawEntry(const JumpTableCtx &Ctx,
+                                        const TableAccess &Access,
+                                        uint64_t I) {
+  Va EntryVa = Access.Table.wrappingAdd(I * Access.EntrySize);
+  if (Access.EntrySize == 8)
+    return Ctx.Img.readU64(EntryVa);
+  if (auto U = Ctx.Img.readU32(EntryVa))
+    return uint64_t(*U);
+  return std::nullopt;
+}
+
+/// MSVC emits 0 for a dead switch case mid-table. A run of raw-zero
+/// entries is internal — not the table's end — when a valid entry
+/// follows it before any referenced boundary, unreadable slot, or
+/// non-zero non-code entry; otherwise the zeros are trailing fill that
+/// `extendFillerTail` already owns.
+static bool zeroRunIsInternal(const JumpTableCtx &Ctx,
+                              const TableAccess &Access, uint64_t I) {
+  for (uint64_t J = I; J < I + 4096; ++J) {
+    Va EntryVa = Access.Table.wrappingAdd(J * Access.EntrySize);
+    if (Ctx.isReferenced(EntryVa))
+      return false;
+    std::optional<uint64_t> Raw = rawEntry(Ctx, Access, J);
+    if (!Raw)
+      return false;
+    if (*Raw == 0)
+      continue;
+    return Access.read(Ctx, J).has_value();
+  }
+  return false;
+}
+
 /// Clip an enumeration of `n` entries at the first entry (index >= 1)
 /// whose address another operand references. A referenced address starts
 /// the next data structure, so a table cannot run past it, whatever the
@@ -929,7 +1014,7 @@ static uint64_t scanCaseTable(const JumpTableCtx &Ctx,
     Va EntryVa = Access.Table.wrappingAdd(I * Access.EntrySize);
     if (I > 0 && Ctx.isReferenced(EntryVa))
       break;
-    if (!Access.read(Ctx, I))
+    if (!Access.read(Ctx, I) && !zeroRunIsInternal(Ctx, Access, I))
       break;
     ++N;
   }
@@ -1064,8 +1149,10 @@ unboundedEntries(const JumpTableCtx &Ctx, const TableAccess &Access,
       if (I > 0 && !IgnoreRefs && Ctx.isReferenced(EntryVa))
         break;
       auto T = Access.read(Ctx, I);
-      if (!T)
+      if (!T && !zeroRunIsInternal(Ctx, Access, I))
         break;
+      if (!T)
+        continue;
       if (!inOwn(*T))
         break;
       Out.emplace_back(I, I, *T);
@@ -1135,8 +1222,10 @@ resolveUnbounded(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
         VaRange{Access.Table, CaseEnd},
         std::optional<VaRange>{VaRange{It.Tr.FirstTable, ByteEnd}});
   } else {
+    // Skipped dead cases (raw-zero entries) still own bytes: bound the
+    // span by the last accepted slot, not the accepted-entry count.
     uint64_t Slots =
-        std::min(scanCaseTable(Ctx, Access), Entries);
+        std::min(scanCaseTable(Ctx, Access), MaxSlot + 1);
     Va End = extendFillerTail(
         Ctx, Ops, Access.Table.wrappingAdd(Slots * Access.EntrySize));
     Res.Spans =
@@ -1219,8 +1308,16 @@ resolveJumpTable(const JumpTableCtx &Ctx, const TargetHooks &Hooks,
                         Access->Table, Access->EntrySize);
     for (uint64_t I = 0; I < N; ++I) {
       auto T = Access->read(Ctx, I);
-      if (!T)
-        continue;
+      // The first entry that is not a code address ends the table: a
+      // guard count borrowed from an unrelated compare must not run the
+      // walk through the next data structure (adjacent tables). An
+      // all-zero entry followed by more valid entries is a dead case
+      // inside the table, not its end.
+      if (!T) {
+        if (zeroRunIsInternal(Ctx, *Access, I))
+          continue;
+        break;
+      }
       Targets[*T].push_back((int64_t)I + Offset);
     }
     // Byte extent by content scan: the guard count bounds valid case

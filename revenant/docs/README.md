@@ -24,6 +24,13 @@ Areas and their libraries: `Object` (RevenantObject, PE32+ loader),
 `Image`, `Instr`, `Function`, `BasicBlock`, `Edge`/`EdgeKind`,
 `BlockEnd`, `Program`, `Xrefs`, `PaddingRun`, `Va`/`VaRange`.
 
+`Transforms` includes Unsroa, which reverses aggregate scalarization on
+LLVM IR. It regroups split allocas, rebuilds field-cluster structs, folds
+only evidence-backed scalar copies, restores typed field GEPs, and
+reassembles split aggregate values. Inferred fields must come from
+constant, nonnegative offsets; byte-dispatch copies and array-like access
+runs stay scalar.
+
 ## Build
 
 Standalone against the shared build tree:
@@ -42,6 +49,27 @@ ninja -C <worktree>/build-rv revenant RevenantUnitTests
 Clang is optional: only `frontend/clang` needs it.
 Never reconfigure or rebuild `build-revenant` itself.
 
+## lit suite
+
+One command runs everything under `revenant/test`:
+
+```
+python <llvm-project>/build-revenant/bin/llvm-lit.py -v <worktree>/revenant/test
+```
+
+The root `revenant/test/lit.cfg.py` picks lit's internal shell (llvm-lit on
+this box resolves `bash` to the System32 WSL stub, so the external-shell
+probe fails) and resolves `%opt`, `%FileCheck`, `%revenant-opt` and
+`%{rv-structure-tool}` from a build dir: `$REVENANT_BUILD_DIR` (or
+`$RV_BUILD_DIR`), else the newest `<worktree>/build-rv*` dir, else the
+shared `build-revenant/bin`. Build the tools the suite needs with
+`ninja -C <worktree>/build-rv revenant-opt rv-structure-tool`.
+
+RUN lines all call the static `revenant-opt` (every `revenant-<name>` pass
+linked in, no `-load-pass-plugin`). Per-pass directories keep their tests in
+`revenant/test/Transforms/<Pass>`; `ir-contract` (contract example modules)
+and `meta-mode` (corpus measurement scripts) are excluded from the suite.
+
 ## Lift tests
 
 `RevenantLiftTests` checks function lifting and cleanup verification. Its corpus
@@ -59,6 +87,13 @@ Drop a `CMakeLists.txt` into `lib/<Area>` (use `add_llvm_library`),
 directory; an unknown one needs a one-line `add_subdirectory` in the
 `REVENANT_AREA_DIRS` list.
 
+## Clang frontend
+
+The LLVM type controls the emitted C/C++ expression category. Debug info may
+refine signedness and record layout, but a conflicting pointer/integer type
+must not override the IR type.
+
+
 ## Driver
 
 ```
@@ -68,5 +103,12 @@ revenant --export-parity <pe> <dir>   revenant-items.bin + file-spans.tsv
                                       + meta.json (contract format)
 ```
 
-Until analysis lands, the export lists no functions: the byte map still
-partitions the file (headers/sections/unknown/certificate/overlay).
+`revenant-decompile <pe> [--libdb <file>]` uses the static-library database
+for recovered function names and prototypes. Without `--libdb`, it looks for
+`libdb.json` beside the executable.
+
+The parity export runs full program analysis without loading a PDB; the
+per-binary command and results are tracked in `parity.md`.
+
+`revenant-decompile` runs the whole pipeline (PE to C/C++/Rust source); see
+`engine.md`.

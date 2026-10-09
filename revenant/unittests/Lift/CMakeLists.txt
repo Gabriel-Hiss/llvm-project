@@ -1,14 +1,16 @@
 revenant_add_unittest(RevenantUnitTests RevenantLiftTests
+
   LiftTest.cpp
+  LiftEHTest.cpp
   PARTIAL_SOURCES_INTENDED
   )
 
 target_link_libraries(RevenantLiftTests PRIVATE
-  RevenantAnalysis
   RevenantLift
+  RevenantAnalysis
+  RevenantIR
   RevenantObject
   RevenantDisasm
-  RevenantIR
   RevenantTargetX86)
 
 target_compile_definitions(RevenantLiftTests PRIVATE
@@ -21,9 +23,11 @@ target_compile_definitions(RevenantLiftTests PRIVATE
 
 target_include_directories(RevenantLiftTests PRIVATE
   "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../lib/Lift/Function"
   "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86/MCTargetDesc"
   "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86"
-)
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../lib/Lift/Function"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
 
 # Differential test: lifted IR, compiled by the JIT, against native x86-64
 # execution of the same bytes (assembled with the build tree's llvm-mc).

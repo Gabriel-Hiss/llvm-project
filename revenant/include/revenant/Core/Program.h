@@ -390,6 +390,27 @@ struct Xrefs {
   size_t totalRefs() const { return Froms.size(); }
 };
 
+/// Source and binary metadata retained for symbolization or crash reports.
+/// These values are descriptive only and must not drive CFG construction.
+struct EmbeddedFunctionMetadata {
+  std::string SourceFile;
+  uint32_t Line = 0;
+  uint32_t Column = 0;
+  std::vector<std::string> PanicMessages;
+  std::vector<std::string> ExceptionTypes;
+  std::vector<std::string> MetadataStrings;
+  std::vector<std::string> ClassNames;
+};
+
+struct EmbeddedTypeMetadata {
+  Va TypeDescriptor;
+  std::string Name;
+  std::string DecoratedName;
+  Va VTable;
+  std::vector<Va> VirtualFunctions;
+  std::vector<std::string> BaseClasses;
+};
+
 /// The analyzed program: image, functions, padding, xrefs, names.
 struct Program {
   std::shared_ptr<Image> Img;
@@ -406,6 +427,17 @@ struct Program {
   std::shared_ptr<std::map<Va, Extern>> Externs;
   /// VA -> display name (functions, data, imports).
   std::shared_ptr<std::map<Va, std::string>> Names;
+  /// Metadata left in optimized binaries for crash diagnostics.
+  std::map<Va, EmbeddedFunctionMetadata> Embedded;
+  /// RTTI types recovered from metadata in the image.
+  std::vector<EmbeddedTypeMetadata> EmbeddedTypes;
+
+  /// Control Flow Guard slots from the load config directory (see
+  /// `PeFile::GuardCFCheckPtr`): `call [GuardCFDispatchPtr]` is an indirect
+  /// call through the target in rax; `call [GuardCFCheckPtr]` is a
+  /// validation-only call before a real `call rcx`.
+  std::optional<Va> GuardCFCheckPtr;
+  std::optional<Va> GuardCFDispatchPtr;
   /// The shared resolver for disasm formatting.
   std::shared_ptr<const NameProvider> Resolver;
 };

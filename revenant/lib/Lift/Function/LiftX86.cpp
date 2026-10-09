@@ -13,6 +13,7 @@
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/PrettyStackTrace.h"
 
 using namespace llvm;
 
@@ -26,6 +27,24 @@ namespace revenant::lift {
 namespace {
 
 constexpr const char *LiftFlagName[] = {"cf", "zf", "sf", "of", "pf"};
+
+/// Crash-time context: names the decoded instruction and VA so an abort in a
+/// generated body or the hand-lifted path points at one instruction.
+class LiftInsnTrace final : public llvm::PrettyStackTraceEntry {
+  const llvm::MCInst &MI;
+  const llvm::MCInstrInfo &MII;
+  uint64_t VA;
+
+public:
+  LiftInsnTrace(const llvm::MCInst &MI, const llvm::MCInstrInfo &MII,
+                uint64_t VA)
+      : MI(MI), MII(MII), VA(VA) {}
+
+  void print(llvm::raw_ostream &OS) const override {
+    OS << "insn=" << MII.getName(MI.getOpcode()) << " va=0x"
+       << llvm::format_hex(VA, 0);
+  }
+};
 
 /// The five EFLAGS bits LiftState keeps as allocas (AF and DF live in the
 /// X86LiftContext base).
@@ -99,6 +118,8 @@ bool GenContext::lift(const Instr &I) {
   Cur = &I;
   Opaque = false;
   PtrOf.clear();
+
+  LiftInsnTrace Trace(I.Inst, *LS.MC.MII, I.Addr.Value);
 
   bool Handled = llvm::revenant::liftX86Inst(*this, I.Inst, I.Addr.Value,
                                              I.Size);

@@ -381,6 +381,11 @@ DICompileUnit &revenant::ir::getOrCreateCompileUnit(Module &M, DIBuilder &DIB,
   DIFile *F = DIB.createFile(
       SourceFileName.empty() ? StringRef("f_recovered") : SourceFileName,
       "revenant");
+  // The verifier and other readers treat DI without this flag as version 0
+  // and drop it.
+  if (!M.getModuleFlag("Debug Info Version"))
+    M.addModuleFlag(Module::Warning, "Debug Info Version",
+                    DEBUG_METADATA_VERSION);
   return *DIB.createCompileUnit(dwLangFor(M), F, "revenant",
                                 /*isOptimized=*/true, /*Flags=*/"",
                                 /*RV=*/0, /*SplitName=*/"",
