@@ -34,6 +34,7 @@
 #include "revenant/Core/Instr.h"
 #include "revenant/Core/Program.h"
 #include "revenant/Disasm/Disasm.h"
+#include <array>
 
 #include <cassert>
 #include <cctype>
@@ -686,6 +687,10 @@ static std::optional<FrameModel> frameModel(const Program &P,
 // Liveness / width queries (direct ports)
 //==--------------------------------------------------------------------==//
 
+static const unsigned GRP[4] = {X86::RCX, X86::RDX, X86::R8, X86::R9};
+static const unsigned XRP[4] = {X86::XMM0, X86::XMM1, X86::XMM2,
+                                X86::XMM3};
+
 using RegSet = SmallSet<unsigned, 8>;
 
 /// Per-block gen (read-before-write) / kill (written) for `watched`.
@@ -759,10 +764,17 @@ static size_t entryBlock(const Function &F) {
   return 0;
 }
 
+using HomeSpillReads = std::map<Va, std::array<bool, 4>>;
+
+static bool isHomeSpillRead(const HomeSpillReads *Spills, Va Addr,
+                            unsigned Reg);
 /// Widest read width of `reg` among reads that can still see the
 /// parameter value.
-static unsigned widestRead(const Function &F, const McTables &T,
-                           unsigned Reg) {
+static unsigned widestRead(const Function &F, const McTables &T, unsigned Reg,
+                           const HomeSpillReads *Spills = nullptr,
+                           bool *Observed = nullptr) {
+  if (Observed)
+    *Observed = false;
   size_t N = F.Blocks.size();
   std::vector<bool> Valid(N, false), Kills(N, false);
   Valid[entryBlock(F)] = true;
@@ -800,13 +812,17 @@ static unsigned widestRead(const Function &F, const McTables &T,
     const BasicBlock &B = F.Blocks[Bi];
     for (size_t i = B.InstrsBegin;
          i < B.InstrsEnd && i < F.Instrs.size(); ++i) {
-      InsnInfo II = insnInfo(F.Instrs[i].Inst, T);
+      const Instr &Ins = F.Instrs[i];
+      InsnInfo II = insnInfo(Ins.Inst, T);
       bool Stop = false;
       for (const RegUse &U : II.Regs) {
         if (grp(U.Reg) != Reg)
           continue;
-        if (U.Read)
+        if (U.Read && !isHomeSpillRead(Spills, Ins.Addr, U.Reg)) {
           Bits = std::max(Bits, regBits(U.Reg));
+          if (Observed)
+            *Observed = true;
+        }
         if (U.Write)
           Stop = true;
       }
@@ -880,6 +896,61 @@ static std::map<int64_t, uint32_t> stackArgs(const Function &F,
   return Args;
 }
 
+
+struct VarArgsInfo {
+  bool Detected = false;
+  HomeSpillReads Spills;
+};
+
+/// Detect the Win64 va_start setup that saves each register argument in its
+/// corresponding home slot.
+static VarArgsInfo detectVarArgs(const Function &F, const McTables &T,
+                                 const FrameModel *Frame) {
+  VarArgsInfo Info;
+  if (!Frame)
+    return Info;
+  bool Seen[4] = {false, false, false, false};
+  for (const Instr &Ins : F.Instrs) {
+    InsnInfo II = insnInfo(Ins.Inst, T);
+    if (!II.MemWrite)
+      continue;
+    for (const MemOp &M : II.Mems) {
+      if (M.Index != 0)
+        continue;
+      std::optional<int64_t> Off;
+      if (M.Base == X86::RSP || M.Base == X86::ESP)
+        Off = Frame->rspOff(Ins.Addr, M.Disp);
+      else if (M.Base == X86::RBP || M.Base == X86::EBP)
+        Off = Frame->rbpOff(M.Disp);
+      if (!Off || *Off < 8 || *Off > 32 || (*Off - 8) % 8 != 0)
+        continue;
+      unsigned K = static_cast<unsigned>((*Off - 8) / 8);
+      for (const RegUse &U : II.Regs) {
+        if (!U.Read || grp(U.Reg) != GRP[K])
+          continue;
+        Info.Spills[Ins.Addr][K] = true;
+        Seen[K] = true;
+      }
+    }
+  }
+  Info.Detected = std::all_of(std::begin(Seen), std::end(Seen),
+                              [](bool V) { return V; });
+  if (!Info.Detected)
+    Info.Spills.clear();
+  return Info;
+}
+static bool isHomeSpillRead(const HomeSpillReads *Spills, Va Addr,
+                            unsigned Reg) {
+  if (!Spills)
+    return false;
+  auto It = Spills->find(Addr);
+  if (It == Spills->end())
+    return false;
+  for (unsigned K = 0; K < 4; ++K)
+    if (It->second[K] && grp(Reg) == GRP[K])
+      return true;
+  return false;
+}
 /// Is `reg` written on every path to `ret`? (must-define fixpoint)
 static bool mustDefine(const Function &F, const McTables &T,
                        unsigned Reg) {
@@ -1018,10 +1089,6 @@ static unsigned callerReadWidth(const CallSites &Sites, FnCache &Fns,
   return Bits;
 }
 
-static const unsigned GRP[4] = {X86::RCX, X86::RDX, X86::R8, X86::R9};
-static const unsigned XRP[4] = {X86::XMM0, X86::XMM1, X86::XMM2,
-                                X86::XMM3};
-
 /// Parameters seen written (rcx..r9 prefix) before a call site.
 static unsigned callsiteArgs(const Function &G, const McTables &T,
                              Va CallIp) {
@@ -1082,11 +1149,22 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
     if (!Live.empty())
       EntryLive = Live[entryBlock(F)];
 
+    VarArgsInfo VarArgs =
+        detectVarArgs(F, T, Frame ? &*Frame : nullptr);
     Signature Sig;
+    Sig.VarArgs = VarArgs.Detected;
     for (int K = 0; K < 4; ++K) {
       unsigned R = GRP[K], Xr = XRP[K];
       bool IntLive = EntryLive.count(R);
       bool XmmLive = EntryLive.count(Xr);
+      unsigned ReadBits = 0;
+      bool HasSemanticRead = false;
+      if (IntLive)
+        ReadBits = widestRead(F, T, R,
+                              VarArgs.Detected ? &VarArgs.Spills : nullptr,
+                              &HasSemanticRead);
+      if (VarArgs.Detected && !HasSemanticRead)
+        IntLive = false;
       if (XmmLive && !IntLive) {
         Param P_;
         P_.Loc = ParamLoc::reg(Xr);
@@ -1096,7 +1174,7 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
       } else if (IntLive) {
         Param P_;
         P_.Loc = ParamLoc::reg(R);
-        P_.Bits = widestRead(F, T, R);
+        P_.Bits = ReadBits;
         Sig.Params.push_back(P_);
       }
     }

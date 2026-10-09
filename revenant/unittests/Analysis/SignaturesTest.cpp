@@ -3,6 +3,8 @@
 #include "revenant/Core/Program.h"
 #include "revenant/Disasm/Disasm.h"
 
+#include <algorithm>
+#include <iterator>
 #include "gtest/gtest.h"
 
 using namespace revenant;
@@ -79,6 +81,42 @@ TEST(SignaturesTest, InfersRegisterParameterAndObservedReturn) {
   EXPECT_EQ(Sig->Params[0].Bits, 32u);
   EXPECT_TRUE(Sig->HasRet);
   EXPECT_EQ(Sig->Ret.Bits, 32u);
+}
+
+TEST(SignaturesTest, RecognizesVarArgsHomeSpillsWithoutInventingParameters) {
+  constexpr uint64_t Base = 0x140003000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x20;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  const uint8_t Code[] = {
+      0x48, 0x89, 0x4C, 0x24, 0x08, // mov [rsp+8], rcx
+      0x48, 0x89, 0x54, 0x24, 0x10, // mov [rsp+16], rdx
+      0x4C, 0x89, 0x44, 0x24, 0x18, // mov [rsp+24], r8
+      0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+32], r9
+      0x8B, 0xC1,                   // mov eax, ecx
+      0xC3,                         // ret
+  };
+  std::copy(std::begin(Code), std::end(Code), Text.Data.begin());
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va Start(Base);
+  P.Functions.emplace(
+      Start, record(Start, 0, 0x17, {0, 5, 0xA, 0xF, 0x14, 0x16}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(Start);
+  ASSERT_NE(Sig, nullptr);
+  EXPECT_TRUE(Sig->VarArgs);
+  ASSERT_EQ(Sig->Params.size(), 1u);
+  EXPECT_EQ(Sig->Params[0].Bits, 32u);
 }
 
 TEST(SignaturesTest, LookupUsesFunctionStart) {
