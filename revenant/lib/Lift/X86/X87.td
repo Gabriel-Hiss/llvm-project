@@ -60,30 +60,30 @@ def rv_fst      : RVOp; // (rv_fst "f32|f64|i16|i32|i64|ti16|ti32|ti64" $m, v)
 
 def : RVLift {
   let Insn = LD_F32m;
-  dag Body = (rv_x87push (rv_fld "f32" $src));
+  dag Body = (rv_x87push (rv_fld "f32", $src));
 }
 def : RVLift {
   let Insn = LD_F64m;
-  dag Body = (rv_x87push (rv_fld "f64" $src));
+  dag Body = (rv_x87push (rv_fld "f64", $src));
 }
 def : RVLift {
   let Insn = LD_F80m;
-  dag Body = (rv_x87push (rv_fld "f80" $src));
+  dag Body = (rv_x87push (rv_fld "f80", $src));
 }
 
 // ILD_F16m/32m/64m: integer loads convert exactly.
 
 def : RVLift {
   let Insn = ILD_F16m;
-  dag Body = (rv_x87push (rv_fld "i16" $src));
+  dag Body = (rv_x87push (rv_fld "i16", $src));
 }
 def : RVLift {
   let Insn = ILD_F32m;
-  dag Body = (rv_x87push (rv_fld "i32" $src));
+  dag Body = (rv_x87push (rv_fld "i32", $src));
 }
 def : RVLift {
   let Insn = ILD_F64m;
-  dag Body = (rv_x87push (rv_fld "i64" $src));
+  dag Body = (rv_x87push (rv_fld "i64", $src));
 }
 
 // LD_Frr: (outs), (ins RSTi:$op). Push a copy of ST(i).
@@ -129,26 +129,26 @@ def : RVLift {
 
 def : RVLift {
   let Insn = ST_F32m;
-  dag Body = (rv_fst "f32" $dst, (rv_x87st 0));
+  dag Body = (rv_fst "f32", $dst, (rv_x87st 0));
 }
 def : RVLift {
   let Insn = ST_F64m;
-  dag Body = (rv_fst "f64" $dst, (rv_x87st 0));
+  dag Body = (rv_fst "f64", $dst, (rv_x87st 0));
 }
 
 // ST_FP32m/64m/80m: same, then pop.
 
 def : RVLift {
   let Insn = ST_FP32m;
-  dag Body = (rv_seq (rv_fst "f32" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "f32", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = ST_FP64m;
-  dag Body = (rv_seq (rv_fst "f64" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "f64", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = ST_FP80m;
-  dag Body = (rv_seq (rv_fst "f80" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "f80", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 
 // ST_Frr/ST_FPrr: (outs), (ins RSTi:$op). Copy ST(0) into ST(i); pop for p.
@@ -160,7 +160,7 @@ def : RVLift {
 def : RVLift {
   let Insn = ST_FPrr;
   dag Body = (rv_seq
-    (rv_x87stset (rv_x87idx $op), (rv_x87st 0))
+    (rv_x87stset (rv_x87idx $op), (rv_x87st 0)),
     (rv_x87pop));
 }
 
@@ -168,35 +168,35 @@ def : RVLift {
 
 def : RVLift {
   let Insn = IST_F16m;
-  dag Body = (rv_fst "i16" $dst, (rv_x87st 0));
+  dag Body = (rv_fst "i16", $dst, (rv_x87st 0));
 }
 def : RVLift {
   let Insn = IST_F32m;
-  dag Body = (rv_fst "i32" $dst, (rv_x87st 0));
+  dag Body = (rv_fst "i32", $dst, (rv_x87st 0));
 }
 def : RVLift {
   let Insn = IST_FP16m;
-  dag Body = (rv_seq (rv_fst "i16" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "i16", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = IST_FP32m;
-  dag Body = (rv_seq (rv_fst "i32" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "i32", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = IST_FP64m;
-  dag Body = (rv_seq (rv_fst "i64" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "i64", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = ISTT_FP16m;
-  dag Body = (rv_seq (rv_fst "ti16" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "ti16", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = ISTT_FP32m;
-  dag Body = (rv_seq (rv_fst "ti32" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "ti32", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = ISTT_FP64m;
-  dag Body = (rv_seq (rv_fst "ti64" $dst, (rv_x87st 0)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fst "ti64", $dst, (rv_x87st 0)), (rv_x87pop));
 }
 
 // ---- register arithmetic --------------------------------------------------
@@ -217,7 +217,7 @@ def : RVLift {
   let Insn = ADD_FPrST0;
   dag Body = (rv_seq
     (rv_x87stset (rv_x87idx $op),
-      (rv_ffadd (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+      (rv_ffadd (rv_x87st (rv_x87idx $op)), (rv_x87st 0))),
     (rv_x87pop));
 }
 def : RVLift {
@@ -233,7 +233,7 @@ def : RVLift {
   let Insn = SUB_FPrST0;
   dag Body = (rv_seq
     (rv_x87stset (rv_x87idx $op),
-      (rv_ffsub (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+      (rv_ffsub (rv_x87st (rv_x87idx $op)), (rv_x87st 0))),
     (rv_x87pop));
 }
 def : RVLift {
@@ -249,7 +249,7 @@ def : RVLift {
   let Insn = SUBR_FPrST0;
   dag Body = (rv_seq
     (rv_x87stset (rv_x87idx $op),
-      (rv_ffsub (rv_x87st 0), (rv_x87st (rv_x87idx $op))))
+      (rv_ffsub (rv_x87st 0), (rv_x87st (rv_x87idx $op)))),
     (rv_x87pop));
 }
 def : RVLift {
@@ -265,7 +265,7 @@ def : RVLift {
   let Insn = MUL_FPrST0;
   dag Body = (rv_seq
     (rv_x87stset (rv_x87idx $op),
-      (rv_ffmul (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+      (rv_ffmul (rv_x87st (rv_x87idx $op)), (rv_x87st 0))),
     (rv_x87pop));
 }
 def : RVLift {
@@ -281,7 +281,7 @@ def : RVLift {
   let Insn = DIV_FPrST0;
   dag Body = (rv_seq
     (rv_x87stset (rv_x87idx $op),
-      (rv_ffdiv (rv_x87st (rv_x87idx $op)), (rv_x87st 0)))
+      (rv_ffdiv (rv_x87st (rv_x87idx $op)), (rv_x87st 0))),
     (rv_x87pop));
 }
 def : RVLift {
@@ -297,7 +297,7 @@ def : RVLift {
   let Insn = DIVR_FPrST0;
   dag Body = (rv_seq
     (rv_x87stset (rv_x87idx $op),
-      (rv_ffdiv (rv_x87st 0), (rv_x87st (rv_x87idx $op))))
+      (rv_ffdiv (rv_x87st 0), (rv_x87st (rv_x87idx $op)))),
     (rv_x87pop));
 }
 
@@ -308,99 +308,99 @@ def : RVLift {
 
 def : RVLift {
   let Insn = ADD_F32m;
-  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "f32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "f32", $src)));
 }
 def : RVLift {
   let Insn = ADD_F64m;
-  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "f64" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "f64", $src)));
 }
 def : RVLift {
   let Insn = SUB_F32m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "f32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "f32", $src)));
 }
 def : RVLift {
   let Insn = SUB_F64m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "f64" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "f64", $src)));
 }
 def : RVLift {
   let Insn = SUBR_F32m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "f32" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "f32", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = SUBR_F64m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "f64" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "f64", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = MUL_F32m;
-  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "f32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "f32", $src)));
 }
 def : RVLift {
   let Insn = MUL_F64m;
-  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "f64" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "f64", $src)));
 }
 def : RVLift {
   let Insn = DIV_F32m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "f32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "f32", $src)));
 }
 def : RVLift {
   let Insn = DIV_F64m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "f64" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "f64", $src)));
 }
 def : RVLift {
   let Insn = DIVR_F32m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "f32" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "f32", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = DIVR_F64m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "f64" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "f64", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = ADD_FI16m;
-  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "i16" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "i16", $src)));
 }
 def : RVLift {
   let Insn = ADD_FI32m;
-  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "i32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffadd (rv_x87st 0), (rv_fld "i32", $src)));
 }
 def : RVLift {
   let Insn = SUB_FI16m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "i16" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "i16", $src)));
 }
 def : RVLift {
   let Insn = SUB_FI32m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "i32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_x87st 0), (rv_fld "i32", $src)));
 }
 def : RVLift {
   let Insn = SUBR_FI16m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "i16" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "i16", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = SUBR_FI32m;
-  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "i32" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffsub (rv_fld "i32", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = MUL_FI16m;
-  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "i16" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "i16", $src)));
 }
 def : RVLift {
   let Insn = MUL_FI32m;
-  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "i32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffmul (rv_x87st 0), (rv_fld "i32", $src)));
 }
 def : RVLift {
   let Insn = DIV_FI16m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "i16" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "i16", $src)));
 }
 def : RVLift {
   let Insn = DIV_FI32m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "i32" $src)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_x87st 0), (rv_fld "i32", $src)));
 }
 def : RVLift {
   let Insn = DIVR_FI16m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i16" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i16", $src), (rv_x87st 0)));
 }
 def : RVLift {
   let Insn = DIVR_FI32m;
-  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i32" $src), (rv_x87st 0)));
+  dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i32", $src), (rv_x87st 0)));
 }
 
 // ---- compares ---------------------------------------------------------------
@@ -414,7 +414,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = COMP_FST0r;
-  dag Body = (rv_seq (rv_fcom (rv_x87idx $op)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom (rv_x87idx $op)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = UCOM_Fr;
@@ -422,15 +422,15 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = UCOM_FPr;
-  dag Body = (rv_seq (rv_fcom (rv_x87idx $reg)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom (rv_x87idx $reg)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = UCOM_FPPr;
-  dag Body = (rv_seq (rv_fcom) (rv_x87pop) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom), (rv_x87pop), (rv_x87pop));
 }
 def : RVLift {
   let Insn = FCOMPP;
-  dag Body = (rv_seq (rv_fcom) (rv_x87pop) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom), (rv_x87pop), (rv_x87pop));
 }
 
 // Memory compares: FCOM32m/64m (no pop), FCOMP32m/64m (pop), integer FICOM*.
@@ -445,11 +445,11 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FCOMP32m;
-  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom $src), (rv_x87pop));
 }
 def : RVLift {
   let Insn = FCOMP64m;
-  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom $src), (rv_x87pop));
 }
 def : RVLift {
   let Insn = FICOM16m;
@@ -457,7 +457,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FICOMP16m;
-  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom $src), (rv_x87pop));
 }
 def : RVLift {
   let Insn = FICOM32m;
@@ -465,7 +465,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FICOMP32m;
-  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcom $src), (rv_x87pop));
 }
 
 // FCOMI-family: (outs), (ins RSTi:$reg), Defs EFLAGS. Plain forms keep the
@@ -478,7 +478,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = COM_FIPr;
-  dag Body = (rv_seq (rv_fcomi (rv_x87idx $reg)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcomi (rv_x87idx $reg)), (rv_x87pop));
 }
 def : RVLift {
   let Insn = UCOM_FIr;
@@ -486,7 +486,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = UCOM_FIPr;
-  dag Body = (rv_seq (rv_fcomi (rv_x87idx $reg)) (rv_x87pop));
+  dag Body = (rv_seq (rv_fcomi (rv_x87idx $reg)), (rv_x87pop));
 }
 
 // ---- status and control words -----------------------------------------------
@@ -568,7 +568,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FFREEP;
-  dag Body = (rv_seq (rv_x87math "free", $reg) (rv_x87pop));
+  dag Body = (rv_seq (rv_x87math "free", $reg), (rv_x87pop));
 }
 def : RVLift {
   let Insn = FINCSTP;
@@ -630,7 +630,7 @@ def : RVLift {
 def : RVLift {
   let Insn = FPATAN;
   dag Body = (rv_seq
-    (rv_x87stset 1, (rv_x87math "atan", (rv_x87st 1), (rv_x87st 0)))
+    (rv_x87stset 1, (rv_x87math "atan", (rv_x87st 1), (rv_x87st 0))),
     (rv_x87pop));
 }
 def : RVLift {
@@ -656,7 +656,7 @@ def : RVLift {
 def : RVLift {
   let Insn = FSINCOS;
   dag Body = (rv_seq
-    (rv_x87stset 0, (rv_x87math "cos", (rv_x87st 0)))
+    (rv_x87stset 0, (rv_x87math "cos", (rv_x87st 0))),
     (rv_x87push (rv_x87math "sin", (rv_x87st 1))));
 }
 def : RVLift {
