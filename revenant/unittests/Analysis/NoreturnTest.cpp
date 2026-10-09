@@ -24,17 +24,27 @@ using namespace revenant;
 
 namespace {
 
-/// Test hooks: no traps beyond the MC `Trap` flow kind. Discovery's real
-/// hooks supply ud0/ud1/ud2/int3/int-0x29 through `isNoreturnTrap`; these
-/// tests use `FlowKind::Trap` terminators for the same paths.
+/// Test hooks add no target-specific traps; these tests exercise the
+/// generic MC Trap flow kind.
 class TestHooks final : public TargetHooks {
 public:
   llvm::StringRef mnemonic(const Instr &) const override { return ""; }
   bool isFiller(const Instr &) const override { return false; }
-  bool isNoreturnTrap(const Instr &) const override { return false; }
+  TrapKind trapKind(const Instr &) const override { return TrapKind::NotTrap; }
+  bool isNopOrInt3(const Instr &) const override { return false; }
+  bool isOpaqueTailJmp(const Image &, const Instr &) const override {
+    return false;
+  }
   std::optional<int64_t> stackDelta(const Instr &) const override {
     return std::nullopt;
   }
+  StackSlots stackSlots(const Instr &) const override { return {}; }
+  FpEstablish fpEstablish(const Instr &) const override { return {}; }
+  bool restoresSpFromFp(const Instr &) const override { return false; }
+  std::optional<int64_t> movEaxImm(const Instr &) const override {
+    return std::nullopt;
+  }
+  bool writesSpDynamically(const Instr &) const override { return false; }
   std::optional<JumpTableInfo>
   matchJumpTable(const Image &, llvm::ArrayRef<std::pair<Va, Va>>,
                  llvm::ArrayRef<BasicBlock>, llvm::ArrayRef<Instr>, size_t,
