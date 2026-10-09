@@ -43,6 +43,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -51,6 +52,27 @@ using namespace llvm;
 
 namespace revenant {
 namespace {
+
+// Store references only; format diagnostics when a crash actually occurs.
+class FunctionStageTrace final : public PrettyStackTraceEntry {
+  StringRef Stage;
+  StringRef Pass;
+  StringRef Name;
+  uint64_t Address;
+
+public:
+  FunctionStageTrace(StringRef Stage, StringRef Pass, StringRef Name,
+                     uint64_t Address = 0)
+      : Stage(Stage), Pass(Pass), Name(Name), Address(Address) {}
+
+  void print(raw_ostream &OS) const override {
+    OS << "Revenant stage=" << Stage << " pass=" << Pass
+       << " function=" << Name;
+    if (Address)
+      OS << " va=" << format_hex(Address, 0);
+    OS << "\n";
+  }
+};
 
 //==--------------------------------------------------------------------==//
 // Small helpers
@@ -202,6 +224,7 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
       if (!F.isDeclaration())
         Functions.push_back(&F);
     for (llvm::Function *F : Functions) {
+      FunctionStageTrace Trace(Stage, Pass, F->getName());
       ValueToValueMapTy SavedMap;
       llvm::Function *Saved = CloneFunction(F, SavedMap);
       FPM.run(*F, FAM);
@@ -340,13 +363,25 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   // ---- asm -----------------------------------------------------------
   std::string AsmText;
   size_t InstrCount = 0;
+  std::vector<Va> Ready;
   for (Va T : Todo) {
     auto FOrErr = materialize(T);
-    if (!FOrErr)
-      return FOrErr.takeError();
+    if (!FOrErr) {
+      std::string Note =
+          formatv("0x{0:x}: {1}", T.Value, toString(FOrErr.takeError())).str();
+      record(R.Stages, "asm", "failed", Note);
+      errs() << "[failed] asm: " << Note << "\n";
+      continue;
+    }
     auto A = disasmFunction(T);
-    if (!A)
-      return A.takeError();
+    if (!A) {
+      std::string Note =
+          formatv("0x{0:x}: {1}", T.Value, toString(A.takeError())).str();
+      record(R.Stages, "asm", "failed", Note);
+      errs() << "[failed] asm: " << Note << "\n";
+      continue;
+    }
+    Ready.push_back(T);
     AsmText += *A;
     InstrCount += FOrErr->Instrs.size();
     if (Opts.Emit == EmitKind::Asm)
@@ -354,6 +389,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         R.LineVas.push_back(
             {static_cast<uint32_t>(R.LineVas.size() + 1), {I.Addr}});
   }
+  Todo = std::move(Ready);
   record(
       R.Stages, "asm", "ok",
       formatv("{0} instructions across {1} functions", InstrCount, Todo.size())
@@ -381,6 +417,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     auto M = moduleFor(Ctx, Out);
     size_t OpaqueSites = 0;
     for (Va T : Todo) {
+      FunctionStageTrace Trace("lift", "liftFunction", Prog.Functions.at(T).Name,
+                               T.Value);
       auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
                                   Sigs.get(), /*TM=*/nullptr,
                                   /*RunPasses=*/false);
@@ -429,6 +467,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- source ------------------------------------------------------------
     if (Opts.Emit == EmitKind::Source) {
+      FunctionStageTrace Trace("source", Out == Lang::Rust ? "rustc" : "clang",
+                               "module");
       Expected<EmitResult> Em = Out == Lang::Rust
                                     ? emitRustcSource(FinalText)
                                     : emitClangSource(*M, Out == Lang::Cpp);
