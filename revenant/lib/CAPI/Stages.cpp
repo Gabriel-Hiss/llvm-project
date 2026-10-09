@@ -29,6 +29,7 @@
 #include "revenant/Lift/LiftFunction.h"
 #include "revenant/Object/PeFile.h"
 #include "revenant/Transforms/Pipeline/Pipeline.h"
+#include "revenant/Transforms/Uncxx/Uncxx.h"
 
 #include <chrono>
 #include <numeric>
@@ -59,6 +60,18 @@ using namespace llvm;
 
 namespace revenant {
 namespace {
+
+CxxFlavor uncxxFlavor(Compiler Producer) {
+  switch (Producer) {
+  case Compiler::Msvc:
+  case Compiler::ClangCl:
+    return CxxFlavor::Msvc;
+  case Compiler::MinGwGcc:
+    return CxxFlavor::Gnu;
+  default:
+    return CxxFlavor::Auto;
+  }
+}
 
 // Store references only; format diagnostics when a crash actually occurs.
 class FunctionStageTrace final : public PrettyStackTraceEntry {
@@ -218,7 +231,8 @@ SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
-                          std::vector<StageReport> &Reports) {
+                          std::vector<StageReport> &Reports,
+                          CxxFlavor Flavor) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -236,7 +250,9 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   auto Passes = pipelineElements(Pipeline);
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
-    if (Error E = PB.parsePassPipeline(FPM, Pass))
+    if (Pass == "revenant-uncxx")
+      FPM.addPass(UncxxPass(Flavor));
+    else if (Error E = PB.parsePassPipeline(FPM, Pass))
       return createStringError("pipeline '" + Pass.str() +
                                "': " + toString(std::move(E)));
     SmallVector<llvm::Function *, 32> Functions;
@@ -314,7 +330,8 @@ Error runModulePass(Module &M, StringRef Pass) {
 }
 
 Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
-                      StringRef Pipeline, std::vector<StageReport> &Reports) {
+                      StringRef Pipeline, std::vector<StageReport> &Reports,
+                      CxxFlavor Flavor = CxxFlavor::Auto) {
   // Validate the whole pipeline first: unknown pass names are configuration
   // errors, not recoverable failures of a particular function or module.
   PassBuilder PB;
@@ -324,7 +341,8 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
     return E;
   for (StringRef Element : pipelineElements(Pipeline)) {
     if (Element.starts_with("function(")) {
-      if (Error E = runFunctionPipeline(Stage, *M, Element, Reports))
+      if (Error E =
+              runFunctionPipeline(Stage, *M, Element, Reports, Flavor))
         return E;
       continue;
     }
@@ -362,10 +380,11 @@ std::string cleanPipeline(bool EnableStructDI) {
 }
 
 /// ir-final: deoptimization, structuring, type recovery, SSA-out.
-std::string finalPipeline(bool Patterns) {
-  return formatv("function({0}{1},revenant-structure,revenant-types,"
+std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
+  return formatv("function({0}{1}{2},revenant-structure,revenant-types,"
                  "revenant-ssaout)",
-                 UnoptPipeline, Patterns ? ",revenant-patterns" : "")
+                 IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
+                 Patterns ? ",revenant-patterns" : "")
       .str();
 }
 
@@ -752,10 +771,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- ir-final ----------------------------------------------------------
     if (auto E =
-            runPipelineText("ir-final", M, finalPipeline(Opts.Patterns),
-                            R.Stages))
+            runPipelineText("ir-final", M,
+                            finalPipeline(Opts.Patterns, Out == Lang::Cpp),
+                            R.Stages, uncxxFlavor(Compiler.Producer)))
       return std::move(E);
-    record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");
+    record(R.Stages, "ir-final", "ok",
+           "Uncxx (C++ only) + unopt + structure + types + ssaout");
     FinalText = moduleText(*M);
     if (Opts.Emit == EmitKind::IrFinal) {
       R.Text = FinalText;
