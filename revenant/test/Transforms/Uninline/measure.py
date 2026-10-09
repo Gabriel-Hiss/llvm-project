@@ -121,7 +121,7 @@ def main():
                     rows.append(row)
                     count[status] += 1
             else:
-                attributes = dict(re.findall(r'^attributes #(\\d+) = (.*)$',
+                attributes = dict(re.findall(r'^attributes #(\d+) = (.*)$',
                                              text, re.M))
                 for caller, body in pre.items():
                     if caller not in post:
@@ -132,8 +132,8 @@ def main():
                     for callee, before in sorted(original.items()):
                         if callee not in pre or callee == caller:
                             continue
-                        header = pre[callee].split('\\n', 1)[0]
-                        attr = re.search(r'#(\\d+)', header)
+                        header = pre[callee].split('\n', 1)[0]
+                        attr = re.search(r'#(\d+)', header)
                         attrs = attributes.get(attr[1], '') if attr else ''
                         if 'noinline' in header + attrs:
                             continue

@@ -25,6 +25,12 @@ def symbol(name):
 
 def inline_records(path):
     text = pathlib.Path(path).read_text(encoding='utf-8')
+    if pathlib.Path(path).suffix == '.txt':
+        pattern = re.compile(r"^note: (.*):([0-9]+):([0-9]+) inline "
+                             r"\(success\): '([^']+)' inlined into '([^']+)'",
+                             re.M)
+        return [{'file': m[1], 'line': int(m[2]), 'column': int(m[3]),
+                 'callee': m[4], 'caller': m[5]} for m in pattern.finditer(text)]
     result = []
     for document in text.split('--- !'):
         if not re.search(r'^Name:\s+Inlined\s*$', document, re.M):
@@ -48,11 +54,12 @@ def inline_records(path):
 
 
 def normalized_ir(path, opt):
-    run = subprocess.run([str(opt), '-passes=strip-debug', '-S', str(path)],
+    run = subprocess.run([str(opt), '-strip-debug', '-passes=verify',
+                          '-S', str(path)],
                          capture_output=True, text=True, timeout=120)
     if run.returncode:
         raise ValueError(run.stderr)
-    return re.sub(r'^; ModuleID =.*\\n', '', run.stdout)
+    return re.sub(r'^; ModuleID =.*\n', '', run.stdout)
 
 
 def verified_index(path, opt, corpus):
@@ -81,5 +88,5 @@ def verified_index(path, opt, corpus):
         result[item['target'], item['tu']] = inline_records(item['record'])
     validated = pathlib.Path(path).with_name('verified-index.json')
     validated.write_text(json.dumps(validation + [i for i in rejected
-                          if i not in validation], indent=2) + '\\n')
+                          if i not in validation], indent=2) + '\n')
     return result, rejected
