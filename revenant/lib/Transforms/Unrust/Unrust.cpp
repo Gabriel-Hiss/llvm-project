@@ -123,15 +123,6 @@ bool isPanicName(StringRef N) {
          N.contains("panic_fmt") || N.contains("panic");
 }
 
-bool isOverflowIntrinsicName(StringRef N) {
-  return N.contains("llvm.sadd.with.overflow") ||
-         N.contains("llvm.uadd.with.overflow") ||
-         N.contains("llvm.ssub.with.overflow") ||
-         N.contains("llvm.usub.with.overflow") ||
-         N.contains("llvm.smul.with.overflow") ||
-         N.contains("llvm.umul.with.overflow");
-}
-
 bool callsPanicBoundsCheck(const Function &F) {
   for (const BasicBlock &BB : F)
     for (const Instruction &I : BB) {
@@ -481,6 +472,7 @@ bool restoreNicheTests(Function &F, unsigned &Changed) {
     auto *Tr = new TruncInst(SI->getValueOperand(),
                              Type::getInt1Ty(F.getContext()),
                              "discr.unrust", SI->getNextNode()->getIterator());
+    (void)Tr;
     // No provenance: even !revenant.va on a new instruction renumbers
     // downstream metadata in the printer. The store keeps its own VA.
     ++Changed;
@@ -650,7 +642,6 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
       IRBuilder<> B(NBT);
       B.SetCurrentDebugLocation(DebugLoc());
       // Reload the discriminant from the parameter at the same offset.
-      Value *Off = nullptr;
       Value *Base = AggPtr;
       if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr)) {
         (void)GEP;
