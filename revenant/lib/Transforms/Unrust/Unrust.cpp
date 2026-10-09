@@ -501,6 +501,11 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
     return false;
   bool HasTriple = false;
   bool HasBufGEP = false;
+  // SROA evidence: the optimizer splits the triple into scalar phis or
+  // dbg_value fragments. At -O0 nothing is split (the triple allocas
+  // are intact or the function never had one): a bare GEP is not
+  // enough, or every btree helper with a buffer GEP grows a frame.
+  bool HasSroaPhi = false;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
@@ -514,14 +519,16 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
             GEP->getSourceElementType()->isIntegerTy(64))
           HasBufGEP = true;
       }
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        if (PN->getType()->isPointerTy() || PN->getType()->isIntegerTy())
+          HasSroaPhi = true;
+      }
     }
   }
-  if (HasTriple || !HasBufGEP)
+  if (HasTriple || !HasBufGEP || !HasSroaPhi)
     return false;
-  // Bail when the function is fully folded (single ret block with no
-  // memory traffic): there is no triple left to name.
   BasicBlock &Entry = F.getEntryBlock();
-  if (Entry.size() < 3)
+  if (Entry.empty())
     return false;
   IRBuilder<> B(&Entry.front());
   B.SetCurrentDebugLocation(DebugLoc());
@@ -795,14 +802,40 @@ bool rebuildIterFrame(Function &F, unsigned &Changed) {
     if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
       continue;
     // Loop shape: an ult-guarded branch inside a function that still
-    // carries a loop phi. Spells the rustc Range/slice-iter latch the
-    // pre shape names.
+    // carries a loop phi (SROA evidence: at -O0 the iter struct is
+    // intact and no phi exists, so a bare ult loop is not enough).
     for (BasicBlock &B2 : F)
       for (Instruction &SI : B2)
         if (isa<PHINode>(&SI))
           HasUltLoop = true;
   }
   if (HasIter || !HasUltLoop)
+    return false;
+  // The ult compare must feed the loop through a phi: one operand must
+  // be a phi node (induction) or flow into one. A plain ult branch
+  // over straight-line code (o0 bounds checks) is not an iter loop.
+  bool UltFeedsPhi = false;
+  for (BasicBlock &BB : F) {
+    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!BI || !BI->isConditional())
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+    if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+      continue;
+    for (Value *Op : Cmp->operands()) {
+      if (isa<PHINode>(Op))
+        UltFeedsPhi = true;
+      if (auto *I = dyn_cast<Instruction>(Op))
+        for (User *U : I->users())
+          if (isa<PHINode>(U))
+            UltFeedsPhi = true;
+    }
+    for (BasicBlock *Succ : BI->successors())
+      for (Instruction &SI : *Succ)
+        if (isa<PHINode>(&SI))
+          UltFeedsPhi = true;
+  }
+  if (!UltFeedsPhi)
     return false;
   BasicBlock &Entry = F.getEntryBlock();
   if (Entry.empty())
