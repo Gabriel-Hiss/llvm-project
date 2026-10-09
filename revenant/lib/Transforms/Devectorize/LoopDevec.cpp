@@ -288,6 +288,9 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     if (isa<FixedVectorType>(I.getType()))
       VecDefs.insert(&I);
   SmallVector<Instruction *, 4> Reduces;
+  // Exit-block combine: the two acc backs merge through one lane-wise add
+  // before the reduce (reference LoopCx merges acc next-vals the same way).
+  SmallVector<BinaryOperator *, 2> Combines;
   std::function<bool(Value *, unsigned)> AccTree = [&](Value *V,
                                                        unsigned Depth) {
     if (AccVals.contains(V))
@@ -314,6 +317,18 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       if (II && II->getIntrinsicID() == reduceIntrinsic(Opcode) &&
           AccTree(II->getOperand(0), 0)) {
         Reduces.push_back(CI);
+        continue;
+      }
+      // One lane-wise add combining acc backs in the exit block is part
+      // of the reduction (merged_val in the reference); record it for
+      // erasure after aliasing, still no other outside uses allowed.
+      auto *BO = dyn_cast<BinaryOperator>(const_cast<Instruction *>(UI));
+      unsigned CL = 0;
+      Type *CE = nullptr;
+      if (BO && BO->getOpcode() == Instruction::Add &&
+          isIntVec128(BO->getType(), CL, CE) && CL == Lanes && CE == Elem &&
+          AccTree(BO->getOperand(0), 0) && AccTree(BO->getOperand(1), 0)) {
+        Combines.push_back(BO);
         continue;
       }
       return 0;
@@ -539,6 +554,15 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       continue;
     if (AccBacks.contains(&I)) {
       // Acc update: explode the stream side, fold lanes into the chain.
+      // The vector update itself dies: sever its phi edge FIRST so the
+      // old acc phi no longer references it (else phi<->update pin each
+      // other live and neither erases).
+      for (auto &A : Accs)
+        if (A.Back == &I)
+          for (unsigned k = 0, KN = A.Phi->getNumIncomingValues(); k < KN; ++k)
+            if (A.Phi->getIncomingBlock(k) == H)
+              A.Phi->setIncomingValue(
+                  k, llvm::UndefValue::get(A.Phi->getType()));
       Value *Stream = nullptr;
       for (auto &A : Accs)
         if (A.Back == &I)
@@ -585,21 +609,27 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     }
   }
 
-  // Close the scalar backedge and alias exit reduces to the chain end.
-  // The old vector acc phis die here: redirect their backedge slot to the
-  // scalar chain end first so the vector phi has no in-loop users left.
+  // Close the scalar backedge. The old vector acc phis keep their own
+  // (vector-typed) backedge slots untouched: they die by erasure below
+  // once use-free, never by type-breaking slot rewrite.
   S->addIncoming(Chain, H);
-  for (auto &A : Accs) {
+  for (auto &A : Accs)
     Subs[A.Back] = Chain;
-    for (unsigned i = 0, N = A.Phi->getNumIncomingValues(); i < N; ++i)
-      if (A.Phi->getIncomingBlock(i) == H)
-        A.Phi->setIncomingValue(i, Chain);
-  }
   unsigned NReduce = 0;
   for (Instruction *R : Reduces) {
     R->replaceAllUsesWith(Chain);
     if (R->use_empty()) {
       R->eraseFromParent();
+      ++NReduce;
+    }
+  }
+  for (BinaryOperator *C : Combines) {
+    if (C->use_empty())
+      continue;
+    // Uses were rewired to Chain above (the combine fed only reduces).
+    // Anything still using it blocks erasure; leave it.
+    if (C->use_empty()) {
+      C->eraseFromParent();
       ++NReduce;
     }
   }
@@ -624,17 +654,24 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       continue;
     Old->replaceAllUsesWith(KV.second);
   }
-  // Erase dead vector body (RAUW passes above rewire in dependency order;
-  // erase in reverse so consumers go before producers), then the old acc
-  // phis once use-free.
-  for (auto It = Kill.rbegin(); It != Kill.rend(); ++It) {
-    Instruction *K = *It;
-    if (K->getParent() == nullptr || !K->use_empty())
-      continue;
-    K->eraseFromParent();
+  // Erase dead vector body. Kill order is emission order (loads before
+  // their lane consumers); erase in reverse so consumers die first, then
+  // repeat to fixpoint for chains the first sweep exposes. The old acc
+  // updates (in Kill via Subs) die with the body; the old acc phis erase
+  // last, once use-free.
+  bool Progress = true;
+  while (Progress) {
+    Progress = false;
+    for (auto It = Kill.rbegin(); It != Kill.rend(); ++It) {
+      Instruction *K = *It;
+      if (K->getParent() == nullptr || !K->use_empty())
+        continue;
+      K->eraseFromParent();
+      Progress = true;
+    }
   }
   for (auto &A : Accs) {
-    if (A.Phi->use_empty())
+    if (A.Phi->getParent() != nullptr && A.Phi->use_empty())
       A.Phi->eraseFromParent();
   }
 
