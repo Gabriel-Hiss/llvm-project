@@ -368,12 +368,20 @@ bool structDIEnabled() {
   return Value && StringRef(Value) == "1";
 }
 
-/// ir-clean: normalize lifted stack/address/width shapes, then cleanup +
-/// idioms, then the module-level ABI recovery passes plus one cleanup round.
+/// ir-clean: normalize lifted stack/address/width shapes, run cleanup and
+/// the module-level ABI recovery, then idioms as the LAST function pass.
+/// Idioms runs twice on purpose. The early run rewrites verified
+/// multiply-high DAGs into udiv/sdiv and the quotient-times-divisor residual
+/// into urem/srem while the DAG still has its source shape. The second
+/// instcombine round then canonicalizes the surviving results, and
+/// instcombine refolds a source-level three-way compare, min/max, abs or
+/// saturating add/sub into llvm.scmp/llvm.smin/llvm.abs/llvm.uadd.sat, so the
+/// late run converts those optimizer forms back to the compiler's
+/// pre-optimization (source) compare/select shape for the emitter.
 std::string cleanPipeline(bool EnableStructDI) {
   return formatv("function({0},{1}),revenant-lift-abi,"
                  "function(instcombine<no-verify-fixpoint>,early-cse,"
-                 "revenant-lift-normalize){2}",
+                 "revenant-lift-normalize,{1}){2}",
                  CleanupPipeline, IdiomsPipeline,
                  EnableStructDI ? ",revenant-lift-structs" : "")
       .str();
