@@ -64,6 +64,32 @@ passes rewrote past exact matching but whose outline-plus-reinline still
 reproduces ir-post. The pass itself still recovers only the exact-match
 subset; the round trip is measurement, not a rewrite rule.
 
+`clones.py` hashes single-block windows (3..16 instructions, SROA
+traffic abstracted) across each ir-post TU: json-clang-o2 alone has
+104,742 classes, 42,936 repeated, 38,138 cross-function. `outline.py`
+then matches each deleted callee's normalized ir-pre body against those
+windows on the same 36,249-event denominator: 0 full, 0 partial, 36,249
+none in every group (O2 0/16,795, O3 0/9,689, LTO 0/9,689, rustc 0/76).
+The miss split is structural, not a threshold artifact: 11,403 sites
+have fewer than 3 normalized instructions left (the callee was a thin
+wrapper whose spills SROA removed, e.g. `vector::back` shrinks to 7
+loads/geps and the no-spill filter keeps 2), 18,954 have no window
+matching at all (fully specialized away: the memcpy in
+`TDEFL_READ_UNALIGNED_WORD2` dissolves into byte loads/shifts, the
+`back()` address math folds into surrounding GEPs), 2 have exactly one
+occurrence (outlining needs a repeat), and 5,890 are retained callees
+the exact path already handles. `outline_synthesize.py` performs the
+CodeExtractor step on one TU (miniz O3: 16,082 classes, 4,171 repeated,
+top class 92 occurrences) and emits new `internal` outlines, but the
+emitted calls carry a void prototype with untyped parameters, so the
+module fails verification today (`%p0 defined with type ptr but
+expected i32`). Conclusion for the integrator: the deleted-callee mass
+is small STL/template wrappers specialized past window recognition plus
+single-caller functions (1,587 of 2,410 deleted callees in json have
+exactly one caller); synthesizing them back does not reproduce the
+original callee bodies, it invents new ones. No pass change follows
+from this phase.
+
 Example, from the assigned worktree:
 
 ```
