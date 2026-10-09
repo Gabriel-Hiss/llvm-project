@@ -157,33 +157,48 @@ TEST(LiftFunction, CleanupPipelineVerifies) {
 }
 
 TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
+  // The five-binary matrix plus the binaries behind earlier lifter crashes
+  // (entry block that is a branch target; invalid casts in Rust code).
   const struct {
     const char *Name;
     const char *Path;
-  } Inputs[] = {{"c-o0", REVENANT_TEST_C_O0},
-                {"c-o2", REVENANT_TEST_C_O2},
-                {"cpp-o2", REVENANT_TEST_CPP_O2},
-                {"c-clang-o2", REVENANT_TEST_C_CLANG_O2},
-                {"c-gcc-o2", REVENANT_TEST_C_GCC_O2}};
+  } Inputs[] = {
+      {"c-o0", REVENANT_TEST_C_O0},
+      {"c-o2", REVENANT_TEST_C_O2},
+      {"cpp-o2", REVENANT_TEST_CPP_O2},
+      {"c-clang-o2", REVENANT_TEST_C_CLANG_O2},
+      {"c-gcc-o2", REVENANT_TEST_C_GCC_O2},
+      {"json-cl-o2", REVENANT_TEST_PARITY "/json-cl-o2/json-cl-o2.exe"},
+      {"rust-o0", REVENANT_TEST_PARITY "/rust-o0/corpus_rust.exe"},
+      {"rust-o3", REVENANT_TEST_PARITY "/rust-o3/corpus_rust.exe"}};
   const char *Only = std::getenv("REVENANT_LIFT_ONLY");
   const char *DumpVa = std::getenv("REVENANT_LIFT_DUMP_VA");
-  for (const auto &Input : Inputs) {
-    if (Only && llvm::StringRef(Only) != Input.Name)
+  const bool Verbose = std::getenv("REVENANT_LIFT_VERBOSE") != nullptr;
+  // REVENANT_LIFT_EXE=<pe> lifts one more binary (named "extra").
+  std::vector<std::pair<std::string, std::string>> All;
+  for (const auto &In : Inputs)
+    All.push_back({In.Name, In.Path});
+  if (const char *Extra = std::getenv("REVENANT_LIFT_EXE"))
+    All.push_back({"extra", Extra});
+  for (const auto &Input : All) {
+    if (Only && llvm::StringRef(Only) != Input.first)
       continue;
-    auto Fx = open(Input.Path);
-    ASSERT_TRUE(Fx.has_value()) << Input.Path;
+    auto Fx = open(Input.second);
+    ASSERT_TRUE(Fx.has_value()) << Input.second;
     auto Hooks = createX86TargetHooks();
     Program P = analyze(*Fx->Pe, *Hooks);
-    ASSERT_FALSE(P.Functions.empty()) << Input.Name;
+    ASSERT_FALSE(P.Functions.empty()) << Input.first;
 
     llvm::LLVMContext C;
-    llvm::Module M(Input.Name, C);
+    llvm::Module M(Input.first, C);
     std::map<std::string, unsigned> LiftErrors;
     std::map<std::string, unsigned> VerifierErrors;
     std::map<std::string, unsigned> Fallbacks;
     unsigned Verified = 0;
     unsigned LiftFailed = 0;
     for (const auto &[Start, Record] : P.Functions) {
+      if (Verbose)
+        llvm::errs() << "lift " << llvm::utohexstr(Start.Value) << "\n";
       auto Lifted = lift::liftFunction(M, P, Record, *Fx->Dis, nullptr,
                                        nullptr, /*RunPasses=*/false);
       if (!Lifted) {
@@ -193,7 +208,8 @@ TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
             Ref.contains("inconsistent rsp delta") ? "stack-delta"
             : Ref.contains("decode")              ? "decode"
                                                    : "other";
-        if (Ref.contains("LLVM verification failed")) {
+        if (Ref.contains("LLVM verification failed") ||
+            (Verbose && Ref.contains("inconsistent rsp"))) {
           for (const BlockRec &BR : Record.Blocks) {
             llvm::errs() << "    block " << BR.startVa(*P.Img) << "\n";
             for (size_t N = BR.InstrsBegin; N < BR.InstrsEnd; ++N) {
@@ -235,7 +251,7 @@ TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
     }
     bool ModuleVerified = !verifyModule(M, &llvm::errs());
     unsigned Total = P.Functions.size();
-    llvm::errs() << Input.Name << ": " << Verified << "/" << Total
+    llvm::errs() << Input.first << ": " << Verified << "/" << Total
                  << " functions verified; lift failures=" << LiftFailed
                  << "; module verifier=" << (ModuleVerified ? "pass" : "fail")
                  << "\n";
@@ -245,8 +261,8 @@ TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
       llvm::errs() << "  verify-error " << Category << ": " << Count << "\n";
     for (const auto &[Mnemonic, Count] : Fallbacks)
       llvm::errs() << "  opaque " << Mnemonic << ": " << Count << "\n";
-    EXPECT_TRUE(ModuleVerified) << Input.Name;
-    EXPECT_GE(Verified * 100, Total * 99) << Input.Name;
+    EXPECT_TRUE(ModuleVerified) << Input.first;
+    EXPECT_GE(Verified * 100, Total * 99) << Input.first;
   }
 }
 
