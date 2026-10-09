@@ -1,6 +1,7 @@
 //==- tools/revenant-decompile - end-to-end driver ------------------------==//
 //
 //   revenant-decompile <pe> [--func <va|name>]... [--lang c|cpp|rust]
+//                        [--meta none|embedded|pdb]
 //                        [--emit asm|ir-raw|ir-clean|ir-final|source]
 //                        [-o <file>] [--patterns] [--list]
 //
@@ -50,6 +51,18 @@ static cl::opt<bool> ListFuncs("list",
 static cl::opt<bool> Patterns("patterns",
                               cl::desc("run the opt-in revenant-patterns pass"));
 static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
+static cl::opt<std::string>
+    MetaOpt("meta", cl::desc("metadata: none|embedded|pdb (default: embedded)"),
+            cl::value_desc("mode"), cl::init("embedded"));
+
+static std::optional<MetaMode> metaMode(StringRef S) {
+  return StringSwitch<std::optional<MetaMode>>(S)
+      .Case("none", MetaMode::None)
+      .Case("embedded", MetaMode::Embedded)
+      .Case("pdb", MetaMode::Pdb)
+      .Default(std::nullopt);
+}
+
 static std::optional<EmitKind> emitKind(StringRef S) {
   return StringSwitch<std::optional<EmitKind>>(S)
       .Case("asm", EmitKind::Asm)
@@ -85,6 +98,17 @@ int main(int Argc, char **Argv) {
     }
     Emit = *K;
   }
+  auto M = metaMode(MetaOpt);
+  if (!M) {
+    errs() << "revenant-decompile: unknown --meta '" << MetaOpt
+           << "' (expected none|embedded|pdb)\n";
+    return 2;
+  }
+  if (*M == MetaMode::Pdb) {
+    errs() << "revenant-decompile: --meta=pdb is not implemented yet\n";
+    return 2;
+  }
+
 
   auto SOrErr = Session::open(Input);
   if (!SOrErr) {
@@ -92,6 +116,7 @@ int main(int Argc, char **Argv) {
     return 1;
   }
   std::unique_ptr<Session> S = std::move(*SOrErr);
+  S->setMetaMode(*M);
 
   Lang Out = Lang::C;
   if (!LangOpt.empty()) {

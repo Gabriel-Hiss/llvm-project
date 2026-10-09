@@ -2,6 +2,7 @@ add_llvm_library(RevenantAnalysis
   Analysis.cpp
   Builder.cpp
   Candidates.cpp
+  EmbeddedMeta.cpp
   JumpTable.cpp
   Noreturn.cpp
   Orphan.cpp

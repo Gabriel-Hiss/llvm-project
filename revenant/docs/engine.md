@@ -35,15 +35,39 @@ rolled back. Function-pass adaptors still retain per-function isolation.
 
 ```text
 revenant-decompile <pe> [--func <va|name>]... [--lang c|cpp|rust]
+                        [--meta none|embedded|pdb]
                         [--emit asm|ir-raw|ir-clean|ir-final|source]
                         [-o <base>] [--patterns] [--list] [--time]
 ```
+
+
+`--meta` defaults to `embedded`. `none` keeps imported symbols for linking
+and uses generic names for functions and data. `pdb` is accepted but reports
+`not implemented yet`.
+`embedded` keeps exports, retained COFF symbols and RTTI names. It attaches
+source locations, panic messages, EH catch types, assertion/file/function
+strings, and RTTI class/vtable data to IR as `!rev.source`, `!rev.panic`,
+`!rev.eh.types`, `!rev.class`, `!rev.strings`, and `!rev.types`. `none` drops
+embedded names and metadata, but retains data bytes and import names.
+
 
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
 (only the stages that ran). `--time` prints the elapsed time of each stage.
 Without `--func` every discovered function is decompiled; a Windows command
 line holds a few hundred `--func` arguments, so chunk large sets.
+
+`test/meta-mode/invariant.py` samples 300 functions per release binary with
+seed 211009, normalizes identifiers and type names, then compares final IR
+for `none` and `embedded`. A function that crashes in both modes is counted
+separately and excluded; a one-mode crash or differing IR fails the check.
+`test/meta-mode/recovery-report.py` compares sampled real names with oracle
+PDB or map symbols. Both scripts accept `--all-release`.
+
+```text
+python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity> --all-release --sample 300 --seed 211009
+python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe> --all-release --sample 300 --seed 211009
+```
 
 ## Rust path
 

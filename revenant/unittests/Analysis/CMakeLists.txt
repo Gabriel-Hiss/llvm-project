@@ -12,6 +12,7 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   StringsTest.cpp
   XrefsTest.cpp
   EHTablesTest.cpp
+  EmbeddedMetaTest.cpp
 )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
