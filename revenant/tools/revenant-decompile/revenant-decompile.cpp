@@ -16,11 +16,14 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
@@ -34,6 +37,9 @@ static cl::list<std::string>
     Funcs("func", cl::desc("function start VA (0x...) or name; repeatable. "
                            "Default: all discovered functions"),
           cl::value_desc("va|name"));
+static cl::opt<std::string>
+    FuncFile("func-file", cl::desc("file of function start VAs or names"),
+             cl::value_desc("file"));
 static cl::opt<std::string>
     LangOpt("lang", cl::desc("output language: c|cpp|rust "
                              "(default: detected producer language)"),
@@ -111,10 +117,31 @@ int main(int Argc, char **Argv) {
              << Rec.InstrRvas.size() << " instrs\n";
     return 0;
   }
+  std::vector<std::string> FunctionInputs(Funcs.begin(), Funcs.end());
+  if (!FuncFile.empty()) {
+    auto FileOrErr = MemoryBuffer::getFile(FuncFile);
+    if (!FileOrErr) {
+      errs() << "revenant-decompile: cannot read function list '"
+             << FuncFile << "': " << FileOrErr.getError().message() << "\n";
+      return 2;
+    }
+    SmallVector<StringRef, 32> Lines;
+    (*FileOrErr)->getBuffer().split(Lines, '\n');
+    for (StringRef Line : Lines) {
+      Line = Line.trim();
+      if (!Line.empty())
+        FunctionInputs.push_back(Line.str());
+    }
+    if (FunctionInputs.empty()) {
+      errs() << "revenant-decompile: function list is empty\n";
+      return 2;
+    }
+  }
+
 
   // Resolve --func arguments.
   std::vector<Va> Targets;
-  for (const std::string &F : Funcs) {
+  for (const std::string &F : FunctionInputs) {
     StringRef Fs(F);
     std::optional<Va> Addr;
     uint64_t V = 0;
