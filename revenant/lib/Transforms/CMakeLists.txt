@@ -39,5 +39,8 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Unabi/CMakeLists.txt)
   add_subdirectory(Unabi)
 endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Unhoist/CMakeLists.txt)
+  add_subdirectory(Unhoist)
+endif()
 
 add_subdirectory(Pipeline)

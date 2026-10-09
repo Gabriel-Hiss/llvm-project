@@ -57,6 +57,9 @@
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
 #include "revenant/Transforms/Unabi/Unabi.h"
 #endif
+#if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
+#include "revenant/Transforms/Unhoist/Unhoist.h"
+#endif
 
 using namespace llvm;
 
@@ -127,6 +130,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           FPM.addPass(UnabiPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
+        if (Name == "revenant-unhoist") {
+          FPM.addPass(UnhoistPass());
           return true;
         }
 #endif
