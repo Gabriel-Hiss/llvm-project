@@ -5,14 +5,12 @@
 // plus the `PaddingRun` they produce (Core/Program.h).
 //
 // A padding run is compiler alignment filler between accepted code chunks:
-// the nop family (any form), int3, `xchg ax,ax` (`66 90`, which MC
-// decodes as an xchg, not a nop), and the 5-byte `call $+5`
-// (`E8 00 00 00 00`, target == next IP) the toolchain leaves as filler.
+// the nop family (any form), int3, and `xchg ax,ax` (`66 90`, which MC
+// decodes as an xchg, not a nop): exactly the `analysis::is_filler` set.
 // Runs are accepted only under the whole-piece rule, so filler bytes
-// inside data blobs are never listed as instructions.
-//
-// The x86-64 hook (Target/TargetHooks.h `isFiller`) should delegate to
-// `isFiller` here so discovery and padding agree on what filler is.
+// inside data blobs are never listed as instructions. `isFillerExt` adds
+// the 5-byte `call $+5` shape as an opt-in for non-parity consumers; the
+// decode path never uses it.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,15 +34,22 @@ struct Image;
 struct Instr;
 struct PeFile;
 
-/// True for compiler alignment filler: nop (any form), int3, `xchg ax,ax`,
-/// and `call $+5` (a direct 5-byte call whose target is the next
-/// instruction). The image overload exists so gap sweeps can pass byte
-/// context later; it currently applies the same rule as the decoder-only
-/// form below.
+/// True for compiler alignment filler, exactly the reference set in
+/// `analysis::is_filler`: nop (any form), int3, and `xchg ax,ax`. This is
+/// the only predicate the `decodePadding` path uses, so gap classification
+/// matches the Rust tool instruction for instruction. The image overload
+/// exists so gap sweeps can pass byte context later; it currently applies
+/// the same rule as the decoder-only form below.
 bool isFiller(const Instr &I, const Image &Img);
 
-/// Decoder-only form: same rule, no byte context needed.
+/// Decoder-only form: same strict rule, no byte context needed.
 bool isFiller(const Instr &I);
+
+/// Extended filler: the strict set plus the 5-byte `call $+5` (`E8 00 00
+/// 00 00`, target == next IP) the toolchain leaves as alignment filler.
+/// Opt-in only: never used by `decodePadding`, so parity with the Rust
+/// tool is unaffected.
+bool isFillerExt(const Instr &I);
 
 /// Byte length of the padding at `Addr`: 0 for non-padding. A zero byte
 /// or int3 counts as one padding byte; anything else must decode as

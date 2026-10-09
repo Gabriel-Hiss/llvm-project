@@ -95,9 +95,9 @@ TEST(PaddingTest, Int3WholeGapIsPadding) {
   EXPECT_EQ(Runs[0].End, 4u);
 }
 
-// The 5-byte `call $+5` decodes as one filler instruction.
-TEST(PaddingTest, CallNextIsPadding) {
-  // chunk, int3 + call $+5, chunk.
+// `call $+5` is NOT gap filler under the strict reference set: the gap
+// stops at the call bytes, and with no aligned leading run it is dropped.
+TEST(PaddingTest, CallNextIsNotGapPadding) {
   Env E({0x51, 0xCC, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x51});
   auto C = E.chunks({0, 1, 7, 8});
   PeFile Pe;
@@ -105,28 +105,16 @@ TEST(PaddingTest, CallNextIsPadding) {
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
       {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
-  auto Runs = decodePadding(Pe, C, {});
-  ASSERT_EQ(Runs.size(), 1u);
-  EXPECT_EQ(Runs[0].Start, 1u);
-  EXPECT_EQ(Runs[0].End, 7u);
-  ASSERT_EQ(Runs[0].Instrs.size(), 2u);
+  EXPECT_TRUE(decodePadding(Pe, C, {}).empty());
 }
 
-// A bare `call $+5` with no int3 slack is filler too: the decoder-only
-// rule accepts any direct 5-byte self-call as `call $+5`.
-TEST(PaddingTest, BareCallNextIsPadding) {
-  Env E({0x51, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x51});
-  auto C = E.chunks({0, 1, 6, 7});
-  PeFile Pe;
-  Pe.Img = E.Img;
-  Pe.FileSize = 0x1000;
-  Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
-  auto Runs = decodePadding(Pe, C, {});
-  ASSERT_EQ(Runs.size(), 1u);
-  EXPECT_EQ(Runs[0].Start, 1u);
-  EXPECT_EQ(Runs[0].End, 6u);
-  ASSERT_EQ(Runs[0].Instrs.size(), 1u);
+// The opt-in extended rule still accepts the 5-byte self-call.
+TEST(PaddingTest, CallNextIsExtFiller) {
+  Env E({0xE8, 0x00, 0x00, 0x00, 0x00});
+  auto I = E.Dis->decodeOne(E.Base);
+  ASSERT_TRUE(I.has_value());
+  EXPECT_FALSE(isFiller(*I));
+  EXPECT_TRUE(isFillerExt(*I));
 }
 
 // Multi-byte nop (`0F 1F 00`: 3 bytes) plus int3 is whole-piece filler.
