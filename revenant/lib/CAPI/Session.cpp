@@ -14,6 +14,11 @@
 #include "revenant/Analysis/Analysis.h"
 #include "revenant/Analysis/EmbeddedMeta.h"
 #include "revenant/Analysis/Resolver.h"
+#include "revenant/Analysis/LibMatch.h"
+#include "revenant/Core/Instr.h"
+
+#include <queue>
+#include <tuple>
 
 #include <algorithm>
 #include <chrono>
@@ -144,6 +149,9 @@ Error Session::analyze() {
   applyEmbeddedMetadata(Prog, *Pe);
   if (!Prog.Resolver)
     Prog.Resolver = std::make_shared<SessionNames>(Prog);
+  OriginalFunctionNames.clear();
+  for (const auto &[Start, Rec] : Prog.Functions)
+    OriginalFunctionNames.emplace(Start, Rec.Name);
   SetupStages.push_back(
       {"analysis", "ok",
        formatv("RevenantAnalysis: {0} functions", Prog.Functions.size()).str(),
@@ -212,6 +220,177 @@ std::optional<Va> Session::functionByName(StringRef Name) const {
       if (Prog.Functions.count(Va(V)))
         return Va(V);
   return std::nullopt;
+}
+
+Expected<FunctionClassification>
+Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
+  FunctionClassification Result;
+  if (!LibraryDBPath.empty()) {
+    auto DBOrErr = LibraryDatabase::load(LibraryDBPath);
+    if (!DBOrErr)
+      return DBOrErr.takeError();
+    Result.HasLibraryDB = true;
+    for (const LibraryMatch &Match : matchLibraryFunctions(Prog, *DBOrErr)) {
+      Result.LibraryStarts.insert(Match.Start);
+      if (Match.FunctionIndex < DBOrErr->Functions.size())
+        Result.LibraryNames[Match.Start] =
+            DBOrErr->Functions[Match.FunctionIndex].Name;
+    }
+  }
+
+  auto functionName = [&](Va Start, const FuncRecord &Rec) -> StringRef {
+    auto It = OriginalFunctionNames.find(Start);
+    return It == OriginalFunctionNames.end() ? StringRef(Rec.Name)
+                                              : StringRef(It->second);
+  };
+  if (Out != Lang::Rust) {
+    for (const auto &[Start, Rec] : Prog.Functions) {
+      StringRef Name = functionName(Start, Rec);
+      if (Name == "main" || Name == "wmain" || Name == "WinMain" ||
+          Name == "wWinMain") {
+        Result.UserEntry = Start;
+        break;
+      }
+    }
+  }
+  if (!Result.UserEntry && Out != Lang::Rust) {
+    for (const auto &[At, Name] : Result.LibraryNames) {
+      if (Name != "invoke_main" &&
+          Name.find("__tmainCRTStartup") == std::string::npos)
+        continue;
+      auto Invoke = materialize(At);
+      if (!Invoke) {
+        consumeError(Invoke.takeError());
+        continue;
+      }
+      for (const Instr &I : Invoke->Instrs)
+        if (I.Flow == FlowKind::Branch && I.HasTarget &&
+            Prog.Functions.count(I.Target) &&
+            !Result.LibraryStarts.count(I.Target)) {
+          Result.UserEntry = I.Target;
+          break;
+        }
+      if (Result.UserEntry)
+        break;
+    }
+  }
+
+  if (!Result.UserEntry) {
+    auto PeEntry = Prog.Functions.upper_bound(Pe->EntryPoint);
+    if (PeEntry != Prog.Functions.begin()) {
+      --PeEntry;
+      std::queue<std::pair<Va, unsigned>> Pending;
+      std::set<Va> Seen;
+      std::optional<std::pair<size_t, Va>> PointerEntry;
+      std::optional<std::tuple<unsigned, size_t, Va>> TailEntry;
+      Pending.push({PeEntry->first, 0});
+      while (!Pending.empty()) {
+        auto [At, Depth] = Pending.front();
+        Pending.pop();
+        if (!Seen.insert(At).second || Depth > 6)
+          continue;
+        auto FunctionOrErr = materialize(At);
+        if (!FunctionOrErr) {
+          consumeError(FunctionOrErr.takeError());
+          continue;
+        }
+        std::optional<Va> PendingCodePointer;
+        for (const Instr &I : FunctionOrErr->Instrs) {
+          if (I.HasMemTarget && Prog.Functions.count(I.MemTarget))
+            PendingCodePointer = I.MemTarget;
+          if (!I.HasTarget || !Prog.Functions.count(I.Target))
+            continue;
+          if (Out == Lang::Rust && I.Flow == FlowKind::Call &&
+              PendingCodePointer &&
+              !Result.LibraryStarts.count(*PendingCodePointer)) {
+            size_t Size =
+                Prog.Functions.find(*PendingCodePointer)->second.InstrRvas.size();
+            if (!PointerEntry || Size > PointerEntry->first)
+              PointerEntry = {Size, *PendingCodePointer};
+            PendingCodePointer.reset();
+          }
+          if (I.Flow == FlowKind::Branch && I.Target != At &&
+              !Result.LibraryStarts.count(I.Target)) {
+            auto Candidate = Prog.Functions.find(I.Target);
+            if (Candidate != Prog.Functions.end() &&
+                Candidate->second.InstrRvas.size() > 2 &&
+                (!TailEntry || Depth > std::get<0>(*TailEntry) ||
+                 (Depth == std::get<0>(*TailEntry) &&
+                  Candidate->second.InstrRvas.size() >
+                      std::get<1>(*TailEntry))))
+              TailEntry =
+                  {Depth, Candidate->second.InstrRvas.size(), I.Target};
+            if (Depth < 6)
+              Pending.push({I.Target, Depth + 1});
+          }
+          if (I.Flow == FlowKind::Call)
+            Pending.push({I.Target, Depth + 1});
+        }
+      }
+      if (Out == Lang::Rust && PointerEntry)
+        Result.UserEntry = PointerEntry->second;
+      else if (TailEntry)
+        Result.UserEntry = std::get<2>(*TailEntry);
+    }
+  }
+
+  auto Entry = Prog.Functions.upper_bound(Pe->EntryPoint);
+  if (Entry != Prog.Functions.begin()) {
+    --Entry;
+    std::queue<Va> Pending;
+    Pending.push(Entry->first);
+    while (!Pending.empty()) {
+      Va At = Pending.front();
+      Pending.pop();
+      if ((Result.UserEntry && At == *Result.UserEntry) ||
+          !Result.Startup.insert(At).second)
+        continue;
+      auto FOrErr = materialize(At);
+      if (!FOrErr) {
+        consumeError(FOrErr.takeError());
+        continue;
+      }
+      for (const Instr &I : FOrErr->Instrs)
+        if (I.HasTarget && Prog.Functions.count(I.Target) &&
+            (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch) &&
+            (!Result.UserEntry || I.Target != *Result.UserEntry))
+          Pending.push(I.Target);
+    }
+  }
+
+  if (!Result.UserEntry)
+    return Result;
+
+  std::queue<Va> UserPending;
+  UserPending.push(*Result.UserEntry);
+  while (!UserPending.empty()) {
+    Va At = UserPending.front();
+    UserPending.pop();
+    if (Result.LibraryStarts.count(At) ||
+        !Result.UserReachable.insert(At).second)
+      continue;
+    auto FOrErr = materialize(At);
+    if (!FOrErr) {
+      consumeError(FOrErr.takeError());
+      continue;
+    }
+    for (const Instr &I : FOrErr->Instrs) {
+      if (I.HasTarget && Prog.Functions.count(I.Target) &&
+          (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
+        UserPending.push(I.Target);
+      if (I.HasMemTarget && Prog.Functions.count(I.MemTarget))
+        UserPending.push(I.MemTarget);
+      for (unsigned OpIdx = 0; OpIdx < I.Inst.getNumOperands(); ++OpIdx) {
+        const MCOperand &Operand = I.Inst.getOperand(OpIdx);
+        if (!Operand.isImm() || Operand.getImm() < 0)
+          continue;
+        Va Target(static_cast<uint64_t>(Operand.getImm()));
+        if (Prog.Functions.count(Target))
+          UserPending.push(Target);
+      }
+    }
+  }
+  return Result;
 }
 
 Expected<Function> Session::materialize(Va Start) const {

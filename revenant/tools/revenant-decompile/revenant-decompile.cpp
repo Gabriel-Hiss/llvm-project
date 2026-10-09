@@ -30,6 +30,7 @@
 using namespace llvm;
 using namespace revenant;
 
+
 static cl::opt<std::string> Input(cl::Positional, cl::desc("<pe>"),
                                   cl::Required);
 static cl::list<std::string>
@@ -145,9 +146,42 @@ int main(int Argc, char **Argv) {
   }
 
   if (ListFuncs) {
-    for (const auto &[Start, Rec] : S->program().Functions)
-      outs() << format_hex(Start.Value, 0) << "\t" << Rec.Name << "\t"
-             << Rec.InstrRvas.size() << " instrs\n";
+    FunctionClassification Classification;
+    if (ClassifyFuncs) {
+      auto ClassificationOrErr =
+          S->classifyFunctions(Out, LibraryDBPath);
+      if (!ClassificationOrErr) {
+        errs() << "revenant-decompile: "
+               << toString(ClassificationOrErr.takeError()) << "\n";
+        return 2;
+      }
+      Classification = std::move(*ClassificationOrErr);
+      if (!Classification.UserEntry) {
+        errs() << "revenant-decompile: unable to trace user entry from PE startup\n";
+        return 2;
+      }
+      outs() << "user-entry\t"
+             << format_hex(Classification.UserEntry->Value, 0) << "\n";
+    }
+    for (const auto &[Start, Rec] : S->program().Functions) {
+      StringRef Name = Rec.Name;
+      auto Lib = Classification.LibraryNames.find(Start);
+      if (Lib != Classification.LibraryNames.end())
+        Name = Lib->second;
+      outs() << format_hex(Start.Value, 0) << "\t" << Name << "\t";
+      if (!ClassifyFuncs)
+        outs() << Rec.InstrRvas.size() << " instrs\n";
+      else if (Classification.UserReachable.count(Start))
+        outs() << "user\n";
+      else if (Classification.LibraryStarts.count(Start))
+        outs() << "library\n";
+      else if (Classification.Startup.count(Start))
+        outs() << "startup\n";
+      else if (Classification.HasLibraryDB)
+        outs() << "library\n";
+      else
+        outs() << "unclassified\n";
+    }
     return 0;
   }
 

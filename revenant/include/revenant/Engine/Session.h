@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +56,16 @@ struct StageReport {
 
 /// Metadata policy for a decompile session.
 enum class MetaMode { None, Embedded, Pdb };
+
+/// Reachability and static-library labels for an analyzed PE.
+struct FunctionClassification {
+  std::optional<Va> UserEntry;
+  std::set<Va> UserReachable;
+  std::set<Va> Startup;
+  std::set<Va> LibraryStarts;
+  std::map<Va, std::string> LibraryNames;
+  bool HasLibraryDB = false;
+};
 
 /// Which representation --emit / the API asks for.
 enum class EmitKind { Source, Asm, IrRaw, IrClean, IrFinal };
@@ -122,6 +133,12 @@ public:
   /// `sub_<va>`), or nullopt.
   std::optional<Va> functionByName(llvm::StringRef Name) const;
 
+  /// Classify user-reachable, startup, and matched library functions.
+  /// An empty database path disables only library matching; entry and
+  /// reachability analysis still run.
+  llvm::Expected<FunctionClassification>
+  classifyFunctions(Lang Out, llvm::StringRef LibraryDBPath = {}) const;
+
   /// Intel-syntax disassembly of the function at `start`.
   llvm::Expected<std::string> disasmFunction(Va Start) const;
 
@@ -158,6 +175,7 @@ private:
   std::vector<StageReport> SetupStages;
   /// Recovered signatures, computed on the first decompile (whole-program).
   std::shared_ptr<const lift::Signatures> Sigs;
+  std::map<Va, std::string> OriginalFunctionNames;
 };
 
 } // namespace revenant

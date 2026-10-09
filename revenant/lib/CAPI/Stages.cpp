@@ -533,6 +533,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         return Recovered.takeError();
       Sigs = std::move(*Recovered);
     }
+    auto ClassificationOrErr =
+        classifyFunctions(Out, Opts.LibraryDBPath);
+    if (!ClassificationOrErr)
+      return ClassificationOrErr.takeError();
+    FunctionClassification Classification =
+        std::move(*ClassificationOrErr);
     record(R.Stages, "sigs", "ok",
            formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
                    Sigs->Externs.size())
@@ -625,6 +631,17 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         continue;
       }
       OpaqueSites += L->AsmFallbacks.size();
+    }
+    for (llvm::Function &F : *M) {
+      auto FunctionVA = ir::getFunctionVA(F);
+      if (!FunctionVA)
+        continue;
+      Va Start(*FunctionVA);
+      if (Classification.UserReachable.count(Start))
+        F.addFnAttr("revenant.user", "true");
+      auto Library = Classification.LibraryNames.find(Start);
+      if (Library != Classification.LibraryNames.end())
+        F.addFnAttr("revenant.lib", Library->second);
     }
     // MSVC catch funclets return their continuation VA in rax.
     auto continuationVA = [](const llvm::Function &F)
