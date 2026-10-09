@@ -8,4 +8,6 @@ add_llvm_library(RevenantTransformTypeRecovery
   LINK_COMPONENTS
   Core
   Support
+  LINK_LIBS
+  RevenantIR
   )
