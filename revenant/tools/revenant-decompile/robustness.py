@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run all root-level corpus PEs from a private executable copy."""
+"""Run every corpus PE (nested dirs included) from a private exe copy."""
 import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -11,16 +12,28 @@ import subprocess
 import time
 
 
+
 def pe_files(corpus):
+    # Walk every target directory recursively so nested build trees
+    # (_trial-bd/debug, _trial/md4c, oracle/*.dbg.exe) contribute their PEs.
+    # Skip noise: artifacts/ duplicates the top-level PE byte-for-byte, and
+    # cargo's build/deps/incremental/examples dirs only hold build scripts.
+    skip_dirs = {'artifacts', 'build', 'deps', 'incremental', 'examples',
+                 '.fingerprint'}
     for directory in sorted(corpus.iterdir()):
         if not directory.is_dir():
             continue
-        for path in sorted(directory.iterdir()):
-            if not path.is_file():
-                continue
-            with path.open('rb') as stream:
-                if stream.read(2) == b'MZ':
-                    yield path
+        for root, dirs, files in os.walk(directory):
+            dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
+            for name in sorted(files):
+                path = Path(root) / name
+                try:
+                    with path.open('rb') as stream:
+                        if stream.read(2) == b'MZ':
+                            yield path
+                except OSError:
+                    continue
+
 
 
 def source_language(target):
@@ -47,8 +60,11 @@ def classify(log, status):
     return 'success' if status == 0 else prefix + 'process exit ' + str(status)
 
 
-def run_one(exe, pe, kind, output, timeout, fingerprint):
-    name = pe.parent.name + '-' + pe.name + '-' + kind
+def run_one(exe, pe, kind, output, timeout, fingerprint, corpus):
+    rel_parts = pe.relative_to(corpus).parts
+    target = rel_parts[0]
+    rel = '-'.join(rel_parts[1:-1])
+    name = target + ('-' + rel if rel else '') + '-' + pe.name + '-' + kind
     result_path = output / (name + '.json')
     if result_path.exists():
         old = json.loads(result_path.read_text())
@@ -60,7 +76,7 @@ def run_one(exe, pe, kind, output, timeout, fingerprint):
         Path(str(base) + suffix).unlink(missing_ok=True)
     command = [str(exe), str(pe), '--emit',
                'ir-final' if kind == 'ir-final' else 'source',
-               '--lang', source_language(pe.parent.name), '--time', '-o', str(base)]
+               '--lang', source_language(target), '--time', '-o', str(base)]
     started = time.monotonic()
     log_path = output / (name + '.log')
     with log_path.open('wb') as stream:
@@ -83,7 +99,7 @@ def run_one(exe, pe, kind, output, timeout, fingerprint):
         functions = sum(line.startswith('define ') for line in
                         final_ir.read_text(errors='replace').splitlines())
     crash_context = re.search(r'Revenant stage=[^\n]+', log)
-    result = dict(target=pe.parent.name, pe=str(pe), kind=kind, status=status,
+    result = dict(target=target, pe=str(pe), kind=kind, status=status,
                   seconds=round(time.monotonic() - started, 2), log=str(log_path),
                   fingerprint=fingerprint, cluster=classify(log, status),
                   functions_ok=functions, failures=failures,
@@ -94,9 +110,9 @@ def run_one(exe, pe, kind, output, timeout, fingerprint):
 
 def report(rows, destination, fingerprint, timeout, expected):
     lines = ['# Pipeline robustness', '',
-             'Executable SHA-256: `' + fingerprint + '`.', '',
+             'Every corpus child is walked recursively for PE files (MZ header);',
+             'artifacts/, build/, deps/, incremental/, examples/ are skipped.', '',
              'Completed invocations: ' + str(len(rows)) + ' / ' + str(expected) + '.', '',
-             'Every immediate corpus child is inspected for PE files by its MZ header.',
              'Each PE runs ir-final and C/C++ source emission without a function filter.',
              'Each invocation has a ' + str(timeout) + ' second timeout. A private executable',
              'copy prevents corpus runs from locking the integration build.', '',
@@ -159,12 +175,14 @@ def main():
         for dll in args.exe.parent.glob('*.dll'):
             shutil.copy2(dll, private / dll.name)
     jobs = [(pe, kind) for pe in pe_files(args.corpus)
-            for kind in ('ir-final', source_language(pe.parent.name))]
+            for kind in ('ir-final',
+                         source_language(pe.relative_to(args.corpus).parts[0]))]
     rows = []
     report(rows, args.report, fingerprint, args.timeout, len(jobs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(run_one, copied, pe, kind, args.output,
-                               args.timeout, fingerprint) for pe, kind in jobs]
+                               args.timeout, fingerprint, args.corpus)
+                   for pe, kind in jobs]
         for future in concurrent.futures.as_completed(futures):
             row = future.result()
             rows.append(row)

@@ -374,7 +374,7 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
   // 64-bit ops.
   unsigned Mask = (W == 64) ? 63 : 31;
   Value *C8 = B.CreateAnd(C, constI(Mask, 64));
-  Value *CW = B.CreateTrunc(C8, V->getType());
+  Value *CW = B.CreateTruncOrBitCast(C8, V->getType());
   Value *Is0 = B.CreateICmpEQ(C8, constI(0, 64));
 
   Value *Res;
@@ -415,14 +415,14 @@ Value *X86LiftContext::flagsShift(StringRef Name, Value *V, Value *Cnt) {
   Value *Cfc;
   if (Name == "shl") {
     Value *Pos = B.CreateSub(constI(W, 64), C8);
-    Cfc = B.CreateTrunc(B.CreateLShr(B.CreateZExt(V, iN(64)), Pos), iN(1));
+    Cfc = B.CreateTrunc(B.CreateLShr(zextOrTrunc(V, iN(64)), Pos), iN(1));
   } else if (Name == "shr") {
-    Cfc = B.CreateTrunc(B.CreateLShr(B.CreateZExt(V, iN(64)),
+    Cfc = B.CreateTrunc(B.CreateLShr(zextOrTrunc(V, iN(64)),
                                      B.CreateSub(C8, constI(1, 64))),
                         iN(1));
   } else if (Name == "sar") {
     Value *Bit = B.CreateTrunc(
-        B.CreateLShr(B.CreateZExt(V, iN(64)), B.CreateSub(C8, constI(1, 64))),
+        B.CreateLShr(zextOrTrunc(V, iN(64)), B.CreateSub(C8, constI(1, 64))),
         iN(1));
     Cfc = B.CreateSelect(B.CreateICmpULE(C8, constI(W, 64)), Bit,
                          B.CreateICmpSLT(V, Zero));
@@ -490,7 +490,7 @@ Value *X86LiftContext::flagsShift2(StringRef Name, Value *V, Value *Extra,
         iN(1));
   else
     Cfc = B.CreateTrunc(B.CreateLShr(
-                            B.CreateZExt(V, iN(64)),
+                            zextOrTrunc(V, iN(64)),
                             B.CreateSub(C8, constI(1, 64))),
                         iN(1));
   Value *InRange =
