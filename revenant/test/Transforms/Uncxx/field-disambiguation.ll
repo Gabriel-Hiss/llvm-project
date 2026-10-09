@@ -81,3 +81,16 @@ entry:
   %result = select i1 %is.null, ptr @fallback, ptr %data
   ret ptr %result
 }
+; CHECK-LABEL: define ptr @string_sso_data
+; CHECK: call ptr @revenant.cxx.string.data(ptr %s)
+
+define ptr @string_sso_data(ptr %s) {
+entry:
+  %data.addr = getelementptr i8, ptr %s, i64 0
+  %cap.addr = getelementptr i8, ptr %s, i64 24
+  %data = load ptr, ptr %data.addr, align 8
+  %cap = load i64, ptr %cap.addr, align 8
+  %short = icmp ult i64 %cap, 16
+  %result = select i1 %short, ptr %s, ptr %data
+  ret ptr %result
+}

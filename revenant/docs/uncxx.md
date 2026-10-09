@@ -21,10 +21,11 @@ For MSVC, a string-size candidate at +16 is accepted only when the same object a
 ## Corpus coverage
 
 The standalone pass completed on all 78 `ir-post` translation units for the
-requested clang C++ corpus IDs, emitting helper calls in 22 modules. It
+requested clang C++ corpus IDs, emitting helper calls in 34 modules. It
 recovered 2,322 calls: vector data 1,355, string size 452, string data 442
 (including four overload-suffixed helpers), vector push_back 39, vector empty
-19, string destructor 10, vector size 3, and vector back 2.
+19, string destructor 10, vector size 3, and vector back 2. Specifically,
+`cpp-clang-o2` yielded 14 calls and `json-clang-o2` yielded 809.
 
 The inline-remark groups are source call events, while these are helper call
 sites in module IR. They are not a one-to-one recall score. The 325 vector-back

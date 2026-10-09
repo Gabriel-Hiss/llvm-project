@@ -462,24 +462,53 @@ bool matchStringData(const DataLayout &DL, Value *V, CxxFlavor Fl,
       Str = S;
     else
       return false;
-    // An SSO selector must test this string's capacity against the
-    // layout's inline-capacity threshold. A null check on a data pointer
-    // (for example, an error-string fallback) is not a string accessor.
+    // An SSO selector must compare this string's capacity against the
+    // inline threshold and select the heap pointer exactly when long mode
+    // is active. A null check on data with an arbitrary fallback is not
+    // evidence of a string accessor.
     auto *Cmp = dyn_cast<ICmpInst>(C);
     if (!Cmp)
       return false;
-    bool HasCapacity = false;
-    bool HasThreshold = false;
-    for (Value *Op : {Cmp->getOperand(0), Cmp->getOperand(1)}) {
-      if (auto *L = dyn_cast<LoadInst>(stripPtr(Op))) {
-        auto R = rootOff(DL, L->getPointerOperand());
-        HasCapacity |= R && R->first == Str && R->second == SL.Cap;
+    bool HeapWhenTrue = false;
+    bool HasModeCompare = false;
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *CapV = Cmp->getOperand(I);
+      Value *LimitV = Cmp->getOperand(1 - I);
+      auto *CapLoad = dyn_cast<LoadInst>(stripPtr(CapV));
+      auto *Limit = dyn_cast<ConstantInt>(LimitV);
+      if (!CapLoad || !Limit)
+        continue;
+      auto R = rootOff(DL, CapLoad->getPointerOperand());
+      if (!R || R->first != Str || R->second != SL.Cap)
+        continue;
+      ICmpInst::Predicate Pred = I == 0 ? Cmp->getPredicate()
+                                       : Cmp->getSwappedPredicate();
+      bool IsInlineLimit = Limit->equalsInt(SL.SsoCap);
+      bool IsNextLimit = Limit->equalsInt(SL.SsoCap + 1);
+      if (IsInlineLimit && Pred == ICmpInst::ICMP_UGT) {
+        HeapWhenTrue = true;
+        HasModeCompare = true;
+      } else if (IsInlineLimit && Pred == ICmpInst::ICMP_ULE) {
+        HeapWhenTrue = false;
+        HasModeCompare = true;
+      } else if (IsNextLimit && Pred == ICmpInst::ICMP_UGE) {
+        HeapWhenTrue = true;
+        HasModeCompare = true;
+      } else if (IsNextLimit && Pred == ICmpInst::ICMP_ULT) {
+        HeapWhenTrue = false;
+        HasModeCompare = true;
       }
-      if (auto *CI = dyn_cast<ConstantInt>(Op))
-        HasThreshold |= CI->getValue().getLimitedValue() ==
-                        static_cast<uint64_t>(SL.SsoCap);
     }
-    return HasCapacity && HasThreshold;
+    bool DataWhenTrue = isDataLoad(A) == Str;
+    if (!HasModeCompare || DataWhenTrue != HeapWhenTrue)
+      return false;
+    Value *Inline = DataWhenTrue ? B : A;
+    if (Inline != Str) {
+      auto R = rootOff(DL, Inline);
+      if (!R || R->first != Str || R->second != 0)
+        return false;
+    }
+    return true;
   }
   if (auto *L = dyn_cast<LoadInst>(V)) {
     if (!L->getType()->isPointerTy())
