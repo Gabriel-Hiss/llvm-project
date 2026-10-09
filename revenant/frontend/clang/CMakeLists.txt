@@ -51,6 +51,7 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lib/Type)
   file(GLOB type_srcs CONFIGURE_DEPENDS lib/Type/*.cpp)
   list(APPEND REVENANT_CLANG_CORE_SOURCES ${type_srcs})
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/lib/Type)
   add_definitions(-DREVENANT_FRONTEND_EXTERNAL_TYPE)
 endif()
 

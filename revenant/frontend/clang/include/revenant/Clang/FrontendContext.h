@@ -16,13 +16,13 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "revenant/Clang/TypeBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/Module.h"
 #include <string>
 
 namespace revenant::clangx {
-class TypeBuilder;
 
 /// Detected producer language, from the `revenant.lang` module flag.
 enum class SourceLang { C, CPlusPlus };
