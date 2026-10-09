@@ -33,11 +33,11 @@ endif()
 
 endif()
 if(COMMAND add_llvm_library)
-  add_llvm_library(RevenantTransformUnipo STATIC Unipo.cpp
-    LINK_COMPONENTS Core Support Analysis
+  add_llvm_library(RevenantTransformUnipo STATIC Unipo.cpp Structural.cpp
+    LINK_COMPONENTS Core Support Analysis Passes InstCombine ScalarOpts TransformUtils
     )
 else()
-  add_library(RevenantTransformUnipo MODULE Unipo.cpp)
+  add_library(RevenantTransformUnipo MODULE Unipo.cpp Structural.cpp)
   if(WIN32)
     target_sources(RevenantTransformUnipo PRIVATE Unipo.def)
   endif()
@@ -52,6 +52,10 @@ else()
     Core
     Support
     Analysis
+    Passes
+    InstCombine
+    ScalarOpts
+    TransformUtils
     )
   target_link_libraries(RevenantTransformUnipo PRIVATE ${LLVM_LIBS})
   target_include_directories(RevenantTransformUnipo PRIVATE

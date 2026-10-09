@@ -99,6 +99,10 @@
 
 using namespace llvm;
 
+namespace revenant {
+bool foldStructuralIPO(Module &M);
+}
+
 namespace {
 
 void copyVA(const Instruction *Src, Instruction *Dst) {
@@ -628,7 +632,7 @@ bool tryFoldClone(Module &M, Function &F) {
 }
 
 bool runOnModule(Module &M) {
-  bool Changed = false;
+  bool Changed = revenant::foldStructuralIPO(M);
   SmallVector<Function *, 16> Work;
   for (Function &F : M) {
     if (F.isDeclaration() || F.isIntrinsic())
