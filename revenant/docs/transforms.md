@@ -32,7 +32,7 @@ structure, matching the engine `--patterns` path. Type recovery
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
-| pre-like locals | `revenant-locals-to-slots` | parameter spills and non-interfering PHI webs, after `revenant-types` |
+| pre-like locals | `revenant-locals-to-slots` | argument spills, debug-backed/loop-carried PHI webs, return slots, after `revenant-types` |
 | ssaout (post) | `revenant-ssaout` | mem2reg/sroa undo, pre-frontend |
 
 ## Registration convention

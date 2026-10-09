@@ -11,8 +11,8 @@ define i32 @count(i32 %limit) {
 ; CHECK: [[LOOP:loop]]:
 ; CHECK-NOT: phi i32
 ; CHECK: %[[I:[0-9]+]] = load i32, ptr %v_i
-; CHECK: %[[NEXT:[0-9]+]] = add i32 %[[I]], 1
-; CHECK: store i32 %[[NEXT]], ptr %v_i
+; CHECK: %next = add i32 %[[I]], 1
+; CHECK: store i32 %next, ptr %v_i
 ; CHECK: br i1 {{.*}}, label %[[LOOP]], label %exit
 ; CHECK-NOT: crit_edge
 entry:
