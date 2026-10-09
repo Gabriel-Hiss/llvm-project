@@ -6,6 +6,7 @@
 
 #include "revenant/Analysis/EHTables.h"
 #include "gtest/gtest.h"
+#include "llvm/Support/Error.h"
 
 using namespace revenant;
 
@@ -114,4 +115,31 @@ TEST(EHTablesTest, DecodesSehScopeRangeAndFinally) {
   EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1180));
   ASSERT_EQ(EH[0].Handlers.size(), 1u);
   EXPECT_EQ(EH[0].Handlers[0].Kind, HandlerKind::Finally);
+  ASSERT_EQ(EH[0].Cleanups.size(), 1u);
+}
+
+TEST(EHTablesTest, DecodesExceptionMetadataFromCorpus) {
+  const char *Paths[] = {
+      REVENANT_TEST_CPP_O2,
+      REVENANT_TEST_CPP_CLANG_O2,
+      REVENANT_TEST_CPP_GCC_O2,
+      REVENANT_TEST_RUST_O2,
+      REVENANT_TEST_JSON_O2,
+      REVENANT_TEST_SPDLOG_O2,
+  };
+  for (const char *Path : Paths) {
+    auto Loaded = PeFile::load(Path);
+    ASSERT_TRUE(!!Loaded) << Path;
+    auto EH = decodeEHTables(*Loaded);
+    EXPECT_FALSE(EH.empty()) << Path;
+    size_t WithContent = 0;
+    for (const FunctionEH &F : EH) {
+      if (!F.TryRegions.empty() || !F.Handlers.empty() ||
+          !F.Cleanups.empty() || !F.CallSites.empty())
+        ++WithContent;
+    }
+    llvm::errs() << Path << " entries=" << EH.size()
+                 << " withcontent=" << WithContent << "\n";
+    EXPECT_EQ(WithContent, EH.size()) << Path;
+  }
 }
