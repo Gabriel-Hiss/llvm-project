@@ -62,12 +62,14 @@ hoisted/sunk common instructions, no speculated blocks. The late
 `sroa,instcombine` round removes never-read frames.
 
 **revenant-idioms (owner: MuseTxIdioms).** Expects cleaned IR.
-Folds the multiply-high + shift/add strength-reduction DAG back into
-`udiv`/`sdiv`/`urem`/`srem` by a constant (Granlund-Montgomery), verified
-on a witness set before rewriting; folds `x - (x/d)*d` spellings into
-`urem`/`srem`. Guarantees no unverified rewrite: anything ambiguous stays
-put. AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax)
-run after structuring, outside this LLVM pipeline.
+Folds verified multiply-high and correction DAGs back into constant
+`udiv`/`sdiv`, then folds quotient-times-divisor residuals into
+`urem`/`srem`. It checks every input for i8/i16 and quotient boundaries plus
+integer extrema for i32/i64. It also canonicalizes select-based abs/min/max,
+unsigned saturating add/sub, rotates and byte swaps. Intrinsic popcount forms
+pass through unchanged. Ambiguous arithmetic remains intact.
+AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax) run after
+structuring, outside this LLVM pipeline.
 
 **revenant-devectorize (owner: MuseTxDevec), phase 1: lane-0.** Expects
 cleaned IR with `i128` xmm webs. Propagates scalar lane-0 values through

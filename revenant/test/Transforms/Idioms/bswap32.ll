@@ -15,3 +15,16 @@ entry:
 }
 ; CHECK-LABEL: define i32 @bswap32(
 ; CHECK: call i32 @llvm.bswap.i32(i32 %x)
+
+; A shift/or is not enough to prove a byte swap.
+define i16 @not_bswap(i16 %x) {
+entry:
+  %left = shl i16 %x, 1
+  %right = lshr i16 %x, 1
+  %combined = or i16 %left, %right
+  ret i16 %combined
+}
+; CHECK-LABEL: define i16 @not_bswap(
+; CHECK: shl i16 %x, 1
+; CHECK: lshr i16 %x, 1
+; CHECK-NOT: call i16 @llvm.bswap.i16

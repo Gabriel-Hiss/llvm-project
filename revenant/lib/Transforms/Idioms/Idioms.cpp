@@ -451,12 +451,25 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
     return std::nullopt;
   int64_t D = (int64_t)R;
 
+  // Small domains are cheap enough to check exhaustively. This makes the
+  // accepted i8/i16 forms proofs rather than heuristic matches. Wider
+  // integers use the quotient boundaries and signed/unsigned extrema above.
+  std::vector<APInt> Inputs;
+  if (W <= 16) {
+    uint32_t Limit = 1u << W;
+    Inputs.reserve(Limit);
+    for (uint32_t X = 0; X < Limit; ++X)
+      Inputs.emplace_back(W, X);
+  } else {
+    Inputs = witnesses(W, D);
+  }
+
   // Candidates: udiv d, sdiv +d, sdiv -d. First fully verified wins.
   for (int Cand = 0; Cand < 3; ++Cand) {
     bool Signed = Cand != 0;
     int64_t DD = (Cand == 2) ? -D : D;
     bool Ok = true;
-    for (const APInt &WX : witnesses(W, DD)) {
+    for (const APInt &WX : Inputs) {
       APInt Expected(W, 0);
       if (Signed) {
         int64_t SVal = WX.getSExtValue();
@@ -464,8 +477,8 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
           Ok = false;
           break;
         }
-        int64_t Q = SVal / DD;
-        Expected = APInt(W, (uint64_t)Q, true);
+        int64_t QV = SVal / DD;
+        Expected = APInt(W, (uint64_t)QV, true);
       } else {
         Expected = WX.udiv(APInt(W, (uint64_t)D));
       }
@@ -746,6 +759,50 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
           LocalChanged = true;
           continue;
         }
+        // Select forms of unsigned saturation produced by ordinary C/C++
+        // arithmetic. Keep the operands tied to the exact add/sub node.
+        if (auto *IC = dyn_cast<ICmpInst>(SI->getCondition())) {
+          Intrinsic::ID ID = Intrinsic::not_intrinsic;
+          Value *LHS = nullptr;
+          Value *RHS = nullptr;
+          auto *Sub = dyn_cast<BinaryOperator>(SI->getFalseValue());
+          auto *Zero = dyn_cast<ConstantInt>(SI->getTrueValue());
+          if (Sub && Sub->getOpcode() == Instruction::Sub && Zero &&
+              Zero->isZero() &&
+              IC->getPredicate() == ICmpInst::ICMP_ULT &&
+              IC->getOperand(0) == Sub->getOperand(0) &&
+              IC->getOperand(1) == Sub->getOperand(1)) {
+            ID = Intrinsic::usub_sat;
+            LHS = Sub->getOperand(0);
+            RHS = Sub->getOperand(1);
+          }
+          auto *Add = dyn_cast<BinaryOperator>(SI->getFalseValue());
+          auto *Max = dyn_cast<ConstantInt>(SI->getTrueValue());
+          if (Add && Add->getOpcode() == Instruction::Add && Max &&
+              Max->isMinusOne() &&
+              IC->getPredicate() == ICmpInst::ICMP_ULT &&
+              IC->getOperand(0) == Add &&
+              (IC->getOperand(1) == Add->getOperand(0) ||
+               IC->getOperand(1) == Add->getOperand(1))) {
+            ID = Intrinsic::uadd_sat;
+            LHS = Add->getOperand(0);
+            RHS = Add->getOperand(1);
+          }
+          if (ID != Intrinsic::not_intrinsic) {
+            B.SetInsertPoint(SI);
+            Function *Decl = Intrinsic::getOrInsertDeclaration(
+                F.getParent(), ID, {SI->getType()});
+            Value *Call = B.CreateCall(Decl, {LHS, RHS});
+            auto *CI = cast<Instruction>(Call);
+            copyProvenance(CI, SI);
+            CI->copyMetadata(*SI);
+            SI->replaceAllUsesWith(Call);
+            Call->takeName(SI);
+            SI->eraseFromParent();
+            LocalChanged = true;
+            continue;
+          }
+        }
         // icmp+select min/max (signed and unsigned, either order).
         if (auto *IC = dyn_cast<ICmpInst>(SI->getCondition())) {
           ICmpInst::Predicate P = IC->getPredicate();
@@ -852,7 +909,9 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
       // -- byte-swap: shift-and-or byte shuffle -> llvm.bswap.
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
         if (BO->getOpcode() == Instruction::Or) {
-          // Collect the OR tree leaves; expect one shift term per byte.
+          // Collect the OR tree leaves and prove that they select each input
+          // byte exactly once, in reverse order. Merely seeing shifts of one
+          // base value is not sufficient to establish a byte swap.
           SmallVector<Value *, 8> Leaves;
           SmallVector<Value *, 8> Stack{BO->getOperand(0),
                                         BO->getOperand(1)};
@@ -862,32 +921,109 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                 O && O->getOpcode() == Instruction::Or) {
               Stack.push_back(O->getOperand(0));
               Stack.push_back(O->getOperand(1));
-            } else
+            } else {
               Leaves.push_back(V);
+            }
           }
           if (auto *IntTy = dyn_cast<IntegerType>(I.getType())) {
             unsigned W = IntTy->getBitWidth();
-            if (Leaves.size() * 8 == W &&
-                (W == 16 || W == 32 || W == 64)) {
+            unsigned ByteCount = W / 8;
+            if ((W == 16 || W == 32 || W == 64) &&
+                Leaves.size() == ByteCount) {
               Value *Base = nullptr;
               bool Ok = true;
+              SmallVector<bool, 8> DestSeen(ByteCount, false);
+              SmallVector<bool, 8> SourceSeen(ByteCount, false);
               for (Value *L : Leaves) {
                 Value *Shifted = L;
-                if (!match(L, m_And(m_Value(Shifted), m_ConstantInt())))
-                  Shifted = L;
-                Value *SX = nullptr, *SAmt = nullptr;
-                if (match(Shifted, m_Shl(m_Value(SX), m_Value(SAmt))) ||
-                    match(Shifted, m_LShr(m_Value(SX), m_Value(SAmt)))) {
-                  if (!Base)
-                    Base = SX;
-                  else if (Base != SX)
+                APInt Mask(W, 0);
+                bool HasMask = false;
+                if (auto *And = dyn_cast<BinaryOperator>(L);
+                    And && And->getOpcode() == Instruction::And) {
+                  auto *MC = dyn_cast<ConstantInt>(And->getOperand(1));
+                  if (!MC)
+                    MC = dyn_cast<ConstantInt>(And->getOperand(0));
+                  if (!MC) {
                     Ok = false;
-                } else {
+                    break;
+                  }
+                  Mask = MC->getValue();
+                  HasMask = true;
+                  Shifted = And->getOperand(0) == MC ? And->getOperand(1)
+                                                      : And->getOperand(0);
+                }
+                auto *Shift = dyn_cast<BinaryOperator>(Shifted);
+                if (!Shift || (Shift->getOpcode() != Instruction::Shl &&
+                               Shift->getOpcode() != Instruction::LShr)) {
                   Ok = false;
                   break;
                 }
+                auto *Amount = dyn_cast<ConstantInt>(Shift->getOperand(1));
+                if (!Amount || Amount->getValue().uge(W)) {
+                  Ok = false;
+                  break;
+                }
+                unsigned ShiftBy = Amount->getZExtValue();
+                bool IsRight = Shift->getOpcode() == Instruction::LShr;
+                unsigned DestShift = 0;
+                if (HasMask) {
+                  unsigned First = Mask.countTrailingZeros();
+                  APInt ExpectedMask(W, 255);
+                  ExpectedMask <<= First;
+                  if ((First % 8) != 0 || Mask != ExpectedMask) {
+                    Ok = false;
+                    break;
+                  }
+                  DestShift = First;
+                } else {
+                  APInt NaturalMask(W, 0);
+                  NaturalMask.setAllBits();
+                  if (IsRight)
+                    NaturalMask.lshr(ShiftBy);
+                  else
+                    NaturalMask.shl(ShiftBy);
+                  DestShift = IsRight ? 0 : ShiftBy;
+                  if (NaturalMask != (APInt(W, 255) << DestShift)) {
+                    Ok = false;
+                    break;
+                  }
+                }
+                if (DestShift >= W || (DestShift % 8) != 0) {
+                  Ok = false;
+                  break;
+                }
+                APInt ByteMask(W, 255);
+                ByteMask <<= DestShift;
+                if (HasMask && Mask != ByteMask) {
+                  Ok = false;
+                  break;
+                }
+                int SourceShift = IsRight
+                                      ? static_cast<int>(ShiftBy + DestShift)
+                                      : static_cast<int>(DestShift) -
+                                            static_cast<int>(ShiftBy);
+                if (SourceShift < 0 || (SourceShift % 8) != 0 ||
+                    SourceShift + 8 > static_cast<int>(W)) {
+                  Ok = false;
+                  break;
+                }
+                unsigned DestByte = DestShift / 8;
+                unsigned SourceByte = static_cast<unsigned>(SourceShift) / 8;
+                if (DestSeen[DestByte] || SourceSeen[SourceByte] ||
+                    SourceByte != ByteCount - DestByte - 1) {
+                  Ok = false;
+                  break;
+                }
+                DestSeen[DestByte] = true;
+                SourceSeen[SourceByte] = true;
+                Value *SX = Shift->getOperand(0);
+                if (!Base)
+                  Base = SX;
+                else if (Base != SX)
+                  Ok = false;
               }
-              if (Ok && Base) {
+              if (Ok && Base &&
+                  llvm::all_of(DestSeen, [](bool Seen) { return Seen; })) {
                 B.SetInsertPoint(BO);
                 Function *Bswap = Intrinsic::getOrInsertDeclaration(
                     F.getParent(), Intrinsic::bswap, {I.getType()});
