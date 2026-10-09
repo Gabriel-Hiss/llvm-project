@@ -327,7 +327,16 @@ bool materializeAssumeCompares(Function &F, bool HasPanicCall,
 // flag feeds no new branch: it replaces the poison-implying flags with
 // an explicit, testable value, and the arithmetic result is reused
 // verbatim. Only fires when the function still panics on overflow
-// elsewhere (the panic edge the pre shape branches to exists).
+// elsewhere (the panic edge the pre shape branches to exists), the
+// module already declares the intrinsic (corpus post keeps its own
+// declare alive: rust-o3 enum_area post still declares
+// umul.with.overflow), and the call carries no call-site attributes
+// (this opt build's verifier rejects intrinsic attributes on the call;
+// the declare keeps them, matching the corpus spelling where the call
+// has none). New instructions carry no metadata: even !revenant.va on
+// a new instruction renumbers downstream metadata in the printer. The
+// intrinsic must already be declared: synthesizing a declare in a
+// module without one trips this opt build's verifier.
 bool rebuildOverflowChecks(Function &F, bool HasOverflowPanic,
                            unsigned &Changed) {
   if (!HasOverflowPanic)
@@ -365,24 +374,48 @@ bool rebuildOverflowChecks(Function &F, bool HasOverflowPanic,
         continue;
       Cands.push_back(BO);
     }
-  // NOTE: materializing llvm.*.with.overflow calls is deliberately out
-  // of scope for this pass version. Synthesizing the intrinsic declare
-  // in a module that lacks one trips this opt build's verifier
-  // ("Attribute list does not match"), and every corpus function that
-  // folds an overflow check keeps its own with.overflow declare alive
-  // (rust-o3 enum_area post still declares umul.with.overflow). The
-  // semantics-preserving undo that always verifies is predicate
-  // canonicalization: InstCombine folds `icmp eq ov-flag, true` tests
-  // and rewrites overflow-branch predicates; restoring the canonical
-  // rustc form (ult/ult flag test + branch to the existing panic
-  // block) needs no new declare. Full call synthesis returns when the
-  // verifier mismatch is root-caused; until then the nsw/nuw muls are
-  // left for a later change and this returns false.
-  (void)Cands;
-  (void)HasOverflowPanic;
-  (void)F;
-  (void)Changed;
-  return false;
+  for (BinaryOperator *BO : Cands) {
+    Intrinsic::ID IID = Intrinsic::not_intrinsic;
+    bool IsSigned = BO->hasNoSignedWrap();
+    switch (BO->getOpcode()) {
+    case Instruction::Add:
+      IID = IsSigned ? Intrinsic::sadd_with_overflow
+                     : Intrinsic::uadd_with_overflow;
+      break;
+    case Instruction::Sub:
+      IID = IsSigned ? Intrinsic::ssub_with_overflow
+                     : Intrinsic::usub_with_overflow;
+      break;
+    default:
+      IID = IsSigned ? Intrinsic::smul_with_overflow
+                     : Intrinsic::umul_with_overflow;
+      break;
+    }
+    Function *OF = Intrinsic::getDeclarationIfExists(F.getParent(), IID,
+                                                     {BO->getType()});
+    if (!OF)
+      continue;
+    IRBuilder<> B(BO->getContext());
+    B.SetInsertPoint(BO->getIterator());
+    B.SetCurrentDebugLocation(DebugLoc());
+    Value *CallV = B.CreateCall(OF, {BO->getOperand(0), BO->getOperand(1)},
+                                BO->getName() + ".ov");
+    auto *Call = cast<CallInst>(CallV);
+    Call->setAttributes(AttributeList());
+    Call->setDebugLoc(DebugLoc());
+    copyProvenance(*BO, *Call);
+    auto *V = ExtractValueInst::Create(Call, 0, BO->getName() + ".v",
+                                       BO->getIterator());
+    V->setDebugLoc(DebugLoc());
+    auto *Of = ExtractValueInst::Create(Call, 1, BO->getName() + ".of",
+                                        BO->getIterator());
+    Of->setDebugLoc(DebugLoc());
+    BO->replaceAllUsesWith(V);
+    BO->eraseFromParent();
+    ++Changed;
+    Any = true;
+  }
+  return Any;
 }
 
 // R3d: restore the niche discriminant test. The optimizer folds
