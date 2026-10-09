@@ -24,6 +24,16 @@ structure, matching the engine `--patterns` path. Type recovery
 `ir-final`. The fidelity-only `ir-pre-like` stage uses
 `revenant-locals-to-slots` after type recovery instead of SSA-out.
 
+The driver's `ir-clean` stage (`Session::decompileAll`, `cleanPipeline` in
+`lib/CAPI/Stages.cpp`) runs `revenant-idioms` twice: once right after
+`<cleanup>` and once as the last pass of the trailing
+`function(instcombine,early-cse,revenant-lift-normalize)` group. The early
+run rewrites the multiply-high DAGs while the compiler's shape survives;
+the late run undoes what that trailing instcombine round refolded
+(`llvm.scmp`, `llvm.smin`/`smax`/`umin`/`umax`, `llvm.abs`,
+`llvm.uadd.sat`/`usub.sat`) back into the source-level compare/select form,
+so `ir-final` carries the compiler's pre-optimization shape.
+
 | stage | passes | source |
 |---|---|---|
 | cleanup | `sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg<no-switch-to-lookup;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks>,gvn,dse,dce,sroa,instcombine<no-verify-fixpoint>` | `crates/lift/src/pipeline.rs` `CLEANUP_PASSES` |
