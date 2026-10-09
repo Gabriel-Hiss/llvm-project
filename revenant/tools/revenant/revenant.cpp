@@ -27,6 +27,10 @@
 using namespace llvm;
 using namespace revenant;
 
+// Implemented in ExportParity.cpp (parity contract export).
+namespace revenant {
+int exportParity(PeFile &Pe, StringRef OutDir);
+}
 static int usage() {
   errs() << "usage: revenant info <pe>\n"
             "       revenant asm <pe> <va> [n]\n"
@@ -106,115 +110,14 @@ static int cmdAsm(StringRef Path, uint64_t Addr, uint64_t Count) {
   }
   return 0;
 }
-
 static int cmdExportParity(StringRef Path, StringRef OutDir) {
   auto Pe = openPe(Path);
   if (!Pe)
     return 1;
-  if (auto Ec = sys::fs::create_directories(OutDir)) {
-    errs() << "revenant: " << OutDir << ": " << Ec.message() << "\n";
-    return 1;
-  }
-
-  Program Prog;
-  Prog.Img = Pe->Img;
-
-  // Every listed instruction as (u32 rva, u32 len), sorted unique. No
-  // functions yet: the list is empty.
-  SmallVector<std::pair<uint32_t, uint32_t>, 0> Items;
-  for (auto &[Start, Rec] : Prog.Functions)
-    for (Rva R : Rec.InstrRvas) {
-      // Instr lens live in decode order; nothing to emit until analysis
-      // fills records.
-      (void)R;
-    }
-  llvm::sort(Items);
-  Items.erase(std::unique(Items.begin(), Items.end()), Items.end());
-
-  SmallString<256> ItemsPath(OutDir);
-  sys::path::append(ItemsPath, "revenant-items.bin");
-  std::error_code Ec;
-  raw_fd_ostream ItemsOs(ItemsPath, Ec, sys::fs::OF_None);
-  if (Ec) {
-    errs() << "revenant: " << ItemsPath << ": " << Ec.message() << "\n";
-    return 1;
-  }
-  for (auto [R, Len] : Items) {
-    char B[4];
-    support::endian::write32le(B, R);
-    ItemsOs.write(B, 4);
-    support::endian::write32le(B, Len);
-    ItemsOs.write(B, 4);
-  }
-  ItemsOs.close();
-
-  FileMap Map = FileMap::build(*Pe, Prog);
-  SmallString<256> SpansPath(OutDir);
-  sys::path::append(SpansPath, "file-spans.tsv");
-  raw_fd_ostream SpansOs(SpansPath, Ec, sys::fs::OF_Text);
-  if (Ec) {
-    errs() << "revenant: " << SpansPath << ": " << Ec.message() << "\n";
-    return 1;
-  }
-  SpansOs << "offset\tend\tva\tkind\n";
-  for (const FileSpan &S : Map.Spans) {
-    SpansOs << S.Offset << "\t" << S.End << "\t";
-    if (S.SpanVa)
-      SpansOs << format_hex(S.SpanVa->Value, 1);
-    else
-      SpansOs << "-";
-    SpansOs << "\t" << fileByteKindLabel(S.Kind) << "\n";
-  }
-  SpansOs.close();
-
-  // The partition must cover the whole file.
-  uint64_t Covered = 0;
-  for (const FileSpan &S : Map.Spans) {
-    if (S.Offset != Covered || S.End <= S.Offset) {
-      errs() << "revenant: file map does not partition the file\n";
-      return 1;
-    }
-    Covered = S.End;
-  }
-  if (Covered != Pe->FileSize) {
-    errs() << "revenant: file map covers " << Covered << " of "
-           << Pe->FileSize << " bytes\n";
-    return 1;
-  }
-
-  std::string ByKind;
-  auto Counts = Map.bytesByKind();
-  for (size_t I = 0; I < FILE_BYTE_KIND_COUNT; ++I) {
-    if (!Counts[I])
-      continue;
-    if (!ByKind.empty())
-      ByKind += ',';
-    ByKind += "\"";
-    ByKind += fileByteKindLabel((FileByteKind)I);
-    ByKind += "\":";
-    ByKind += std::to_string(Counts[I]);
-  }
-  SmallString<256> MetaPath(OutDir);
-  sys::path::append(MetaPath, "meta.json");
-  raw_fd_ostream MetaOs(MetaPath, Ec, sys::fs::OF_Text);
-  if (Ec) {
-    errs() << "revenant: " << MetaPath << ": " << Ec.message() << "\n";
-    return 1;
-  }
-  MetaOs << "{\"pdb_loaded\":false,\"functions\":"
-         << Prog.Functions.size() << ",\"instructions\":" << Items.size()
-         << ",\"file_bytes\":" << Pe->FileSize
-         << ",\"represented_bytes\":" << Covered << ",\"bytes_by_kind\":{"
-         << ByKind << "}}\n";
-  MetaOs.close();
-
-  outs() << "file_bytes=" << Pe->FileSize << " represented_bytes=" << Covered
-         << "\n";
-  outs() << "functions=" << Prog.Functions.size()
-         << " unique_instructions=" << Items.size() << " padding_runs="
-         << Prog.Padding.size() << "\n";
-  return 0;
+  return exportParity(*Pe, OutDir);
 }
+
+
 
 static std::optional<uint64_t> parseVa(StringRef S) {
   StringRef T = S;
