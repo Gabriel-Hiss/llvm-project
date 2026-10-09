@@ -48,7 +48,7 @@ and uses generic names for functions and data. `pdb` is accepted but reports
 source locations, panic messages, EH catch types, assertion/file/function
 strings, and RTTI class/vtable data to IR as `!rev.source`, `!rev.panic`,
 `!rev.eh.types`, `!rev.class`, `!rev.strings`, and `!rev.types`. `none` drops
-those records and referenced strings while preserving import names.
+embedded names and metadata, but retains data bytes and import names.
 
 
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
@@ -62,13 +62,13 @@ line holds a few hundred `--func` arguments, so chunk large sets.
 instructions and terminators intact while neutralizing identifiers and
 debug metadata.
 
-`test/meta-mode/recovery-report.py` compares names from `--list` with oracle
-symbols. It needs `--pdbutil` for the C and C++ PDBs; Rust and GCC names come
-from their link maps. Oracle files are read only after the decompiler runs.
+`test/meta-mode/recovery-report.py` compares recovered names with oracle PDB
+or map names after decompilation. Pass `--pdbutil` to inspect PDBs. Both
+scripts accept `--all-release` to include the optimized corpus targets.
 
 ```text
-python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity>
-python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe>
+python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity> --all-release
+python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe> --all-release
 ```
 
 ## Rust path

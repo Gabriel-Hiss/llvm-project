@@ -13,11 +13,14 @@
 
 #include "revenant/Analysis/Analysis.h"
 #include "revenant/Analysis/EmbeddedMeta.h"
+#include "revenant/Analysis/Resolver.h"
 
 #include <algorithm>
 #include <chrono>
 #include <map>
 #include <set>
+
+#include "llvm/ADT/StringExtras.h"
 
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -160,16 +163,17 @@ void Session::setMetaMode(MetaMode Mode) {
 
   // Imports are needed to keep external calls linked. Other names are
   // optional metadata and must not leak into none-mode output.
-  std::map<Va, std::string> ImportNames;
+  std::map<Va, std::string> AvailableNames;
   if (Prog.Externs)
     for (const auto &[Slot, Ext] : *Prog.Externs)
-      ImportNames.emplace(Slot, Ext.Name);
+      AvailableNames.emplace(Slot, Ext.Name);
+  for (auto &[Start, Rec] : Prog.Functions) {
+    Rec.Name = "sub_" + utohexstr(Start.Value);
+    AvailableNames.insert_or_assign(Start, Rec.Name);
+  }
   if (Prog.Names)
-    *Prog.Names = std::move(ImportNames);
-  if (Prog.Strings)
-    Prog.Strings->clear();
-  for (auto &[Start, Rec] : Prog.Functions)
-    Rec.Name = formatv("sub_{0:x-8}", Start.Value).str();
+    *Prog.Names = std::move(AvailableNames);
+  Prog.Resolver = makeResolver(Prog.Names, Prog.Externs, nullptr);
   SymNames.clear();
   if (Prog.Externs)
     for (const auto &[Slot, Ext] : *Prog.Externs) {
