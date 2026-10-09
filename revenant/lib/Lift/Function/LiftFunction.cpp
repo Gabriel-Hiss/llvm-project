@@ -220,48 +220,7 @@ static llvm::Error emitSwitch(LiftState &LS, const FuncRecord &F,
     Loc.Tag = CmpOperand::Kind::Reg;
     Loc.Reg = (unsigned)llvm::X86::RAX;
   }
-  // The guard is the predecessor ending in a jcc that branches here.
-  std::optional<BlockRec> Guard;
-  Va GuardLastVA;
-  for (const BlockRec &G : F.Blocks) {
-    if (G.InstrsEnd == 0 || G.InstrsBegin >= G.InstrsEnd)
-      continue;
-    bool BranchesHere = false;
-    for (const EdgeRec &E : F.edgesOf(G))
-      if (F.edgeTo(Img, &E - F.Edges.data()) == Start)
-        BranchesHere = true;
-    if (!BranchesHere)
-      continue;
-    Va LastVA = F.instrVa(Img, G.InstrsEnd - 1);
-    for (const Instr &GI : LS.Instrs) {
-      if (GI.Addr == LastVA && GI.Flow == FlowKind::CondBranch) {
-        Guard = G;
-        GuardLastVA = LastVA;
-        break;
-      }
-    }
-    if (Guard)
-      break;
-  }
-  llvm::Value *Base = nullptr;
-  bool Captured = false;
-  if (LS.SwOperand && Guard && LS.SwOperand->first == GuardLastVA) {
-    Base = LS.SwOperand->second;
-    Captured = true;
-  } else {
-    if (Guard) {
-      llvm::BasicBlock *GLB = LS.Blocks.find(Guard->startVa(Img))->second;
-      if (llvm::Instruction *Term = GLB->getTerminator())
-        LS.B.SetInsertPoint(Term);
-      else
-        LS.B.SetInsertPoint(GLB);
-      Base = LS.evalCmpOperand(Loc, Guard->startVa(Img));
-      LS.B.SetInsertPoint(Cur);
-    } else {
-      LS.B.SetInsertPoint(Cur);
-      Base = LS.evalCmpOperand(Loc, Start);
-    }
-  }
+  llvm::Value *Base = LS.evalCmpOperand(Loc, Start);
   int64_t MinCase = 0;
   bool HaveMin = false;
   for (size_t E = BR.EdgesBegin; E < BR.EdgesEnd; ++E) {
@@ -275,7 +234,7 @@ static llvm::Error emitSwitch(LiftState &LS, const FuncRecord &F,
             HaveMin = true;
           }
   }
-  int64_t Total = Captured ? MinCase : (Off + MinCase);
+  int64_t Total = Off + MinCase;
   LS.B.SetInsertPoint(Cur);
   llvm::Value *Operand = LS.extTo(Base, 64);
   if (Total != 0)

@@ -46,6 +46,10 @@ struct UnrotatePass : llvm::PassInfoMixin<UnrotatePass> {
 };
 
 struct UntailRecPass : llvm::PassInfoMixin<UntailRecPass> {
+  // Undoes optimizer tail-call elimination: a TailCallElim-style loop
+  // (entry split, per-argument header phis, pure latch backedge) becomes
+  // the recursive call the source had. Never fires when the function
+  // already contains a self-call.
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &AM);
   static bool isRequired() { return true; }

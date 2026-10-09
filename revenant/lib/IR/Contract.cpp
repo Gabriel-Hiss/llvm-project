@@ -336,7 +336,8 @@ bool revenant::ir::isOpaqueAsmCall(const Instruction &I) {
 Function *revenant::ir::getOrCreateOpaqueAsmFn(Module &M, StringRef Mnemonic,
                                              Type *RetTy,
                                              ArrayRef<Type *> ArgTys) {
-  FunctionType *FT = FunctionType::get(RetTy, ArgTys, /*isVarArg=*/false);
+  FunctionType *FT = FunctionType::get(RetTy, {}, /*isVarArg=*/true);
+  (void)ArgTys;
   return cast<Function>(
       M.getOrInsertFunction((OpaqueAsmPrefix + Mnemonic.lower()).str(), FT)
           .getCallee());

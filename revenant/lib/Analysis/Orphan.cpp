@@ -140,12 +140,8 @@ bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd,
 }
 
 bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd) {
-  // Decoder-only fallback for tests that link this slice without the x86
-  // hooks. `jmp reg` decodes as JMP64r with a single register operand;
-  // memory forms carry base/scale/index/disp/segment, with the index in
-  // slot 2 (reg 0 = no index). RIP-relative detection uses the decoded
-  // absolute slot instead of a register table: `HasMemTarget` into
-  // non-executable bytes is a thunk slot however the base is spelled.
+  // Without target hooks, accept only direct-register jumps and resolved
+  // memory slots into non-executable bytes. Other memory forms stay unknown.
   struct LocalHooks final : public TargetHooks {
     llvm::StringRef mnemonic(const Instr &) const override { return ""; }
     bool isFiller(const Instr &) const override { return false; }
@@ -157,14 +153,8 @@ bool orphanFunctionOk(const Image &Img, const Function &F, Va BoundEnd) {
       if (I.Flow != FlowKind::IndirectBranch)
         return false;
       const llvm::MCInst &M = I.Inst;
-      if (M.getNumOperands() == 0 || !M.getOperand(0).isReg())
-        return false;
-      if (M.getNumOperands() == 1)
-        return true; // jmp reg
-      // Memory form: opaque only for the thunk slot shape, a mem target
-      // into non-executable bytes ([rip+disp] at the IAT, [reg+disp]
-      // through an object). The reference rejects any mem target in
-      // executable bytes as a failed table, and anything else indexed.
+      if (M.getNumOperands() == 1 && M.getOperand(0).isReg())
+        return true;
       return M.getNumOperands() >= 5 && I.HasMemTarget &&
              !Img.isExecutable(I.MemTarget);
     }

@@ -63,9 +63,7 @@ std::string printFunction(llvm::Module &M, llvm::Function &F) {
   std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(FCtx, Types);
   fillTranslationUnit(**T, M, Types, *Stmts, *Exprs);
 
-  clang::FunctionDecl *FD = FCtx.functionDecl(F, [&](llvm::Type *Ty, const llvm::DIType *DI) {
-    return Types.typeOf(Ty, DI);
-  });
+  clang::FunctionDecl *FD = FCtx.functionDecl(F, Types);
   std::string Out;
   raw_string_ostream OS(Out);
   FD->print(OS, (*T)->ast().getPrintingPolicy());
@@ -83,7 +81,8 @@ TEST(StructuredStmtBuilderTest, IfThen) {
   llvm::BasicBlock *Then = BasicBlock::Create(C, "bb_1010", F);
   llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_1020", F);
   llvm::IRBuilder<> B(Entry);
-  B.CreateCondBr(X, Then, Follow);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), Then,
+                 Follow);
   B.SetInsertPoint(Then);
   B.CreateBr(Follow);
   B.SetInsertPoint(Follow);
@@ -107,7 +106,7 @@ TEST(StructuredStmtBuilderTest, IfElse) {
   llvm::BasicBlock *E = BasicBlock::Create(C, "bb_2020", F);
   llvm::BasicBlock *Merge = BasicBlock::Create(C, "bb_2030", F);
   llvm::IRBuilder<> B(Entry);
-  B.CreateCondBr(X, T, E);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), T, E);
   B.SetInsertPoint(T);
   B.CreateBr(Merge);
   B.SetInsertPoint(E);
@@ -252,7 +251,7 @@ TEST(StructuredStmtBuilderTest, GotoFallback) {
   llvm::BasicBlock *Bb = BasicBlock::Create(C, "bb_7010", F);
   llvm::BasicBlock *Cc = BasicBlock::Create(C, "bb_7020", F);
   llvm::IRBuilder<> B(A);
-  B.CreateCondBr(X, Bb, Cc);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), Bb, Cc);
   B.SetInsertPoint(Bb);
   B.CreateBr(Cc);
   B.SetInsertPoint(Cc);

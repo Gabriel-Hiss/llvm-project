@@ -1,29 +1,21 @@
-# Corpus-weighted opaque lift coverage
+# Corpus-weighted opaque lift gaps
 
-The opcode census covers all 274 PE builds listed in `target/parity`. Across those builds, the static instruction counts sum to 66,461,721. Opaque fallback handles 7,657,523 instructions, or 11.52%. The other 58,804,198 instructions, or 88.48%, hit a generated DSL case or a supported direct-pattern case.
+The census covers all 274 PE builds in `target/parity`, for 66,461,721 static decoded instructions. The CFG-aware function lifter handles control-flow instructions at block terminators, so the opaque-rate denominator excludes the control-flow opcode families listed below. The remaining non-control instructions total 52,255,347; 1,481,683 hit an opaque fallback (2.84%), and 50,773,664 use generated semantics (97.16%).
 
-The census marks opcodes whose generated case starts with an opaque call, plus any opcode name missing from the generated dispatcher. It cannot identify runtime-conditional opaque branches from per-opcode counts alone, such as a locked memory NEG.
+Control-flow opcodes excluded from this rate account for 14,206,374 static occurrences. The generated table would dispatch 6,175,840 of those through an opaque case when they occur outside a block terminator; the function-level CFG path handles block-final branches, calls, returns, and traps. Per-opcode counts cannot distinguish block position.
 
-These are weighted static instruction occurrences, not distinct opcodes. Several parity binaries share a filename, so the census tool's original per-filename CSVs overwrote each other. I re-censused those duplicate-name PEs into separate temporary output directories, then aggregated every parity row.
+The top-200 list below excludes those control-flow families and is weighted by static occurrences across PEs, not unique opcode names. Duplicate binary filenames in the initial census were re-censused into separate temporary directories. Family labels use mnemonic-prefix heuristics. `other` holds remaining non-control opcodes.
 
-The table lists the 200 most common opaque opcodes across the corpus. Family labels use mnemonic-prefix rules. Branch, call, return, and miscellaneous data movement are grouped under system or other. No x87 or string opcode appears in the top 200. This does not mean those families have zero opaque instructions below rank 200.
-
-The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opcodes (424,209), 11 system/control opcodes (6,179,192), and 6 other opcodes (554,096). There are 798 distinct opaque opcode names in the full census.
+Top-200 family entries: ALU/flags 50, SSE/AVX 136, system 3, other 7. No x87 or string opcode appears in this top 200; both can still occur below rank 200.
 
 | Family | Opcode | Static count |
 |---|---|---:|
-| system | `JCC_1` | 4,206,696 |
-| system | `JCC_4` | 1,487,090 |
 | other | `MOV64mi32` | 532,421 |
-| system | `CALL64m` | 262,411 |
-| system | `TRAP` | 120,913 |
 | ALU/flags | `AND64mi8` | 74,095 |
 | ALU/flags | `AND32mi8` | 61,811 |
 | SSE/AVX | `XORPSrr` | 59,467 |
 | ALU/flags | `OR32mi8` | 55,366 |
-| system | `CALL64r` | 54,061 |
 | SSE/AVX | `VMOVDQUYrm` | 50,988 |
-| system | `JMP64r` | 27,280 |
 | ALU/flags | `ADD8mr` | 24,753 |
 | ALU/flags | `ADD32mr` | 23,658 |
 | ALU/flags | `ADD64mi8` | 22,505 |
@@ -36,7 +28,6 @@ The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opco
 | ALU/flags | `OR32mr` | 14,704 |
 | other | `XADD32rm` | 14,592 |
 | ALU/flags | `SHR32rCL` | 11,662 |
-| system | `INT` | 11,273 |
 | SSE/AVX | `VPCMPEQDYrr` | 10,798 |
 | SSE/AVX | `VMOVDQAYmr` | 10,199 |
 | ALU/flags | `SHL64rCL` | 9,999 |
@@ -55,7 +46,6 @@ The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opco
 | SSE/AVX | `VMOVDQAYrm` | 5,395 |
 | SSE/AVX | `VINSERTF128rri` | 5,309 |
 | SSE/AVX | `VPERMQYri` | 5,220 |
-| system | `JMP64m` | 5,150 |
 | SSE/AVX | `VMOVUPSYmr` | 4,619 |
 | SSE/AVX | `VEXTRACTF128rri` | 4,513 |
 | SSE/AVX | `VPCMPEQQYrr` | 4,440 |
@@ -97,7 +87,6 @@ The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opco
 | SSE/AVX | `VPMINUBYrr` | 2,184 |
 | SSE/AVX | `VPMAXSWYrr` | 2,138 |
 | SSE/AVX | `VPMINSWYrr` | 2,130 |
-| system | `CPUID` | 2,089 |
 | ALU/flags | `ADC8mr` | 2,080 |
 | SSE/AVX | `VPCMPGTQYrr` | 2,070 |
 | SSE/AVX | `ADDPSrr` | 2,041 |
@@ -117,7 +106,6 @@ The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opco
 | SSE/AVX | `VMAXPDYrr` | 1,652 |
 | SSE/AVX | `VMINPDYrr` | 1,652 |
 | SSE/AVX | `VPMAXUBYrr` | 1,594 |
-| system | `PAUSE` | 1,591 |
 | ALU/flags | `AND64mi32` | 1,575 |
 | SSE/AVX | `XORPSrm` | 1,573 |
 | SSE/AVX | `VMOVDQUrm` | 1,551 |
@@ -185,7 +173,6 @@ The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opco
 | SSE/AVX | `VPCMPGTWYrr` | 655 |
 | ALU/flags | `AND8mr` | 654 |
 | SSE/AVX | `VMASKMOVPDYrm` | 649 |
-| system | `LDMXCSR` | 638 |
 | SSE/AVX | `VPMAXSDYrr` | 626 |
 | SSE/AVX | `VPMINSDYrr` | 618 |
 | SSE/AVX | `VCOMISDrm` | 616 |
@@ -212,5 +199,44 @@ The top 200 contain 47 ALU/flags opcodes (449,217 occurrences), 136 SSE/AVX opco
 | SSE/AVX | `PMINUWrr` | 531 |
 | SSE/AVX | `VPMOVZXWDYrm` | 531 |
 | SSE/AVX | `CVTDQ2PSrr` | 530 |
+| SSE/AVX | `VPINSRQrri` | 529 |
+| ALU/flags | `OR16mi` | 509 |
+| ALU/flags | `OR64mr` | 509 |
+| other | `PACKUSWBrr` | 500 |
+| SSE/AVX | `CMPPDrri` | 496 |
+| ALU/flags | `OR64mi32` | 490 |
+| SSE/AVX | `VPCLMULQDQrri` | 488 |
+| SSE/AVX | `PMAXSWrr` | 478 |
 
-Distinct opaque opcode names in the full census: 798.
+| Control-flow opcode | Static count |
+|---|---:|
+| `JCC_1` | 4,206,696 |
+| `CALL64pcrel32` | 4,007,738 |
+| `JMP_1` | 1,729,483 |
+| `JCC_4` | 1,487,090 |
+| `RET64` | 1,219,827 |
+| `JMP_4` | 1,011,697 |
+| `CALL64m` | 262,411 |
+| `TRAP` | 120,913 |
+| `INT3` | 61,088 |
+| `CALL64r` | 54,061 |
+| `JMP64r` | 27,280 |
+| `INT` | 11,273 |
+| `JMP64m` | 5,150 |
+| `LRET32` | 253 |
+| `IRET32` | 246 |
+| `LRETI32` | 240 |
+| `RETI64` | 203 |
+| `JRCXZ` | 194 |
+| `LOOPE` | 190 |
+| `LOOP` | 179 |
+| `LOOPNE` | 137 |
+| `LRET64` | 9 |
+| `LRETI64` | 7 |
+| `IRET64` | 4 |
+| `LRET16` | 2 |
+| `JMP_2` | 1 |
+| `LRETI16` | 1 |
+| `RETI16` | 1 |
+
+Distinct opaque opcode names after excluding control flow: 780.

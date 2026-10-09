@@ -10,7 +10,9 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   StackPtrTest.cpp
   StringsTest.cpp
   XrefsTest.cpp
-  )
+  SignaturesTest.cpp
+  EHTablesTest.cpp
+)
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
   RevenantAnalysis

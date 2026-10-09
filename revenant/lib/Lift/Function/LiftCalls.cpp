@@ -266,7 +266,9 @@ void LiftState::emitTailCall(Va Target) {
   Empty.Ret.reset();
   std::vector<llvm::Value *> Args = callArgs(Sig ? Sig : &Empty, std::nullopt);
   coerceArgs(Callee, Args);
-  llvm::CallInst *Call = B.CreateCall(Callee, Args, "tc");
+  llvm::CallInst *Call =
+      B.CreateCall(Callee, Args,
+                   Callee->getReturnType()->isVoidTy() ? "" : "tc");
   ir::setInstructionVA(*Call, CurVa.Value);
   const Signature *Caller = Sigs ? Sigs->of(F.Start) : nullptr;
   if (Caller && Caller->Ret) {
@@ -311,7 +313,8 @@ void LiftState::emitIndirectTailCall(const Instr &I) {
     Args.push_back(llvm::UndefValue::get(i64()));
   llvm::Value *FP =
       B.CreateIntToPtr(TV, llvm::PointerType::getUnqual(FT), "fp");
-  llvm::CallInst *Call = B.CreateCall(FT, FP, Args, "itc");
+  llvm::CallInst *Call =
+      B.CreateCall(FT, FP, Args, FT->getReturnType()->isVoidTy() ? "" : "itc");
   ir::setInstructionVA(*Call, I.Addr.Value);
   if (Call->getType()->isVoidTy()) {
     B.CreateRetVoid();

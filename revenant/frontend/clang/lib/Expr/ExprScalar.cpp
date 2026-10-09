@@ -493,4 +493,50 @@ Expr *ExprBuilderImpl::cond(llvm::Value *Cond, ExprScope &Scope) {
   return truthTest(C);
 }
 
+Expr *ExprBuilderImpl::inverted(llvm::Value *Cond, ExprScope &Scope) {
+  assert(AST && "beginFunction must run before inverted()");
+  // Canonical negation: predicate flip on comparisons, else `!x`.
+  Expr *C = cond(Cond, Scope);
+  if (auto *B = llvm::dyn_cast<clang::BinaryOperator>(C)) {
+    BinaryOperatorKind Flip = BO_EQ;
+    bool Flippable = true;
+    switch (B->getOpcode()) {
+    case BO_EQ:
+      Flip = BO_NE;
+      break;
+    case BO_NE:
+      Flip = BO_EQ;
+      break;
+    case BO_LT:
+      Flip = BO_GE;
+      break;
+    case BO_LE:
+      Flip = BO_GT;
+      break;
+    case BO_GT:
+      Flip = BO_LE;
+      break;
+    case BO_GE:
+      Flip = BO_LT;
+      break;
+    default:
+      Flippable = false;
+      break;
+    }
+    if (Flippable) {
+      return BinaryOperator::Create(*AST, B->getLHS(), B->getRHS(), Flip,
+                                    B->getType(), VK_PRValue, OK_Ordinary,
+                                    SourceLocation(), FPOptionsOverride());
+    }
+  }
+  // `!!x` folds back to a truth test instead of stacking negations.
+  if (auto *UO = llvm::dyn_cast<clang::UnaryOperator>(C)) {
+    if (UO->getOpcode() == UO_LNot)
+      return truthTest(UO->getSubExpr());
+  }
+  return UnaryOperator::Create(*AST, parenIfNeeded(C, Prec::Unary), UO_LNot,
+                               AST->BoolTy, VK_PRValue, OK_Ordinary,
+                               SourceLocation(), false, FPOptionsOverride());
+}
+
 } // namespace revenant::clangx

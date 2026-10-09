@@ -236,10 +236,10 @@ public:
       if (const auto *Sig = dyn_cast_or_null<DISubroutineType>(SP->getType())) {
         clang::QualType Ret = typeOfIR(F.getReturnType());
         SmallVector<clang::QualType, 8> Params;
-        auto Types = Sig->getTypeArray();
-        unsigned I = 0;
-        for (DIType *T : Types) {
-          if (I++ == 0) {
+        bool First = true;
+        for (DIType *T : Sig->getTypeArray()) {
+          if (First) {
+            First = false;
             if (T)
               Ret = mapDIOrFallback(T);
             continue;

@@ -8,10 +8,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "revenant/Analysis/Analysis.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 #include "revenant/Lift/LiftFunction.h"
 #include "revenant/Object/PeFile.h"
+#include "revenant/Target/TargetHooks.h"
 
 #include "gtest/gtest.h"
 
@@ -183,46 +185,81 @@ TEST(LiftFunction, CleanupPipelineVerifies) {
   EXPECT_FALSE(verifyModule(M, &llvm::errs()));
 }
 
-TEST(LiftFunction, RealPdataSamplesVerify) {
+TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
   const struct {
     const char *Name;
     const char *Path;
   } Inputs[] = {{"c-o0", REVENANT_TEST_C_O0},
                 {"c-o2", REVENANT_TEST_C_O2},
-                {"cpp-o2", REVENANT_TEST_CPP_O2}};
+                {"cpp-o2", REVENANT_TEST_CPP_O2},
+                {"c-clang-o2", REVENANT_TEST_C_CLANG_O2},
+                {"c-gcc-o2", REVENANT_TEST_C_GCC_O2}};
   for (const auto &Input : Inputs) {
     auto Fx = open(Input.Path);
     ASSERT_TRUE(Fx.has_value()) << Input.Path;
-    unsigned Tried = 0;
+    auto Hooks = createX86TargetHooks();
+    Program P = analyze(*Fx->Pe, *Hooks);
+    ASSERT_FALSE(P.Functions.empty()) << Input.Name;
+
+    llvm::LLVMContext C;
+    llvm::Module M(Input.Name, C);
+    std::map<std::string, unsigned> LiftErrors;
+    std::map<std::string, unsigned> VerifierErrors;
+    std::map<std::string, unsigned> Fallbacks;
     unsigned Verified = 0;
-    unsigned Failed = 0;
-    for (const RuntimeFunction &RF : Fx->Pe->Pdata) {
-      if (Tried == 12)
-        break;
-      std::vector<Instr> Block = Fx->Dis->decodeRange(RF.Begin, RF.End);
-      if (Block.empty())
-        continue;
-      ++Tried;
-      Program P = emptyProgram(Fx->Pe->Img);
-      FuncRecord R = singleBlockFunc(P, Block);
-      llvm::LLVMContext C;
-      llvm::Module M(Input.Name, C);
-      auto Lifted = lift::liftFunction(M, P, R, *Fx->Dis, nullptr, nullptr,
-                                       /*RunPasses=*/false);
+    unsigned LiftFailed = 0;
+    for (const auto &[Start, Record] : P.Functions) {
+      auto Lifted = lift::liftFunction(M, P, Record, *Fx->Dis, nullptr,
+                                       nullptr, /*RunPasses=*/false);
       if (!Lifted) {
-        consumeError(Lifted.takeError());
-        ++Failed;
+        std::string Message = toString(Lifted.takeError());
+        llvm::StringRef Ref(Message);
+        std::string Category =
+            Ref.contains("inconsistent rsp delta") ? "stack-delta"
+            : Ref.contains("decode")              ? "decode"
+                                                   : "other";
+        if (Ref.contains("LLVM verification failed")) {
+          for (const BlockRec &BR : Record.Blocks) {
+            llvm::errs() << "    block " << BR.startVa(*P.Img) << "\n";
+            for (size_t N = BR.InstrsBegin; N < BR.InstrsEnd; ++N) {
+              auto I = Fx->Dis->decodeOne(
+                  P.Img->Base.wrappingAdd(Record.InstrRvas[N]));
+              if (I)
+                llvm::errs() << "      " << Fx->Dis->format(*I) << "\n";
+            }
+          }
+        }
+        ++LiftErrors[Category];
+        llvm::errs() << "  lift-failure at " << Start.Value << ": "
+                     << Message << "\n";
+        ++LiftFailed;
         continue;
       }
-      if (verifyModule(M, &llvm::errs()))
-        ++Failed;
-      else
-        ++Verified;
+      for (const auto &[VA, Text] : Lifted->AsmFallbacks) {
+        llvm::StringRef S(Text);
+        ++Fallbacks[S.take_front(S.find(" (")).trim().lower()];
+      }
+      if (llvm::verifyFunction(*Lifted->Fn, &llvm::errs())) {
+        ++VerifierErrors["function-verifier"];
+        llvm::errs() << "  verify-failure at " << Start.Value << "\n";
+        continue;
+      }
+      ++Verified;
     }
-    llvm::errs() << Input.Name << ": " << Verified << "/" << Tried
-                 << " pdata functions verified (" << Failed << " failed)\n";
-    EXPECT_EQ(Verified + Failed, Tried);
-    EXPECT_GT(Verified, 0u);
+    bool ModuleVerified = !verifyModule(M, &llvm::errs());
+    unsigned Total = P.Functions.size();
+    llvm::errs() << Input.Name << ": " << Verified << "/" << Total
+                 << " functions verified; lift failures=" << LiftFailed
+                 << "; module verifier=" << (ModuleVerified ? "pass" : "fail")
+                 << "\n";
+    for (const auto &[Category, Count] : LiftErrors)
+      llvm::errs() << "  lift-error " << Category << ": " << Count << "\n";
+    for (const auto &[Category, Count] : VerifierErrors)
+      llvm::errs() << "  verify-error " << Category << ": " << Count << "\n";
+    for (const auto &[Mnemonic, Count] : Fallbacks)
+      llvm::errs() << "  opaque " << Mnemonic << ": " << Count << "\n";
+    EXPECT_TRUE(ModuleVerified) << Input.Name;
+    EXPECT_GE(Verified * 100, Total * 99) << Input.Name;
   }
 }
 

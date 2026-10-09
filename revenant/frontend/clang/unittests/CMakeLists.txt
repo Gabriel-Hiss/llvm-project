@@ -1,4 +1,7 @@
-# RevenantClangTypeTests — gtest for lib/Type
+# RevenantClangTypeTests — gtest for lib/Type. Runs both standalone
+# (cmake -S revenant/frontend/clang/unittests) and inside the top-level
+# revenant/ superbuild.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 cmake_minimum_required(VERSION 3.20)
 project(RevenantClangTypeTests CXX)
 
@@ -10,14 +13,13 @@ if(DEFINED Clang_DIR)
 endif()
 find_package(LLVM REQUIRED CONFIG PATHS "${LLVM_DIR}" NO_DEFAULT_PATH)
 find_package(Clang REQUIRED CONFIG PATHS "${CLANG_CMAKE_DIR}" NO_DEFAULT_PATH)
+endif()
 
 if(NOT DEFINED REVENANT_CLANG_INCLUDE_DIR)
-  set(REVENANT_CLANG_INCLUDE_DIR
-      "C:/Users/User/RustroverProjects/rv-wt/Swe2ClangCore/revenant/frontend/clang/include")
+  set(REVENANT_CLANG_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../include")
 endif()
 if(NOT DEFINED REVENANT_TYPE_SRC_DIR)
-  set(REVENANT_TYPE_SRC_DIR
-      "C:/Users/User/RustroverProjects/rv-wt/MuseClangCpp/revenant/frontend/clang/lib/Type")
+  set(REVENANT_TYPE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../lib/Type")
 endif()
 
 llvm_map_components_to_libnames(LLVM_LIBS Demangle DebugInfoDWARF

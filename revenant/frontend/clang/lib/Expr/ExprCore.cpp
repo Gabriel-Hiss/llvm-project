@@ -646,12 +646,6 @@ Stmt *ExprBuilderImpl::instr(llvm::Instruction &I, ExprScope &Scope) {
   }
 }
 
-Expr *ExprBuilderImpl::inverted(llvm::Value *Cond, ExprScope &Scope) {
-  Expr *E = this->cond(Cond, Scope);
-  return UnaryOperator::Create(*AST, E, UO_LNot, AST->BoolTy, VK_PRValue,
-                               OK_Ordinary, SourceLocation(),
-                               /*CanOverflow=*/false, FPOptionsOverride());
-}
 
 Expr *ExprBuilderImpl::retVal(llvm::Value *V, ExprScope &Scope) {
   assert(AST && "beginFunction must run before retVal()");

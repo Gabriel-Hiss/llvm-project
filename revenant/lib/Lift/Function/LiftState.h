@@ -167,8 +167,6 @@ public:
   std::map<Va, llvm::Value *> Globals;
   /// Current-block flag producer for fusion.
   std::optional<FlagProd> Prod;
-  /// Guard jcc VA -> the index SSA value its producer compared.
-  std::optional<std::pair<Va, llvm::Value *>> SwOperand;
   std::vector<std::pair<Va, std::string>> Fallbacks;
   /// VA of the instruction being lowered (for rsp reads).
   Va CurVa;
