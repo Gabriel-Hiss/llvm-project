@@ -1,0 +1,8 @@
+7.416081e-02 unrust-assume.ll
+7.482600e-02 unrust-bounds.ll
+9.266615e-02 unrust-gate.ll
+6.688237e-02 unrust-iter.ll
+8.459496e-02 unrust-niche.ll
+7.308459e-02 unrust-nofire.ll
+6.733060e-02 unrust-overflow.ll
+8.115935e-02 unrust-vec.ll
