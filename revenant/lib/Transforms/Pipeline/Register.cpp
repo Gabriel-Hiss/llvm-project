@@ -73,6 +73,9 @@
 #if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
 #include "revenant/Transforms/UnloopVec/UnloopVec.h"
 #endif
+#if __has_include("revenant/Transforms/Unsroa/Unsroa.h")
+#include "revenant/Transforms/Unsroa/Unsroa.h"
+#endif
 #if __has_include("revenant/Transforms/Unrust/Unrust.h")
 #include "revenant/Transforms/Unrust/Unrust.h"
 #endif
@@ -170,6 +173,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Uneh/Uneh.h")
         if (Name == "revenant-uneh") {
           FPM.addPass(UnehPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unsroa/Unsroa.h")
+        if (Name == "revenant-unsroa") {
+          FPM.addPass(UnsroaPass());
           return true;
         }
 #endif
