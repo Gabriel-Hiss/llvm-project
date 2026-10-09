@@ -13,11 +13,7 @@ add_llvm_library(RevenantAnalysis
   StackPtr.cpp
   Strings.cpp
   Xrefs.cpp
-<<<<<<< HEAD
-  Signatures.cpp
   EHTables.cpp
-=======
->>>>>>> rv/Swe2Sigs
 
   LINK_COMPONENTS
   MC
