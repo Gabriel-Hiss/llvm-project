@@ -15,7 +15,7 @@
 
 namespace revenant {
 
-enum class EHModel : uint8_t { None, MSVC, SEH, Itanium };
+enum class EHModel : uint8_t { None, MSVC, SEH, Itanium, Rust };
 enum class HandlerKind : uint8_t { Catch, Filter, Finally, Cleanup };
 
 struct EHTryRegion {

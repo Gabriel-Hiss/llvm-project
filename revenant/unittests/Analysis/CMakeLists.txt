@@ -20,4 +20,11 @@ target_link_libraries(RevenantAnalysisTests PRIVATE
   RevenantDisasm)
 
 target_compile_definitions(RevenantAnalysisTests PRIVATE
-  REVENANT_TEST_C_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2/c-o2.exe")
+  REVENANT_TEST_C_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2/c-o2.exe"
+  REVENANT_TEST_CPP_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-o2/artifacts/cpp-o2.exe"
+  REVENANT_TEST_CPP_CLANG_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-clang-o2/artifacts/cpp-clang-o2.exe"
+  REVENANT_TEST_CPP_GCC_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-gcc-o2/oracle/cpp-gcc-o2.dbg.exe"
+  REVENANT_TEST_RUST_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/rust-o2/corpus_rust.exe"
+  REVENANT_TEST_JSON_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/json-cl-o2/artifacts/json-cl-o2.exe"
+  REVENANT_TEST_SPDLOG_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/spdlog-cl-o2/artifacts/spdlog-cl-o2.exe"
+)

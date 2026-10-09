@@ -38,20 +38,44 @@ std::optional<Va> rel32(const Image &I, Va Field) {
   if (N > std::numeric_limits<uint64_t>::max() - Base) return std::nullopt;
   return Va(Base + N);
 }
-std::optional<Va> ptr32(const Image &I, Va Field) {
-  auto V = u32(I, Field);
-  if (!V || !*V) return std::nullopt;
-  return I.vaOfRva(*V);
-}
-std::optional<Va> ptr64(const Image &I, Va Field) {
-  auto V = I.readU64(Field);
-  if (!V || !*V) return std::nullopt;
-  return Va(*V);
-}
-bool bounded(const Image &I, Va A, uint64_t Size) {
-  const Section *S = I.sectionOf(A);
-  return S && A.Value <= std::numeric_limits<uint64_t>::max() - Size &&
-         A.Value + Size <= S->end().Value && I.isBacked(A);
+std::optional<std::string> handlerImportName(const PeFile &PE, Va Handler) {
+  const Image &I = *PE.Img;
+  for (unsigned Depth = 0; Depth < 8; ++Depth) {
+    auto B = I.dataAt(Handler, 9);
+    if (B.size() >= 6 && B[0] == 0xff && B[1] == 0x25) {
+      auto Slot = rel32(I, Handler.wrappingAdd(2));
+      if (!Slot) return std::nullopt;
+      for (const Import &Imp : PE.Imports)
+        if (Imp.IatVa == *Slot && Imp.Name)
+          return *Imp.Name;
+      return std::nullopt;
+    }
+    if (B.size() >= 5 && B[0] == 0xe9) {
+      auto Target = rel32(I, Handler.wrappingAdd(1));
+      if (!Target || *Target == Handler) return std::nullopt;
+      Handler = *Target;
+      continue;
+    }
+    if (B.size() >= 7 && B[0] == 0x48 && B[1] == 0xff && B[2] == 0x25) {
+      auto Slot = rel32(I, Handler.wrappingAdd(3));
+      if (!Slot) return std::nullopt;
+      for (const Import &Imp : PE.Imports)
+        if (Imp.IatVa == *Slot && Imp.Name)
+          return *Imp.Name;
+      return std::nullopt;
+    }
+    if (B.size() >= 9 && B[0] == 0x48 && B[1] == 0x8b && B[2] == 0x05 &&
+        B[7] == 0xff && B[8] == 0xe0) {
+      auto Slot = rel32(I, Handler.wrappingAdd(3));
+      if (!Slot) return std::nullopt;
+      for (const Import &Imp : PE.Imports)
+        if (Imp.IatVa == *Slot && Imp.Name)
+          return *Imp.Name;
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
 }
 
 struct UnwindRecord { Va Handler; Va Data; uint8_t Flags; };
@@ -75,35 +99,61 @@ std::optional<std::string> typeName(const Image &I, Va TypeDescriptor) {
   return std::nullopt;
 }
 
+bool bounded(const Image &I, Va A, uint64_t Size) {
+  const Section *S = I.sectionOf(A);
+  return S && A.Value <= std::numeric_limits<uint64_t>::max() - Size &&
+         A.Value + Size <= S->end().Value && I.isBacked(A);
+}
+
 void readSEH(const Image &I, FunctionEH &F, Va Data) {
   auto Count = u32(I, Data);
-  if (!Count || *Count > MaxEntries) return;
-  F.Model = EHModel::SEH;
+  if (!Count || !*Count || *Count > MaxEntries ||
+      !bounded(I, Data, 4 + uint64_t(*Count) * 16))
+    return;
   Va E = Data.wrappingAdd(4);
   for (uint32_t N = 0; N < *Count; ++N, E = E.wrappingAdd(16)) {
-    auto Begin = i32(I, E), End = i32(I, E.wrappingAdd(4));
-    auto Filter = i32(I, E.wrappingAdd(8));
-    auto Handler = i32(I, E.wrappingAdd(12));
-    if (!Begin || !End || !Filter || !Handler) return;
-    // Scope-table code offsets are image RVAs, not function-relative offsets.
-    Va Lo = I.vaOfRva(static_cast<uint32_t>(*Begin));
-    Va Hi = I.vaOfRva(static_cast<uint32_t>(*End));
-    if (Hi <= Lo) continue;
-    EHTryRegion T; T.Begin = Lo; T.End = Hi; T.State = static_cast<int32_t>(N);
+    auto Begin = u32(I, E), End = u32(I, E.wrappingAdd(4));
+    auto Filter = u32(I, E.wrappingAdd(8));
+    auto Handler = u32(I, E.wrappingAdd(12));
+    // Scope-table offsets are image RVAs. Begin/End must be ordered and
+    // backed; the handler/filter RVAs only need to be mapped so synthetic
+    // fixtures and linker tables without executable flags still decode.
+    if (!Begin || !End || !Filter || !Handler || *End <= *Begin ||
+        !I.sectionOf(I.vaOfRva(*Begin)) || !I.sectionOf(I.vaOfRva(*End)) ||
+        !I.sectionOf(I.vaOfRva(*Handler)) ||
+        (*Filter && !I.sectionOf(I.vaOfRva(*Filter))))
+      return;
+  }
+  F.Model = EHModel::SEH;
+  E = Data.wrappingAdd(4);
+  for (uint32_t N = 0; N < *Count; ++N, E = E.wrappingAdd(16)) {
+    Va Lo = I.vaOfRva(*u32(I, E));
+    Va Hi = I.vaOfRva(*u32(I, E.wrappingAdd(4)));
+    uint32_t Filter = *u32(I, E.wrappingAdd(8));
+    Va Target = I.vaOfRva(*u32(I, E.wrappingAdd(12)));
+    EHTryRegion T;
+    T.Begin = Lo;
+    T.End = Hi;
+    T.State = static_cast<int32_t>(N);
     F.TryRegions.push_back(T);
-    Va Target = I.vaOfRva(static_cast<uint32_t>(*Handler));
-    if (*Filter == 0)
+    F.CallSites.push_back({Lo, static_cast<int32_t>(N)});
+    if (!Filter) {
+      F.Cleanups.push_back({Target, static_cast<int32_t>(N)});
       F.Handlers.push_back({Target, HandlerKind::Finally, {}, static_cast<int32_t>(N)});
-    else
-      F.Handlers.push_back({I.vaOfRva(static_cast<uint32_t>(*Filter)),
-                            HandlerKind::Filter, {}, static_cast<int32_t>(N)});
+    } else {
+      F.Handlers.push_back({I.vaOfRva(Filter), HandlerKind::Filter, {},
+                            static_cast<int32_t>(N)});
+      F.Handlers.push_back({Target, HandlerKind::Catch, {},
+                            static_cast<int32_t>(N)});
+    }
   }
 }
 
 void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
   auto Magic = u32(I, Data);
   if (!Magic || (*Magic != EH_MAGIC && *Magic != EH_MAGIC_1 &&
-                 *Magic != EH_MAGIC_2 && *Magic != EH_MAGIC_3))
+                 *Magic != EH_MAGIC_2 && *Magic != EH_MAGIC_3 &&
+                 *Magic != EH_MAGIC_4))
     return;
   auto MaxState = i32(I, Data.wrappingAdd(4));
   auto UnwindRva = u32(I, Data.wrappingAdd(8));
@@ -167,7 +217,8 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
   if (*IPRva) {
     Va IP = I.vaOfRva(*IPRva);
     for (uint32_t N = 0; N < *IPCount; ++N, IP = IP.wrappingAdd(8)) {
-      auto Offset = u32(I, IP), State = i32(I, IP.wrappingAdd(4));
+      auto Offset = u32(I, IP);
+      auto State = i32(I, IP.wrappingAdd(4));
       if (!Offset || !State)
         break;
       F.CallSites.push_back({I.vaOfRva(*Offset), *State});
@@ -235,7 +286,7 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
   if (Header & 0x01) {
     if (!fh4int(I, P)) return;
   }
-  F.Model = EHModel::MSVC;
+  if (!(Header & 0x18)) return;
   if (UnwindDisp) {
     Va U(I.Base.Value + static_cast<int64_t>(UnwindDisp));
     Va Cursor = U;
@@ -303,6 +354,21 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
       F.TryRegions.push_back(std::move(Region));
     }
   }
+  if ((Header & 0x02) && *IPDisp) {
+    Va Segments(I.Base.Value + static_cast<int64_t>(*IPDisp));
+    auto SegmentCount = fh4int(I, Segments);
+    if (!SegmentCount || *SegmentCount > MaxEntries) return;
+    uint32_t FunctionRva = static_cast<uint32_t>(F.Function.Value - I.Base.Value);
+    int32_t SegmentIPDisp = 0;
+    for (uint32_t N = 0; N < *SegmentCount; ++N) {
+      auto StartRva = u32(I, Segments);
+      auto Disp = relativeDword(I, Segments);
+      if (!StartRva || !Disp) return;
+      if (*StartRva == FunctionRva)
+        SegmentIPDisp = *Disp;
+    }
+    IPDisp = SegmentIPDisp;
+  }
   if (*IPDisp) {
     Va IP(I.Base.Value + static_cast<int64_t>(*IPDisp));
     auto Count = fh4int(I, IP);
@@ -317,6 +383,8 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
       }
     }
   }
+  if (!F.TryRegions.empty() || !F.Cleanups.empty() || !F.CallSites.empty())
+    F.Model = EHModel::MSVC;
   for (EHTryRegion &T : F.TryRegions) {
     for (size_t N = 0; N < F.CallSites.size(); ++N) {
       int32_t State = F.CallSites[N].State;
@@ -370,19 +438,27 @@ std::optional<uint64_t> encoded(const Image &I, Va &P, uint8_t Encoding,
   uint64_t Raw = 0;
   int64_t Signed = 0;
   switch (Form) {
-  case 0x00: {
+  case 0x00:
+  case 0x04: {
     auto V = I.readU64(P);
     if (!V) return std::nullopt;
     Raw = *V; P = P.wrappingAdd(8); break;
   }
+  case 0x02:
+  case 0x0a: {
+    auto B = I.read(P, 2);
+    if (!B) return std::nullopt;
+    uint16_t V = uint16_t((*B)[0]) | (uint16_t((*B)[1]) << 8);
+    if (Form == 0x02) Raw = V;
+    else Signed = static_cast<int16_t>(V);
+    P = P.wrappingAdd(2); break;
+  }
   case 0x03: {
-    auto V = u32(I, P);
-    if (!V) return std::nullopt;
+    auto V = u32(I, P); if (!V) return std::nullopt;
     Raw = *V; P = P.wrappingAdd(4); break;
   }
   case 0x0b: {
-    auto V = i32(I, P);
-    if (!V) return std::nullopt;
+    auto V = i32(I, P); if (!V) return std::nullopt;
     Signed = *V; P = P.wrappingAdd(4); break;
   }
   case 0x01: {
@@ -393,19 +469,36 @@ std::optional<uint64_t> encoded(const Image &I, Va &P, uint8_t Encoding,
     auto V = sleb(I, P); if (!V) return std::nullopt;
     Signed = *V; break;
   }
+  case 0x0c: {
+    auto V = I.readU64(P); if (!V) return std::nullopt;
+    Signed = static_cast<int64_t>(*V); P = P.wrappingAdd(8); break;
+  }
   default:
     return std::nullopt;
   }
-  if (Form == 0x0b || Form == 0x09)
+  if (Form == 0x0a || Form == 0x0b || Form == 0x0c || Form == 0x09)
     Raw = static_cast<uint64_t>(Signed);
   uint8_t Application = Encoding & 0x70;
   if (Application == 0x10) {
-    uint64_t Base = (Encoding & 0x80) ? FunctionBase.Value : Field.Value;
-    return Base + Raw;
-  }
-  if (Application != 0)
+    Raw = Field.Value + Raw;
+  } else if (Application == 0x40) {
+    Raw = FunctionBase.Value + Raw;
+  } else if (Application != 0) {
     return std::nullopt;
+  }
+  if (Encoding & 0x80) {
+    auto Pointer = I.readU64(Va(Raw));
+    if (!Pointer) return std::nullopt;
+    Raw = *Pointer;
+  }
   return Raw;
+}
+
+std::optional<std::string> itaniumTypeName(const Image &I, Va TypeInfo) {
+  auto NamePointer = I.readU64(TypeInfo.wrappingAdd(8));
+  if (!NamePointer || !*NamePointer)
+    return std::nullopt;
+  return I.readCstr(Va(*NamePointer), 1024);
 }
 
 void readLSDA(const Image &I, FunctionEH &F, Va Data) {
@@ -432,9 +525,11 @@ void readLSDA(const Image &I, FunctionEH &F, Va Data) {
   if (CallEncodingBytes.empty()) return;
   uint8_t CallEnc = CallEncodingBytes[0]; P = P.wrappingAdd(1);
   auto CallLength = uleb(I, P);
-  if (!CallLength || *CallLength > (1u << 20)) return;
+  if (!CallLength || !*CallLength || *CallLength > (1u << 20) ||
+      !bounded(I, P, *CallLength))
+    return;
   Va CallEnd = P.wrappingAdd(*CallLength);
-  F.Model = EHModel::Itanium;
+  bool HasCallSite = false;
   while (P < CallEnd) {
     auto Start = encoded(I, P, CallEnc, F.Function);
     auto Length = encoded(I, P, CallEnc, F.Function);
@@ -444,37 +539,46 @@ void readLSDA(const Image &I, FunctionEH &F, Va Data) {
     if (!*Length) continue;
     uint64_t Lo = LPStart + *Start;
     uint64_t Hi = Lo + *Length;
-    if (Hi <= Lo) continue;
+    if (Hi <= Lo || Lo < F.Function.Value || Hi > F.End.Value) continue;
+    HasCallSite = true;
     EHTryRegion Region;
     Region.Begin = Va(Lo); Region.End = Va(Hi);
     Region.State = static_cast<int32_t>(*Action);
+    F.CallSites.push_back({Va(Lo), Region.State});
     if (*Landing) {
-      Va LandingPad( LPStart + *Landing );
+      Va LandingPad(LPStart + *Landing);
       Region.Handlers.push_back(F.Handlers.size());
       F.Handlers.push_back({LandingPad,
           *Action ? HandlerKind::Catch : HandlerKind::Cleanup, {}, Region.State});
+      if (!*Action)
+        F.Cleanups.push_back({LandingPad, Region.State});
       if (*Action && TypeTable) {
-        Va A = CallEnd;
+        Va A = CallEnd.wrappingAdd(*Action - 1);
         // Action records are 1-based signed type filters plus a signed
-        // displacement to the next action record.
+        // displacement relative to the following-offset field.
         for (unsigned N = 0; N < 64; ++N) {
-          auto Filter = sleb(I, A), Next = sleb(I, A);
+          auto Filter = sleb(I, A);
+          Va NextField = A;
+          auto Next = sleb(I, A);
           if (!Filter || !Next) break;
           if (*Filter > 0) {
+            uint8_t Form = TypeEnc & 0x0f;
             int64_t EntryOffset = -static_cast<int64_t>(*Filter) *
-                                  ((TypeEnc & 0x0f) == 0x00 ? 8 : 4);
+                                  ((Form == 0 || Form == 4) ? 8 : 4);
             Va TypeField(TypeTable + EntryOffset);
             if (auto Type = encoded(I, TypeField, TypeEnc, F.Function))
-              if (auto Name = typeName(I, Va(*Type)))
+              if (auto Name = itaniumTypeName(I, Va(*Type)))
                 F.Handlers.back().TypeName = *Name;
           }
           if (!*Next) break;
-          A = A.wrappingAdd(static_cast<uint64_t>(*Next));
+          A = NextField.wrappingAdd(static_cast<uint64_t>(*Next));
         }
       }
     }
     F.TryRegions.push_back(std::move(Region));
   }
+  if (HasCallSite)
+    F.Model = EHModel::Itanium;
 }
 } // namespace
 
@@ -490,21 +594,47 @@ std::vector<FunctionEH> revenant::decodeEHTables(const PeFile &PE) {
     F.End = R.End;
     F.Personality = U->Handler;
     F.Metadata = U->Data;
-    auto Magic = u32(I, U->Data);
-    if (Magic && (*Magic == EH_MAGIC || *Magic == EH_MAGIC_1 ||
-                  *Magic == EH_MAGIC_2 || *Magic == EH_MAGIC_3)) {
-      readFuncInfo3(I, F, U->Data);
-    } else {
-      auto First = I.dataAt(U->Data, 1);
-      if (First.empty())
-        continue;
-      uint8_t B = First[0];
-      if (B == 0xff || (B & 0x70) == 0x10) {
-        readLSDA(I, F, U->Data);
-      } else if (!(B & 0x80) && (B & 0x78)) {
-        readFuncInfo4(I, F, U->Data);
-      } else {
+    auto HandlerName = handlerImportName(PE, U->Handler);
+    if (HandlerName) {
+      if (HandlerName->find("C_specific_handler") != std::string::npos) {
         readSEH(I, F, U->Data);
+      } else if (HandlerName->find("CxxFrameHandler3") != std::string::npos) {
+        readFuncInfo3(I, F, U->Data);
+      } else if (HandlerName->find("CxxFrameHandler4") != std::string::npos) {
+        readFuncInfo4(I, F, U->Data);
+      } else if (HandlerName->find("gxx_personality_seh0") != std::string::npos) {
+        readLSDA(I, F, U->Data);
+      } else if (HandlerName->find("rust_eh_personality") != std::string::npos) {
+        // Rust on non-Windows targets: Itanium LSDA with cleanup-only actions.
+        readLSDA(I, F, U->Data);
+        if (F.Model == EHModel::Itanium)
+          F.Model = EHModel::Rust;
+      }
+    }
+    if (F.Model == EHModel::None) {
+      F.TryRegions.clear();
+      F.Handlers.clear();
+      F.Cleanups.clear();
+      F.CallSites.clear();
+    }
+    if (F.Model == EHModel::None) {
+      auto Magic = u32(I, U->Data);
+      if (Magic && (*Magic == EH_MAGIC || *Magic == EH_MAGIC_1 ||
+                    *Magic == EH_MAGIC_2 || *Magic == EH_MAGIC_3 ||
+                    *Magic == EH_MAGIC_4)) {
+        readFuncInfo3(I, F, U->Data);
+      } else {
+        auto First = I.dataAt(U->Data, 1);
+        if (First.empty())
+          continue;
+        uint8_t B = First[0];
+        if (B == 0xff || B == 0x1b) {
+          readLSDA(I, F, U->Data);
+        } else if (!(B & 0x80) && (B & 0x78)) {
+          readFuncInfo4(I, F, U->Data);
+        } else {
+          readSEH(I, F, U->Data);
+        }
       }
     }
     if (F.Model != EHModel::None) Out.push_back(std::move(F));
