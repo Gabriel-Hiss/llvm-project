@@ -4,9 +4,8 @@
 // crates/engine `Session`: open a PE, detect the producer, hold the
 // analyzed Program, and decompile one or all functions through the stage
 // pipeline (analysis -> signatures -> lift -> transforms -> structure ->
-// source). Every stage that has no landed LLVM-side implementation runs a
-// visible fallback: the artifact files and StageReport say which stages
-// were real and which were stubs.
+// source). Every stage is a real implementation; StageReport carries the
+// status and elapsed time of each one.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,6 +32,10 @@ class Module;
 } // namespace llvm
 
 namespace revenant {
+namespace lift {
+struct Signatures;
+} // namespace lift
+
 
 class Disasm;
 struct PeFile;
@@ -40,8 +43,7 @@ struct PeFile;
 /// One pipeline stage's outcome for the manifest and progress reporting.
 struct StageReport {
   std::string Name;
-  /// "ok" (real implementation ran), "stub" (fallback ran instead),
-  /// "skipped" (not requested / not applicable), "failed".
+  /// "ok" (the stage ran), "skipped" (not requested / not applicable).
   std::string Status;
   std::string Note;
   /// Artifact path written for this stage, when one exists.
@@ -76,9 +78,8 @@ struct Decompiled {
   std::vector<StageReport> Stages;
 };
 
-/// Session setup (mirrors `Session::open`): load, detect, analyze.
-/// Stages without a real implementation run their fallback and record it
-/// in `SetupStages`.
+/// Session setup (mirrors `Session::open`): load, detect, analyze. The
+/// setup stages' reports are kept in `SetupStages`.
 class Session {
 public:
   ~Session();
@@ -137,8 +138,7 @@ private:
   Session();
 
   llvm::Error setup();
-  /// Build Program.Functions/Externs/Names. Uses the real analysis when
-  /// available, else the .pdata-seeded fallback.
+  /// Build Program.Functions/Externs/Names with RevenantAnalysis.
   llvm::Error analyze();
 
   std::unique_ptr<PeFile> Pe;
@@ -147,20 +147,9 @@ private:
   CompilerInfo Compiler;
   std::vector<std::string> SymNames;
   std::vector<StageReport> SetupStages;
-  /// Real analysis pass ran (vs .pdata fallback).
-  bool RealAnalysis = false;
+  /// Recovered signatures, computed on the first decompile (whole-program).
+  std::shared_ptr<const lift::Signatures> Sigs;
 };
-
-/// The `.pdata`-seeded fallback analyzer: discovers functions from runtime
-/// function entries, exports, entry point and TLS callbacks, decodes each
-/// body and builds a direct-branch CFG. Runs only when no real analysis
-/// library is present; recorded as a stub stage.
-llvm::Expected<Program> fallbackAnalyze(const PeFile &Pe, Disasm &D);
-
-/// Materialize `FuncRecord` into a decoded `Function` (shared by the
-/// fallback analyzer and `Session::materialize`).
-llvm::Expected<Function> materializeFunction(const PeFile &Pe, Disasm &D,
-                                             const FuncRecord &Rec);
 
 } // namespace revenant
 

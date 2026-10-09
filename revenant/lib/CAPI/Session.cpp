@@ -1,8 +1,7 @@
 //==- lib/CAPI/Session.cpp - session setup and lookups -------------------==//
 //
 // crates/engine Session::open ported: parse the PE, build the disassembler,
-// run analysis (real library when present, .pdata fallback otherwise),
-// collect symbol names, detect the producer language.
+// run analysis, collect symbol names, detect the producer language.
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,6 +13,7 @@
 
 #include "revenant/Analysis/Analysis.h"
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 
@@ -68,11 +68,25 @@ Session::~Session() = default;
 Session::Session(Session &&) = default;
 Session &Session::operator=(Session &&) = default;
 
+/// Microseconds since `Start`.
+static uint64_t microsSince(std::chrono::steady_clock::time_point Start) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - Start)
+      .count();
+}
+
 Expected<std::unique_ptr<Session>> Session::open(StringRef Path) {
+  auto Start = std::chrono::steady_clock::now();
   auto PeOrErr = PeFile::load(Path);
   if (!PeOrErr)
     return PeOrErr.takeError();
-  return create(std::move(*PeOrErr));
+  uint64_t LoadMicros = microsSince(Start);
+  auto S = create(std::move(*PeOrErr));
+  if (!S)
+    return S.takeError();
+  (*S)->SetupStages.insert((*S)->SetupStages.begin(),
+                           {"load", "ok", Path.str(), "", LoadMicros});
+  return S;
 }
 
 Expected<std::unique_ptr<Session>> Session::create(PeFile Pe) {
@@ -107,6 +121,7 @@ Error Session::setup() {
   SymNames.erase(std::unique(SymNames.begin(), SymNames.end()),
                  SymNames.end());
 
+  auto DetectStart = std::chrono::steady_clock::now();
   Compiler = detectProducer(*Pe, SymNames, *Pe->Img);
   SetupStages.push_back(
       {"detect", "ok",
@@ -115,20 +130,20 @@ Error Session::setup() {
                Compiler.Evidence.empty() ? StringRef("no evidence")
                                          : StringRef(Compiler.Evidence[0]))
            .str(),
-       ""});
+       "", microsSince(DetectStart)});
   return Error::success();
 }
 
 Error Session::analyze() {
+  auto Start = std::chrono::steady_clock::now();
   Prog = revenant::analyze(*Pe, *createX86TargetHooks());
   if (!Prog.Resolver)
     Prog.Resolver = std::make_shared<SessionNames>(Prog);
-  RealAnalysis = true;
   SetupStages.push_back(
       {"analysis", "ok",
        formatv("RevenantAnalysis: {0} functions", Prog.Functions.size())
            .str(),
-       ""});
+       "", microsSince(Start)});
   return Error::success();
 }
 
