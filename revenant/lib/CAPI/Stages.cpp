@@ -45,6 +45,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 
@@ -173,7 +174,8 @@ Error verifyStage(StringRef Stage, const Module &M) {
 
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
-Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline) {
+Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline,
+                      std::vector<StageReport> &Reports) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -185,11 +187,47 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline) {
   PB.registerCGSCCAnalyses(CGAM);
   PB.registerModuleAnalyses(MAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-  ModulePassManager MPM;
-  if (Error E = PB.parsePassPipeline(MPM, Pipeline))
-    return createStringError("pipeline '" + Pipeline.str() +
-                             "': " + toString(std::move(E)));
-  MPM.run(M, MAM);
+  // Verify each function pass independently and retain its last valid body.
+  if (!Pipeline.consume_front("function(") || !Pipeline.consume_back(")"))
+    return createStringError("expected a function pipeline");
+  SmallVector<StringRef, 16> Passes;
+  Pipeline.split(Passes, ',');
+  for (StringRef Pass : Passes) {
+    FunctionPassManager FPM;
+    if (Error E = PB.parsePassPipeline(FPM, Pass))
+      return createStringError("pipeline '" + Pass.str() +
+                               "': " + toString(std::move(E)));
+    SmallVector<llvm::Function *, 32> Functions;
+    for (llvm::Function &F : M)
+      if (!F.isDeclaration())
+        Functions.push_back(&F);
+    for (llvm::Function *F : Functions) {
+      ValueToValueMapTy SavedMap;
+      llvm::Function *Saved = CloneFunction(F, SavedMap);
+      FPM.run(*F, FAM);
+      std::string Message;
+      raw_string_ostream OS(Message);
+      if (verifyFunction(*F, &OS)) {
+        std::string Name = F->getName().str();
+        FAM.clear(*F, Name);
+        F->deleteBody();
+        F->copyAttributesFrom(Saved);
+        ValueToValueMapTy RestoreMap;
+        RestoreMap[Saved] = F;
+        auto Dest = F->arg_begin();
+        for (Argument &A : Saved->args())
+          RestoreMap[&A] = &*Dest++;
+        SmallVector<ReturnInst *, 8> Returns;
+        CloneFunctionInto(F, Saved, RestoreMap,
+                          CloneFunctionChangeType::LocalChangesOnly, Returns);
+        record(Reports, Stage, "failed",
+               Name + ": " + Pass.str() + ": " + Message);
+        errs() << "[failed] " << Stage << ": " << Name << ": " << Pass
+               << ": " << Message;
+      }
+      Saved->eraseFromParent();
+    }
+  }
   return verifyStage(Stage, M);
 }
 
@@ -346,8 +384,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
                                   Sigs.get(), /*TM=*/nullptr,
                                   /*RunPasses=*/false);
-      if (!L)
-        return L.takeError();
+      if (!L) {
+        std::string Message = toString(L.takeError());
+        std::string Note = formatv("0x{0:x}: {1}", T.Value, Message).str();
+        record(R.Stages, "lift", "failed", Note);
+        errs() << "[failed] lift: " << Note << "\n";
+        continue;
+      }
       OpaqueSites += L->AsmFallbacks.size();
     }
     if (Error E = verifyStage("lift", *M))
@@ -363,7 +406,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-clean ----------------------------------------------------------
-    if (auto E = runPipelineText("ir-clean", *M, cleanPipeline()))
+    if (auto E = runPipelineText("ir-clean", *M, cleanPipeline(), R.Stages))
       return std::move(E);
     record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
     CleanText = moduleText(*M);
@@ -374,7 +417,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- ir-final ----------------------------------------------------------
     if (auto E =
-            runPipelineText("ir-final", *M, finalPipeline(Opts.Patterns)))
+            runPipelineText("ir-final", *M, finalPipeline(Opts.Patterns),
+                            R.Stages))
       return std::move(E);
     record(R.Stages, "ir-final", "ok", "unopt + structure + types + ssaout");
     FinalText = moduleText(*M);

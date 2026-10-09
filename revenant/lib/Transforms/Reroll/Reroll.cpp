@@ -136,6 +136,24 @@ void copyProvenance(const Instruction *Src, Instruction *Dst) {
 // Match `Phi = phi [Init, Pre] [Next, Self]` where Next = Phi +/- Step
 // with |Step| in [MinStep, MaxStep]. Returns the step magnitude and the
 // increment instruction.
+// Constants in lifted IR include i128 masks. Reroll's affine model is
+// signed i64, so reject values and differences it cannot represent.
+std::optional<int64_t> signedConstant(const ConstantInt *C) {
+  if (!C->getValue().isSignedIntN(64))
+    return std::nullopt;
+  return C->getSExtValue();
+}
+
+std::optional<int64_t> constantDifference(const ConstantInt *A,
+                                        const ConstantInt *B) {
+  if (!signedConstant(A) || !signedConstant(B))
+    return std::nullopt;
+  APInt D = B->getValue().sextOrTrunc(65) - A->getValue().sextOrTrunc(65);
+  if (!D.isSignedIntN(64))
+    return std::nullopt;
+  return D.getSExtValue();
+}
+
 bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
                    Instruction *&StepInstOut) {
   if (Phi->getNumIncomingValues() != 2)
@@ -162,7 +180,10 @@ bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
   auto *C = dyn_cast<ConstantInt>(Other);
   if (!C)
     return false;
-  int64_t Step = C->getSExtValue();
+  auto SignedStep = signedConstant(C);
+  if (!SignedStep || *SignedStep == INT64_MIN)
+    return false;
+  int64_t Step = *SignedStep;
   if (BO->getOpcode() == Instruction::Sub)
     Step = -Step;
   int64_t Mag = Step >= 0 ? Step : -Step;
@@ -202,8 +223,12 @@ std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
     return Affine{0, 0};
   if (V == IV)
     return Affine{1, 0};
-  if (auto *C = dyn_cast<ConstantInt>(V))
-    return Affine{0, C->getSExtValue()};
+  if (auto *C = dyn_cast<ConstantInt>(V)) {
+    auto Signed = signedConstant(C);
+    if (!Signed)
+      return std::nullopt;
+    return Affine{0, *Signed};
+  }
   if (Instruction *Def = DL.find(V)) {
     if (auto *GDef = dyn_cast<GetElementPtrInst>(Def)) {
       // Unfolding a GEP *def*: indices scale by the element size (the
@@ -412,7 +437,10 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
   auto *CA = dyn_cast<ConstantInt>(A);
   auto *CC = dyn_cast<ConstantInt>(C);
   if (CA && CC) {
-    int64_t D = CC->getSExtValue() - CA->getSExtValue();
+    auto Difference = constantDifference(CA, CC);
+    if (!Difference)
+      return false;
+    int64_t D = *Difference;
     if (D == 0)
       return true;
     auto Key = std::make_pair(Pos, Op);
@@ -928,7 +956,12 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
               continue;
             if (auto *IA = dyn_cast<ConstantInt>(VA))
               if (auto *IC = dyn_cast<ConstantInt>(VC)) {
-                int64_t D = IC->getSExtValue() - IA->getSExtValue();
+                auto Difference = constantDifference(IA, IC);
+                if (!Difference) {
+                  ScanOK = false;
+                  break;
+                }
+                int64_t D = *Difference;
                 if (D != 0) {
                   SawOff = true;
                   int64_t Per = D / (int64_t)K;
@@ -1094,7 +1127,7 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
           Value *VA = W0I->getOperand(o), *VC = W1I->getOperand(o);
           auto *IA = dyn_cast<ConstantInt>(VA);
           auto *IC = dyn_cast<ConstantInt>(VC);
-          if (IA && IC && IC->getSExtValue() - IA->getSExtValue() == *Delta) {
+          if (IA && IC && constantDifference(IA, IC) == Delta) {
             // Emit i*Delta + c0 ahead of NI.
             IRBuilder<> EB(NI);
             Value *Scaled = EB.CreateMul(IPhi, ConstantInt::get(I64, *Delta),

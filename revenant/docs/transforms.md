@@ -153,3 +153,17 @@ rust-o3 dot4/vec_ops), and `.constprop.N`/`.isra.N`/`.specialized.N`/
 `-passes=revenant-unipo`, not in the default pipeline. Guarantees
 `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM 22
 parseable output.
+
+## Robustness
+
+Reroll's affine model accepts signed 64-bit constants only. Lifted i128
+SIMD masks outside that range veto the candidate rather than narrowing
+through `APInt::getSExtValue`. Constant differences use 65-bit arithmetic
+and must fit signed 64 bits before the model consumes them. The minimum
+signed stride also vetoes the candidate because its magnitude cannot fit.
+
+The engine verifies every function after each function pass. If a pass
+produces invalid IR, it restores the previous body, reports the function,
+stage and pass, and continues with the next pass. A returned lift error
+also reports the failed function and continues with the remaining functions.
+Assertions still require fixing their offending pass or lifter operation.
