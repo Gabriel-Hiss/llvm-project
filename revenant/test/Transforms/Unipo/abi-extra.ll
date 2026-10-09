@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin %unipo_plugin -passes=revenant-unipo,verify -S %s | FileCheck %s
+; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo,verify -S %s | %FileCheck %s
 ; Real lifted shape: c-gcc-o2.ll, sub_140001017 bb_140001037:
 ; store i64 2, ptr %rcx; load i64, ptr %rcx; call @sub_140003A10().
 ; Names below keep the stripped register-slot convention. Multiple callers and

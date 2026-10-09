@@ -4,20 +4,133 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include <optional>
 #include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 
 namespace {
+
+// Lifted IR carries one data object per virtual address, not per source
+// object. A compiler that deduplicated identical bytes leaves several
+// @g_/@str_/@a globals with the same initializer, and the same VA can be
+// re-emitted under a dotted suffix. Two globals are equivalent when they
+// describe the same bytes: identical !revenant.va, or same-typed internal
+// constants with identical initializers.
+std::optional<uint64_t> globalVA(const GlobalObject &GV) {
+  MDNode *N =
+      GV.getMetadata(GV.getContext().getMDKindID("revenant.va"));
+  if (!N || N->getNumOperands() != 1)
+    return std::nullopt;
+  auto *V = mdconst::dyn_extract<ConstantInt>(N->getOperand(0));
+  return V ? std::optional<uint64_t>(V->getZExtValue()) : std::nullopt;
+}
+
+bool globalEquivalent(const GlobalValue *A, const GlobalValue *B) {
+  if (A == B)
+    return true;
+  if (const auto *FA = dyn_cast<Function>(A)) {
+    // Tail-call/trap stubs: the lifter emits a no-body `sub_0x<va>`
+    // declaration for the trap bytes reached after a noreturn call.
+    // Same-type stubs are the same unreachable marker; their distinct
+    // VAs live only in the removed !revenant.va metadata.
+    const auto *FB = dyn_cast<Function>(B);
+    if (!FB || !FA->isDeclaration() || !FB->isDeclaration())
+      return false;
+    if (FA->getFunctionType() != FB->getFunctionType())
+      return false;
+    return FA->getName().starts_with("sub_0x") &&
+           FB->getName().starts_with("sub_0x");
+  }
+  const auto *VA = dyn_cast<GlobalVariable>(A);
+  const auto *VB = dyn_cast<GlobalVariable>(B);
+  if (!VA || !VB || VA->getValueType() != VB->getValueType())
+    return false;
+  std::optional<uint64_t> X = globalVA(*VA);
+  std::optional<uint64_t> Y = globalVA(*VB);
+  if (X && Y && *X == *Y)
+    return true;
+  return VA->isConstant() && VB->isConstant() && VA->hasInitializer() &&
+         VB->hasInitializer() && VA->getInitializer() == VB->getInitializer();
+}
+
+
+// Within an operand pair that is already constantsEquivalent: did the
+// equality rely on dedup'd constant data (a GlobalVariable pair), rather
+// than identical sub-trees or trap-stub decls?
+bool differsOnlyByDataGlobal(const Constant *A, const Constant *B) {
+  if (A == B)
+    return false;
+  if (const auto *GA = dyn_cast<GlobalVariable>(A))
+    return isa<GlobalVariable>(B) &&
+           globalEquivalent(GA, cast<GlobalVariable>(B));
+  if (isa<GlobalValue>(A))
+    return false; // trap stubs and other globals are not data
+  const auto *EA = dyn_cast<ConstantExpr>(A);
+  const auto *EB = dyn_cast<ConstantExpr>(B);
+  if (!EA || !EB || EA->getNumOperands() != EB->getNumOperands())
+    return false;
+  for (unsigned I = 0; I < EA->getNumOperands(); ++I)
+    if (differsOnlyByDataGlobal(EA->getOperand(I), EB->getOperand(I)))
+      return true;
+  return false;
+}
+
+// `sub_<hexva>` lifted names carry the entry address; used to prefer the
+// lowest-VA equivalent as the fold survivor (GCC keeps the general body
+// at its own address and places clones at fresh addresses).
+std::optional<uint64_t> functionVA(const Function &F) {
+  StringRef N = F.getName();
+  if (!N.consume_front("sub_"))
+    return std::nullopt;
+  uint64_t V = 0;
+  if (N.getAsInteger(16, V))
+    return std::nullopt;
+  return V;
+}
+} // namespace
+
+namespace revenant {
+// Constant equivalence modulo dedup'd constant data and trap-stub
+// declarations; ConstantExprs compare structurally through it.
+bool constantsEquivalent(const Constant *A, const Constant *B) {
+  if (A == B)
+    return true;
+  if (!A || !B || A->getType() != B->getType())
+    return false;
+  if (const auto *GA = dyn_cast<GlobalValue>(A))
+    return isa<GlobalValue>(B) &&
+           globalEquivalent(GA, cast<GlobalValue>(B));
+  const auto *EA = dyn_cast<ConstantExpr>(A);
+  const auto *EB = dyn_cast<ConstantExpr>(B);
+  if (!EA || !EB || EA->getOpcode() != EB->getOpcode() ||
+      EA->getNumOperands() != EB->getNumOperands())
+    return false;
+  for (unsigned I = 0; I < EA->getNumOperands(); ++I)
+    if (!constantsEquivalent(EA->getOperand(I), EB->getOperand(I)))
+      return false;
+  return true;
+}
+} // namespace revenant
+
+namespace {
+
 bool eligible(Function &F) {
   if (F.isDeclaration() || F.isVarArg() || F.hasPersonalityFn() ||
       F.hasDLLExportStorageClass() || F.hasAddressTaken())
+    return false;
+  // `.part.N` and `.cold` symbols are outlined regions of their parent
+  // (ipa-split/hot-cold partitioning), not specializations; merging them
+  // is uninline's job. Lifted `sub_<va>` names never match this check.
+  if (F.getName().contains(".part.") || F.getName().contains(".cold"))
     return false;
   for (Argument &A : F.args())
     if (F.getAttributes().getParamAttrs(A.getArgNo()).hasAttributes())
@@ -50,7 +163,13 @@ hash_code bodyHash(Function &F) {
   return H;
 }
 
-bool equalBodies(Function &A, Function &B, unsigned P, bool Dropped) {
+// `SawDataGlobal` (optional) records that at least one operand pair was
+// equal only through GlobalVariable equivalence (dedup'd constant data),
+// so the bodies are not literally identical. Trap-stub-decl equivalence
+// alone does not set it: identical throw/trap tails are far more common
+// than clones and are not IPO evidence by themselves.
+bool equalBodies(Function &A, Function &B, unsigned P, bool Dropped,
+                 bool *SawDataGlobal = nullptr) {
   if (A.size() != B.size())
     return false;
   DenseMap<const Value *, const Value *> Map;
@@ -90,8 +209,19 @@ bool equalBodies(Function &A, Function &B, unsigned P, bool Dropped) {
       for (unsigned K = 0; K < I.getNumOperands(); ++K) {
         Value *V = I.getOperand(K), *W = J.getOperand(K);
         auto It = Map.find(V);
-        if (It != Map.end() ? It->second != W : V != W)
-          return false;
+        if (It != Map.end()) {
+          if (It->second != W)
+            return false;
+        } else if (V != W) {
+          // Constants differ only by pointer: equal iff they describe the
+          // same dedup'd data or the same trap-stub decl.
+          auto *CV = dyn_cast<Constant>(V);
+          auto *CW = dyn_cast<Constant>(W);
+          if (!CV || !CW || !revenant::constantsEquivalent(CV, CW))
+            return false;
+          if (SawDataGlobal && differsOnlyByDataGlobal(CV, CW))
+            *SawDataGlobal = true;
+        }
       }
     }
   }
@@ -144,7 +274,10 @@ void redirect(Function &A, Function &B, unsigned P, Constant *C, bool Dropped) {
     SmallVector<Value *, 8> Args;
     for (unsigned I = 0, J = 0; I < A.arg_size(); ++I) {
       if (I == P) {
-        Args.push_back(C);
+        // C == nullptr: the folded-out formal is provably dead in A
+        // (equalBodies matched with it unbound), so poison is correct.
+        Args.push_back(C ? (Value *)C
+                         : (Value *)PoisonValue::get(A.getArg(I)->getType()));
         if (!Dropped)
           ++J;
       } else
@@ -171,21 +304,25 @@ bool foldStructuralIPO(Module &M) {
   for (Function &F : M)
     if (eligible(F))
       Functions.push_back(&F);
-  // Remove erased entries immediately, rather than retaining dangling worklist
-  // pointers. Normalized copies never become candidates themselves.
+  // Remove erased entries immediately, rather than retaining dangling
+  // worklist pointers. Normalized copies never become candidates.
   for (unsigned BI = 0; BI < Functions.size();) {
     Function &B = *Functions[BI];
     bool Folded = false;
     Function *DroppedBody = nullptr;
     if (rewritable(B))
-      for (Function *AP : Functions) {
-        Function &A = *AP;
+      for (unsigned AI = 0; AI < Functions.size() && !Folded; ++AI) {
+        Function &A = *Functions[AI];
         bool Dropped = A.arg_size() == B.arg_size() + 1;
         if (&A == &B || (!Dropped && A.arg_size() != B.arg_size()) ||
             A.getReturnType() != B.getReturnType() ||
             A.getCallingConv() != B.getCallingConv() ||
-            A.getAttributes().getFnAttrs().removeAttribute(M.getContext(), "revenant.va") !=
-                B.getAttributes().getFnAttrs().removeAttribute(M.getContext(), "revenant.va") ||
+            A.getAttributes()
+                    .getFnAttrs()
+                    .removeAttribute(M.getContext(), "revenant.va") !=
+                B.getAttributes()
+                    .getFnAttrs()
+                    .removeAttribute(M.getContext(), "revenant.va") ||
             A.getAttributes().getRetAttrs() != B.getAttributes().getRetAttrs())
           continue;
         for (unsigned P = 0; P < A.arg_size() && !Folded; ++P) {
@@ -198,13 +335,21 @@ bool foldStructuralIPO(Module &M) {
           }
           if (!TypesMatch)
             continue;
+          // A same-arity specialization must bind a live formal. A dropped
+          // formal may be dead: its value is irrelevant and callers can pass
+          // poison when rebuilding the general signature.
+          if (!Dropped && A.getArg(P)->use_empty())
+            continue;
           SmallVector<Constant *, 8> Constants;
           if (!Dropped) {
+            // Same arity: only a constant B's callers unanimously pass.
             Constant *C = nullptr;
             bool Same = true;
             for (User *U : B.users()) {
-              auto *V = dyn_cast<Constant>(cast<CallInst>(U)->getArgOperand(P));
-              if (!V || isa<UndefValue>(V) || isa<PoisonValue>(V) || (C && C != V)) {
+              auto *V =
+                  dyn_cast<Constant>(cast<CallInst>(U)->getArgOperand(P));
+              if (!V || isa<UndefValue>(V) || isa<PoisonValue>(V) ||
+                  (C && C != V)) {
                 Same = false;
                 break;
               }
@@ -272,8 +417,26 @@ bool foldStructuralIPO(Module &M) {
             break;
           }
         }
-        if (Folded)
-          break;
+        // Same-arity clone with no surviving specialization constant: the
+        // bodies are equal modulo dedup'd constant data (the GCC .isra
+        // shape that differs only in a pooled string). Literal-identical
+        // bodies are linker-folded duplicates, not compiler clones, and
+        // trap-stub-only differences merge unrelated throw/cold tails, so
+        // require at least one dedup'd-data operand pair. Survivor: the
+        // lowest entry VA (clone addresses are fresh), falling back to
+        // module order when names lack VAs.
+        if (!Folded && !Dropped) {
+          std::optional<uint64_t> AV = functionVA(A);
+          std::optional<uint64_t> BV = functionVA(B);
+          bool Earlier = AV && BV ? *AV < *BV : AI < BI;
+          bool DataGlobal = false;
+          if (Earlier && equalBodies(A, B, ~0u, false, &DataGlobal) &&
+              DataGlobal) {
+            redirect(A, B, ~0u, nullptr, false);
+            Functions.erase(Functions.begin() + BI);
+            Folded = Changed = true;
+          }
+        }
       }
     if (DroppedBody)
       DroppedBody->eraseFromParent();

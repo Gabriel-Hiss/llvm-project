@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin %unipo_plugin -passes=revenant-unipo,verify -S %s | FileCheck %s
+; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo,verify -S %s | %FileCheck %s
 ; Corpus-derived shape: c-clang-o2lto/artifacts/main.post.ll, cmp_unsigned.
 ; Specialization fixtures below replace its second operand by 7 and strip all
 ; source symbols, as lifted IR does. They are controlled specializations of a
@@ -96,3 +96,45 @@ define i32 @middle_caller(i32 %x, i32 %y) {
 
 !0 = !{i64 4096}
 !1 = !{i64 4100}
+
+; GCC .isra shape: pooled string globals have equal bytes but distinct lifted
+; names, and the noreturn trap tail is emitted as two VA-specific stubs.
+; CHECK-NOT: define i32 @sub_5000
+; CHECK: define i32 @global_caller
+; CHECK: call i32 @sub_4000(i32 %x)
+; CHECK: define void @part_cold.cold
+; CHECK: define void @part_clone.cold
+@str_a = internal constant [4 x i8] c"abc\00", !revenant.va !2
+@str_b = internal constant [4 x i8] c"abc\00", !revenant.va !3
+declare void @sub_0x6000(ptr)
+declare void @sub_0x6001(ptr)
+
+define i32 @sub_4000(i32 %x) {
+  call void @sub_0x6000(ptr @str_a)
+  ret i32 %x
+}
+
+define i32 @sub_5000(i32 %x) {
+  call void @sub_0x6001(ptr @str_b)
+  ret i32 %x
+}
+
+define i32 @global_caller(i32 %x) {
+  %v = call i32 @sub_5000(i32 %x)
+  ret i32 %v
+}
+
+; Outlined cold regions are not function clones. Keep both even when the
+; normalized bodies have the same shape and reference equivalent data.
+define void @part_cold.cold() {
+  call void @sub_0x6000(ptr @str_a)
+  ret void
+}
+
+define void @part_clone.cold() {
+  call void @sub_0x6001(ptr @str_b)
+  ret void
+}
+
+!2 = !{i64 8192}
+!3 = !{i64 8200}

@@ -170,23 +170,23 @@ not evidence used by structural matching. New calls preserve instruction
 metadata and VA provenance. Structural matching rejects opaque instructions
 and region annotations rather than discarding them during normalization.
 
-Measured with the standalone plugin and `revenant-unipo,verify` on stripped
-raw lifted modules:
+Measured with the standalone plugin and `revenant-unipo,verify` on the fresh
+normalized `cpp-gcc-o2` lift (`fresh-cpp-gcc-o2.ll`, 916 definitions):
 
-| Target | Definitions | Oracle `.constprop`/`.isra` entries | Clone merges | Clone signature restorations | All extended signatures |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| c-gcc-o2 | 151 | 0 | 0 | 0 | 8 |
-| c-gcc-o3 | 151 | 0 | 0 | 0 | 6 |
-| cpp-gcc-o2 | 916 | 9 | 0 | 0 | 5 |
-| cpp-gcc-o3 | 916 | 9 | 0 | 0 | 5 |
-| c-clang-o2lto | 3401 | 0 | 0 | 0 | 0 |
+| Oracle entries | Recoveries | Remaining |
+| --- | ---: | ---: |
+| 7 named clones | 2 signatures restored, 0 bodies merged | 5 not restored |
+| 2 `.cold` partitions | 0 changed | 2 left intact |
 
-Oracle instruction owners were grouped by symbol and their first RVA mapped
-to lifted `sub_<image-base+RVA>` definitions for scoring only. All nine GCC C++
-entries were present, including two `.cold` partitions. None met the structural
-or unanimous extra-register evidence requirements. These are missed cases,
-not successful IPO inversions. Extended non-oracle signatures demonstrate the
-ABI evidence rule, not recovery of an oracle-proven specialization.
+The two recovered signatures are the pool `free` and `allocate` constprop
+clones. Their folded pool pointer is reconstructed as an extra formal, but
+the pass does not merge them because callers disagree on the surviving `n`
+argument. The `.isra` equivalence test covers distinct lifted string globals
+with identical contents and VA-specific `sub_0x` trap declarations. The
+outlined `.part.0` and `.cold` regions remain ineligible for clone folding.
+The corpus output retains all 916 definitions; it passes LLVM verification.
+The other five named entries did not meet the pass's structural or caller
+evidence checks, so they remain unresolved rather than being guessed.
 
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
