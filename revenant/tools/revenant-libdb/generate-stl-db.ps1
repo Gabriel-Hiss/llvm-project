@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Source = Join-Path $ScriptDirectory 'stl-instantiations.cpp'
+    $Source = Join-Path $ScriptDirectory 'gen/stl-instantiations.cpp'
 $MergeScript = Join-Path $ScriptDirectory 'merge-databases.py'
 $ScratchRoot = Join-Path $HOME 'RustroverProjects\rv-scratch'
 $WorkDirectory = [IO.Path]::GetFullPath($WorkDirectory)
