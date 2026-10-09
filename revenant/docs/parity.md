@@ -4,13 +4,39 @@ The `--export-parity` driver runs fresh PE analysis without loading a PDB and wr
 
 ## Full C/C++ corpus
 
-Run from any shell with the parity virtual environment installed. The runner selects every oracle-backed `native` and `gnu` target (cl, clang-cl, and MinGW GCC across available optimization levels), enables the ASM sidecar in the exporter subprocess, invokes the unmodified `compare.py`, clusters failures, and updates the per-binary table below.
+Run from any shell with the parity virtual environment installed. The runner selects every oracle-backed `native` and `gnu` target, enables the ASM sidecar, runs `compare.py`, and writes the per-binary C/C++ table.
 
 ```bat
-C:\Users\User\RustroverProjects\Revenant\target\parity-venv\Scripts\python.exe C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\revenant\tools\revenant\run_parity.py --revenant-dir C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\build-rv\tools\revenant --parity-root C:\Users\User\RustroverProjects\Revenant\target\parity --tag luna-final --out C:\Users\User\RustroverProjects\Revenant\target\parity\summary-luna-final.json
+C:\Users\User\RustroverProjects\Revenant\target\parity-venv\Scripts\python.exe C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\revenant\tools\revenant\run_parity.py --revenant-dir C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\build-rv\tools\revenant --parity-root C:\Users\User\RustroverProjects\Revenant\target\parity --tag recovered-ccpp --out C:\Users\User\RustroverProjects\Revenant\target\parity\summary-recovered-ccpp.json
 ```
 
-Use `--only c-o2` to compare a subset. `--asm-only` recalculates the text metric from the sidecars produced by an earlier comparison. The JSON report includes up to 50 representative records per function-symbol cluster and per-binary counts.
+Use `--only c-o2` to compare a subset. `--asm-only` recalculates the text metric from sidecars produced by an earlier comparison. The JSON report includes representative records and per-binary counts.
+
+## Rust corpus
+
+Run every oracle-backed Rust target and refresh the separate Rust table:
+
+```bat
+C:\Users\User\RustroverProjects\Revenant\target\parity-venv\Scripts\python.exe C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\revenant\tools\revenant\run_parity.py --revenant-dir C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\build-rv\tools\revenant --parity-root C:\Users\User\RustroverProjects\Revenant\target\parity --tag recovered-rust --kinds rust-single rust-cargo --section rust --out C:\Users\User\RustroverProjects\Revenant\target\parity\summary-recovered-rust.json
+```
+
+<!-- parity-results:rust-start -->
+Rust parity has not been measured yet.
+<!-- parity-results:rust-end -->
+
+<!-- parity-results:ccpp-start -->
+## Rust corpus
+
+Run all oracle-backed Rust targets, independent of the C/C++ table:
+
+```bat
+C:\Users\User\RustroverProjects\Revenant\target\parity-venv\Scripts\python.exe C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\revenant\tools\revenant\run_parity.py --revenant-dir C:\Users\User\RustroverProjects\rv-wt\Swe2ParityDriver\build-rv\tools\revenant --parity-root C:\Users\User\RustroverProjects\Revenant\target\parity --tag recovered-rust --kinds rust-single rust-cargo --section rust --out C:\Users\User\RustroverProjects\Revenant\target\parity\summary-recovered-rust.json
+```
+
+<!-- parity-results:rust-start -->
+Rust parity has not been measured yet.
+<!-- parity-results:rust-end -->
+
 
 ## Metrics
 
@@ -22,7 +48,7 @@ Use `--only c-o2` to compare a subset. `--asm-only` recalculates the text metric
 
 The table is refreshed by `run_parity.py` after each scan; `summary-<tag>.json` contains the full records and owner evidence.
 
-<!-- parity-results:start -->
+<!-- parity-results:ccpp-start -->
 Latest C/C++ scan (`recovered-ccpp`): 325 binaries, 325 clean; missing=0, conflicts=0, ASM mismatches=0.
 
 | Binary | Status | Missing | Conflicts | Extra | ASM checked | ASM mismatch |
@@ -352,4 +378,5 @@ Latest C/C++ scan (`recovered-ccpp`): 325 binaries, 325 clean; missing=0, confli
 | zlib-gcc-os | ok | 0 | 0 | 240 | 13,848 | 0 |
 | zlib-gcc-pie | ok | 0 | 0 | 391 | 16,601 | 0 |
 | zlib-gcc-unroll | ok | 0 | 0 | 375 | 26,872 | 0 |
+<!-- parity-results:ccpp-end -->
 <!-- parity-results:end -->

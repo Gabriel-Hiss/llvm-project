@@ -53,7 +53,13 @@ from iced_x86 import (  # noqa: E402
 )
 
 
-def corpus_ids(parity_root: Path, ccpp_only=True):
+def corpus_ids(parity_root: Path, kinds=None):
+    """Oracle-backed corpus ids; `kinds` limits the corpus `kind` field
+    (None = native+gnu C/C++ targets, empty = every kind)."""
+    if kinds is None:
+        kinds = ("native", "gnu")
+    else:
+        kinds = set(kinds) or None
     targets = []
     for frag in sorted((HARNESS / "corpus.d").glob("*.json")) + [HARNESS / "corpus.json"]:
         try:
@@ -62,7 +68,7 @@ def corpus_ids(parity_root: Path, ccpp_only=True):
             continue
     ids = []
     for t in targets:
-        if ccpp_only and t.get("kind") not in ("native", "gnu"):
+        if kinds is not None and t.get("kind") not in kinds:
             continue
         if (parity_root / t["id"] / "oracle" / "oracle-items.bin").exists():
             ids.append(t["id"])
@@ -396,15 +402,16 @@ def merge_asm(parity_root, tag, only):
     return rows
 
 
-def update_parity_doc(tag, summary):
+def update_parity_doc(tag, summary, section="ccpp"):
     path = Path(__file__).resolve().parents[2] / "docs" / "parity.md"
     text = path.read_text()
-    start = "<!-- parity-results:start -->"
-    end = "<!-- parity-results:end -->"
+    start = f"<!-- parity-results:{section}-start -->"
+    end = f"<!-- parity-results:{section}-end -->"
     start_at = text.index(start) + len(start)
     end_at = text.index(end, start_at)
+    label = "C/C++" if section == "ccpp" else section.capitalize()
     lines = [
-        f"Latest C/C++ scan (`{tag}`): {summary['binaries']} binaries, "
+        f"Latest {label} scan (`{tag}`): {summary['binaries']} binaries, "
         f"{summary['clean']} clean; missing={summary['total_missing']}, "
         f"conflicts={summary['total_conflicts']}, "
         f"ASM mismatches={summary['total_asm_text_mismatch']}.",
@@ -434,28 +441,29 @@ def main():
     ap.add_argument("--tag", default="swe2pd")
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--all-kinds", action="store_true")
+    ap.add_argument("--kinds", nargs="*", default=None,
+                    help="corpus kinds to include when --only is absent "
+                         "(default native+gnu; use --all-kinds for all)")
+    ap.add_argument("--section", choices=("ccpp", "rust"), default=None,
+                    help="parity.md section to refresh on a full scan")
     ap.add_argument("--asm-only", action="store_true",
-                    help="skip compare.py; only (re)compute asm metrics")
+                    help="skip compare.py; only recompute ASM metrics")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
-    full_ccpp_scan = args.only is None and not args.all_kinds
-
+    full_scan = args.only is None
     exporter = args.revenant_dir / "export-parity.cmd"
     if not exporter.exists() or not (args.revenant_dir / "revenant.exe").exists():
         sys.exit(f"exporter pair missing in {args.revenant_dir}")
-
     only = args.only
     if only is None:
-        only = corpus_ids(args.parity_root, ccpp_only=not args.all_kinds)
-
+        kinds = [] if args.all_kinds else args.kinds
+        only = corpus_ids(args.parity_root, kinds=kinds)
     if not only:
         sys.exit("no oracle-backed corpus ids selected")
-
     if not args.asm_only:
         rc = run_compare(args.parity_root, exporter, args.tag, only)
         if rc != 0:
             sys.exit(f"compare.py exited {rc}")
-
     rows = merge_asm(args.parity_root, args.tag, only)
     missing_reports = sorted(set(only) - {r.get("id") for r in rows})
     if missing_reports:
@@ -504,9 +512,11 @@ def main():
                          "asm_checked": r.get("asm_checked"),
                          "asm_text_mismatch": r.get("asm_text_mismatch")}
                         for r in rows]}
-
-    if full_ccpp_scan:
-        update_parity_doc(args.tag, summary)
+    if full_scan:
+        section = args.section
+        if section is None:
+            section = "ccpp" if args.kinds is None and not args.all_kinds else "rust"
+        update_parity_doc(args.tag, summary, section=section)
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))
         concise = {k: v for k, v in summary.items()
