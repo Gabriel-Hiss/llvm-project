@@ -102,6 +102,8 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
   P.Names = std::make_shared<std::map<Va, std::string>>();
   P.Externs = std::make_shared<std::map<Va, Extern>>();
   P.Strings = std::make_shared<std::map<Va, std::string>>();
+  P.GuardCFCheckPtr = Pe.GuardCFCheckPtr;
+  P.GuardCFDispatchPtr = Pe.GuardCFDispatchPtr;
   if (!P.Img)
     return P;
 

@@ -47,6 +47,93 @@ llvm::FunctionType *LiftState::fnType(const Signature *S) {
 
 static const llvm::MCRegister Win64Regs[4] = {llvm::X86::RCX, llvm::X86::RDX,
                                               llvm::X86::R8, llvm::X86::R9};
+/// VA stored in a Control Flow Guard load-config slot, when the image
+/// carries one. The lifter folds a `call [slot]`'s slot read to this
+/// handler constant, so both forms must be recognized here.
+static std::optional<Va> cfgHandler(const LiftState &LS,
+                                    std::optional<Va> Slot) {
+  if (!Slot || !LS.P.Img)
+    return std::nullopt;
+  if (auto H = LS.P.Img->readU64(*Slot))
+    return Va(*H);
+  return std::nullopt;
+}
+
+/// `call`/`jmp` target forms that hit the CFG check or dispatch wrappers:
+/// the slot VA itself (`call [slot]`, `jmp [slot]`) or the stored handler
+/// (`call _guard_dispatch_icall_nop`).
+static bool isGuardCheck(const LiftState &LS, const Instr &I,
+                         std::optional<Va> Target) {
+  if (!LS.P.GuardCFCheckPtr)
+    return false;
+  if (I.HasMemTarget && I.MemTarget == *LS.P.GuardCFCheckPtr)
+    return true;
+  std::optional<Va> H = cfgHandler(LS, LS.P.GuardCFCheckPtr);
+  return Target && H && *Target == *H;
+}
+
+static bool isGuardDispatch(const LiftState &LS, const Instr &I,
+                            std::optional<Va> Target) {
+  if (!LS.P.GuardCFDispatchPtr)
+    return false;
+  if (I.HasMemTarget && I.MemTarget == *LS.P.GuardCFDispatchPtr)
+    return true;
+  std::optional<Va> H = cfgHandler(LS, LS.P.GuardCFDispatchPtr);
+  return Target && H && *Target == *H;
+}
+
+/// `ret` shaped to the caller's recovered signature. `_guard_check_icall`
+/// is a nop here: `call [check]` is dropped outright and `jmp [check]`
+/// becomes this return.
+static void emitGuardReturn(LiftState &LS, Va At) {
+  const Signature *Sig = LS.Sigs ? LS.Sigs->of(LS.F.Start) : nullptr;
+  if (!Sig || !Sig->Ret) {
+    llvm::ReturnInst *RI = LS.B.CreateRetVoid();
+    ir::setInstructionVA(*RI, At.Value);
+    return;
+  }
+  llvm::Value *Ret;
+  unsigned Bits = std::max(1u, Sig->Ret->Bits);
+  if (Sig->Ret->Float) {
+    Ret = LS.regRead(llvm::X86::XMM0);
+    llvm::Type *Ty = Bits == 32
+                         ? llvm::Type::getFloatTy(LS.Mod.getContext())
+                         : llvm::Type::getDoubleTy(LS.Mod.getContext());
+    Ret = LS.B.CreateBitCast(LS.extTo(Ret, Bits), Ty);
+  } else {
+    Ret = LS.extTo(LS.regRead(llvm::X86::RAX), Bits);
+  }
+  llvm::ReturnInst *RI = LS.B.CreateRet(Ret);
+  ir::setInstructionVA(*RI, At.Value);
+}
+
+/// Shared tail of `emitIndirectTailCall`: `jmp Target` as a tail call,
+/// returning the call's result in the caller's own shape.
+static void emitIndirectTail(LiftState &LS, llvm::Value *TV, Va At) {
+  const Signature *Sig = LS.Sigs ? LS.Sigs->of(LS.F.Start) : nullptr;
+  Signature Empty;
+  if (!Sig) {
+    for (unsigned K = 0; K < 4; ++K)
+      Empty.Params.push_back(
+          {ParamLoc::reg(Win64Regs[K]), 64, false, std::nullopt});
+    Empty.Ret = RetLoc{false, 64};
+    Sig = &Empty;
+  }
+  llvm::FunctionType *FT = LS.fnType(Sig);
+  std::vector<llvm::Value *> Args = LS.callArgs(Sig, std::nullopt);
+  Args.resize(std::min<size_t>(Args.size(), FT->getNumParams()));
+  while (Args.size() < FT->getNumParams())
+    Args.push_back(llvm::UndefValue::get(LS.i64()));
+  llvm::Value *FP =
+      LS.B.CreateIntToPtr(TV, llvm::PointerType::getUnqual(FT), "fp");
+  llvm::CallInst *Call = LS.B.CreateCall(
+      FT, FP, Args, FT->getReturnType()->isVoidTy() ? "" : "itc");
+  ir::setInstructionVA(*Call, At.Value);
+  if (Call->getType()->isVoidTy())
+    LS.B.CreateRetVoid();
+  else
+    LS.B.CreateRet(Call);
+}
 
 llvm::Function *LiftState::calleeFn(Va Target, const Signature *S) {
   std::string Name =
@@ -141,6 +228,41 @@ llvm::Value *LiftState::readCallerArg(int64_t Off) {
 void LiftState::emitCall(const Instr &I) {
   setVA(I.Addr);
   Va IP = I.Addr;
+  // Control Flow Guard wrappers, identified by the load-config slots rather
+  // than symbol names. `call [check]` is validation-only: the check handler
+  // is a nop and the real `call rcx` follows, so the call itself is
+  // dropped. `call [dispatch]` is an indirect call through the target in
+  // rax (`_guard_dispatch_icall` ends in `jmp rax`).
+  if (isGuardCheck(*this, I, std::nullopt))
+    return;
+  if (isGuardDispatch(*this, I, std::nullopt) ||
+      (I.HasTarget && isGuardDispatch(*this, I, I.Target))) {
+    llvm::Value *Ptr = regRead(llvm::X86::RAX);
+    size_t Prefix = 0;
+    if (Sigs)
+      if (auto It = Sigs->IndirectArgs.find(IP);
+          It != Sigs->IndirectArgs.end())
+        Prefix = It->second;
+    Signature S;
+    for (size_t K = 0; K < Prefix && K < 4; ++K)
+      S.Params.push_back(
+          {ParamLoc::reg(Win64Regs[K]), 64, false, std::nullopt});
+    S.Ret = RetLoc{false, 64};
+    llvm::FunctionType *FT = fnType(&S);
+    llvm::Value *FP =
+        B.CreateIntToPtr(Ptr, llvm::PointerType::getUnqual(FT), "fp");
+    std::vector<llvm::Value *> Args = callArgs(&S, Prefix);
+    llvm::CallInst *Call = B.CreateCall(FT, FP, Args, "ic");
+    ir::setInstructionVA(*Call, I.Addr.Value);
+    clobberVolatile();
+    regWrite(llvm::X86::RAX, extTo(Call, 64));
+    Prod.reset();
+    return;
+  }
+  if (I.HasTarget && isGuardCheck(*this, I, I.Target)) {
+    // `call _guard_check_icall_nop` (a ret): same as `call [check]`, drop.
+    return;
+  }
   // Import through `call qword [rip+slot]`: MemTarget is the IAT slot.
   if (I.HasMemTarget && P.Externs) {
     if (auto It = P.Externs->find(I.MemTarget); It != P.Externs->end()) {
@@ -260,6 +382,22 @@ void LiftState::emitCall(const Instr &I) {
 }
 
 void LiftState::emitTailCall(Va Target) {
+  // The CFG dispatch handler tail-jumps to rax (`jmp rax`), so `jmp
+  // [dispatch]` and `jmp _guard_dispatch_icall_nop` are tail calls through
+  // rax. `jmp [check]` reaches a plain `ret`, which is the caller's own
+  // return.
+  if (P.GuardCFDispatchPtr &&
+      (Target == *P.GuardCFDispatchPtr ||
+       cfgHandler(*this, P.GuardCFDispatchPtr) == Target)) {
+    emitIndirectTail(*this, regRead(llvm::X86::RAX), CurVa);
+    return;
+  }
+  if (P.GuardCFCheckPtr &&
+      (Target == *P.GuardCFCheckPtr ||
+       cfgHandler(*this, P.GuardCFCheckPtr) == Target)) {
+    emitGuardReturn(*this, CurVa);
+    return;
+  }
   const Signature *Sig = Sigs ? Sigs->of(Target) : nullptr;
   llvm::Function *Callee = calleeFn(Target, Sig);
   Signature Empty;
@@ -295,32 +433,19 @@ void LiftState::emitTailCall(Va Target) {
 
 void LiftState::emitIndirectTailCall(const Instr &I) {
   setVA(I.Addr);
+  // `jmp [dispatch]` tail-calls the target in rax; `jmp [check]` runs the
+  // nop check handler's `ret`.
+  if (isGuardDispatch(*this, I, std::nullopt)) {
+    emitIndirectTail(*this, regRead(llvm::X86::RAX), I.Addr);
+    return;
+  }
+  if (isGuardCheck(*this, I, std::nullopt)) {
+    emitGuardReturn(*this, I.Addr);
+    return;
+  }
   auto Ops = opsOf(I);
   llvm::Value *TV = Ops.empty() ? ci(0) : opReadInt(I, 0, 64);
-  const Signature *Sig = Sigs ? Sigs->of(F.Start) : nullptr;
-  Signature Empty;
-  if (!Sig) {
-    for (unsigned K = 0; K < 4; ++K)
-      Empty.Params.push_back(
-          {ParamLoc::reg(Win64Regs[K]), 64, false, std::nullopt});
-    Empty.Ret = RetLoc{false, 64};
-    Sig = &Empty;
-  }
-  llvm::FunctionType *FT = fnType(Sig);
-  std::vector<llvm::Value *> Args = callArgs(Sig, std::nullopt);
-  Args.resize(std::min<size_t>(Args.size(), FT->getNumParams()));
-  while (Args.size() < FT->getNumParams())
-    Args.push_back(llvm::UndefValue::get(i64()));
-  llvm::Value *FP =
-      B.CreateIntToPtr(TV, llvm::PointerType::getUnqual(FT), "fp");
-  llvm::CallInst *Call =
-      B.CreateCall(FT, FP, Args, FT->getReturnType()->isVoidTy() ? "" : "itc");
-  ir::setInstructionVA(*Call, I.Addr.Value);
-  if (Call->getType()->isVoidTy()) {
-    B.CreateRetVoid();
-  } else {
-    B.CreateRet(Call);
-  }
+  emitIndirectTail(*this, TV, I.Addr);
 }
 
 } // namespace revenant::lift
