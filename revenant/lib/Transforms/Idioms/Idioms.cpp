@@ -10,24 +10,24 @@
 // Strategy notes per idiom family:
 //
 // - Magic division/modulo (MSVC `mul`+fixup and clang `imul`+sign-correct
-//   shapes): the pass *evaluates* the instruction DAG feeding each candidate
-//   root as a function q(x) of the unique non-constant leaf x (the Rust
-//   reference does this on revenant-ir; here the same evaluation runs on
-//   LLVM IR values), recovers |d| as the smallest positive input with a
-//   nonzero result, then verifies q(x) == x/d on a deterministic witness
-//   set covering quotient step boundaries and range extremes. Only fully
-//   verified rewrites become udiv/sdiv/urem/srem by a constant.
+//   shapes): identify the widened dividend and evaluate the arithmetic DAG
+//   as q(x), even when x is itself an instruction. Recover |d| from the
+//   first positive nonzero result, then exhaustively verify i8/i16 or check
+//   quotient boundaries and extrema for i32/i64 before rewriting.
 // - abs/min/max/clamp: icmp+select (signed and unsigned, both operand
-//   orders) become llvm.abs/llvm.{s,u}{min,max} canonical intrinsics so the
-//   frontend prints min/max/abs. xor+sub negations fold to sub(0,x) too.
-// - Rotates: the lifter lowers rol/ror to (a<<c)|(a>>(w-c)); those shapes
-//   fold to llvm.fshl, which the frontend prints as a rotate.
-// - Byte-swap: shift-and-or byte shuffles become llvm.bswap.
-// - Strength-reduced multiplies: mul by a power of two folds to shl; mul
-//   by any other constant stays a mul (the canonical readable form).
-// - Compiler intrinsics: ctpop spellings already arrive as intrinsic
-//   calls and pass through; memset/memcpy loop recovery is owned by
-//   revenant-patterns, not this pass.
+//   orders) become llvm.abs/llvm.{s,u}{min,max}; xor+sub negations fold to
+//   sub(0,x). Signed subtraction-flag chains become llvm.scmp.
+// - Saturating arithmetic: exact unsigned add/sub select forms become
+//   llvm.uadd.sat/llvm.usub.sat.
+// - Rotates: (a<<c)|(a>>(w-c)) folds to llvm.fshl.
+// - Byte-swap: only a complete, reversed byte permutation becomes
+//   llvm.bswap.
+// - Kernighan popcount loops become llvm.ctpop after checking their loop
+//   state and side-effect-free body. Existing ctpop calls pass through.
+// - Bit tests already use the readable `and`/`icmp` IR form.
+// - Strength-reduced multiplies: mul by a power of two folds to shl; other
+//   constant multiplies stay as mul.
+// - Memset/memcpy loop recovery belongs to revenant-patterns, not this pass.
 
 #include "revenant/Transforms/Idioms/Idioms.h"
 
@@ -36,7 +36,9 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/NoFolder.h"
@@ -49,6 +51,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
@@ -83,6 +86,7 @@ struct DagEval {
   unsigned DividendW = 0;
   bool WidthConflict = false;
   bool WideMul = false;
+  Value *Input = nullptr;
   unsigned Budget = 256;
   SmallPtrSet<Value *, 16> Visited;
   DenseMap<Value *, std::optional<std::pair<APInt, unsigned>>> Memo;
@@ -92,6 +96,14 @@ struct DagEval {
 };
 
 bool DagEval::evalOperand(Value *V, unsigned W, APInt &Out128) {
+  if (V == Input && Input) {
+    Dividend = Input;
+    DividendW = W;
+    Out128 = XVal.zextOrTrunc(W).zext(128);
+    return true;
+  }
+  if (Input && !isa<ConstantInt>(V) && !isa<Instruction>(V))
+    return false;
   if (auto *C = dyn_cast<ConstantInt>(V)) {
     Out128 = C->getValue().zextOrTrunc(W).zext(128);
     return true;
@@ -375,9 +387,11 @@ std::vector<APInt> witnesses(unsigned W, int64_t D) {
 std::optional<APInt> evalRoot(Instruction *Root, const APInt &X, unsigned W,
                               Value *&Dividend, bool &WideMul,
                               bool &WidthConflict,
-                              SmallVectorImpl<Value *> *Members) {
+                              SmallVectorImpl<Value *> *Members,
+                              Value *Input = nullptr) {
   DagEval E;
   E.XVal = X.zextOrTrunc(W);
+  E.Input = Input;
   APInt Out(128, 0);
   unsigned OutW = 0;
   if (!E.evalInst(Root, Out, OutW))
@@ -406,10 +420,35 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
   if (hasOpaque(Root))
     return std::nullopt;
 
+  // The numerator may itself be an instruction, such as (a - b) or (a | b).
+  // Treat the source of a W->2W extension as the symbolic dividend instead
+  // of requiring the full arithmetic DAG to have a single argument leaf.
+  SmallPtrSet<Value *, 4> CandidateSet;
+  SmallPtrSet<Value *, 32> Seen;
+  SmallVector<Value *, 32> Work{Root};
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !Seen.insert(V).second)
+      continue;
+    if (auto *CI = dyn_cast<CastInst>(I)) {
+      auto *SrcTy = dyn_cast<IntegerType>(CI->getSrcTy());
+      auto *DstTy = dyn_cast<IntegerType>(CI->getDestTy());
+      if (SrcTy && DstTy && SrcTy->getBitWidth() == W &&
+          DstTy->getBitWidth() == 2 * W)
+        CandidateSet.insert(CI->getOperand(0));
+    }
+    for (Value *Operand : I->operands())
+      Work.push_back(Operand);
+  }
+  if (CandidateSet.size() > 1)
+    return std::nullopt;
+  Value *DivInput = CandidateSet.empty() ? nullptr : *CandidateSet.begin();
+
   APInt Zero(W, 0);
   Value *Div = nullptr;
   bool Wide = false, Conflict = false;
-  auto V0 = evalRoot(Root, Zero, W, Div, Wide, Conflict, nullptr);
+  auto V0 = evalRoot(Root, Zero, W, Div, Wide, Conflict, nullptr, DivInput);
   if (!V0 || !V0->trunc(W).isZero() || Conflict || !Wide || !Div)
     return std::nullopt;
   if (Div->getType() && Div->getType()->isIntegerTy() &&
@@ -424,7 +463,7 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
     X.setBit(K);
     Value *D2 = nullptr;
     bool W2 = false, C2 = false;
-    auto V = evalRoot(Root, X, W, D2, W2, C2, nullptr);
+    auto V = evalRoot(Root, X, W, D2, W2, C2, nullptr, DivInput);
     if (!V)
       return std::nullopt;
     if (!V->trunc(W).isZero()) {
@@ -439,7 +478,7 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
     uint64_t Mid = (Lo + R) / 2;
     Value *D2 = nullptr;
     bool W2 = false, C2 = false;
-    auto V = evalRoot(Root, APInt(W, Mid), W, D2, W2, C2, nullptr);
+    auto V = evalRoot(Root, APInt(W, Mid), W, D2, W2, C2, nullptr, DivInput);
     if (!V)
       return std::nullopt;
     if (!V->trunc(W).isZero())
@@ -484,7 +523,7 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
       }
       Value *D2 = nullptr;
       bool W2 = false, C2 = false;
-      auto Got = evalRoot(Root, WX, W, D2, W2, C2, nullptr);
+      auto Got = evalRoot(Root, WX, W, D2, W2, C2, nullptr, DivInput);
       if (!Got || Got->trunc(W) != Expected) {
         Ok = false;
         break;
@@ -499,7 +538,8 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
       Q.W = W;
       Value *D3 = nullptr;
       bool W3 = false, C3 = false;
-      evalRoot(Root, APInt(W, (uint64_t)D), W, D3, W3, C3, &Q.Members);
+      evalRoot(Root, APInt(W, (uint64_t)D), W, D3, W3, C3, &Q.Members,
+               DivInput);
       return Q;
     }
   }
@@ -613,6 +653,216 @@ bool matchAbsFromSelect(SelectInst *SI, Value *&X) {
   return false;
 }
 
+// Recover the compare-with-flags idiom emitted for a signed three-way
+// comparison: sign(x-y) plus an overflow-corrected nonzero bit.
+bool matchSignedCompare(Value *V, Value *&LHS, Value *&RHS) {
+  auto *Add = dyn_cast<BinaryOperator>(V);
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return false;
+  for (unsigned I = 0; I != 2; ++I) {
+    auto *Sign = dyn_cast<SExtInst>(Add->getOperand(I));
+    auto *Nonzero = dyn_cast<ZExtInst>(Add->getOperand(1 - I));
+    auto *Less = Sign ? dyn_cast<ICmpInst>(Sign->getOperand(0)) : nullptr;
+    auto *And = Nonzero ? dyn_cast<BinaryOperator>(Nonzero->getOperand(0))
+                        : nullptr;
+    if (!Less || !And || And->getOpcode() != Instruction::And ||
+        Less->getPredicate() != ICmpInst::ICMP_SLT)
+      continue;
+    auto *GreaterOrEqual =
+        dyn_cast<ICmpInst>(And->getOperand(0));
+    auto *Unequal = dyn_cast<ICmpInst>(And->getOperand(1));
+    if (!GreaterOrEqual || !Unequal) {
+      GreaterOrEqual = dyn_cast<ICmpInst>(And->getOperand(1));
+      Unequal = dyn_cast<ICmpInst>(And->getOperand(0));
+    }
+    if (!GreaterOrEqual || !Unequal ||
+        GreaterOrEqual->getPredicate() != ICmpInst::ICMP_SGT ||
+        Unequal->getPredicate() != ICmpInst::ICMP_NE)
+      continue;
+    auto *NegOne = dyn_cast<ConstantInt>(GreaterOrEqual->getOperand(1));
+    if (!NegOne || !NegOne->isMinusOne())
+      continue;
+    Value *X = Less->getOperand(0);
+    Value *Y = Less->getOperand(1);
+    if (Unequal->getOperand(0) != X || Unequal->getOperand(1) != Y)
+      continue;
+    auto *Sub = dyn_cast<BinaryOperator>(GreaterOrEqual->getOperand(0));
+    if (!Sub || Sub->getOpcode() != Instruction::Xor)
+      continue;
+    auto matchXor = [](Value *V, Value *A, Value *B) {
+      auto *Xor = dyn_cast<BinaryOperator>(V);
+      return Xor && Xor->getOpcode() == Instruction::Xor &&
+             ((Xor->getOperand(0) == A && Xor->getOperand(1) == B) ||
+              (Xor->getOperand(0) == B && Xor->getOperand(1) == A));
+    };
+    Value *Difference = nullptr;
+    Value *Overflow = nullptr;
+    for (unsigned K = 0; K != 2; ++K) {
+      auto *Candidate = dyn_cast<BinaryOperator>(Sub->getOperand(K));
+      if (Candidate && Candidate->getOpcode() == Instruction::Sub &&
+          Candidate->getOperand(0) == X &&
+          Candidate->getOperand(1) == Y) {
+        Difference = Candidate;
+        Overflow = Sub->getOperand(1 - K);
+        break;
+      }
+    }
+    auto *OverflowAnd = dyn_cast<BinaryOperator>(Overflow);
+    if (!Difference || !OverflowAnd ||
+        OverflowAnd->getOpcode() != Instruction::And)
+      continue;
+    if (!matchXor(OverflowAnd->getOperand(0), X, Y) ||
+        !matchXor(OverflowAnd->getOperand(1), X, Difference))
+      continue;
+    LHS = X;
+    RHS = Y;
+    return true;
+  }
+  return false;
+}
+bool recoverKernighanPopcount(Function &F) {
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  SmallVector<Loop *, 4> Loops(LI.begin(), LI.end());
+  for (Loop *L : Loops) {
+    if (!L->getSubLoops().empty() || L->getNumBlocks() != 2)
+      continue;
+    BasicBlock *Header = L->getHeader();
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Latch = L->getLoopLatch();
+    auto *Branch = dyn_cast<BranchInst>(Header->getTerminator());
+    if (!Preheader || !Latch || Latch == Header || !Branch ||
+        !Branch->isConditional())
+      continue;
+    BasicBlock *Continue = L->contains(Branch->getSuccessor(0))
+                               ? Branch->getSuccessor(0)
+                               : Branch->getSuccessor(1);
+    BasicBlock *Exit = Branch->getSuccessor(0) == Continue
+                           ? Branch->getSuccessor(1)
+                           : Branch->getSuccessor(0);
+    if (Continue != Latch || L->contains(Exit))
+      continue;
+    auto *LatchBranch = dyn_cast<BranchInst>(Latch->getTerminator());
+    if (!LatchBranch || !LatchBranch->isUnconditional() ||
+        LatchBranch->getSuccessor(0) != Header)
+      continue;
+    auto *Test = dyn_cast<ICmpInst>(Branch->getCondition());
+    if (!Test || (Test->getPredicate() != ICmpInst::ICMP_NE &&
+                  Test->getPredicate() != ICmpInst::ICMP_EQ))
+      continue;
+    auto *X = dyn_cast<PHINode>(Test->getOperand(0));
+    Value *Zero = Test->getOperand(1);
+    if (!X) {
+      X = dyn_cast<PHINode>(Test->getOperand(1));
+      Zero = Test->getOperand(0);
+    }
+    auto *ZeroC = dyn_cast<ConstantInt>(Zero);
+    if (!X || !ZeroC || !ZeroC->isZero() ||
+        !X->getType()->isIntegerTy() || X->getParent() != Header)
+      continue;
+    bool LoopOnTrue = Continue == Branch->getSuccessor(0);
+    if ((Test->getPredicate() == ICmpInst::ICMP_NE) != LoopOnTrue)
+      continue;
+    int PreIndex = X->getBasicBlockIndex(Preheader);
+    int BackIndex = X->getBasicBlockIndex(Latch);
+    if (PreIndex < 0 || BackIndex < 0 || X->getNumIncomingValues() != 2)
+      continue;
+    Value *Input = X->getIncomingValue(PreIndex);
+    Value *XNext = X->getIncomingValue(BackIndex);
+    auto *And = dyn_cast<BinaryOperator>(XNext);
+    if (!And || And->getOpcode() != Instruction::And)
+      continue;
+    Value *MinusOne = nullptr;
+    if (And->getOperand(0) == X)
+      MinusOne = And->getOperand(1);
+    else if (And->getOperand(1) == X)
+      MinusOne = And->getOperand(0);
+    else
+      continue;
+    auto *Sub = dyn_cast<BinaryOperator>(MinusOne);
+    auto *One = Sub ? dyn_cast<ConstantInt>(Sub->getOperand(1)) : nullptr;
+    if (!Sub || Sub->getOpcode() != Instruction::Sub ||
+        Sub->getOperand(0) != X || !One || !One->isOne())
+      continue;
+
+    PHINode *Count = nullptr;
+    BinaryOperator *CountNext = nullptr;
+    for (PHINode &Phi : Header->phis()) {
+      if (&Phi == X || !Phi.getType()->isIntegerTy() ||
+          Phi.getType() != X->getType())
+        continue;
+      PreIndex = Phi.getBasicBlockIndex(Preheader);
+      BackIndex = Phi.getBasicBlockIndex(Latch);
+      if (PreIndex < 0 || BackIndex < 0 || Phi.getNumIncomingValues() != 2)
+        continue;
+      auto *Init = dyn_cast<ConstantInt>(Phi.getIncomingValue(PreIndex));
+      auto *Inc = dyn_cast<BinaryOperator>(Phi.getIncomingValue(BackIndex));
+      if (!Init || !Init->isZero() || !Inc ||
+          Inc->getOpcode() != Instruction::Add)
+        continue;
+      ConstantInt *IncOne = dyn_cast<ConstantInt>(Inc->getOperand(1));
+      Value *Counter = Inc->getOperand(0);
+      if (!IncOne || !IncOne->isOne()) {
+        IncOne = dyn_cast<ConstantInt>(Inc->getOperand(0));
+        Counter = Inc->getOperand(1);
+      }
+      if (!IncOne || !IncOne->isOne() || Counter != &Phi)
+        continue;
+      Count = &Phi;
+      CountNext = Inc;
+      break;
+    }
+    if (!Count || !CountNext)
+      continue;
+
+    bool Safe = true;
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        if (&I == X || &I == Count || &I == Test || &I == And ||
+            &I == Sub || &I == CountNext || &I == Branch ||
+            &I == LatchBranch || isa<DbgInfoIntrinsic>(&I))
+          continue;
+        Safe = false;
+        break;
+      }
+      if (!Safe)
+        break;
+    }
+    if (!Safe)
+      continue;
+    for (BasicBlock *BB : L->blocks())
+      for (Instruction &I : *BB)
+        for (User *U : I.users())
+          if (auto *UseI = dyn_cast<Instruction>(U))
+            if (!L->contains(UseI->getParent()) && &I != Count)
+              Safe = false;
+    if (!Safe)
+      continue;
+
+    SmallVector<WeakTrackingVH, 16> Dead;
+    for (BasicBlock *BB : L->blocks())
+      for (Instruction &I : *BB)
+        Dead.push_back(&I);
+    IRBuilder<NoFolder> B(Branch);
+    Function *Ctpop = Intrinsic::getOrInsertDeclaration(
+        F.getParent(), Intrinsic::ctpop, {X->getType()});
+    Value *Pop = B.CreateCall(Ctpop, {Input});
+    auto *PopI = cast<Instruction>(Pop);
+    copyProvenance(PopI, Count);
+    PopI->copyMetadata(*Count);
+    Count->replaceAllUsesWith(Pop);
+    BranchInst::Create(Exit, Branch);
+    Branch->eraseFromParent();
+    SmallVector<BasicBlock *, 2> DeadBlocks;
+    for (BasicBlock *BB : L->blocks())
+      if (BB != Header)
+        DeadBlocks.push_back(BB);
+    DeleteDeadBlocks(DeadBlocks);
+    RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+    return true;
+  }
+  return false;
+}
 } // namespace
 
 PreservedAnalyses revenant::IdiomsPass::run(Function &F,
@@ -715,6 +965,36 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
     for (Instruction &I : make_early_inc_range(instructions(F))) {
       if (hasOpaque(&I))
         continue;
+      Value *CmpLHS = nullptr;
+      Value *CmpRHS = nullptr;
+      if (matchSignedCompare(&I, CmpLHS, CmpRHS)) {
+        SmallVector<WeakTrackingVH, 16> Dead;
+        SmallVector<Value *, 16> Work{&I};
+        SmallPtrSet<Value *, 16> Seen;
+        while (!Work.empty()) {
+          Value *V = Work.pop_back_val();
+          auto *Node = dyn_cast<Instruction>(V);
+          if (!Node || !Seen.insert(V).second)
+            continue;
+          Dead.push_back(Node);
+          for (Value *Operand : Node->operands())
+            Work.push_back(Operand);
+        }
+        B.SetInsertPoint(&I);
+        Function *Scmp = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::scmp,
+            {CmpLHS->getType(), CmpLHS->getType()});
+        Value *Call = B.CreateCall(Scmp, {CmpLHS, CmpRHS});
+        auto *CI = cast<Instruction>(Call);
+        copyProvenance(CI, &I);
+        CI->copyMetadata(I);
+        I.replaceAllUsesWith(Call);
+        Call->takeName(&I);
+        I.eraseFromParent();
+        RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+        LocalChanged = true;
+        continue;
+      }
       // -- mul by power of two -> shl. Mul by any other constant is
       //    already the canonical readable form and stays.
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
@@ -979,9 +1259,9 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                   APInt NaturalMask(W, 0);
                   NaturalMask.setAllBits();
                   if (IsRight)
-                    NaturalMask.lshr(ShiftBy);
+                    NaturalMask = NaturalMask.lshr(ShiftBy);
                   else
-                    NaturalMask.shl(ShiftBy);
+                    NaturalMask = NaturalMask.shl(ShiftBy);
                   DestShift = IsRight ? 0 : ShiftBy;
                   if (NaturalMask != (APInt(W, 255) << DestShift)) {
                     Ok = false;
@@ -1076,6 +1356,7 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
       break;
   }
 
+  Changed |= recoverKernighanPopcount(F);
   if (!Changed)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();

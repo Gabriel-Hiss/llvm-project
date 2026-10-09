@@ -66,8 +66,10 @@ Folds verified multiply-high and correction DAGs back into constant
 `udiv`/`sdiv`, then folds quotient-times-divisor residuals into
 `urem`/`srem`. It checks every input for i8/i16 and quotient boundaries plus
 integer extrema for i32/i64. It also canonicalizes select-based abs/min/max,
-unsigned saturating add/sub, rotates and byte swaps. Intrinsic popcount forms
-pass through unchanged. Ambiguous arithmetic remains intact.
+three-way signed compare flag chains, Kernighan popcount loops, unsigned
+saturating add/sub, rotates and byte swaps. Bit tests retain their direct
+`and`/`icmp` form; intrinsic popcount calls pass through unchanged.
+Ambiguous arithmetic remains intact.
 AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax) run after
 structuring, outside this LLVM pipeline.
 
