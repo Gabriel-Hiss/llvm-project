@@ -60,6 +60,19 @@ if(WIN32 AND MSVC)
 endif()
 add_definitions(${LLVM_DEFINITIONS})
 
+# Target backend generated headers (X86Gen*.inc) live in the build tree;
+# revenant-tblgen and lib/Lift consume them.
+if(EXISTS "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86/X86GenInstrInfo.inc")
+  set(REVENANT_X86_GEN_DIR "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86")
+  set(REVENANT_X86_SRC_DIR "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86")
+endif()
+
+# revenant-tblgen generates code consumed by lib/Lift, so it must be
+# added before the Lift directory below.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/revenant-tblgen/CMakeLists.txt")
+  add_subdirectory(tools/revenant-tblgen)
+endif()
+
 # Every slice adds its own CMakeLists under lib/<Area>, tools/<tool>,
 # frontend/<tool>, unittests/<Area>. Directories land independently, so
 # guard each one.

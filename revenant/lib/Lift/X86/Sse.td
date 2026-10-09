@@ -24,7 +24,6 @@
 // DSL operators (emitted by -gen-revenant-lift; implemented on
 // X86LiftContext::vop or as direct IRBuilder calls).
 class RVOp;
-def rv_setz         : RVOp; // (rv_setz $dst, val): write + zero upper root bits (VEX)
 def rv_xlane0f32    : RVOp; // (rv_xlane0f32 x_i128): float lane 0
 def rv_xlane0f64    : RVOp; // (rv_xlane0f64 x_i128): double lane 0
 def rv_xsetlane0f32 : RVOp; // (rv_xsetlane0f32 x_i128, f): keep upper lanes
@@ -33,19 +32,6 @@ def rv_xnewlane0f32 : RVOp; // (rv_xnewlane0f32 f): fresh vector, undef upper
 def rv_xnewlane0f64 : RVOp; // (rv_xnewlane0f64 f): fresh vector, undef upper
 def rv_floadf32     : RVOp; // (rv_floadf32 addr_i64): float load
 def rv_floadf64     : RVOp; // (rv_floadf64 addr_i64): double load
-def rv_ffadd        : RVOp; // float add (type-polymorphic)
-def rv_ffsub        : RVOp; // float sub
-def rv_ffmul        : RVOp; // float mul
-def rv_ffdiv        : RVOp; // float div
-def rv_fminnum      : RVOp; // llvm.minnum
-def rv_fmaxnum      : RVOp; // llvm.maxnum
-def rv_fsqrt        : RVOp; // llvm.sqrt
-def rv_sitofpf32    : RVOp; // (rv_sitofpf32 int): any width -> float
-def rv_sitofpf64    : RVOp; // (rv_sitofpf64 int): any width -> double
-def rv_fptosi       : RVOp; // (rv_fptosi W, float): float -> iW
-def rv_fpext        : RVOp; // float -> double (dest width from context)
-def rv_fptrunc      : RVOp; // double -> float
-def rv_fcmpf        : RVOp; // (rv_fcmpf fa, fb): flags-only FP compare
 def rv_pshufd       : RVOp; // (rv_pshufd x, imm)
 def rv_pshufhw      : RVOp; // (rv_pshufhw x, imm)
 def rv_pshuflw      : RVOp; // (rv_pshuflw x, imm)
