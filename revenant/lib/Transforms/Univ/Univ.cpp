@@ -314,7 +314,7 @@ struct LoopShape {
   bool Mirror = false;
   // Pointer loop whose trip count is a countdown PHI stepped by -1 and
   // tested with `icmp eq %step, 0`; the bound is its start value.
-  bool Countdown = false;
+  bool PtrCountdown = false;
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> PtrSteps;
   // Self-feeding extra integer PHIs (kept mirrors/counters the exit compare
@@ -336,6 +336,13 @@ struct LoopShape {
   // `zext`/`sext` of the IV that only fed the rebuilt addresses; dead after
   // the rewrite.
   SmallVector<Instruction *, 2> Widenings;
+  // LSR countdown trip counter stepped by -1 (integer half only); its start
+  // value is the bound and both it and its step die with the rewrite.
+  PHINode *Countdown = nullptr;
+  Instruction *CountdownStep = nullptr;
+  // The old exit compare tested a step value (the IV's step or the
+  // countdown's step), so the rebuilt compare tests the new step.
+  bool TripTestsStep = false;
   // The old IV is already `i32`, so in-loop value uses of it keep working
   // through an RAUW instead of being rebuilt away.
   bool IVIsNarrow = false;
@@ -354,6 +361,45 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   Instruction *Step = nullptr;
   int64_t StepC = 0;
   SmallVector<std::pair<Value *, BasicBlock *>, 2> Starts;
+  // A countdown trip PHI (stepped by -1) is not the index: it is the LSR trip
+  // counter and its start value is the bound. Scanned separately from
+  // matchStep because its start is the trip count, not a zero index.
+  PHINode *Countdown = nullptr;
+  Instruction *CountdownStep = nullptr;
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> CountdownStarts;
+  for (Instruction &I : *Header) {
+    auto *PN = dyn_cast<PHINode>(&I);
+    if (!PN)
+      break;
+    if (!PN->getType()->isIntegerTy())
+      continue;
+    Value *Back = nullptr;
+    SmallVector<std::pair<Value *, BasicBlock *>, 2> Entries;
+    for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+      if (PN->getIncomingBlock(i) == Latch) {
+        if (Back)
+          Back = nullptr;
+        Back = PN->getIncomingValue(i);
+      } else {
+        Entries.emplace_back(PN->getIncomingValue(i), PN->getIncomingBlock(i));
+      }
+    }
+    auto *St = dyn_cast<Instruction>(Back);
+    if (!St || St->getParent() != Latch ||
+        St->getOpcode() != Instruction::Add)
+      continue;
+    Value *Other = St->getOperand(0) == PN   ? St->getOperand(1)
+                   : St->getOperand(1) == PN ? St->getOperand(0)
+                                             : nullptr;
+    auto *C = Other ? dyn_cast<ConstantInt>(Other) : nullptr;
+    if (!C || C->getSExtValue() != -1)
+      continue;
+    if (Countdown)
+      return false; // two countdowns: not a shape we invert
+    Countdown = PN;
+    CountdownStep = St;
+    CountdownStarts = std::move(Entries);
+  }
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
@@ -374,19 +420,6 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (!IV)
     return false;
-  // Other integer PHIs must be accumulators (no step in the latch), not
-  // coupled IVs.
-  for (Instruction &I : *Header) {
-    auto *PN = dyn_cast<PHINode>(&I);
-    if (!PN)
-      break;
-    if (PN != IV && PN->getType()->isIntegerTy()) {
-      SmallVector<std::pair<Value *, BasicBlock *>, 2> Cand;
-      int64_t C = 0;
-      if (matchStep(PN, Header, Latch, C, Cand))
-        return false;
-    }
-  }
   // No pointer PHIs either: those are the pointer half's loops.
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
@@ -396,13 +429,15 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       return false;
   }
 
-  // Exit compare in the header or latch: `ne`/`eq` on the IV or its step.
-  // A single-block loop has Header == Latch; scan once so the exit
-  // compare is not seen twice. Multi-block loops test in the latch (the
-  // header holds only addresses); body-block compares belong to a
-  // different loop shape (early exit) and stay put.
+  // Exit compare in the header or latch: `ne`/`eq` on the IV, its step, or
+  // the countdown trip PHI (whose step the LSR exit tests). A single-block
+  // loop has Header == Latch; scan once so the exit compare is not seen
+  // twice. Multi-block loops test in the latch (the header holds only
+  // addresses); body-block compares belong to a different loop shape
+  // (early exit) and stay put.
   ICmpInst *Cmp = nullptr;
   Value *Wide = nullptr;
+  bool CountdownTrip = false;
   auto inLoop = [&](BasicBlock *BB) {
     return BB == Header || BB == Latch ||
            (reachable(Header, BB) && reachable(BB, Latch));
@@ -419,24 +454,36 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       Value *A = C->getOperand(0), *B = C->getOperand(1);
       bool AIs = A == IV || A == Step;
       bool BIs = B == IV || B == Step;
-      if (AIs == BIs)
+      bool ACount = Countdown && (A == Countdown || A == CountdownStep);
+      bool BCount = Countdown && (B == Countdown || B == CountdownStep);
+      if (AIs == BIs && ACount == BCount)
         continue;
       // The other operand must be loop-invariant: body compares on the IV
       // (the `i % 3 == 0` of `break_continue`) are not trip counts.
-      if (!isLoopInvariant(AIs ? B : A, Header, Latch))
+      if (!isLoopInvariant(AIs || ACount ? B : A, Header, Latch))
         continue;
       if (Cmp)
         return false;
       Cmp = C;
-      Wide = AIs ? B : A;
+      Wide = AIs || ACount ? B : A;
+      CountdownTrip = ACount || BCount;
     }
   }
   if (!Cmp || !Wide || !isLoopInvariant(Wide, Header, Latch))
     return false;
-  // The bound: an already-narrow `i32`, the widening of one, or (byte
-  // loops) its stride scaling.
+  // The bound: an already-narrow `i32`, the widening of one, (byte loops)
+  // its stride scaling, or the countdown's start value.
   Value *Narrow = nullptr;
-  if (Wide->getType()->isIntegerTy(32)) {
+  if (CountdownTrip) {
+    if (CountdownStarts.size() != 1 || !CountdownStarts.front().first)
+      return false;
+    Narrow = CountdownStarts.front().first;
+    if (!Narrow->getType()->isIntegerTy(32)) {
+      Narrow = peelWidening(Narrow);
+      if (!Narrow)
+        return false;
+    }
+  } else if (Wide->getType()->isIntegerTy(32)) {
     Narrow = Wide;
   } else {
     Narrow = peelWidening(Wide);
@@ -614,6 +661,11 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   S.TruncEscapes = std::move(Truncs);
   S.Widenings = std::move(Widenings);
   S.IVIsNarrow = NarrowIV;
+  S.Countdown = Countdown;
+  S.CountdownStep = CountdownStep;
+  S.TripTestsStep = CountdownTrip ||
+                    S.ExitCmp->getOperand(0) == Step ||
+                    S.ExitCmp->getOperand(1) == Step;
   for (auto *GI : GEPs)
     S.Touches.push_back({nullptr, GI, nullptr});
   return true;
@@ -890,7 +942,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   S.Bound = Bound;
   S.IsPtr = true;
   S.Mirror = Mirror;
-  S.Countdown = Countdown;
+  S.PtrCountdown = Countdown;
   // Self-feeding extra PHIs (kept mirrors/counters the compare does not
   // test) die with the rewrite.
   for (unsigned K = 0; K < Stepped.size(); ++K)
@@ -981,10 +1033,8 @@ static bool rewriteIntLoop(LoopShape &S) {
   if (!S.ExitCmp)
     return false;
   // Exit compare on the same operand the old one tested (PHI or step).
-  Value *Tested = S.ExitCmp->getOperand(0) == S.Step ||
-                          S.ExitCmp->getOperand(1) == S.Step
-                      ? NewStep
-                      : static_cast<Value *>(NewIV);
+  Value *Tested = S.TripTestsStep ? static_cast<Value *>(NewStep)
+                                  : static_cast<Value *>(NewIV);
   ICmpInst::Predicate OldPredicate = S.ExitCmp->getPredicate();
   IRBuilder<> CB(S.ExitCmp);
   Value *NewCmp =
@@ -1016,6 +1066,13 @@ static bool rewriteIntLoop(LoopShape &S) {
   for (auto *W : S.Widenings)
     if (W->use_empty())
       W->eraseFromParent();
+  // The countdown trip counter dies with its step: nothing references it
+  // after the compare above was replaced.
+  if (S.Countdown) {
+    S.Countdown->dropAllReferences();
+    S.CountdownStep->eraseFromParent();
+    S.Countdown->eraseFromParent();
+  }
   // Drop the old IV machinery. Detach the latch incoming (it references the
   // old step, erased next) before anything else; then rewrite any
   // remaining in-loop value user of an already-narrow IV onto the new
