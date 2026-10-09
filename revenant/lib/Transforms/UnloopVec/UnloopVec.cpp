@@ -1158,7 +1158,9 @@ bool scalarizeCountedWideMemory(Function &F) {
       auto *Store = dyn_cast<StoreInst>(&I);
       if (!Store)
         continue;
-      if (Store->getValueOperand()->getType()->isVectorTy() &&
+      if (Store->isVolatile() || Store->isAtomic())
+        continue;
+      if (isa<FixedVectorType>(Store->getValueOperand()->getType()) &&
           broadcastScalar(Store->getValueOperand())) {
         Stores.push_back(Store);
         continue;
@@ -1166,7 +1168,7 @@ bool scalarizeCountedWideMemory(Function &F) {
       auto *Load = dyn_cast<LoadInst>(Store->getValueOperand());
       if (Load && Load->hasOneUse() &&
           Load->getType()->isIntegerTy(128) &&
-          !Load->isVolatile() && !Store->isVolatile())
+          !Load->isVolatile() && !Load->isAtomic())
         Copies.push_back({Load, Store});
     }
   }
@@ -1183,7 +1185,7 @@ bool scalarizeCountedWideMemory(Function &F) {
       if (auto *GEP = dyn_cast<Instruction>(Ptr))
         copyVA(Store, GEP);
       auto *ScalarStore = B.CreateStore(Scalar, Ptr);
-      ScalarStore->setAlignment(Store->getAlign());
+      ScalarStore->setAlignment(Align(1));
       copyVA(Store, ScalarStore);
     }
     Value *Vector = Store->getValueOperand();
