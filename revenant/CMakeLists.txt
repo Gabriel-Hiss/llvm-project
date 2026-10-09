@@ -77,7 +77,7 @@ set(REVENANT_AREA_DIRS
     lib/IR
     lib/Target/X86
     tools/revenant
-    tools/revenant-tblgen
+    tools/revenant-detect
     tools/revenant-ir-verify
     tools/revenant-opt
     frontend/clang
