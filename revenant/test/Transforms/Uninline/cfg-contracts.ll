@@ -1,6 +1,6 @@
 ; Controlled variants of the mz_zip_get_mode corpus shape from cfg.ll.
 ; Rebuilding a call must not reintroduce stronger argument/return contracts.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline,verify -S %s | %FileCheck %s
 
 define i32 @nonnull_mode(ptr nonnull %p) {
 entry:

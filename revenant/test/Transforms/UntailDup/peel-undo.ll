@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-untaildup -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untaildup -S %s | %FileCheck %s
 ; Loop peeling undo (pure shape): block %P holds the peeled first iteration
 ; of the loop body with the IV replaced by its initial value 0. The loop
 ; accumulates s = s + (i * 2); the peeled copy computes the i=0 step

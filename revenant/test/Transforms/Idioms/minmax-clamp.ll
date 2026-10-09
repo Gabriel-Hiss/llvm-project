@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; clamp: source-level compare/select shapes remain visible.
 define i32 @clamp(i32 %x, i32 %lo, i32 %hi) {
 entry:

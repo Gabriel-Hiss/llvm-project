@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-locals-to-slots -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-locals-to-slots -S %s | %FileCheck %s
 ;
 ; A loop-carried PHI makes its source variable memory-backed. A constant on a
 ; critical incoming edge must store on the split edge, not on both branches.

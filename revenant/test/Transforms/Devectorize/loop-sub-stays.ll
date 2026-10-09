@@ -1,6 +1,6 @@
 ; Negative: a sub-reduction loop is not a lane-wise reduction; the loop
 ; stays vector. Ports the reference bail on non-red ops.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
 

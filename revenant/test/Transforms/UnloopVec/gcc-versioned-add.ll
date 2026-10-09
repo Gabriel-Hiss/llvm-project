@@ -2,7 +2,7 @@
 ; guard, a scalar fallback loop, a four-lane loop, then up to three scalar
 ; epilogue iterations. The lane-wise vector body matches scalar iterations
 ; 4*i + k, so the complete versioned region can fold to the fallback loop.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define void @add_vec(ptr align 4 %dst, ptr align 4 %src, i32 %value, i32 %n) {
 entry:

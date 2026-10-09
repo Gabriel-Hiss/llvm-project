@@ -1,7 +1,7 @@
 ; Two straight-line vector blocks get function-wide unique handling:
 ; each block explodes independently, no names collide, SSA stays closed.
 ; Ports straight_blocks_get_unique_names.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 define i32 @slp_two(ptr %p, ptr %q) {
 entry:

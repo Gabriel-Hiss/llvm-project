@@ -3,7 +3,7 @@
 ; the rewrite is positional). Corpus: audio-nodegraph-clang-o1
 ; ?indexOf@NodeGraph (ptr this, ptr sret, i32) -> optional, and cpp-clang-o2
 ; ?begin/?end vector iterators with the same shape.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.Optional = type { i64, i8 }
 ; CHECK-LABEL: define %struct.Optional @indexOf(ptr %this, i32 %a1)

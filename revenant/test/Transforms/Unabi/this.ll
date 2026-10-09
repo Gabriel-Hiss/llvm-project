@@ -1,7 +1,7 @@
 ; `this` for C++ methods: the lifted form passes the receiver as a plain
 ; i64 with no name; the annotation restores the ptr receiver named `this`.
 ; Corpus: cpp-clang-o2 ?area@Rect (ptr this -> this), ?area@Circle.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.Rect = type { ptr, i32, i32, i32 }
 

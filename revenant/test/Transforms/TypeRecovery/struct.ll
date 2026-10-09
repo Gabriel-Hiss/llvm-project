@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-types -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-types -S %s | %FileCheck %s
 ;
 ; Two distinct constant offsets through one base become a DICompositeType
 ; struct with one member per offset; the GEPs and loads stay as-is.

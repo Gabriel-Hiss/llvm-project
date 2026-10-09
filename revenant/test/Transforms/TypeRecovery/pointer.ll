@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-types -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-types -S %s | %FileCheck %s
 ;
 ; A single-offset pointer base stays a scalar pointer (no struct); the
 ; opaque inttoptr call keeps its !revenant.opaque marker.

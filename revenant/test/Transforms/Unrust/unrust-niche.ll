@@ -2,7 +2,7 @@
 ; niche pair `{i64, i64}` with a `trunc to i1` discriminant test; post
 ; folds the whole test to constant stores. The pass restores the trunc
 ; next to a sentinel store when no test survives.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

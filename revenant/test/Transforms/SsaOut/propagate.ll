@@ -1,6 +1,6 @@
 ; Single-use pure defs stay inline (no local, no DI); a load feeding
 ; a use materializes into one named local with one store and loads.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-ssaout -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-ssaout -S %s | %FileCheck %s
 
 ; CHECK: define i32 @prop
 ; CHECK-NOT: alloca

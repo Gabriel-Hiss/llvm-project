@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Switch-of-select (SimplifyCFG simplifySwitchOnSelect) back to a branch:
 ; `switch (select c, 10, 20)` with one case per arm becomes `br c`.
 

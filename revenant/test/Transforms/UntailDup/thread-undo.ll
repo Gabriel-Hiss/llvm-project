@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-untaildup -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untaildup -S %s | %FileCheck %s
 ; Jump-threading undo at the clone level: two identical branch blocks over
 ; the same successor pair fold into one. Pre shape mirrors the
 ; `simplifycfg<no-hoist-common-insts>` join in c-clang-o2 `nested_if`.

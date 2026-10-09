@@ -1,6 +1,6 @@
 ; DI-backed return recovery: errfile's source prototype says i32 even though
 ; the optimized body retains only the dead value used to return it.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define i32 @errfile_like(ptr %a, ptr %b, i32 %n)
 ; CHECK: ret i32 %v

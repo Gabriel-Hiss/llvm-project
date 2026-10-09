@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes='revenant-lift-abi,function(revenant-lift-normalize,instcombine<no-verify-fixpoint>),verify' -S %s | FileCheck %s
+; RUN: %revenant-opt -passes='revenant-lift-abi,function(revenant-lift-normalize,instcombine<no-verify-fixpoint>),verify' -S %s | %FileCheck %s
 ; Lifted memory bases and returned addresses are kept in i64 registers.
 target datalayout = "e-p:64:64-i64:64-n8:16:32:64"
 ; CHECK-LABEL: define i32 @read(ptr

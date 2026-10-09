@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Kernighan's source-level popcount loop remains a loop, matching clang -O0.
 define i32 @popcount_loop(i32 %x) {
 entry:

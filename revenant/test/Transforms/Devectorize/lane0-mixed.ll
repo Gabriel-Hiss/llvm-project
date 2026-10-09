@@ -1,6 +1,6 @@
 ; Negative: mixed i32/i64 extracts of one value disagree on the lane
 ; layout; nothing scalarizes. Ports lane0_mixed_layouts_untouched.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 define i64 @lane0_mixed(ptr %p0, ptr %q) {
 entry:

@@ -2,7 +2,7 @@
 ; `llvm.assume` facts (`icmp ne %buf, null`) after the optimizer deletes
 ; the dead branches. The pass materializes a plain ult compare next to
 ; the assume when the function still calls panic_bounds_check.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

@@ -2,7 +2,7 @@
 ; The callee is the actual optimized null-check/load/return-PHI shape,
 ; with SSA names normalized. Caller context exercises inliner splicing,
 ; a live prefix, a live exit suffix, and a successor PHI.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline,verify -S %s | %FileCheck %s
 
 define i32 @mz_zip_get_mode(ptr %p) {
 entry:

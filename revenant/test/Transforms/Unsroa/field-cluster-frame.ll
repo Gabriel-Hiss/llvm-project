@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Corpus: c-o2 sub_140001620 (main): the caller builds `struct Point p`
 ; inside the lifter's [728 x i8] frame at offsets 312..327, then passes

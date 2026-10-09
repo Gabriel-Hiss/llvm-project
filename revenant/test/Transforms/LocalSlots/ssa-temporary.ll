@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-locals-to-slots -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-locals-to-slots -S %s | %FileCheck %s
 ;
 ; A one-shot merge value that is neither debug-backed nor loop-carried stays
 ; in SSA form instead of becoming a register-named stack slot.

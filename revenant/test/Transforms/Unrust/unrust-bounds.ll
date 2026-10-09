@@ -1,7 +1,7 @@
 ; Corpus: rust-o3 artifacts/corpus_rust.pre.ll @vec_index (ir-pre keeps
 ; `icmp ult %i, %_11` plus a branch to panic_bounds_check; the optimizer
 ; flips the surviving compare to `ugt`). The pass flips ugt back to ult.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

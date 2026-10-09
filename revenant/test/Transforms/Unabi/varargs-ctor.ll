@@ -3,7 +3,7 @@
 ; own receiver in rax. Corpus: c-clang-o2 @printf(ptr, ...) and
 ; cpp-clang-o2 runtime_error ctor @"??0runtime_error@std@@QEAA@PEBD@Z"
 ; (ptr returned, ptr %1) -> void.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define i32 @myprintf(ptr %a0, ptr %a1, ...)
 define i32 @myprintf(ptr %0, ptr %1) #0 {

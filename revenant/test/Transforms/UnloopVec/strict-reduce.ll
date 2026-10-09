@@ -1,7 +1,7 @@
 ; Strict FP source-order lane reduction: eight consecutive loads feed eight
 ; chained fadds in order. Adapted from c-clang-o2 sum_vec_d. No fast-math
 ; flags are present; folding is valid only for this serial arithmetic chain.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
 define double @sum_ordered(ptr %a, i64 %n) {
 entry:

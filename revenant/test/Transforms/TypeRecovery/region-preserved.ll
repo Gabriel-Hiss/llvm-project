@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-types -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-types -S %s | %FileCheck %s
 ;
 ; Signed compare votes signed: the local gets int32_t, and the
 ; !revenant.region structure annotation on the branch survives.

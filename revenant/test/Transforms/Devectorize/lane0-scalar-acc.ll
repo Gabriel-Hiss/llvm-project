@@ -2,7 +2,7 @@
 ; a <2 x double> phi web where every use reads lane 0 (extractelement 0)
 ; or forwards the vector (insertelement base, vector bitcast) scalarizes
 ; to a double phi. Ports crates/unopt lane0_scalar_acc.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 define void @lane0_acc(ptr %p0, double %fl, i1 %c) {
 entry:

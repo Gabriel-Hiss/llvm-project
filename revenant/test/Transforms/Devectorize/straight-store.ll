@@ -1,7 +1,7 @@
 ; A 128-bit vector store splits into per-lane scalar stores covering the
 ; same bytes, before the observing call. Ports
 ; straight_store_stays_before_observer_call.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 declare void @observe(ptr)
 

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shape from target/parity/c-clang-o2/artifacts/main.post.ll @sum_vec.
 ; The scalar tail uses a widened i64 IV, equality exit, and typed i32 GEP.

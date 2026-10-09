@@ -2,7 +2,7 @@
 ; lowering for struct copies in ir-pre (e.g. vector-iterator arithmetic in
 ; audio-nodegraph-clang-o1 ??H?$_Vector_iterator). A memcpy that READS the
 ; slot (slot as source) still bails.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.It = type { ptr }
 

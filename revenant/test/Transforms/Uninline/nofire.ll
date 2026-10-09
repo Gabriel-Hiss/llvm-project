@@ -2,7 +2,7 @@
 ; code (measured 7 false sites in miniz O1 for 1 true inline), opaque
 ; helpers and region annotations are never disturbed, and a callee with a
 ; store body is ineligible.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline -S %s | %FileCheck %s --allow-unused-prefixes
+; RUN: %revenant-opt -passes=revenant-uninline -S %s | %FileCheck %s --allow-unused-prefixes
 
 ; CHECK-LABEL: define internal i32 @getter(
 define internal i32 @getter(ptr %p) {

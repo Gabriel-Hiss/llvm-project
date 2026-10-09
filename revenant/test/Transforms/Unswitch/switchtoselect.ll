@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Switch-to-select (SimplifyCFG trySwitchToSelect/foldSwitchToSelect) back
 ; to a switch: chained `icmp eq; select` feeding a return.
 ; Corpus shape: rust-o3 option handling / lua need_value select folds.

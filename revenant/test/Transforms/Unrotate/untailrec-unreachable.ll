@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -S %s | %FileCheck %s
 
 ; Latch with a store (side effect): not the TailCallElim shape, untouched.
 ; The exit returns a function argument (dominates everything), and the

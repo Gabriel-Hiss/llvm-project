@@ -3,7 +3,7 @@
 ; unknown token, sret slot that escapes via load, ctor shape broken (returns
 ; an unrelated value), musttail call site, indirect use (address taken), and
 ; pre-existing sret/byval attributes.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.S = type { i64 }
 

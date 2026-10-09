@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Provenance survives the fold: !revenant.va on the kept instructions is
 ; preserved, and the rewritten step keeps the original VA node.
 

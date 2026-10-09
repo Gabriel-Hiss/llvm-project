@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Negative: an intermediate window value read after the run has no single
 ; loop value, so the run must stay straight-line. Ports
 ; reroll_intermediate_live_out_blocks_synth.

@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -verify-each -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -verify-each -S %s | %FileCheck %s
 ; Numeric SSA values have empty instruction names. Clone matching must not
 ; confuse two unnamed sexts or place a header user before its latch clone.
 define i32 @unnamed(i32 %a, i32 %b) {

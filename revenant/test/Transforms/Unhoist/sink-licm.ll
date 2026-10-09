@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unhoist -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unhoist -S %s | %FileCheck %s
 ;
 ; Corpus: c-clang-o1 main.pre.ll @sum_vec (loop-invariant bound load
 ; hoisted by LICM into the preheader). After LICM the loop header reads

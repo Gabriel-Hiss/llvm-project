@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-untaildup -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untaildup -S %s | %FileCheck %s
 ; Negative tests: volatile ops, opaque asm calls, and mismatched opcodes
 ; never merge.
 ; CHECK-LABEL: define i32 @volatile_keep(

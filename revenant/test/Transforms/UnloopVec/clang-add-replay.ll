@@ -1,7 +1,7 @@
 ; Adapted from c-clang-o2 add_vec: guarded vector body plus scalar fallback
 ; and unrolled scalar remainder. The fallback starts at zero on dispatch and
 ; covers the whole trip count, so the vector arm and its middle block are dead.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
 define void @add_replay(ptr %dst, ptr %src, i32 %bias, i32 %n) {
 entry:

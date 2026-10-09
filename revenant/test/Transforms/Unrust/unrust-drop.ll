@@ -2,7 +2,7 @@
 ; tail-calls Drop::drop then RawVec's shim; post inlines the body into
 ; the caller leaving `icmp eq len, 0` guarding a __rust_dealloc arm).
 ; The pass outlines the guarded region into drop_glue.unrust.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

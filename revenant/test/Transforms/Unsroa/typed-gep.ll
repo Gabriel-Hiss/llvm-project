@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Corpus: c-clang-o2, @struct_access. instcombine flattens the typed field
 ; GEPs of ir-pre into byte GEPs (`gep i8, ptr %0, i64 4`); the pass rebuilds

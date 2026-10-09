@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Narrow-width magic-division graphs exercise the pass's exhaustive proof path.
 ; The divisor matches div_by_const7 in corpus src/c/main.c.
 define i8 @udiv7_i8(i8 %x) {

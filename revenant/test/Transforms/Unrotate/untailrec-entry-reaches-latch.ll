@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -verify-each -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -verify-each -S %s | %FileCheck %s
 
 ; The alternate entry edge enters the latch and then reaches the loop header.
 ; This is an ordinary loop, not a tail-call-elimination loop.

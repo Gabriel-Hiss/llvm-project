@@ -1,6 +1,6 @@
 ; Controlled CFG proof regressions. Corpus null-check fixtures are in cfg.ll
 ; and cfg-effects.ll; this file specifically checks cyclic PHI references.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline,verify -S %s | %FileCheck %s
 
 define i32 @sum_loop(ptr %p, i32 %n) {
 entry:

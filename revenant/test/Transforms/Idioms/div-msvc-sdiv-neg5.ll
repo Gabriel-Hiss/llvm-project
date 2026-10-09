@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; sdiv-neg5: MSVC smulhi + sign-correction shape -> sdiv -5.
 define i32 @sdivneg5(i32 %x) {
 entry:

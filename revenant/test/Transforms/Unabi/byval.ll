@@ -4,7 +4,7 @@
 ; the named struct exists. Callee-copy ownership stays with sigs (open
 ; question with MuseSigs2: the slice plugin cannot add param attributes).
 ; Corpus: audio-nodegraph-clang-o1 ?setNodeApp (std::string params).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.String = type { ptr, i64, i64 }
 

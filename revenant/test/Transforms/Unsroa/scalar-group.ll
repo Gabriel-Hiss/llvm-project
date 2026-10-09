@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Scalar alloca group back to an aggregate: two `.sroa.` members fold into
 ; one aggregate alloca; member accesses become byte GEPs into it.
