@@ -193,9 +193,14 @@ Error runPipelineText(StringRef Stage, Module &M, StringRef Pipeline) {
   return verifyStage(Stage, M);
 }
 
-/// ir-clean: normalize lifted stack/address/width shapes, then cleanup + idioms.
+/// ir-clean: normalize lifted stack/address/width shapes, then cleanup +
+/// idioms, then module-level ABI recovery followed by cleanup for ptr casts.
 std::string cleanPipeline() {
-  return formatv("function({0},{1})", CleanupPipeline, IdiomsPipeline).str();
+  return formatv("function({0},{1}),revenant-lift-abi,"
+                 "function(instcombine<no-verify-fixpoint>,early-cse,"
+                 "revenant-lift-normalize)",
+                 CleanupPipeline, IdiomsPipeline)
+      .str();
 }
 
 /// ir-final: deoptimization, structuring, type recovery, SSA-out.
