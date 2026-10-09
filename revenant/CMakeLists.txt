@@ -35,6 +35,9 @@ include(AddLLVM)
 include(HandleLLVMOptions)
 include(Revenant)
 
+if(EXISTS "${LLVM_BUILD_BINARY_DIR}/lib/Target/X86/X86GenInstrInfo.inc")
+  set(REVENANT_X86_SRC_DIR "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86")
+endif()
 # Match the LLVM build's ABI flags (no EH, no RTTI unless enabled there).
 if(NOT LLVM_ENABLE_RTTI)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLVM_CXXFLAGS_RTTI_DISABLE}")
@@ -63,16 +66,16 @@ set(REVENANT_AREA_DIRS
     lib/Core
     lib/Object
     lib/Disasm
+    lib/IR
     lib/Analysis
+    lib/Target/X86
+    tools/revenant-tblgen
     lib/Lift
     lib/Transforms
     lib/Structure
     lib/Export
     lib/CAPI
-    lib/IR
-    lib/Target/X86
     tools/revenant
-    tools/revenant-tblgen
     tools/revenant-ir-verify
     tools/revenant-decompile
     frontend/clang
