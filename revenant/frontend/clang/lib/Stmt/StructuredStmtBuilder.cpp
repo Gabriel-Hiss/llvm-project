@@ -501,8 +501,9 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     SmallVector<Stmt *, 8> Cases;
     for (auto &Case : SI->cases()) {
       Expr *LH = IntegerLiteral::Create(
-          *AST, Case.getCaseValue()->getValue().sextOrTrunc(64), CT,
-          SourceLocation());
+          *AST, Case.getCaseValue()->getValue().sextOrTrunc(
+                    AST->getIntWidth(CT)),
+          CT, SourceLocation());
       CaseStmt *CS = CaseStmt::Create(*AST, LH, nullptr, SourceLocation(),
                                       SourceLocation(), SourceLocation());
       CS->setSubStmt(gotoTo(Case.getCaseSuccessor()));
@@ -921,8 +922,9 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
     Stmt *CS = emitCase(D);
     CaseStmt *First = nullptr, *Prev = nullptr;
     for (ConstantInt *V : DestCases[D]) {
-      Expr *LH = IntegerLiteral::Create(*AST, V->getValue().sextOrTrunc(64),
-                                        CT, SourceLocation());
+      Expr *LH = IntegerLiteral::Create(
+          *AST, V->getValue().sextOrTrunc(AST->getIntWidth(CT)), CT,
+          SourceLocation());
       CaseStmt *Cur = CaseStmt::Create(*AST, LH, nullptr, SourceLocation(),
                                        SourceLocation(), SourceLocation());
       if (Prev)
@@ -986,8 +988,13 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
     if (Region *R = regionOf(BB); R && !R->Degraded) {
       // Region headers only emit at the top level when they are not
       // nested inside another region's member set.
-      if (!enclosingRegion(BB))
+      if (!enclosingRegion(BB)) {
+        if (NeededLabels.contains(BB) && isLoopKind(R->Kind))
+          Stmts.push_back(new (*AST)
+                              LabelStmt(SourceLocation(), labelFor(BB),
+                                        new (*AST) NullStmt(SourceLocation())));
         Stmts.push_back(emitRegionHeader(*R, nullptr));
+      }
       continue;
     }
     Region *Parent = enclosingRegion(BB);

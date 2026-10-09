@@ -46,8 +46,7 @@ enum class Prec : unsigned {
   Atom = 18,
 };
 
-/// Concrete ExprBuilder. Owns the per-function ExprScope bookkeeping plus
-/// the temp-VarDecl emission StmtBuilder consumes through PendingTemps.
+/// Concrete ExprBuilder; Core consumes its pending temporary declarations.
 class ExprBuilderImpl final : public ExprBuilder {
 public:
   ExprBuilderImpl(FrontendContext &Ctx, TypeBuilder &Types)
@@ -59,6 +58,7 @@ public:
   clang::Stmt *instr(llvm::Instruction &I, ExprScope &Scope) override;
   clang::Expr *cond(llvm::Value *Cond, ExprScope &Scope) override;
   clang::Expr *retVal(llvm::Value *V, ExprScope &Scope) override;
+  clang::Expr *inverted(llvm::Value *Cond, ExprScope &Scope) override;
 
   // Public for the unit tests: precedence of a built Expr, and the
   // literal-text rule for integer constants.

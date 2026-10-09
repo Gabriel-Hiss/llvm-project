@@ -196,6 +196,9 @@ bool ExprBuilderImpl::isSignedIntValue(const llvm::Value *V) const {
 QualType ExprBuilderImpl::exprTypeOf(llvm::Value *V) {
   const llvm::DIType *DI = debugTypeOf(V);
   QualType T = Types.typeOf(V->getType(), DI);
+  if (CurFD && V->getType() == CurF->getReturnType() &&
+      V->getType()->isStructTy())
+    T = CurFD->getReturnType();
   assert(!T.isNull() && "TypeBuilder must never return null");
   return T;
 }
@@ -379,8 +382,7 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
       return declRef(D);
     // Forward reference: ask Core to materialize a declaration-only
     // FunctionDecl so the call still prints by name.
-    FunctionDecl *FD = Ctx.functionDecl(
-        *F, [&](llvm::Type *Ty, const llvm::DIType *DI) { return Types.typeOf(Ty, DI); });
+    FunctionDecl *FD = Ctx.functionDecl(*F, Types);
     if (FD)
       return declRef(FD);
     return IntegerLiteral::Create(*AST, llvm::APInt(64, 0u), uintptrTy(),
@@ -424,15 +426,10 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
 Expr *ExprBuilderImpl::tempFor(llvm::Instruction *I, ExprScope &Scope) {
   if (ValueDecl *D = Ctx.lookupDecl(I))
     return declRef(D);
-  // Not yet materialized: StmtBuilder emits the VarDecl when it reaches
-  // the instruction (it walks PendingTemps). Record it now so repeat
-  // uses share one temporary.
+  // Record this value so Core can declare its temporary in the function
+  // prologue. Bind it now so later uses share the same VarDecl.
   if (Materialized.insert(I).second)
     Scope.PendingTemps.push_back(I);
-  // Synthesize a placeholder VarDecl so inline uses before emission still
-  // resolve; StmtBuilder replaces it with the real one. In practice
-  // StmtBuilder always emits temps before their uses (dominance order),
-  // so this path only fires for irreducible CFG edges.
   std::string Name = "v" + std::to_string(TempCounter++);
   IdentifierInfo *Id = Ctx.ident(Name);
   QualType T = exprTypeOf(I);
@@ -445,13 +442,9 @@ Expr *ExprBuilderImpl::tempFor(llvm::Instruction *I, ExprScope &Scope) {
 
 Expr *ExprBuilderImpl::ensureTemp(llvm::Instruction *I, ExprScope &Scope,
                                   clang::Expr *Inline) {
-  // Single-use (or still-useless) instructions fold into their use site,
-  // mirroring how emit-c prints expressions inline. Only values that
-  // already have several uses get a `v<N>` temporary; StmtBuilder emits
-  // the DeclStmt from PendingTemps. PHIs have no inline spelling and
-  // always materialize. Calls fold like anything else when they have a
-  // single use; instr() on a multi-use value-call binds the temp exactly
-  // once, and StmtBuilder emits it.
+  // Values with multiple uses need a local. Core emits the declaration;
+  // instr() emits the cached initializer at this instruction's position.
+  // PHIs have no inline spelling and remain declaration-only here.
   bool NeedsTemp = !I->hasOneUse() && !I->use_empty();
   if (I->getOpcode() == llvm::Instruction::PHI)
     NeedsTemp = true;
@@ -470,6 +463,7 @@ Expr *ExprBuilderImpl::ensureTemp(llvm::Instruction *I, ExprScope &Scope,
                                   Inline->getType(), TSI, SC_None);
     Ctx.bindTemp(I, VD);
   }
+  Scope.PendingInitializers[I] = Inline;
   return declRef(llvm::cast<ValueDecl>(Ctx.lookupDecl(I)));
 }
 
@@ -483,6 +477,7 @@ void ExprBuilderImpl::beginFunction(llvm::Function &F, FunctionDecl *FD,
   Materialized.clear();
   DebugTypes.clear();
   Scope.PendingTemps.clear();
+  Scope.PendingInitializers.clear();
   TempCounter = 0;
   ThisRecord = nullptr;
   ThisArgIndex = 0;
@@ -618,35 +613,44 @@ Stmt *ExprBuilderImpl::instr(llvm::Instruction &I, ExprScope &Scope) {
   if (llvm::isa<llvm::DbgInfoIntrinsic>(I))
     return nullptr;
   assert(AST && "beginFunction must run before instr()");
+  auto EmitTemp = [&]() -> Stmt * {
+    auto It = Scope.PendingInitializers.find(&I);
+    auto *D = llvm::dyn_cast_or_null<ValueDecl>(Ctx.lookupDecl(&I));
+    if (It == Scope.PendingInitializers.end() || !D)
+      return nullptr;
+    Expr *Init = It->second;
+    Scope.PendingInitializers.erase(It);
+    Expr *LHS = declRef(D);
+    return BinaryOperator::Create(*AST, LHS, Init, BO_Assign, D->getType(),
+                                  VK_PRValue, OK_Ordinary, SourceLocation(),
+                                  FPOptionsOverride());
+  };
   switch (I.getOpcode()) {
   case llvm::Instruction::Store:
     return buildStore(llvm::cast<llvm::StoreInst>(I), Scope);
   case llvm::Instruction::Call:
-    return buildCallStmt(llvm::cast<llvm::CallInst>(I), Scope);
+    if (Stmt *S = buildCallStmt(llvm::cast<llvm::CallInst>(I), Scope))
+      return S;
+    return EmitTemp();
   case llvm::Instruction::Alloca:
   case llvm::Instruction::PHI:
-    // Declarations / edge copies are emitted by StmtBuilder from
-    // PendingTemps and predecessor edges; nothing inline.
+    // Alloca declarations and PHI edge copies are handled separately.
     (void)value(&I, Scope);
     return nullptr;
-  case llvm::Instruction::Fence: {
-    // `llvm.dbg.*` intrinsics (old form) lower to nothing.
+  case llvm::Instruction::Fence:
     return nullptr;
-  }
-  default: {
-    if (I.mayHaveSideEffects()) {
-      // Atomicrmw / cmpxchg / volatile ops: keep a temp binding so the
-      // effect is sequenced; StmtBuilder emits `vN = <op>;`.
-      (void)value(&I, Scope);
-      return nullptr;
-    }
-    // Pure instructions fold into uses; if a temp was bound (multi-use),
-    // StmtBuilder emits it from PendingTemps. No statement here.
+  default:
     if (!I.getType()->isVoidTy())
       (void)value(&I, Scope);
-    return nullptr;
+    return EmitTemp();
   }
-  }
+}
+
+Expr *ExprBuilderImpl::inverted(llvm::Value *Cond, ExprScope &Scope) {
+  Expr *E = this->cond(Cond, Scope);
+  return UnaryOperator::Create(*AST, E, UO_LNot, AST->BoolTy, VK_PRValue,
+                               OK_Ordinary, SourceLocation(),
+                               /*CanOverflow=*/false, FPOptionsOverride());
 }
 
 Expr *ExprBuilderImpl::retVal(llvm::Value *V, ExprScope &Scope) {

@@ -162,8 +162,7 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
                           ExprBuilder &Exprs) {
   c::ASTContext &AST = FCtx.ast();
   c::FunctionDecl *FD = FCtx.functionDecl(F, Types);
-  if (F.isDeclaration())
-    return;
+  // Declarations still need ParmVarDecls for Clang's printer, but have no body.
 
   // Parameters: DI arg names when present, else a1..aN.
   DenseMap<unsigned, const llvm::DILocalVariable *> PV;
@@ -187,7 +186,10 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
   }
   FD->setParams(Params);
 
+  if (F.isDeclaration())
+    return;
   // Locals: one VarDecl per alloca, DI names/types when available.
+  SmallVector<c::Stmt *, 16> LocalDecls;
   for (llvm::BasicBlock &BB : F)
     for (llvm::Instruction &I : BB)
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
@@ -205,10 +207,28 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
                                c::SourceLocation(), II, LT, nullptr,
                                c::SC_None);
         FCtx.bindDecl(AI, VD);
+        LocalDecls.push_back(new (AST) c::DeclStmt(
+            c::DeclGroupRef(VD), c::SourceLocation(), c::SourceLocation()));
       }
 
   ExprScope Scope;
   c::CompoundStmt *Body = Stmts.buildBody(F, FD, Exprs, Scope);
+  for (llvm::Instruction *I : Scope.PendingTemps) {
+    auto *VD = llvm::dyn_cast_or_null<c::VarDecl>(FCtx.lookupDecl(I));
+    if (!VD)
+      continue;
+    LocalDecls.push_back(new (AST) c::DeclStmt(
+        c::DeclGroupRef(VD), c::SourceLocation(), c::SourceLocation()));
+  }
+  if (!LocalDecls.empty()) {
+    SmallVector<c::Stmt *, 32> WithLocals(LocalDecls.begin(),
+                                          LocalDecls.end());
+    WithLocals.push_back(Body);
+    Body = c::CompoundStmt::Create(AST, WithLocals, c::FPOptionsOverride(),
+                                   c::SourceLocation(),
+                                   c::SourceLocation());
+  }
+
   c::QualType RT =
       FD->getType()->castAs<c::FunctionType>()->getReturnType();
   if (!RT->isVoidType()) {
@@ -241,12 +261,19 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
-  for (c::Decl *D : TU->decls()) {
-    if (D->isImplicit())
-      continue;
-    D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
-    OS << "\n";
-  }
+  for (unsigned Pass = 0; Pass != 2; ++Pass)
+    for (c::Decl *D : TU->decls()) {
+      if (D->isImplicit())
+        continue;
+      bool IsRecord = llvm::isa<c::RecordDecl>(D);
+      if (IsRecord != (Pass == 0))
+        continue;
+      D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
+      if (auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
+          !FD || !FD->doesThisDeclarationHaveABody())
+        OS << ";";
+      OS << "\n";
+    }
 }
 
 } // namespace revenant::clangx
