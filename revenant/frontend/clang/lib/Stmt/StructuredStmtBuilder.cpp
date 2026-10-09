@@ -436,6 +436,19 @@ Expr *StructuredStmtBuilder::widenSwitchCond(Expr *Cond, QualType &CT,
   // printed type is signed and any case needs the high bit, wrap the
   // condition in an explicit unsigned cast (same bit-pattern
   // dispatch) so C++ narrowing accepts the cases.
+  if (!CT->isIntegerType()) {
+    unsigned Bits = SI->getCondition()->getType()->getIntegerBitWidth();
+    QualType IntegerTy = AST->getIntTypeForBitwidth(Bits, false);
+    if (IntegerTy.isNull())
+      return Cond;
+    CastKind K = Cond->getType()->isPointerType() ? CK_PointerToIntegral
+                                                  : CK_IntegralCast;
+    CT = IntegerTy;
+    return CStyleCastExpr::Create(*AST, IntegerTy, VK_PRValue, K, Cond,
+                                  nullptr, FPOptionsOverride(),
+                                  AST->getTrivialTypeSourceInfo(IntegerTy),
+                                  SourceLocation(), SourceLocation());
+  }
   Expr *Stripped = Cond;
   while (auto *IC = dyn_cast<ImplicitCastExpr>(Stripped))
     Stripped = IC->getSubExpr();

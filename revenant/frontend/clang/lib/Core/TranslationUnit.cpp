@@ -207,8 +207,7 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = DI ? Types.typeOfDI(DI)
-                            : Types.typeOf(AI->getAllocatedType(), nullptr);
+        c::QualType LT = Types.typeOf(AI->getAllocatedType(), DI);
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
@@ -244,11 +243,22 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
   if (!RT->isVoidType()) {
     SmallVector<c::Stmt *, 2> Tail;
     Tail.push_back(Body);
-    Tail.push_back(c::ReturnStmt::Create(
-        AST, c::SourceLocation(),
-        c::IntegerLiteral::Create(AST, APInt(AST.getIntWidth(RT), 0), RT,
-                                  c::SourceLocation()),
-        nullptr));
+    c::Expr *Zero = c::IntegerLiteral::Create(
+        AST, APInt(64, 0), AST.UnsignedLongLongTy, c::SourceLocation());
+    if (RT->isPointerType())
+      Zero = c::CStyleCastExpr::Create(
+          AST, RT, c::VK_PRValue, c::CK_NullToPointer, Zero, nullptr,
+          c::FPOptionsOverride(), AST.getTrivialTypeSourceInfo(RT),
+          c::SourceLocation(), c::SourceLocation());
+    else if (RT->isIntegerType() && RT != AST.UnsignedLongLongTy) {
+      c::TypeSourceInfo *TSI = AST.getTrivialTypeSourceInfo(RT);
+      Zero = c::CStyleCastExpr::Create(
+          AST, RT, c::VK_PRValue, c::CK_IntegralCast, Zero, nullptr,
+          c::FPOptionsOverride(), TSI, c::SourceLocation(),
+          c::SourceLocation());
+    }
+    Tail.push_back(c::ReturnStmt::Create(AST, c::SourceLocation(), Zero,
+                                         nullptr));
     Body = c::CompoundStmt::Create(AST, Tail, c::FPOptionsOverride(),
                                    c::SourceLocation(), c::SourceLocation());
   }
