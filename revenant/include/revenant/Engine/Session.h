@@ -68,7 +68,7 @@ struct FunctionClassification {
 };
 
 /// Which representation --emit / the API asks for.
-enum class EmitKind { Source, Asm, IrRaw, IrClean, IrFinal };
+enum class EmitKind { Source, Asm, IrRaw, IrClean, IrPreLike, IrFinal };
 
 /// Options for one decompile run.
 struct DecompileOpts {

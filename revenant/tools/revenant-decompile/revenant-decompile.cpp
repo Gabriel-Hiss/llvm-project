@@ -84,7 +84,7 @@ static std::optional<EmitKind> emitKind(StringRef S) {
       .Case("ir-raw", EmitKind::IrRaw)
       .Case("ir-clean", EmitKind::IrClean)
       .Case("ir-final", EmitKind::IrFinal)
-      .Case("source", EmitKind::Source)
+      .Case("ir-pre-like", EmitKind::IrPreLike)
       .Default(std::nullopt);
 }
 

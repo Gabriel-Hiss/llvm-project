@@ -801,6 +801,14 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       break;
     }
 
+    // ---- ir-pre-like --------------------------------------------------------
+    // Emit right after cleanup + idioms, before any deopt passes. This gives
+    // a baseline to compare against ir-final and the compiler's ir-pre.
+    if (Opts.Emit == EmitKind::IrPreLike) {
+      R.Text = CleanText;
+      break;
+    }
+
     // ---- ir-final ----------------------------------------------------------
     if (auto E =
             runPipelineText("ir-final", M,
