@@ -196,11 +196,13 @@ excluded). The outlined `.part.0` owners `d_encoding` and
 `d_index_template_argument` are likewise left intact. No oracle/PDB data is
 consulted by the pass.
 
-The same pass was attempted on fresh normalized `c-clang-o2lto` IR. It did not
-produce a measurable result: after `revenant-unipo`, LLVM asserted in constant
-uniquing (`Constant not found in constant table`) and verification reported
-attribute/module-context mismatches. Baseline `opt -passes=verify` on the input
-passed, so this failure is in the pass path and remains open.
+On fresh normalized `c-clang-o2lto` IR, the statically linked
+`revenant-opt -passes=revenant-unipo,verify` run succeeds: definitions change
+from 3,401 to 3,358 (43 duplicate bodies folded), with 260 surviving
+definitions changing return or parameter types. This is not a GCC named-clone
+oracle corpus, so it is reported separately, not added to the 9-entry GCC
+recovery score. The earlier plugin-DLL run failed because of cross-LLVMContext
+constant/attribute state; the static run avoids that plugin boundary.
 
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
