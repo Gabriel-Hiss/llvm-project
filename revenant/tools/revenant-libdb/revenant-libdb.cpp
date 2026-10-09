@@ -689,8 +689,11 @@ static int matchBinary() {
       continue;
     auto Candidate = std::find_if(
         Matches.begin(), Matches.end(), [&](const LibraryMatch &M) {
-          return M.Start == Match.Start &&
-                 DBOrErr->Functions[M.FunctionIndex].Name == Name->second;
+          if (M.Start != Match.Start)
+            return false;
+          const std::string &DBName = DBOrErr->Functions[M.FunctionIndex].Name;
+          return DBName == Name->second ||
+                 Name->second == DBName + "__" + utohexstr(M.Start.Value, true);
         });
     if (Candidate == Matches.end())
       continue;
@@ -708,7 +711,7 @@ static int matchBinary() {
           // Spelling variants (decorations, closure/hash tokens, template
           // sugar) compare on alphanumeric runs; substring containment
           // covers impl-block spellings like `<T as Trait>::fmt`.
-          std::string Got = normKey(Name->second);
+          std::string Got = normKey(F.Name);
           std::string Want = normKey(PDBName);
           Correct = !Want.empty() &&
                     (Got == Want || Got.find(Want) != std::string::npos ||
@@ -719,7 +722,7 @@ static int matchBinary() {
       }
     }
     outs() << format_hex_no_prefix(Match.Start.Value, 0, true) << ','
-           << '"' << Name->second << "\",\"" << F.Archive << "\",\""
+           << '"' << F.Name << "\",\"" << F.Archive << "\",\""
            << F.Member << "\"," << (Sig ? Sig->Params.size() : 0) << ",\""
            << PDBName << "\"," << Correct << '\n';
   }

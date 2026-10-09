@@ -65,6 +65,8 @@ struct DecompileOpts {
   std::string ArtifactBase;
   /// Run the optional patterns stage when the pass exists.
   bool Patterns = false;
+  /// Optional static-library database used to recover function names/types.
+  std::string LibraryDBPath;
 };
 
 /// Per-function decompile result plus stage outputs.
