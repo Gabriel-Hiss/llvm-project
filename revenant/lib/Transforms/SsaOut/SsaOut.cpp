@@ -13,6 +13,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
@@ -140,6 +141,31 @@ std::string sanitize(StringRef N) {
   return S;
 }
 
+// DILocation stores its line in 32 bits; use the low 32 bits of the
+// instruction VA as a stable location, or zero when provenance is absent.
+unsigned debugLineFromVA(const Instruction &I) {
+  MDNode *VA = I.getMetadata("revenant.va");
+  if (!VA || VA->getNumOperands() == 0)
+    return 0;
+  auto *CAM = dyn_cast<ConstantAsMetadata>(VA->getOperand(0));
+  auto *CI = CAM ? dyn_cast<ConstantInt>(CAM->getValue()) : nullptr;
+  return CI ? static_cast<unsigned>(CI->getZExtValue()) : 0;
+}
+
+bool attachMissingCallLocations(Function &F, DISubprogram &SP) {
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (!isa<CallBase>(I) || I.getDebugLoc())
+        continue;
+      I.setDebugLoc(DILocation::get(F.getContext(), debugLineFromVA(I), 0,
+                                    &SP));
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 } // namespace
 
 PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
@@ -157,6 +183,7 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   DICompileUnit *CU = nullptr;
   DIFile *File = nullptr;
   DISubprogram *SP = F.getSubprogram();
+  bool Changed = false;
   if (NamedMDNode *CUs = M->getNamedMetadata("llvm.dbg.cu")) {
     if (CUs->getNumOperands() > 0)
       CU = dyn_cast<DICompileUnit>(CUs->getOperand(0));
@@ -205,7 +232,12 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
                             DISubprogram::SPFlagDefinition |
                                 DISubprogram::SPFlagOptimized);
     F.setSubprogram(SP);
+    Changed = true;
   }
+  // SSA-out can introduce the first !dbg scope, notably when replaying the
+  // pipeline with revenant-types disabled. Give every call a location now;
+  // otherwise LLVM rejects inlinable calls in this debug-info function.
+  Changed |= attachMissingCallLocations(F, *SP);
 
   // One local per phi web + per materialized def. Keyed by canonical
   // name so web members share the slot.
@@ -213,7 +245,6 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   std::map<std::string, AllocaInst *> LocalByName;
   DenseMap<AllocaInst *, DILocalVariable *> LocalVar;
   unsigned TmpN = 0;
-  bool Changed = false;
 
   auto getOrCreateLocal = [&](std::string Key, Type *Ty,
                               const Instruction *Provenance) -> AllocaInst * {
