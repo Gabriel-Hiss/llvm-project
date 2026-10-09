@@ -53,6 +53,34 @@ def inline_records(path):
     return result
 
 
+def mask_ids(line):
+    return re.sub(r'(!|#)\d+', r'\1?', line)
+
+
+def body_lines(text):
+    return [mask_ids(line) for line in text.splitlines()
+            if not line.startswith(('!', 'attributes #', ';'))]
+
+
+def meta_nodes(text):
+    return sorted(mask_ids(line.split(' = ', 1)[1])
+                  if ' = ' in line else mask_ids(line)
+                  for line in text.splitlines()
+                  if line.startswith(('!', 'attributes #')))
+
+
+def semantic_equal(before, after):
+    """Bodies equal after strip-debug, up to numbering.
+
+    Line-table debug info changes which distinct scope nodes each compile
+    emits, so metadata contents legitimately differ between two identical
+    compiles of the same TU. What must agree exactly is every body line
+    (with numbering masked): opcodes, operands, types, attributes and the
+    metadata attachments on instructions.
+    """
+    return body_lines(before) == body_lines(after)
+
+
 def normalized_ir(path, opt):
     run = subprocess.run([str(opt), '-strip-debug', '-passes=verify',
                           '-S', str(path)],
@@ -60,7 +88,6 @@ def normalized_ir(path, opt):
     if run.returncode:
         raise ValueError(run.stderr)
     return re.sub(r'^; ModuleID =.*\n', '', run.stdout)
-
 
 def verified_index(path, opt, corpus):
     result, rejected, validation = {}, [], []
@@ -77,7 +104,7 @@ def verified_index(path, opt, corpus):
                             if f['kind'] == 'ir-post' and f['tu'] == item['tu'])
             before = normalized_ir(original, opt)
             replay = normalized_ir(item['generated_ir'], opt)
-            same = before == replay
+            same = semantic_equal(before, after=replay)
             item['identical_after_strip_debug'] = same
             item['original_semantic_sha256'] = hashlib.sha256(before.encode()).hexdigest()
             item['replay_semantic_sha256'] = hashlib.sha256(replay.encode()).hexdigest()
