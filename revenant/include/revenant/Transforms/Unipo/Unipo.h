@@ -2,14 +2,10 @@
 //
 // Part of the Revenant LLVM fork.
 //
-// Inverts one family of LLVM IPO transforms on lifted IR: DeadArgElim's
-// return elimination (i32/i64 -> void when every caller drops the value)
-// and dead-argument removal (a trailing formal nobody reads), IPSCCP/
-// function-specialization clones (`.constprop.N`, `.isra.N`,
-// `.specialized.N`, `.lto_priv`, `.llvm.N` folded back under the base
-// name with the constant as an argument), and ArgPromotion's by-value
-// struct splitting. Each rewrite is a semantics-preserving equivalence;
-// see Unipo.cpp for the per-shape guards.
+// Inverts selected LLVM IPO transforms on lifted IR: source-DI-backed return
+// restoration, DI-backed dead-formal restoration, named clone recovery, and
+// same-signature structural clone folding. Every signature rewrite needs
+// independent evidence for its source-level shape; see Unipo.cpp guards.
 //
 // Runs on LLVM IR only, as the module pass `revenant-unipo` (signature
 // rewrites need a new Function object; see revenant-unabi for why a
