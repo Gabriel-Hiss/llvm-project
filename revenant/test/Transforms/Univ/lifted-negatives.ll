@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shapes Univ deliberately leaves alone: un-unrolling and countdown elimination
 ; belong to the unroll pass, and a negative step is a countdown, not an index.

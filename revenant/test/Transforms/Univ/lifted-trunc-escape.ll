@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shape from lifted c-clang-o2 `cmp_vec` (VA 0x1400019F0). The early-exit
 ; block returns the index, so the IV escapes as `trunc i64 %iv to i32` in a
