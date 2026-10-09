@@ -31,6 +31,7 @@
 #include "clang/AST/StmtCXX.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -160,7 +161,7 @@ private:
   /// Null when BB does not end in an invoke into a catchswitch or
   /// landingpad/cleanuppad dispatch.
   Stmt *tryTry(BasicBlock *BB);
-  VarDecl *catchVariable(CatchPadInst *Pad);
+  VarDecl *catchVariable(MDNode *TypeMD);
   void emitCatchBlockStmts(BasicBlock *BB, SmallVectorImpl<Stmt *> &Out);
   Expr *condOf(BranchInst *BI, BasicBlock *ContinueSucc);
   Expr *inverted(Value *V);
@@ -205,10 +206,16 @@ LabelDecl *StructuredStmtBuilder::labelFor(BasicBlock *BB) {
   if (It != Labels.end())
     return It->second;
   StringRef BlockName = BB->getName();
-  std::string Name = BlockName.empty()
-                         ? "L_anon" + Twine(Labels.size()).str()
-                         : labelName(*BB);
+  std::string FunctionName = FD->getNameAsString();
+  for (char &C : FunctionName)
+    if (!isAlnum(C) && C != '_')
+      C = '_';
+  std::string Name =
+      FunctionName + "_" +
+      (BlockName.empty() ? "L_anon" + Twine(Labels.size()).str()
+                         : labelName(*BB));
   IdentifierInfo *II = Ctx.ident(Name);
+
   if (LabelNames.contains(II)) {
     Name += "_" + Twine(Labels.size()).str();
     II = Ctx.ident(Name);
@@ -1075,7 +1082,8 @@ void StructuredStmtBuilder::emitCatchBlockStmts(
     if (auto *CI = dyn_cast<CallInst>(&I)) {
       if (Function *Callee = CI->getCalledFunction()) {
         StringRef N = Callee->getName();
-        if (N == "llvm.eh.exceptioncode" || N == "llvm.eh.typeid.for")
+        if (N == "__cxa_begin_catch" || N == "__cxa_end_catch" ||
+            N == "llvm.eh.exceptioncode" || N == "llvm.eh.typeid.for")
           continue;
       }
     }
@@ -1083,22 +1091,34 @@ void StructuredStmtBuilder::emitCatchBlockStmts(
       Out.push_back(S);
   }
 }
-VarDecl *StructuredStmtBuilder::catchVariable(CatchPadInst *Pad) {
-  MDNode *TypeMD = Pad->getMetadata("revenant.catchtype");
+VarDecl *StructuredStmtBuilder::catchVariable(MDNode *TypeMD) {
   auto *TypeName = TypeMD && TypeMD->getNumOperands() == 1
                        ? dyn_cast<MDString>(TypeMD->getOperand(0))
                        : nullptr;
   if (!TypeName || !FD)
     return nullptr;
   StringRef Decorated = TypeName->getString();
-  if (!Decorated.starts_with(".?AV") && !Decorated.starts_with(".?AU"))
-    return nullptr;
-  StringRef Body = Decorated.drop_front(4);
-  if (!Body.ends_with("@@"))
-    return nullptr;
-  Body = Body.drop_back(2);
   SmallVector<StringRef, 4> Parts;
-  Body.split(Parts, '@');
+  if (Decorated.starts_with("St")) {
+    StringRef Encoded = Decorated.drop_front(2);
+    size_t Digits = 0;
+    while (Digits < Encoded.size() && isDigit(Encoded[Digits]))
+      ++Digits;
+    unsigned Length = 0;
+    if (!Digits || Encoded.take_front(Digits).getAsInteger(10, Length) ||
+        Length == 0 || Length > Encoded.size() - Digits)
+      return nullptr;
+    Parts.push_back(Encoded.drop_front(Digits).take_front(Length));
+    Parts.push_back("std");
+  } else {
+    if (!Decorated.starts_with(".?AV") && !Decorated.starts_with(".?AU"))
+      return nullptr;
+    StringRef Body = Decorated.drop_front(4);
+    if (!Body.ends_with("@@"))
+      return nullptr;
+    Body = Body.drop_back(2);
+    Body.split(Parts, '@');
+  }
   if (Parts.size() < 2 || Parts.front().empty())
     return nullptr;
 
@@ -1195,26 +1215,47 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
       IsSEH = GV->getName() == "__C_specific_handler";
   }
 
-  // Try body: spell the invoke's call through a scratch CallInst so
-  // ExprBuilder (which only takes CallInst) prints the real call.
+  // A decoded try-table entry can protect several invoke sites. Gather the
+  // calls carrying its region ID and emit one AST try around them, using the
+  // first site's shared handler set.
+  SmallVector<InvokeInst *, 8> RegionInvokes{II};
+  SmallVector<BasicBlock *, 8> RegionBlocks{BB};
+  if (MDNode *Region = II->getMetadata("revenant.eh.region")) {
+    for (BasicBlock *Candidate : Blocks) {
+      if (Candidate == BB || EHClaimed.contains(Candidate))
+        continue;
+      auto *Other = dyn_cast<InvokeInst>(Candidate->getTerminator());
+      if (!Other || Other->getMetadata("revenant.eh.region") != Region)
+        continue;
+      RegionInvokes.push_back(Other);
+      RegionBlocks.push_back(Candidate);
+    }
+  }
+
+  // Try body: spell each invoke's call through a scratch CallInst so
+  // ExprBuilder (which only takes CallInst) prints the real calls.
   SmallVector<Stmt *, 8> TryBody;
-  {
-    // Unparented scratch call: never inserted into the function, so no
-    // CFG or dominator invalidation. Deleted after spelling.
-    SmallVector<Value *, 8> Args(II->args());
+  for (InvokeInst *Protected : RegionInvokes) {
+    SmallVector<Value *, 8> Args(Protected->args());
     CallInst *ScratchCall = CallInst::Create(
-        II->getFunctionType(), II->getCalledOperand(), Args);
-    ScratchCall->setCallingConv(II->getCallingConv());
-    ScratchCall->setAttributes(II->getAttributes());
+        Protected->getFunctionType(), Protected->getCalledOperand(), Args);
+    ScratchCall->setCallingConv(Protected->getCallingConv());
+    ScratchCall->setAttributes(Protected->getAttributes());
     if (Stmt *S = Exprs->instr(*ScratchCall, *Scope))
       TryBody.push_back(S);
     delete ScratchCall;
   }
 
-  EHClaimed.insert(BB);
-  for (BasicBlock *H : Handlers)
-    EHClaimed.insert(H);
-  EHClaimed.insert(Dispatch);
+  for (BasicBlock *Protected : RegionBlocks) {
+    EHClaimed.insert(Protected);
+    BasicBlock *ProtectedDispatch =
+        cast<InvokeInst>(Protected->getTerminator())->getUnwindDest();
+    EHClaimed.insert(ProtectedDispatch);
+    for (Instruction &I : *ProtectedDispatch)
+      if (auto *ProtectedSwitch = dyn_cast<CatchSwitchInst>(&I))
+        for (BasicBlock *H : ProtectedSwitch->handlers())
+          EHClaimed.insert(H);
+  }
 
   if (IsSEH && CP && CP->getMetadata("revenant.finally")) {
     SmallVector<Stmt *, 4> FinallyBody;
@@ -1252,11 +1293,14 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
   SmallVector<Stmt *, 2> CatchStmts;
   for (BasicBlock *H : Handlers) {
     VarDecl *ExceptionDecl = nullptr;
-    for (Instruction &I : *H)
-      if (auto *Pad = dyn_cast<CatchPadInst>(&I)) {
-        ExceptionDecl = catchVariable(Pad);
+    for (Instruction &I : *H) {
+      if (auto *Pad = dyn_cast<CatchPadInst>(&I))
+        ExceptionDecl = catchVariable(Pad->getMetadata("revenant.catchtype"));
+      else if (auto *LP = dyn_cast<LandingPadInst>(&I))
+        ExceptionDecl = catchVariable(LP->getMetadata("revenant.catchtype"));
+      if (ExceptionDecl)
         break;
-      }
+    }
     SmallVector<Stmt *, 4> HandlerBody;
     emitCatchBlockStmts(H, HandlerBody);
     if (auto *CR = dyn_cast<CatchReturnInst>(H->getTerminator())) {
@@ -1288,12 +1332,13 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
         auto *RI = dyn_cast<ReturnInst>(Continuation->getTerminator());
         if (RI) {
           Value *ReturnValue = RI->getReturnValue();
-          if (auto *Load = dyn_cast<LoadInst>(ReturnValue))
-            for (Instruction &I : *H)
-              if (auto *Store = dyn_cast<StoreInst>(&I);
-                  Store && Store->getPointerOperand() ==
-                               Load->getPointerOperand())
-                ReturnValue = Store->getValueOperand();
+          if (ReturnValue)
+            if (auto *Load = dyn_cast<LoadInst>(ReturnValue))
+              for (Instruction &I : *H)
+                if (auto *Store = dyn_cast<StoreInst>(&I);
+                    Store &&
+                    Store->getPointerOperand() == Load->getPointerOperand())
+                  ReturnValue = Store->getValueOperand();
           if (ReturnValue)
             HandlerBody.push_back(ReturnStmt::Create(
                 *AST, SourceLocation(), Exprs->retVal(ReturnValue, *Scope),

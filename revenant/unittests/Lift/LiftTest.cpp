@@ -32,6 +32,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Error.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/Support/MemoryBuffer.h"
 
 // revenant::Function/BasicBlock collide with llvm::Function/BasicBlock;
@@ -264,6 +265,59 @@ TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
     EXPECT_TRUE(ModuleVerified) << Input.first;
     EXPECT_GE(Verified * 100, Total * 99) << Input.first;
   }
+}
+
+TEST(LiftFunction, SoftwareInterruptsLift) {
+  // `int imm8` lifts to a call of llvm.x86.int(vector): int3 is vector 3,
+  // int 0x29 (__fastfail) additionally marks the call site noreturn.
+  const uint8_t Code[] = {0xCD, 0x29, 0xCC, 0xC3}; // int 0x29; int3; ret
+  auto Img = std::make_shared<Image>();
+  Img->Base = Va(0x140000000);
+  Section Sec;
+  Sec.Name = ".text";
+  Sec.SecVa = Va(0x140001000);
+  Sec.Vsize = sizeof(Code);
+  Sec.Data.assign(Code, Code + sizeof(Code));
+  Sec.Flags = SectionFlags::rx();
+  Img->Sections.push_back(Sec);
+  auto D = Disasm::create(*Img);
+  ASSERT_FALSE(!D) << toString(D.takeError());
+  std::vector<Instr> Block =
+      D->decodeSlice(Sec.SecVa, llvm::ArrayRef(Code, sizeof(Code)));
+  ASSERT_EQ(Block.size(), 3u);
+
+  Program P = emptyProgram(Img);
+  FuncRecord R = singleBlockFunc(P, Block);
+  llvm::LLVMContext C;
+  llvm::Module M("int_trap", C);
+  auto Lifted = lift::liftFunction(M, P, R, *D, nullptr, nullptr,
+                                   /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+
+  const llvm::Function *IntDecl = M.getFunction("llvm.x86.int");
+  ASSERT_NE(IntDecl, nullptr) << "no llvm.x86.int declaration";
+  std::vector<const llvm::CallInst *> Calls;
+  for (const llvm::User *U : IntDecl->users())
+    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U))
+      Calls.push_back(CI);
+  ASSERT_EQ(Calls.size(), 2u);
+  auto VectorOf = [](const llvm::CallInst *CI) {
+    const auto *Imm =
+        llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(0));
+    return Imm ? Imm->getZExtValue() : ~0ull;
+  };
+  const llvm::CallInst *FastFail = nullptr;
+  const llvm::CallInst *DebugTrap = nullptr;
+  for (const llvm::CallInst *CI : Calls) {
+    if (VectorOf(CI) == 0x29)
+      FastFail = CI;
+    if (VectorOf(CI) == 3)
+      DebugTrap = CI;
+  }
+  ASSERT_NE(FastFail, nullptr);
+  ASSERT_NE(DebugTrap, nullptr);
+  EXPECT_TRUE(FastFail->doesNotReturn());
+  EXPECT_FALSE(DebugTrap->doesNotReturn());
 }
 
 } // end anonymous namespace

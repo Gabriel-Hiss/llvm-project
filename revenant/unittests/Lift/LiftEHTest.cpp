@@ -93,6 +93,19 @@ TEST(LiftEHTest, MsvcCallInTryBecomesInvokeWithCatchswitch) {
       if (isa<CatchPadInst>(I))
         ++Pads;
     }
+  InvokeInst *Invoke = nullptr;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB)
+      if (auto *II = dyn_cast<InvokeInst>(&I))
+        Invoke = II;
+  ASSERT_NE(Invoke, nullptr);
+  MDNode *Region = Invoke->getMetadata("revenant.eh.region");
+  ASSERT_NE(Region, nullptr);
+  auto *RegionValue =
+      dyn_cast<ConstantInt>(cast<ConstantAsMetadata>(Region->getOperand(0))
+                                ->getValue());
+  ASSERT_NE(RegionValue, nullptr);
+  EXPECT_EQ(RegionValue->getZExtValue(), 0u);
   EXPECT_EQ(Invokes, 1u);
   EXPECT_EQ(Switches, 1u);
   EXPECT_EQ(Pads, 1u);
@@ -159,6 +172,45 @@ TEST(LiftEHTest, ItaniumRangeEmitsLandingpad) {
       if (isa<LandingPadInst>(I))
         ++Pads;
   EXPECT_EQ(Pads, 1u);
+}
+TEST(LiftEHTest, ItaniumCatchHasTypedLandingpadAndConsumesException) {
+  LLVMContext &C = ctx();
+  Module M("t_lifteh_itanium_catch", C);
+  Function *F = makeCaller(M, "f_itanium_catch", 0x1100);
+  FunctionEH EH;
+  EH.Function = Va(0x1000);
+  EH.End = Va(0x1200);
+  EH.Model = EHModel::Itanium;
+  EHTryRegion T;
+  T.Begin = Va(0x1000);
+  T.End = Va(0x1200);
+  T.Handlers.push_back(0);
+  EH.TryRegions.push_back(T);
+  EHHandler H;
+  H.Address = Va(0x1300);
+  H.Kind = HandlerKind::Catch;
+  H.TypeName = "St9exception";
+  H.TypeDescriptor = Va(0x1400);
+  EH.Handlers.push_back(H);
+
+  EXPECT_EQ(liftEH(*F, EH), 1u);
+  EXPECT_TRUE(!verifyFunction(*F, &errs()));
+  unsigned TypedPads = 0;
+  bool BeginCatch = false;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB) {
+      if (auto *LP = dyn_cast<LandingPadInst>(&I)) {
+        ++TypedPads;
+        EXPECT_EQ(LP->getNumClauses(), 1u);
+        EXPECT_TRUE(isa<ConstantExpr>(LP->getClause(0)));
+        EXPECT_TRUE(LP->getMetadata("revenant.catchtype"));
+      }
+      if (auto *Call = dyn_cast<CallBase>(&I))
+        if (Function *Callee = Call->getCalledFunction())
+          BeginCatch |= Callee->getName() == "__cxa_begin_catch";
+    }
+  EXPECT_EQ(TypedPads, 1u);
+  EXPECT_TRUE(BeginCatch);
 }
 
 } // namespace

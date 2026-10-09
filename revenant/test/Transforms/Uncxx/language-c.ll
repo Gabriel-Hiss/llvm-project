@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uncxx -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uncxx,verify -S %s | %FileCheck %s
 ; The module language flag must stop STL recovery on C IR, even when a
 ; struct happens to contain two pointer fields at the vector first/last offsets.
 ; CHECK-LABEL: define i1 @c_pointer_fields_equal

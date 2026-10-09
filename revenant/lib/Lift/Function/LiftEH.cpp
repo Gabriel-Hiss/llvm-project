@@ -37,6 +37,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 
 using namespace llvm;
@@ -177,18 +178,46 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     // Build the pad in the dispatch block per model.
     Value *Pad = nullptr;
     if (EH.Model == EHModel::Itanium) {
-      // MinGW LSDA: landingpad + resume. Catch clauses come from the
-      // type table when the action is nonzero; cleanup always present
-      // for the unwind-only shape.
       auto *LP = LandingPadInst::Create(
           StructType::get(C, {PointerType::getUnqual(C), Type::getInt32Ty(C)}),
           0, "eh.lpad", Dispatch);
-      LP->setCleanup(true);
-      auto *Resume = ResumeInst::Create(LP, Dispatch);
+      bool HasCatch = false;
+      for (const EHHandler *H : Handlers) {
+        if (H->Kind != HandlerKind::Catch)
+          continue;
+        Constant *TypeInfo = ConstantPointerNull::get(
+            PointerType::getUnqual(C));
+        if (H->TypeDescriptor)
+          TypeInfo = ConstantExpr::getIntToPtr(
+              ConstantInt::get(Type::getInt64Ty(C),
+                               H->TypeDescriptor->Value),
+              PointerType::getUnqual(C));
+        LP->addClause(TypeInfo);
+        HasCatch = true;
+        if (!H->TypeName.empty())
+          LP->setMetadata("revenant.catchtype",
+                          MDNode::get(C, MDString::get(C, H->TypeName)));
+      }
+      if (HasCatch) {
+        auto *ExceptionObject =
+            IRBuilder<>(Dispatch).CreateExtractValue(LP, 0, "eh.object");
+        FunctionCallee BeginCatch = M->getOrInsertFunction(
+            "__cxa_begin_catch",
+            FunctionType::get(PointerType::getUnqual(C),
+                              {PointerType::getUnqual(C)}, false));
+        FunctionCallee EndCatch = M->getOrInsertFunction(
+            "__cxa_end_catch", FunctionType::get(Type::getVoidTy(C), {}, false));
+        IRBuilder<> Builder(Dispatch);
+        Builder.CreateCall(BeginCatch, {ExceptionObject});
+        Builder.CreateCall(EndCatch);
+        Builder.CreateBr(Normal);
+      } else {
+        LP->setCleanup(true);
+        auto *Resume = ResumeInst::Create(LP, Dispatch);
+        ir::copyInstructionVA(*CI, *Resume);
+      }
       ir::copyInstructionVA(*CI, *LP);
-      ir::copyInstructionVA(*CI, *Resume);
-      (void)Handler;
-      (void)Cleanup;
+      Pad = LP;
     } else if (Handler && Handler->Kind != HandlerKind::Finally &&
                Handler->Kind != HandlerKind::Cleanup &&
                (EH.Model == EHModel::MSVC || EH.Model == EHModel::SEH)) {
@@ -271,6 +300,10 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     II->setCallingConv(CI->getCallingConv());
     II->setAttributes(CI->getAttributes());
     ir::copyInstructionVA(*CI, *II);
+    II->setMetadata(
+        "revenant.eh.region",
+        MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
+                        Type::getInt32Ty(C), RI))}));
     if (CI->use_empty()) {
       CI->eraseFromParent();
     } else if (pred_size(Normal) == 1 && !II->getType()->isVoidTy()) {

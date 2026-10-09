@@ -53,7 +53,13 @@ from iced_x86 import (  # noqa: E402
 )
 
 
-def corpus_ids(parity_root: Path, ccpp_only=True):
+def corpus_ids(parity_root: Path, kinds=None):
+    """Oracle-backed corpus ids; `kinds` limits the corpus `kind` field
+    (None = native+gnu C/C++ targets, empty = every kind)."""
+    if kinds is None:
+        kinds = ("native", "gnu")
+    else:
+        kinds = set(kinds) or None
     targets = []
     for frag in sorted((HARNESS / "corpus.d").glob("*.json")) + [HARNESS / "corpus.json"]:
         try:
@@ -62,7 +68,7 @@ def corpus_ids(parity_root: Path, ccpp_only=True):
             continue
     ids = []
     for t in targets:
-        if ccpp_only and t.get("kind") not in ("native", "gnu"):
+        if kinds is not None and t.get("kind") not in kinds:
             continue
         if (parity_root / t["id"] / "oracle" / "oracle-items.bin").exists():
             ids.append(t["id"])
@@ -133,11 +139,29 @@ def _operand_width(text):
 def canon(text, near_branch=False, ip_rel_memory=False,
           symbol_memory=False, memory_index=None, memory_scale=1):
     """Normalize printer-only Intel differences and preserve operand identity."""
-    t = _PAREN.sub("", text).strip().lower()
+    # iced-x86 spells legacy PCLMUL immediate variants as separate
+    # mnemonics; LLVM's printer uses the base mnemonic plus the selector.
+    pclmul_aliases = {
+        "pclmullqlqdq": ("pclmulqdq", 0),
+        "pclmullqhqdq": ("pclmulqdq", 16),
+        "pclmulhqlqdq": ("pclmulqdq", 1),
+        "pclmulhqhqdq": ("pclmulqdq", 17),
+        "vpclmullqlqdq": ("vpclmulqdq", 0),
+        "vpclmullqhqdq": ("vpclmulqdq", 16),
+        "vpclmulhqlqdq": ("vpclmulqdq", 1),
+        "vpclmulhqhqdq": ("vpclmulqdq", 17),
+    }
+    t = re.sub(r"^\s*addr32\s+", "", text.lower()).strip()
+    t = _PAREN.sub("", t).strip().lower()
+    head0 = t.split(None, 1)[0] if t else ""
+    if head0 in pclmul_aliases:
+        mnemonic, selector = pclmul_aliases[head0]
+        operands = t.split(None, 1)[1].split(",")
+        t = mnemonic + " " + ", ".join(operands) + f", {selector}"
     if ip_rel_memory:
         t = _RIPBR.sub("[@]", t)
-        # The oracle may contain an unrelocated object literal; the final
-        # binary decode established that this bracket operand is RIP-relative.
+        # Oracle text can retain unrelocated object literals; decode the
+        # linked PE to identify the corresponding RIP-relative operand.
         t = _BAREABS.sub("[@]", t)
     elif symbol_memory:
         expr = "[@"
@@ -147,6 +171,8 @@ def canon(text, near_branch=False, ip_rel_memory=False,
                 expr += "*" + str(memory_scale)
         expr += "]"
         t = re.sub(r"\[[^\]]*\]", expr, t, count=1)
+    if t.startswith("hint-taken "):
+        t = t[len("hint-taken "):]
     if near_branch:
         mnemonic = t.split(None, 1)[0] if t else ""
         return mnemonic + "@"
@@ -165,6 +191,8 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     head = {"fwait": "wait", "fucompi": "fucomip", "fcompi": "fcomip"}.get(
         head, head)
     operands = [o.strip() for o in rest.split(",")] if rest.strip() else []
+    if head == "sha256rnds2" and operands[-1:] == ["xmm0"]:
+        operands = operands[:-1]
     if head.startswith("f") and head != "fs":
         # x87 implicit operands: the stack top and (for pops/exchange) st(1)
         # print explicitly in one syntax and not in the other.
@@ -175,7 +203,7 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     if head in ("pblendvb", "blendvps", "blendvpd") and operands[-1:] == ["xmm0"]:
         operands = operands[:-1]
     if head == "xchg" and len(operands) == 2:
-        operands = sorted(operands)
+        operands = sorted(operands, key=lambda o: _WS.sub('', _PTR.sub('', o)))
     if head == "push" and len(operands) == 1:
         neg = re.fullmatch(r"-(0x[0-9a-f]+|[0-9a-f]+h|\d+)", operands[0])
         if neg:
@@ -190,6 +218,7 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     t = re.sub(r",\s*-(0x[0-9a-f]+|[0-9a-f]+h|\d+)\b",
                mask_negative_immediate, t)
     t = _PTR.sub("", t)
+    t = re.sub(r"\b(?:ds|ss):", "", t)
     t = _SCALE.sub(r"\2*\1", t)
     t = _NUMBER.sub(lambda m: f"#{_number_value(m.group(0))}", t)
     t = _WS.sub("", t)
@@ -328,7 +357,9 @@ def asm_metric(bindir: Path, revdir: Path, binary: Path):
                     ip_rel_memory=oracle_mem is not None and symbol_mem is None,
                     symbol_memory=symbol_mem is not None,
                     memory_index=memory_index, memory_scale=memory_scale)
-                loose = lambda s: re.sub(r"#\d+", "#", s)
+                loose = lambda s: re.sub(
+                    r"#\d+", "#",
+                    re.sub(r"[+-]#\d+(?=\])", "", s))
                 ok = (revenant_text == linked and
                       loose(oracle_text) == loose(linked))
             checked += 1
@@ -394,15 +425,16 @@ def merge_asm(parity_root, tag, only):
     return rows
 
 
-def update_parity_doc(tag, summary):
+def update_parity_doc(tag, summary, section="ccpp"):
     path = Path(__file__).resolve().parents[2] / "docs" / "parity.md"
     text = path.read_text()
-    start = "<!-- parity-results:start -->"
-    end = "<!-- parity-results:end -->"
+    start = f"<!-- parity-results:{section}-start -->"
+    end = f"<!-- parity-results:{section}-end -->"
     start_at = text.index(start) + len(start)
     end_at = text.index(end, start_at)
+    label = "C/C++" if section == "ccpp" else section.capitalize()
     lines = [
-        f"Latest C/C++ scan (`{tag}`): {summary['binaries']} binaries, "
+        f"Latest {label} scan (`{tag}`): {summary['binaries']} binaries, "
         f"{summary['clean']} clean; missing={summary['total_missing']}, "
         f"conflicts={summary['total_conflicts']}, "
         f"ASM mismatches={summary['total_asm_text_mismatch']}.",
@@ -432,28 +464,29 @@ def main():
     ap.add_argument("--tag", default="swe2pd")
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--all-kinds", action="store_true")
+    ap.add_argument("--kinds", nargs="*", default=None,
+                    help="corpus kinds to include when --only is absent "
+                         "(default native+gnu; use --all-kinds for all)")
+    ap.add_argument("--section", choices=("ccpp", "rust"), default=None,
+                    help="parity.md section to refresh on a full scan")
     ap.add_argument("--asm-only", action="store_true",
-                    help="skip compare.py; only (re)compute asm metrics")
+                    help="skip compare.py; only recompute ASM metrics")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
-    full_ccpp_scan = args.only is None and not args.all_kinds
-
+    full_scan = args.only is None
     exporter = args.revenant_dir / "export-parity.cmd"
     if not exporter.exists() or not (args.revenant_dir / "revenant.exe").exists():
         sys.exit(f"exporter pair missing in {args.revenant_dir}")
-
     only = args.only
     if only is None:
-        only = corpus_ids(args.parity_root, ccpp_only=not args.all_kinds)
-
+        kinds = [] if args.all_kinds else args.kinds
+        only = corpus_ids(args.parity_root, kinds=kinds)
     if not only:
         sys.exit("no oracle-backed corpus ids selected")
-
     if not args.asm_only:
         rc = run_compare(args.parity_root, exporter, args.tag, only)
         if rc != 0:
             sys.exit(f"compare.py exited {rc}")
-
     rows = merge_asm(args.parity_root, args.tag, only)
     missing_reports = sorted(set(only) - {r.get("id") for r in rows})
     if missing_reports:
@@ -502,9 +535,11 @@ def main():
                          "asm_checked": r.get("asm_checked"),
                          "asm_text_mismatch": r.get("asm_text_mismatch")}
                         for r in rows]}
-
-    if full_ccpp_scan:
-        update_parity_doc(args.tag, summary)
+    if full_scan:
+        section = args.section
+        if section is None:
+            section = "ccpp" if args.kinds is None and not args.all_kinds else "rust"
+        update_parity_doc(args.tag, summary, section=section)
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))
         concise = {k: v for k, v in summary.items()

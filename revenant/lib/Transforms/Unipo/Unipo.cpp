@@ -6,15 +6,13 @@
 // FunctionPassManager pass cannot erase safely mid-iteration (LLVM's own
 // ArgPromotion and DeadArgElim are module passes for the same reason).
 //
-// Structural.cpp proves general/specialized body equivalence on normalized
-// copies before redirecting calls. This file restores signature evidence:
-// dead return values, DI formal records, and unanimous extra ABI register
-// constants at lifted calls. Clone-only recovery keeps the stripped function
-// name and replaces scalar constant uses by the newly restored formal.
-//
-// Named suffix recovery is retained for modules that have actual symbols,
-// but structural detection and ABI restoration never consult oracle names.
-// Calls copied during signature changes retain instruction metadata and VAs.
+// Structural.cpp folds equal-signature bodies only when distinct constant-data
+// references and equivalent trap tails support clone identity. It does not
+// infer source formals from caller constants. This file restores returns and
+// arguments only when debug or named-clone evidence provides the missing
+// signature shape; folded-global recovery handles the narrow GCC constprop
+// case. Calls copied during signature changes retain instruction metadata and
+// VA provenance.
 //
 //===----------------------------------------------------------------------===//
 
@@ -22,6 +20,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -33,6 +32,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugProgramInstruction.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 
@@ -40,6 +40,9 @@ using namespace llvm;
 
 namespace revenant {
 bool foldStructuralIPO(Module &M);
+// Constant equivalence modulo dedup'd constant data and trap-stub
+// declarations (Structural.cpp).
+bool constantsEquivalent(const Constant *A, const Constant *B);
 }
 
 namespace {
@@ -228,22 +231,31 @@ bool stripCloneSuffix(StringRef Name, StringRef &Base) {
 
 // Rebind only operands that permit runtime values. Switch cases, struct GEP
 // indices, intrinsic immargs and other constant-only operands stay constant.
+// Operands equivalent to C (dedup'd data globals, equivalent ConstantExprs)
+// rebind too: GCC folds the source global, the lifter re-emits it per VA.
 void rebindConstantToArg(Function &NewF, Constant *C, Argument *A) {
   if (!C || !A || C->getType() != A->getType())
     return;
   for (BasicBlock &BB : NewF)
     for (Instruction &I : BB) {
-      if (!isa<BinaryOperator>(I) && !isa<CmpInst>(I) &&
-          !isa<SelectInst>(I) && !isa<CastInst>(I) && !isa<PHINode>(I) &&
-          !isa<ReturnInst>(I) && !isa<FreezeInst>(I))
+      if (isa<BinaryOperator>(I) || isa<CmpInst>(I) || isa<SelectInst>(I) ||
+          isa<CastInst>(I) || isa<PHINode>(I) || isa<ReturnInst>(I) ||
+          isa<FreezeInst>(I) || isa<StoreInst>(I)) {
+        for (unsigned N = 0; N < I.getNumOperands(); ++N) {
+          auto *Old = dyn_cast<Constant>(I.getOperand(N));
+          if (Old && Old->getType() == C->getType() &&
+              revenant::constantsEquivalent(Old, C))
+            I.setOperand(N, A);
+        }
         continue;
-      for (unsigned N = 0; N < I.getNumOperands(); ++N) {
-        auto *Old = dyn_cast<ConstantInt>(I.getOperand(N));
-        auto *Value = dyn_cast<ConstantInt>(C);
-        if (Old && Value && Old->getType() == Value->getType() &&
-            Old->getValue() == Value->getValue())
-          I.setOperand(N, A);
       }
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        for (unsigned N = 0; N < CB->arg_size(); ++N) {
+          auto *Old = dyn_cast<Constant>(CB->getArgOperand(N));
+          if (Old && Old->getType() == C->getType() &&
+              revenant::constantsEquivalent(Old, C))
+            CB->setArgOperand(N, A);
+        }
     }
 }
 
@@ -436,9 +448,45 @@ bool rewriteSignature(Module &M, Function &F, Type *NewRet,
   return true;
 }
 
-// Rule 1: return elimination. Void function whose every return block
-// ends with the same dead computed value (or the same constant, the
-// constprop/ret-elimination boundary) gets the value restored.
+// A dead value proves what the optimized body computes, not that it was the
+// source function's return value. Use scalar return metadata to reject sret,
+// constructor and pointer-return shapes that can leave unrelated dead values.
+bool returnMatchesDebugType(Module &M, Function &F, Type *ValueTy) {
+  DISubprogram *SP = F.getSubprogram();
+  auto *ST = SP ? dyn_cast_or_null<DISubroutineType>(SP->getType()) : nullptr;
+  if (!ST || ST->getTypeArray().size() == 0)
+    return false;
+  DIType *Ty = dyn_cast_or_null<DIType>(ST->getTypeArray()[0]);
+  while (auto *Derived = dyn_cast_or_null<DIDerivedType>(Ty)) {
+    switch (Derived->getTag()) {
+    case dwarf::DW_TAG_pointer_type:
+    case dwarf::DW_TAG_reference_type:
+    case dwarf::DW_TAG_rvalue_reference_type: {
+      unsigned Bits = M.getDataLayout().getPointerSizeInBits(0);
+      return ValueTy->isIntegerTy(Bits) || ValueTy->isPointerTy();
+    }
+    case dwarf::DW_TAG_typedef:
+    case dwarf::DW_TAG_const_type:
+    case dwarf::DW_TAG_volatile_type:
+    case dwarf::DW_TAG_restrict_type:
+    case dwarf::DW_TAG_atomic_type:
+      Ty = Derived->getBaseType();
+      continue;
+    default:
+      return false;
+    }
+  }
+  auto *Basic = dyn_cast_or_null<DIBasicType>(Ty);
+  if (!Basic)
+    return false;
+  unsigned Bits = Basic->getSizeInBits();
+  if (Basic->getEncoding() == dwarf::DW_ATE_float)
+    return (Bits == 32 && ValueTy->isFloatTy()) ||
+           (Bits == 64 && ValueTy->isDoubleTy());
+  return Bits && ValueTy->isIntegerTy(Bits);
+}
+
+// Rule 1: restore a dead return only when scalar DI agrees with its ABI type.
 bool tryRestoreReturn(Module &M, Function &F) {
   if (!F.getReturnType()->isVoidTy())
     return false;
@@ -449,7 +497,7 @@ bool tryRestoreReturn(Module &M, Function &F) {
       return false;
   }
   Value *Dead = findDeadReturnValue(F);
-  if (!Dead)
+  if (!Dead || !returnMatchesDebugType(M, F, Dead->getType()))
     return false;
   Type *RT = Dead->getType();
   if (!RT->isIntegerTy() && !RT->isPointerTy() && !RT->isFloatTy() &&
@@ -465,13 +513,9 @@ bool tryRestoreReturn(Module &M, Function &F) {
                           /*RebindParam=*/-1, /*NewName=*/"", Dead);
 }
 
-// Rule 2: trailing dead formal. An unused trailing pointer/integer
-// formal with poison-friendly call sites is NOT restored blindly (no
-// corpus signal names its type); instead this handles the annotated
-// case only: a `llvm.dbg.value(ptr poison, !DILocalVariable(arg: N))`
-// with N past the arity, or a DISubprogram subroutine type with more
-// formals than the IR. The re-added formal takes the DI type when it
-// is a plain pointer/integer, else poison-typed ptr.
+// Restore a trailing formal only when an optimized-out parameter has an
+// explicit poison `dbg.value` marker. DISubprogram arity can retain stale
+// source types for LTO helpers that never had the extra formal.
 bool tryRestoreDeadArg(Module &M, Function &F) {
   if (F.isVarArg() || hasBadCallSite(F) || callsOpaqueOrSpecial(F, false))
     return false;
@@ -479,56 +523,29 @@ bool tryRestoreDeadArg(Module &M, Function &F) {
   unsigned Want = Have;
   Type *WantTy = nullptr;
 
-  // DISubprogram subroutine type: {ret, p0, ...} may name more formals
-  // than the IR keeps (rust-o3 dot4: !{!173, !1885, !1885} vs ()).
-  if (DISubprogram *SP = F.getSubprogram()) {
-    if (auto *ST = dyn_cast_or_null<DISubroutineType>(SP->getType())) {
-      DITypeRefArray Tys = ST->getTypeArray();
-      // Index 0 is the return; the rest are formals.
-      if (Tys.size() > 0 && (unsigned)Tys.size() - 1 > Want) {
-        Want = (unsigned)Tys.size() - 1;
-        // Recover the formal type from the DI record when simple.
-        if (Tys.size() > 1) {
-          if (auto *DT = dyn_cast_or_null<DIDerivedType>(Tys[1])) {
-            if (DT->getTag() == dwarf::DW_TAG_pointer_type)
-              WantTy = PointerType::getUnqual(M.getContext());
-          } else if (auto *BT = dyn_cast_or_null<DIBasicType>(Tys[1])) {
-            unsigned Bits = (unsigned)BT->getSizeInBits();
-            if (Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64)
-              WantTy = IntegerType::get(M.getContext(), Bits);
-          }
-        }
-      }
-    }
-  }
-  // dbg.value markers: arg: N with N > arity.
-  for (BasicBlock &BB : F) {
+  auto RestoreFromMarker = [&](Value *V, DILocalVariable *Var) {
+    if (!Var || !Var->isParameter() || Var->getArg() == 0 ||
+        (V && !isa<PoisonValue>(V) && !isa<UndefValue>(V)))
+      return;
+    if (Var->getArg() <= Want)
+      return;
+    Want = (unsigned)Var->getArg();
+    if (!WantTy)
+      if (auto *DT = dyn_cast_or_null<DIDerivedType>(Var->getType()))
+        if (DT->getTag() == dwarf::DW_TAG_pointer_type)
+          WantTy = PointerType::getUnqual(M.getContext());
+  };
+  for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
-      Value *V = nullptr;
-      DILocalVariable *Var = nullptr;
-      if (auto *DVI = dyn_cast<DbgValueInst>(&I)) {
-        V = DVI->getValue();
-        Var = DVI->getVariable();
-      } else if (auto *DPI = dyn_cast<DbgDeclareInst>(&I)) {
-        continue; // declares address a live slot, not a lost formal
-      }
-      if (!Var || !Var->isParameter() || Var->getArg() == 0)
-        continue;
-      if (V && !isa<PoisonValue>(V) && !isa<UndefValue>(V))
-        continue;
-      if (Var->getArg() > Want) {
-        Want = (unsigned)Var->getArg();
-        if (!WantTy) {
-          if (auto *DT = dyn_cast_or_null<DIDerivedType>(Var->getType())) {
-            if (DT->getTag() == dwarf::DW_TAG_pointer_type)
-              WantTy = PointerType::getUnqual(M.getContext());
-          }
-        }
-      }
+      if (auto *DVI = dyn_cast<DbgValueInst>(&I))
+        RestoreFromMarker(DVI->getValue(), DVI->getVariable());
+      for (DbgRecord &Record : I.getDbgRecordRange())
+        if (auto *DVR = dyn_cast<DbgVariableRecord>(&Record))
+          if (DVR->isDbgValue())
+            RestoreFromMarker(DVR->getValue(), DVR->getVariable());
     }
-    if (Want > Have + 4)
-      return false; // garbage DI: bail rather than invent formals
-  }
+  if (Want > Have + 4)
+    return false; // garbage DI: bail rather than invent formals
   if (Want <= Have)
     return false;
   if (!WantTy)
@@ -576,60 +593,94 @@ bool tryFoldClone(Module &M, Function &F) {
                           Base);
 }
 
-// Read a locally reaching Win64 ABI register constant. Calls and unknown
-// writes are barriers; no predecessor guessing or stale register inference.
-Constant *extraRegisterConstant(CallInst &Call, StringRef Register) {
-  for (auto It = Call.getIterator(); It != Call.getParent()->begin();) {
-    Instruction &I = *--It;
-    if (isa<CallBase>(I))
-      return nullptr;
-    if (auto *S = dyn_cast<StoreInst>(&I)) {
-      auto *Slot = dyn_cast<AllocaInst>(S->getPointerOperand());
-      if (!Slot)
-        return nullptr;
-      if (Slot->getName() != Register)
-        continue;
-      if (S->isVolatile() || S->isAtomic())
-        return nullptr;
-      auto *C = dyn_cast<ConstantInt>(S->getValueOperand());
-      return C && C->getType()->isIntegerTy(64) ? C : nullptr;
-    }
-    if (I.mayWriteToMemory())
-      return nullptr;
+
+// Peel a constant expression down to the global it derives from. Only
+// transparent casts qualify: a ConstantExpr mixing a global with other
+// data (add/sub, GEP past the head) is not a whole-object reference.
+GlobalVariable *globalBehind(const Constant *C) {
+  if (const auto *GV = dyn_cast<GlobalVariable>(C))
+    return const_cast<GlobalVariable *>(GV);
+  if (const auto *E = dyn_cast<ConstantExpr>(C)) {
+    if (E->getNumOperands() == 1 &&
+        (E->getOpcode() == Instruction::PtrToInt ||
+         E->getOpcode() == Instruction::BitCast ||
+         E->getOpcode() == Instruction::AddrSpaceCast))
+      if (const auto *Op = dyn_cast<Constant>(E->getOperand(0)))
+        return globalBehind(Op);
   }
   return nullptr;
 }
 
-bool restoreABIExtra(Module &M, Function &F) {
-  static const char *Registers[] = {"rcx", "rdx", "r8", "r9"};
-  if (!M.getTargetTriple().isOSWindows() ||
-      !M.getTargetTriple().isArch64Bit() || F.isVarArg() ||
-      F.arg_size() >= 4 || F.use_empty() || hasBadCallSite(F) ||
-      F.hasDLLExportStorageClass())
+// True when C contains any global-bearing leaf (used to veto functions
+// that touch a second data object).
+bool containsGlobal(const Constant *C) {
+  if (isa<GlobalValue>(C))
+    return true;
+  if (const auto *E = dyn_cast<ConstantExpr>(C))
+    for (const Value *V : E->operand_values())
+      if (const auto *Op = dyn_cast<Constant>(V))
+        if (containsGlobal(Op))
+          return true;
+  return false;
+}
+
+// Folded-global argument restoration (clone-only constprop). A GCC
+// constprop clone of a single-object function keeps the folded object
+// reference inline: the body passes `ptrtoint(@g)` (or an equivalent
+// dedup'd global) to its callees, once per use, where the general
+// version read `this`. The signature evidence is narrow on purpose:
+// exactly one surviving formal, callers that disagree on it (so no
+// caller-side constant is the specialization), and exactly one
+// equivalence class of referenced data global, appearing at least twice
+// as a call argument and nowhere else. That is `this`/the singleton the
+// specialization folded; restoring it as formal 0 and passing it at
+// every call site is a plain rebind, equivalent by construction.
+// Zero-caller clones restore the same signature (the rebind is
+// semantics-preserving even with no sites to update).
+bool restoreFoldedGlobal(Module &M, Function &F) {
+  if (F.isDeclaration() || F.isVarArg() || F.arg_size() != 1 ||
+      F.hasDLLExportStorageClass() || hasBadCallSite(F) ||
+      callsOpaqueOrSpecial(F, true))
     return false;
-  Constant *Common = nullptr;
-  for (User *U : F.users()) {
-    auto *Call = dyn_cast<CallInst>(U);
-    if (!Call || Call->hasOperandBundles())
+  for (Argument &A : F.args())
+    if (A.hasAttribute(Attribute::StructRet) ||
+        A.hasAttribute(Attribute::ByVal))
       return false;
-    Constant *C = extraRegisterConstant(*Call, Registers[F.arg_size()]);
-    if (!C || (Common && Common != C))
-      return false;
-    Common = C;
-  }
-  SmallVector<Type *, 8> Params;
-  SmallVector<int64_t, 8> Forward;
-  for (Argument &A : F.args()) {
-    Params.push_back(A.getType());
-    Forward.push_back(A.getArgNo());
-  }
-  Params.push_back(Common->getType());
-  Forward.push_back(-1);
-  // All known callers supply Common, so replacing scalar occurrences by the
-  // added formal is equivalent even when no general definition survived IPO.
-  // This proves the restored call behavior, not the original source signature.
+  Constant *Bound = nullptr;
+  unsigned ArgUses = 0;
+  SmallPtrSet<GlobalVariable *, 4> Class;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      for (unsigned K = 0; K < I.getNumOperands(); ++K) {
+        auto *C = dyn_cast<Constant>(I.getOperand(K));
+        if (!C || !containsGlobal(C))
+          continue;
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (K >= CB->arg_size())
+            continue; // the callee operand itself is not evidence
+          if (GlobalVariable *G = globalBehind(C)) {
+            // A folded `this` is the first call argument. Buffers and
+            // other global operands often occupy later ABI positions.
+            if (K != 0)
+              return false;
+            Class.insert(G);
+            ++ArgUses;
+            if (!Bound)
+              Bound = C;
+            continue;
+          }
+        }
+        return false; // a second data object, or a non-argument global use
+      }
+    }
+  if (ArgUses < 2 || Class.size() != 1 || !Bound)
+    return false;
+  SmallVector<Type *, 4> Params;
+  Params.push_back(Bound->getType());
+  Params.push_back(F.getArg(0)->getType());
+  SmallVector<int64_t, 4> Forward = {-1, 0};
   return rewriteSignature(M, F, F.getReturnType(), Params, Forward,
-                          Common, F.arg_size(), "");
+                          Bound, /*RebindParam=*/0, "");
 }
 
 bool runOnModule(Module &M) {
@@ -639,8 +690,8 @@ bool runOnModule(Module &M) {
     if (!F.isDeclaration())
       Names.push_back(F.getName().str());
   for (const std::string &Name : Names)
-    while (restoreABIExtra(M, *M.getFunction(Name)))
-      Changed = true;
+    if (Function *F = M.getFunction(Name))
+      Changed |= restoreFoldedGlobal(M, *F);
   SmallVector<Function *, 16> Work;
   for (Function &F : M) {
     if (F.isDeclaration() || F.isIntrinsic())
@@ -652,7 +703,7 @@ bool runOnModule(Module &M) {
   // function per iteration: every rewrite erases the Function.
   for (Function *F : Work) {
     if (F->getParent() != &M)
-      continue; // erased by an earlier rewrite this round
+      continue;
     if (F->isDeclaration())
       continue;
     Changed |= tryFoldClone(M, *F);

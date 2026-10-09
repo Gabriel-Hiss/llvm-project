@@ -20,8 +20,9 @@ function(<cleanup>,revenant-idioms,<unopt>,revenant-structure)
 
 `defaultPipeline(true)` inserts `revenant-patterns` between unopt and
 structure, matching the engine `--patterns` path. Type recovery
-(`revenant-types`) and SSA-out (`revenant-ssaout`) run post-structure,
-pre-emission; they are not in the default text, pass them explicitly.
+(`revenant-types`) and SSA-out (`revenant-ssaout`) run post-structure in
+`ir-final`. The fidelity-only `ir-pre-like` stage uses
+`revenant-locals-to-slots` after type recovery instead of SSA-out.
 
 | stage | passes | source |
 |---|---|---|
@@ -31,7 +32,12 @@ pre-emission; they are not in the default text, pass them explicitly.
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
+| pre-like locals | `revenant-locals-to-slots` | argument spills, debug-backed/loop-carried PHI webs, return slots, after `revenant-types` |
 | ssaout (post) | `revenant-ssaout` | mem2reg/sroa undo, pre-frontend |
+
+When SSA-out creates a function's first `DISubprogram`, it also gives any
+call without `!dbg` a `DILocation`. The line uses the low 32 bits of
+`!revenant.va`, or 0 when the instruction has no VA metadata.
 
 ## Registration convention
 
@@ -62,12 +68,17 @@ hoisted/sunk common instructions, no speculated blocks. The late
 `sroa,instcombine` round removes never-read frames.
 
 **revenant-idioms (owner: MuseTxIdioms).** Expects cleaned IR.
-Folds the multiply-high + shift/add strength-reduction DAG back into
-`udiv`/`sdiv`/`urem`/`srem` by a constant (Granlund-Montgomery), verified
-on a witness set before rewriting; folds `x - (x/d)*d` spellings into
-`urem`/`srem`. Guarantees no unverified rewrite: anything ambiguous stays
-put. AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax)
-run after structuring, outside this LLVM pipeline.
+Folds verified multiply-high and correction DAGs back into constant
+`udiv`/`sdiv`, then folds quotient-times-divisor residuals into
+`urem`/`srem`. It checks every input for i8/i16 and quotient boundaries plus
+integer extrema for i32/i64. It converts llvm.abs/min/max, three-way compare,
+and unsigned saturation intrinsics back into compare/subtract/select IR.
+Signed three-way compare flag chains become source-level comparisons/selects.
+Source-level Kernighan popcount, rotate and byte-swap operations remain
+arithmetic/loop IR; source builtin intrinsics such as llvm.bswap pass through.
+Bit tests retain direct `and`/`icmp`. Ambiguous arithmetic remains intact.
+AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax) run after
+structuring, outside this LLVM pipeline.
 
 **revenant-devectorize (owner: MuseTxDevec), phase 1: lane-0.** Expects
 cleaned IR with `i128` xmm webs. Propagates scalar lane-0 values through
@@ -142,17 +153,7 @@ runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
-**revenant-unipo (owner: MuseDeoptIPO).** Module pass (not function):
-rewrites function signatures, snapshotting the function list first so
-erasure is safe. Undoes DeadArgElim return elimination (void back to the
-dead computed value, e.g. errfile/pushmode/luaK_codek/g_iofile,
-TIXML_SNPRINTF, xml_buffered_writer::flush, xpath_parser::error_oom),
-dead-argument removal named by DISubprogram/dbg.value records (e.g.
-rust-o3 dot4/vec_ops), and `.constprop.N`/`.isra.N`/`.specialized.N`/
-`.lto_priv`/`.llvm.N` clone fold-back. Runs explicitly via
-`-passes=revenant-unipo`, not in the default pipeline. Guarantees
-`!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM 22
-parseable output.
+**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies, and requires matching operands except for equivalent constant data and trap-only stubs. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
 ## Robustness
 
@@ -172,64 +173,93 @@ produces invalid IR, it restores the previous body, reports the function,
 stage and pass, and continues with the next pass. A returned lift error
 also reports the failed function and continues with the remaining functions.
 Assertions still require fixing their offending pass or lifter operation.
+
 **revenant-unoutline (owner: Swe2DeoptOutliner).** Module pass that restores
 small shared binary-derived fragments and direct-call thunks at their call
 sites. It requires multiple direct callers and a single straight-line block;
 uncertain functions remain calls. Runs explicitly with
 `-passes=revenant-unoutline`.
+
 **revenant-unipo, structural recovery.** Structural clone recovery does not
-inspect function names or oracle symbols.
-It specializes a candidate general definition at one constant parameter, runs
-InstCombine, SimplifyCFG and SCCP on temporary copies, then hashes normalized
-bodies with constants abstracted. Hash matches require exact instruction,
-operand, CFG and semantic-metadata equality modulo local names before merging.
-The specialized function may retain its parameter or omit one parameter,
-including a middle parameter. Direct callers then call the general definition
-with the proven constant, and the specialized definition is deleted.
+inspect function names or oracle symbols. It specializes a candidate general
+definition at one constant parameter, runs InstCombine, SimplifyCFG and SCCP
+on temporary copies, then compares normalized bodies with constants
+abstracted. Hash matches require exact instruction, operand, CFG and
+semantic-metadata equality modulo local names before merging. The specialized
+function may retain its parameter or omit one parameter, including a middle
+parameter. Direct callers then call the general definition with the proven
+constant, and the specialized definition is deleted.
 
-When no general definition survived, lifted Win64 register-slot stores provide
-another recovery path. Every direct caller must have the same locally reaching
-constant in the next RCX/RDX/R8/R9 slot. Calls and unknown writes stop the search.
-The pass adds that formal and passes the observed constant at every caller.
-Scalar body uses of that constant become uses of the formal. Constant-only
-operands, including switch cases and struct GEP indices, stay constant.
-This proves equivalence at the recovered callers; it does not prove that a
-source-level formal existed. Conflicting constants, missing register evidence,
-address-taken functions, exports and operand bundles prevent this recovery.
-LunaSigs3 currently exposes no extra-argument IR metadata, so Unipo reads lifted
-call sites directly. Run this recovery before dead register stores disappear.
+Return restoration requires scalar return metadata whose ABI width and category
+match the dead value in the optimized body. Dead values alone cannot distinguish
+a source return from sret state or an unrelated computed value. Dead formals
+require an explicit poison `dbg.value` record; `DISubprogram` arity alone can be
+stale. Named-clone recovery requires a clone suffix. Folded constant-global
+recovery is limited to one global passed only as the first call argument, the
+GCC constprop `this` shape.
 
-Existing return restoration and DI-driven dead-argument restoration remain.
-Named clone suffixes are only a source-name recovery path when a symbol exists,
-not evidence used by structural matching. New calls preserve instruction
-metadata and VA provenance. Structural matching rejects opaque instructions
-and region annotations rather than discarding them during normalization.
+New calls preserve instruction metadata and VA provenance. Structural matching
+rejects opaque instructions, region annotations, and outlined `.part.N` or
+`.cold` bodies rather than rewriting those paths.
 
-Measured with the standalone plugin and `revenant-unipo,verify` on stripped
-raw lifted modules:
 
-| Target | Definitions | Oracle `.constprop`/`.isra` entries | Clone merges | Clone signature restorations | All extended signatures |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| c-gcc-o2 | 151 | 0 | 0 | 0 | 8 |
-| c-gcc-o3 | 151 | 0 | 0 | 0 | 6 |
-| cpp-gcc-o2 | 916 | 9 | 0 | 0 | 5 |
-| cpp-gcc-o3 | 916 | 9 | 0 | 0 | 5 |
-| c-clang-o2lto | 3401 | 0 | 0 | 0 | 0 |
+Measured with the standalone plugin and `revenant-unipo,verify` on fresh
+normalized GCC lifts:
 
-Oracle instruction owners were grouped by symbol and their first RVA mapped
-to lifted `sub_<image-base+RVA>` definitions for scoring only. All nine GCC C++
-entries were present, including two `.cold` partitions. None met the structural
-or unanimous extra-register evidence requirements. These are missed cases,
-not successful IPO inversions. Extended non-oracle signatures demonstrate the
-ABI evidence rule, not recovery of an oracle-proven specialization.
+| Target | Oracle clone entries | Recovered / 9 | Named clone entries merged/restored | Cold partitions |
+| --- | ---: | ---: | --- | --- |
+| cpp-gcc-o2 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
+| cpp-gcc-o3 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
+
+The pool constprop clones regain their folded pool-object formal by rebinding
+the equivalent internal constant global. Their remaining arguments stay
+site-specific, so callers retain distinct allocation sizes rather than
+requiring a unanimous constant. The `_S_construct.isra` pair folds only when
+the body match proves equivalent initialized string data and equivalent
+trap-only `sub_0x` callees; pooled data is treated as equal only when constant
+initializers match and its address is not compared. Four named entries remain:
+`_M_construct.isra` at VA `0x14001bca0` (O2) / `0x14001bf40` (O3), whose body
+CFG/opcode shapes differ from unspecialized `_M_construct` at `0x14001bbf0` /
+`0x14001be90`; `d_demangle_callback.constprop` at `0x14000aa20` / `0x14000ac30`
+(no equivalent general body survived; its two callers pass different callback
+values); `next_is_type_qual.isra` at `0x140002430` / `0x140002640` (no matching
+general body/call evidence); and `is_designated_init.part.0.isra` at
+`0x1400023f0` / `0x140002600` (an outlined `.part.0` region, intentionally
+excluded). The outlined `.part.0` owners `d_encoding` and
+`d_index_template_argument` are likewise left intact. No oracle/PDB data is
+consulted by the pass.
+
+The first static `c-clang-o2lto` run folded 43 definitions and changed 260
+surviving signatures. A linker-map/PDB audit found 41 folded call targets had
+different source symbols from their replacements. One pair shared the generic
+`$$000000` map label, which does not establish clone identity; one deleted
+definition had no changed direct-call target. No folded pair was confirmed as
+a clone of one source function.
+
+The 260 signature edits comprised 256 return changes and four added parameters.
+The PDB identifies `_onexit` and `at_quick_exit` as returning function pointers,
+but the pass recovered `i32`; it identifies `__acrt_set_locale_changed` as
+`void()` but the pass recovered `i32`, and `__acrt_can_use_xstate_apis` as
+`bool()` but the pass recovered `i64`. `getCallIndex` returns a `DName` by
+value, while the pass exposed an `i64` return despite the MSVC sret ABI. The
+four added parameters were on startup-argument helpers whose PDB prototypes
+each have one formal. These are scoring findings only; the pass never reads
+the map or PDB.
+
+After the linker-map/PDB audit, the pass was tightened. It no longer folds
+constant-substituted signatures, guesses returns from dead values without scalar
+DI evidence, adds formals from ABI register stores, or treats globals in later
+call-argument positions as folded `this` pointers. The static
+`c-clang-o2lto` run now keeps all 3,401 definitions and makes zero signature
+changes; `revenant-unipo,verify` succeeds. The map and PDB remain scoring-only.
 
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
 `sub_140001017` call sequence that stores 2 in RCX before calling
-`sub_140003A10`. Controlled variants cover omitted/middle/retained parameters,
-clone-only restoration, exact constant mismatches, address-taking, barriers,
-conflicting callers and constant-only switch operands. They do not claim those
-controlled specializations existed in the measured binaries.
+`sub_140003A10`. They cover same-signature structural matches, constant
+specialization rejection, DI-backed return recovery, address-taking, and
+outlined cold partitions. They do not claim controlled fixture clones existed
+in the measured binaries.
 
 Raw clang LTO emission succeeds with the current driver. Its `ir-final` path
 currently aborts in RerollPass on `sub_140001930` because an APInt exceeds the

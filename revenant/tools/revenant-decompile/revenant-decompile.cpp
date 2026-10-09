@@ -17,18 +17,22 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
-
 using namespace llvm;
 using namespace revenant;
+
+
 
 static cl::opt<std::string> Input(cl::Positional, cl::desc("<pe>"),
                                   cl::Required);
@@ -36,6 +40,9 @@ static cl::list<std::string>
     Funcs("func", cl::desc("function start VA (0x...) or name; repeatable. "
                            "Default: all discovered functions"),
           cl::value_desc("va|name"));
+static cl::opt<std::string>
+    FuncFile("func-file", cl::desc("file of function start VAs or names"),
+             cl::value_desc("file"));
 static cl::opt<std::string>
     LangOpt("lang", cl::desc("output language: c|cpp|rust "
                              "(default: detected producer language)"),
@@ -49,6 +56,8 @@ static cl::opt<std::string> Output("o", cl::desc("output file (default stdout)")
                                    cl::value_desc("file"));
 static cl::opt<bool> ListFuncs("list",
                                cl::desc("list discovered functions and exit"));
+static cl::opt<bool> ClassifyFuncs(
+    "classify", cl::desc("with --list, classify each function as user/library/startup"));
 static cl::opt<bool> Patterns("patterns",
                               cl::desc("run the opt-in revenant-patterns pass"));
 static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
@@ -66,8 +75,8 @@ static std::optional<MetaMode> metaMode(StringRef S) {
 
 static cl::opt<std::string>
     LibraryDB("libdb",
-              cl::desc("static-library database (default: libdb.json next to "
-                       "the executable)"),
+              cl::desc("static-library match database (default: optional "
+                       "libdb.json next to the executable)"),
               cl::value_desc("file"));
 static std::optional<EmitKind> emitKind(StringRef S) {
   return StringSwitch<std::optional<EmitKind>>(S)
@@ -101,6 +110,8 @@ int main(int Argc, char **Argv) {
         sys::fs::getMainExecutable(Argv[0], reinterpret_cast<void *>(&main)));
     LibraryDBPath = sys::path::parent_path(ExePath);
     sys::path::append(LibraryDBPath, "libdb.json");
+    if (!sys::fs::exists(LibraryDBPath))
+      LibraryDBPath.clear();
   }
 
   EmitKind Emit = EmitKind::Source;
@@ -144,16 +155,74 @@ int main(int Argc, char **Argv) {
     Out = S->compiler().Language;
   }
 
+  if (ClassifyFuncs && !ListFuncs) {
+    errs() << "revenant-decompile: --classify requires --list\n";
+    return 2;
+  }
   if (ListFuncs) {
-    for (const auto &[Start, Rec] : S->program().Functions)
-      outs() << format_hex(Start.Value, 0) << "\t" << Rec.Name << "\t"
-             << Rec.InstrRvas.size() << " instrs\n";
+    FunctionClassification Classification;
+    if (ClassifyFuncs) {
+      auto ClassificationOrErr =
+          S->classifyFunctions(Out, LibraryDBPath);
+      if (!ClassificationOrErr) {
+        errs() << "revenant-decompile: "
+               << toString(ClassificationOrErr.takeError()) << "\n";
+        return 2;
+      }
+      Classification = std::move(*ClassificationOrErr);
+      if (!Classification.UserEntry) {
+        errs() << "revenant-decompile: unable to trace user entry from PE startup\n";
+        return 2;
+      }
+      outs() << "user-entry\t"
+             << format_hex(Classification.UserEntry->Value, 0) << "\n";
+    }
+    for (const auto &[Start, Rec] : S->program().Functions) {
+      StringRef Name = Rec.Name;
+      auto Lib = Classification.LibraryNames.find(Start);
+      if (Lib != Classification.LibraryNames.end())
+        Name = Lib->second;
+      outs() << format_hex(Start.Value, 0) << "\t" << Name << "\t";
+      if (!ClassifyFuncs)
+        outs() << Rec.InstrRvas.size() << " instrs\n";
+      else if (Classification.UserReachable.count(Start))
+        outs() << "user\n";
+      else if (Classification.LibraryStarts.count(Start))
+        outs() << "library\n";
+      else if (Classification.Startup.count(Start))
+        outs() << "startup\n";
+      else if (Classification.HasLibraryDB)
+        outs() << "library\n";
+      else
+        outs() << "unclassified\n";
+    }
     return 0;
   }
+  std::vector<std::string> FunctionInputs(Funcs.begin(), Funcs.end());
+  if (!FuncFile.empty()) {
+    auto FileOrErr = MemoryBuffer::getFile(FuncFile);
+    if (!FileOrErr) {
+      errs() << "revenant-decompile: cannot read function list '"
+             << FuncFile << "': " << FileOrErr.getError().message() << "\n";
+      return 2;
+    }
+    SmallVector<StringRef, 32> Lines;
+    (*FileOrErr)->getBuffer().split(Lines, '\n');
+    for (StringRef Line : Lines) {
+      Line = Line.trim();
+      if (!Line.empty())
+        FunctionInputs.push_back(Line.str());
+    }
+    if (FunctionInputs.empty()) {
+      errs() << "revenant-decompile: function list is empty\n";
+      return 2;
+    }
+  }
+
 
   // Resolve --func arguments.
   std::vector<Va> Targets;
-  for (const std::string &F : Funcs) {
+  for (const std::string &F : FunctionInputs) {
     StringRef Fs(F);
     std::optional<Va> Addr;
     uint64_t V = 0;
