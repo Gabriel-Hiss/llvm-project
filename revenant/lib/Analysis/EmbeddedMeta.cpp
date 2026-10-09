@@ -89,23 +89,19 @@ void forEachXrefTo(const Xrefs &Refs, Va Target, Fn &&Visit) {
 }
 
 void collectLocation(const Image &Img, Program &P, Va Target, Va From) {
+  // The panic call loads the `Location` static itself (`lea rdx,[rip+loc]`),
+  // so the referenced address is the record. Reading a record out of the
+  // neighbourhood attached neighbouring constants to the wrong function: a
+  // static that sits right before a record made the pass read that record.
   const FuncRecord *F = functionForReference(P, From);
   if (!F)
     return;
-
-  for (int Offset = -24; Offset <= 24; Offset += 8) {
-    if (Offset < 0 && Target.Value < static_cast<uint64_t>(-Offset))
-      continue;
-    Va Candidate = Offset < 0 ? Va(Target.Value - static_cast<uint64_t>(-Offset))
-                              : Target.wrappingAdd(static_cast<uint64_t>(Offset));
-    EmbeddedFunctionMetadata M;
-    if (!readLocation(Img, Candidate, M))
-      continue;
-    auto [It, Inserted] = P.Embedded.emplace(F->Start, M);
-    if (!Inserted && It->second.SourceFile.empty())
-      It->second = std::move(M);
+  EmbeddedFunctionMetadata M;
+  if (!readLocation(Img, Target, M))
     return;
-  }
+  auto [It, Inserted] = P.Embedded.emplace(F->Start, M);
+  if (!Inserted && It->second.SourceFile.empty())
+    It->second = std::move(M);
 }
 
 std::string classNameFromRTTI(StringRef Decorated) {
