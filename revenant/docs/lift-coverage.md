@@ -4,6 +4,12 @@ The census covers all 274 PE builds listed in `target/parity`. Across those buil
 
 The CFG-aware function lifter handles control-flow instructions at block terminators, so the headline opaque rate excludes the control-flow opcode families listed at the end. The remaining non-control instructions total 52,255,347; 55,402 hit an opaque fallback (0.11%, down from the 2.84% baseline measured before the RMW-memory, shift-by-CL, BMI/BMI2 and XADD forms were lifted), and 52,199,945 use generated semantics (99.89%).
 
+This weighted census predates the subsequent FMA3, AES-NI/PCLMULQDQ,
+RDRAND/RDSEED, MXCSR, scalar-conversion-memory, and software-interrupt
+lifting changes. The 0.11% figure and opcode table below are a historical
+baseline, not a remeasurement of the current dispatcher. A fresh census over
+all 274 PE builds is still required before quoting updated weighted coverage.
+
 Control-flow opcodes excluded from the headline rate account for 14,206,374 static occurrences. The generated table now lifts direct branches, calls and returns (brOp/brccOp/callToOp/retOp); the remaining 482,054 control occurrences (indirect `JMP64r`/`CALL64r`/`CALL64m`, `TRAP`, `INT` and far returns) still dispatch through an opaque case when they occur outside a block terminator.
 
 The census marks opcodes whose generated case starts with an opaque call. It cannot identify runtime-conditional opaque branches from per-opcode counts alone; the only conditional ones left are `NEG8m`/`NEG16m`/`NEG32m`/`NEG64m` (locked memory NEG), 898 static occurrences included in the opaque total above.

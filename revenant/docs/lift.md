@@ -4,7 +4,7 @@
 
 `X86Lift.td` owns shared DSL operators and scalar/system semantics. `X87.td`, `StringAtomic.td`, `System.td`, `Sse.td`, and `Avx.td` add family semantics through `RevenantX86.td`. The emitter lowers supported expression and statement DAGs to IRBuilder calls and X86 context hooks. Direct pattern inversion currently accepts one-result, no-implicit-def patterns whose source DAG fits the supported SelectionDAG expression set.
 
-The generated footer reports the table census. At this revision, the X86 target contains 21,973 instruction records. The dispatcher handles all of them: 1,631 DSL cases and 1,801 direct-pattern cases emit IR semantics; the remaining 18,541 emit opaque calls. These are table counts, not corpus instruction coverage; `lift-coverage.md` has the corpus-weighted numbers (99.89% of non-control instructions lifted). Dispatch is complete, but AVX-512, FMA, x87 long forms and several system instructions still lack non-opaque lifting semantics.
+The generated footer reports the table census. The X86 target contains 21,973 instruction records. The current dispatcher has 3,699 DSL cases, 1,801 direct-pattern cases, and 16,473 opaque cases. These are table counts, not corpus instruction coverage; `lift-coverage.md` has the last corpus-wide weighted census. FMA3 scalar forms, AES-NI, PCLMULQDQ, RNG, MXCSR and software interrupts now have explicit hooks. AVX-512 masked operations, string-compare intrinsic semantics, CRC32 and x87 long forms still need non-opaque lifting and a fresh whole-corpus coverage census.
 
 Build the generated dispatcher and context implementations, then run the provenance test:
 
