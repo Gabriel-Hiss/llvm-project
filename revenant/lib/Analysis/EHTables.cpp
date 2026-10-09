@@ -152,6 +152,38 @@ void readSEH(const Image &I, FunctionEH &F, Va Data) {
   }
 }
 
+/// Resolve try-state intervals against the ordered MSVC IP-to-state map.
+void resolveTryRanges(FunctionEH &F) {
+  std::vector<EHTryRegion> Resolved;
+  for (const EHTryRegion &T : F.TryRegions) {
+    bool Active = false;
+    EHTryRegion Run = T;
+    for (const EHCallSite &Site : F.CallSites) {
+      bool InTry = Site.State >= T.CatchLow && Site.State <= T.CatchHigh;
+      if (InTry) {
+        if (!Active) {
+          Run = T;
+          Run.Begin = Site.Address;
+          Active = true;
+        }
+        continue;
+      }
+      if (Active) {
+        Run.End = Site.Address;
+        if (Run.Begin < Run.End)
+          Resolved.push_back(std::move(Run));
+        Active = false;
+      }
+    }
+    if (Active) {
+      Run.End = F.End;
+      if (Run.Begin < Run.End)
+        Resolved.push_back(std::move(Run));
+    }
+  }
+  F.TryRegions = std::move(Resolved);
+}
+
 void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
   auto Magic = u32(I, Data);
   if (!Magic || (*Magic != EH_MAGIC && *Magic != EH_MAGIC_1 &&
@@ -227,16 +259,7 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
       F.CallSites.push_back({I.vaOfRva(*Offset), *State});
     }
   }
-  for (EHTryRegion &T : F.TryRegions) {
-    for (size_t N = 0; N < F.CallSites.size(); ++N) {
-      int32_t State = F.CallSites[N].State;
-      if (State < T.CatchLow || State > T.CatchHigh)
-        continue;
-      T.Begin = F.CallSites[N].Address;
-      T.End = N + 1 < F.CallSites.size() ? F.CallSites[N + 1].Address : F.End;
-      break;
-    }
-  }
+  resolveTryRanges(F);
 }
 
 std::optional<uint32_t> fh4int(const Image &I, Va &P) {
@@ -299,15 +322,13 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
         auto Packed = fh4int(I, Cursor);
         if (!Packed) break;
         uint32_t Kind = *Packed & 3;
-        if (Kind == 3) {
+        if (Kind == 3 || Kind == 1 || Kind == 2) {
           auto Action = relativeDword(I, Cursor);
           if (!Action) break;
-          F.Cleanups.push_back({Va(I.Base.Value + *Action), static_cast<int32_t>(N)});
-        } else if (Kind == 1 || Kind == 2) {
-          auto Action = relativeDword(I, Cursor);
-          auto Object = fh4int(I, Cursor);
-          if (!Action || !Object) break;
-          F.Cleanups.push_back({Va(I.Base.Value + *Action), static_cast<int32_t>(N)});
+          if (Kind != 3 && !fh4int(I, Cursor)) break;
+          Va Target(I.Base.Value + *Action);
+          if (I.sectionOf(Target))
+            F.Cleanups.push_back({Target, static_cast<int32_t>(N)});
         }
       }
     }
@@ -342,10 +363,14 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
           if (Flags & 4) if (!fh4int(I, H)) break;
           auto Catch = relativeDword(I, H);
           if (!Catch) break;
-          Region.Handlers.push_back(F.Handlers.size());
-          if (*Catch)
-            F.Handlers.push_back({Va(I.Base.Value + *Catch), HandlerKind::Catch,
-                                  Name, static_cast<int32_t>(*Lo)});
+          if (*Catch) {
+            Va Target(I.Base.Value + *Catch);
+            if (I.sectionOf(Target)) {
+              Region.Handlers.push_back(F.Handlers.size());
+              F.Handlers.push_back({Target, HandlerKind::Catch, Name,
+                                    static_cast<int32_t>(*Lo)});
+            }
+          }
           uint8_t Continuations = (Flags >> 4) & 3;
           for (uint8_t K = 0; K < Continuations; ++K) {
             if (Flags & 8) {
@@ -388,15 +413,7 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
   }
   if (!F.TryRegions.empty() || !F.Cleanups.empty() || !F.CallSites.empty())
     F.Model = EHModel::MSVC;
-  for (EHTryRegion &T : F.TryRegions) {
-    for (size_t N = 0; N < F.CallSites.size(); ++N) {
-      int32_t State = F.CallSites[N].State;
-      if (State < T.CatchLow || State > T.CatchHigh) continue;
-      T.Begin = F.CallSites[N].Address;
-      T.End = N + 1 < F.CallSites.size() ? F.CallSites[N + 1].Address : F.End;
-      break;
-    }
-  }
+  resolveTryRanges(F);
 }
 
 std::optional<uint64_t> uleb(const Image &I, Va &P) {
@@ -639,7 +656,10 @@ std::vector<FunctionEH> revenant::decodeEHTables(const PeFile &PE) {
         }
       }
     }
-    if (F.Model != EHModel::None) Out.push_back(std::move(F));
+    if (F.Model != EHModel::None &&
+        (!F.TryRegions.empty() || !F.Handlers.empty() ||
+         !F.Cleanups.empty() || !F.CallSites.empty()))
+      Out.push_back(std::move(F));
   }
   return Out;
 }

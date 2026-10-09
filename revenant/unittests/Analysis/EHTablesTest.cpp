@@ -51,14 +51,23 @@ PeFile makePE(bool Cxx) {
     put32(D, 16, 0);
     put32(D, 20, 1);
     put32(D, 24, 0x1200);
-    put32(D, 28, 0);
-    put32(D, 32, 0);
+    put32(D, 28, 4);
+    put32(D, 32, 0x1300);
     // One try record and one handler type entry.
-    put32(D, 0x200, 0);
-    put32(D, 0x204, 0);
+    put32(D, 0x200, 1);
+    put32(D, 0x204, 1);
     put32(D, 0x208, 0);
     put32(D, 0x20c, 1);
     put32(D, 0x210, 0x1220);
+    // Two adjacent IP-map entries have the active try state.
+    put32(D, 0x300, 0x100);
+    put32(D, 0x304, 0);
+    put32(D, 0x308, 0x110);
+    put32(D, 0x30c, 1);
+    put32(D, 0x310, 0x118);
+    put32(D, 0x314, 1);
+    put32(D, 0x318, 0x120);
+    put32(D, 0x31c, 0);
     put32(D, 0x220, 0);
     put32(D, 0x224, 0x1240);
     put32(D, 0x228, 0);
@@ -106,6 +115,8 @@ TEST(EHTablesTest, DecodesFuncInfo3CatchHandlerAndTypeName) {
   ASSERT_EQ(EH[0].Handlers.size(), 1u);
   EXPECT_EQ(EH[0].Handlers[0].Address, Va(0x2300));
   EXPECT_EQ(EH[0].Handlers[0].TypeName, ".H");
+  EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1110));
+  EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1120));
 }
 
 TEST(EHTablesTest, DecodesSehScopeRangeAndFinally) {
