@@ -1,3 +1,4 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 cmake_minimum_required(VERSION 3.20)
 project(RevenantUnhoist CXX)
 
@@ -30,25 +31,31 @@ if(MSVC)
 else()
   add_compile_options(-fno-exceptions -fno-rtti)
 endif()
+endif()
 
-add_library(RevenantTransformUnhoist MODULE
-  Unhoist.cpp
-)
-target_compile_definitions(RevenantTransformUnhoist PRIVATE REVENANT_BUILD_PLUGIN)
-set_target_properties(RevenantTransformUnhoist PROPERTIES
-  OUTPUT_NAME "RevenantTransformUnhoist"
-  PREFIX ""
-  SUFFIX ".dll"
-)
-llvm_map_components_to_libnames(LLVM_LIBS
-  Core
-  Support
-  Analysis
-  TransformUtils
-)
-target_link_libraries(RevenantTransformUnhoist PRIVATE ${LLVM_LIBS})
-target_include_directories(RevenantTransformUnhoist PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
-)
+if(COMMAND add_llvm_library)
+  add_llvm_library(RevenantTransformUnhoist STATIC Unhoist.cpp
+    LINK_COMPONENTS Core Support Analysis TransformUtils
+    )
+else()
+  add_library(RevenantTransformUnhoist MODULE Unhoist.cpp)
+  target_compile_definitions(RevenantTransformUnhoist PRIVATE
+    REVENANT_BUILD_PLUGIN)
+  set_target_properties(RevenantTransformUnhoist PROPERTIES
+    OUTPUT_NAME "RevenantTransformUnhoist"
+    PREFIX ""
+    SUFFIX ".dll"
+    )
+  llvm_map_components_to_libnames(LLVM_LIBS
+    Core
+    Support
+    Analysis
+    TransformUtils
+    )
+  target_link_libraries(RevenantTransformUnhoist PRIVATE ${LLVM_LIBS})
+  target_include_directories(RevenantTransformUnhoist PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
+    )
+endif()
 set_property(TARGET RevenantTransformUnhoist PROPERTY CXX_STANDARD 17)
 set_property(TARGET RevenantTransformUnhoist PROPERTY CXX_STANDARD_REQUIRED ON)

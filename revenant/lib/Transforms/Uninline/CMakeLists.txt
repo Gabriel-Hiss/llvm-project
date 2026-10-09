@@ -1,3 +1,4 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 cmake_minimum_required(VERSION 3.20)
 project(RevenantUninline CXX)
 
@@ -30,26 +31,32 @@ else()
   add_compile_options(-fno-exceptions -fno-rtti)
 endif()
 
-add_library(RevenantTransformUninline MODULE
-  Uninline.cpp
-)
-if(WIN32)
-  target_sources(RevenantTransformUninline PRIVATE Uninline.def)
 endif()
-target_compile_definitions(RevenantTransformUninline PRIVATE REVENANT_BUILD_PLUGIN)
-set_target_properties(RevenantTransformUninline PROPERTIES
-  OUTPUT_NAME "RevenantTransformUninline"
-  PREFIX ""
-  SUFFIX ".dll"
-)
-llvm_map_components_to_libnames(LLVM_LIBS
-  Core
-  Support
-  Analysis
-)
-target_link_libraries(RevenantTransformUninline PRIVATE ${LLVM_LIBS})
-target_include_directories(RevenantTransformUninline PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
-)
+if(COMMAND add_llvm_library)
+  add_llvm_library(RevenantTransformUninline STATIC Uninline.cpp
+    LINK_COMPONENTS Core Support Analysis
+    )
+else()
+  add_library(RevenantTransformUninline MODULE Uninline.cpp)
+  if(WIN32)
+    target_sources(RevenantTransformUninline PRIVATE Uninline.def)
+  endif()
+  target_compile_definitions(RevenantTransformUninline PRIVATE
+    REVENANT_BUILD_PLUGIN)
+  set_target_properties(RevenantTransformUninline PROPERTIES
+    OUTPUT_NAME "RevenantTransformUninline"
+    PREFIX ""
+    SUFFIX ".dll"
+    )
+  llvm_map_components_to_libnames(LLVM_LIBS
+    Core
+    Support
+    Analysis
+    )
+  target_link_libraries(RevenantTransformUninline PRIVATE ${LLVM_LIBS})
+  target_include_directories(RevenantTransformUninline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
+    )
+endif()
 set_property(TARGET RevenantTransformUninline PROPERTY CXX_STANDARD 17)
 set_property(TARGET RevenantTransformUninline PROPERTY CXX_STANDARD_REQUIRED ON)
