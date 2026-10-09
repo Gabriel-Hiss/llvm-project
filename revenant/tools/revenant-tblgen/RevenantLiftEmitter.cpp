@@ -1875,6 +1875,39 @@ class RevenantLiftEmitter {
     }
     if (Name == "rv_fclex")
       return true;
+    // x87 environment/save/restore and BCD: (rv_fxenv "st|ld", $m) and
+    // (rv_fbcd "ld|st", $m) address the memory operand.
+    if ((Name == "rv_fxenv" || Name == "rv_fbcd") && Body.getNumArgs() == 2) {
+      const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
+      auto Mem = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Kind || !Mem)
+        return false;
+      StringRef K = Kind->getValue();
+      if (Name == "rv_fbcd")
+        OS << "    LC." << (K == "ld" ? "x87BcdLoad" : "x87BcdStore")
+           << "(LC.memAddr(MI, " << *Mem << "));\n";
+      else
+        OS << "    LC." << (K == "ld" ? "fxrstorOp" : "fxsaveOp")
+           << "(LC.memAddr(MI, " << *Mem << "));\n";
+      return true;
+    }
+    // 28-byte environment (FNSTENV/FSTENV/FLDENV) and 108-byte FPU image
+    // (FSAVE/FNSAVE/FRSTOR).
+    if ((Name == "rv_x87env" || Name == "rv_x87save") &&
+        Body.getNumArgs() == 2) {
+      const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
+      auto Mem = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Kind || !Mem)
+        return false;
+      StringRef K = Kind->getValue();
+      if (Name == "rv_x87env")
+        OS << "    LC.x87Env(\"" << K << "\", LC.memAddr(MI, " << *Mem
+           << "));\n";
+      else
+        OS << "    LC.x87SaveRestore(\"" << K << "\", LC.memAddr(MI, " << *Mem
+           << "));\n";
+      return true;
+    }
     // AVX-512 k-register statements. KMOV's destination width comes from the
     // k register class (VK8/16/32/64); the source is read at that width and
     // merge-written into the k register.

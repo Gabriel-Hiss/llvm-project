@@ -15,8 +15,13 @@ branches/calls, traps and far returns. Excluding those instructions leaves
 other 32,479,666 (99.920%) use a DSL or supported direct-pattern case. This
 remeasurement adds AVX-512 masked operations and mask-register moves
 (`VMOVDQU8Z*`, `VPSUBQZ256rmk`, `VPCMPUQZ256rmi`, `KMOVQkm`, ...), which lift
-as a k-register `<N x i1>` select over `llvm.fma` / the plain vector op. The
-non-control opaque count fell from 30,916 to 26,076 instructions.
+as a k-register `<N x i1>` select over `llvm.fma` / the plain vector op, and
+the x87 environment, save/restore and BCD forms (`FNSTENV`/`FLDENV`,
+`FSAVE`/`FRSTOR`, `FXSAVE`/`FXRSTOR`, `FBLD`/`FBSTP`), which lift as
+memory-modeling calls over the modeled control/status words and x87 stack.
+Together these families account for 162,082 corpus instructions (216 AVX-512
+opcodes, 6 x87 opcodes); the non-control opaque count fell from 30,916 to
+26,076 instructions.
 
 The `NEG8m`/`NEG16m`/`NEG32m`/`NEG64m` locked forms use an internal
 sequentially consistent compare-exchange loop. The differential suite checks

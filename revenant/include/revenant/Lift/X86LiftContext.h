@@ -295,8 +295,6 @@ public:
   /// One-operand stack math: sqrt/sin/cos/patan/atan/prem/scale/abs/chs/
   /// rnd/extract/decstp/incstp/free/tst/exam implemented on TOP or pairs.
   Value *x87Math(StringRef Name, Value *A, Value *B = nullptr);
-  /// FLDENV/FNSTENV 28-byte image at Addr.
-  void x87Env(StringRef Dir, Value *Addr);
   /// Stack index (0-7) of an RSTi operand register, for DSL rv_x87idx.
   unsigned x87IndexOf(MCRegister Reg) const;
   /// FXCH: swap ST(0) with ST(i).
@@ -349,6 +347,22 @@ public:
   Value *avx512FmaVec(StringRef Kind, Value *A, Value *B, Value *C, unsigned W,
                       unsigned EltBits, int64_t Rc);
 
+  // ---- x87 environment / save / restore / BCD -------------------------------
+  /// FNSTENV/FSTENV ("st") or FLDENV ("ld"): the 28-byte environment image.
+  /// The control and status words are the modeled fields; the tag/ip/opcode
+  /// fields stay as the caller's memory (28 bytes are reserved on store).
+  void x87Env(StringRef Dir, Value *Addr);
+  /// FSAVE/FNSAVE ("st") or FRSTOR ("ld"): the 108-byte image = environment
+  /// followed by the eight 10-byte ST(i) registers.
+  void x87SaveRestore(StringRef Dir, Value *Addr);
+  /// FXSAVE/FXRSTOR through the backend intrinsic (512-byte state image,
+  /// defined read/write memory effects).
+  void fxsaveOp(Value *Addr);
+  void fxrstorOp(Value *Addr);
+  /// FBLD: read 10-byte packed BCD, convert to x86_fp80, push onto the stack.
+  void x87BcdLoad(Value *Addr);
+  /// FBSTP: pop ST(0), convert to 10-byte packed BCD, store at Addr.
+  void x87BcdStore(Value *Addr);
 
 
 protected:

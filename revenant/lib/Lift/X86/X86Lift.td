@@ -103,6 +103,8 @@ def rv_kmasked: RVOp; // (rv_kmasked $k, src, merge): masked move (VMOVDQU*)
 def rv_kload  : RVOp; // (rv_kload $k, addr, merge, W, ebits): masked load
 def rv_kstore : RVOp; // (rv_kstore $k, addr, src, W, ebits): masked store
 def rv_kfma   : RVOp; // (rv_kfma "op", $k, a, b, c, merge, W, ebits, rc)
+def rv_fxenv  : RVOp; // (rv_fxenv "st|ld", $m): FXSAVE/FXRSTOR intrinsic
+def rv_fbcd   : RVOp; // (rv_fbcd "ld|st", $m): FBLD/FBSTP packed BCD
 def rv_rng : RVOp;
 def rv_pclmul : RVOp;
 def rv_fneg    : RVOp;

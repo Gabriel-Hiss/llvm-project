@@ -522,6 +522,53 @@ std::vector<Case> cases() {
             .zmm(2, 0x4040000040400000ull, 0x3333333333333333ull, 0, 0, 0, 0, 0, 0));
   }
 
+  // ---- x87 environment, save/restore and BCD --------------------------------
+  // The 28-byte environment holds the control word at offset 0 and the status
+  // word at offset 4; both round-trip through the modeled state. The images
+  // are placed past the eight compared stack qwords (rsp+0x20..0x5f) and the
+  // result is read back into a register, so the comparison covers the modeled
+  // words only.
+  add(Case("x87 fnstenv control word",
+           "xor eax, eax\n"
+           "fldcw word ptr [rsp+0x20]\n"
+           "fnstenv [rsp+0x28]\n"
+           "mov ax, word ptr [rsp+0x28]")
+          .stack({0x027f}));
+  add(Case("x87 fldenv control word",
+           "fninit\n"
+           "mov word ptr [rsp+0x28], 0x037f\n"
+           "fldenv [rsp+0x28]\n"
+           "xor eax, eax\n"
+           "fnstcw word ptr [rsp+0x40]\n"
+           "mov ax, word ptr [rsp+0x40]")
+          .stack({0, 0x037f}));
+  add(Case("x87 fsave/frstor stack round trip",
+           "fldpi\n"
+           "fld1\n"
+           "fsave [rsp+0x80]\n"
+           "frstor [rsp+0x80]\n"
+           "fstp qword ptr [rsp+0x40]\n"
+           "fstp qword ptr [rsp+0x48]")
+          .stack({0, 0, 0, 0, 0, 0}));
+  add(Case("x87 fbld packed bcd",
+           "fbld [rsp+0x20]\n"
+           "fstp qword ptr [rsp+0x40]")
+          // 1234: digits 4,3,2,1 in nibbles, sign byte 0.
+          .stack({0x0000000000004321ull, 0, 0, 0}));
+  add(Case("x87 fbstp packed bcd",
+           "fld qword ptr [rsp+0x20]\n"
+           "fbstp [rsp+0x60]\n"
+           "mov rax, qword ptr [rsp+0x60]")
+          .stack({0x4059000000000000ull}));
+  add(Case("x87 fxsave/fxrstor control word",
+           "fninit\n"
+           "fldcw word ptr [rsp+0x20]\n"
+           "fxsave [rsp+0x80]\n"
+           "fxrstor [rsp+0x80]\n"
+           "xor eax, eax\n"
+           "fnstcw word ptr [rsp+0x40]\n"
+           "mov ax, word ptr [rsp+0x40]")
+          .stack({0x027f}));
   return V;
 }
 

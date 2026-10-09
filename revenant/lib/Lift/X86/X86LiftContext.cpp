@@ -1669,18 +1669,6 @@ Value *X86LiftContext::x87Math(StringRef Name, Value *A, Value *B_) {
   return UndefValue::get(F80);
 }
 
-void X86LiftContext::x87Env(StringRef Dir, Value *Addr) {
-  // Only the control/status words map onto modeled state; the ip/opcode/tag
-  // fields are opaque to us either direction.
-  if (Dir == "st") {
-    memWriteAddr(Addr, x87ControlWord());
-    memWriteAddr(B.CreateAdd(Addr, constI(2, 64)), x87StatusWord());
-  } else {
-    x87SetControlWord(memReadAddr(Addr, iN(16)));
-    x87SetStatusWord(memReadAddr(B.CreateAdd(Addr, constI(2, 64)), iN(16)));
-  }
-}
-
 unsigned X86LiftContext::x87IndexOf(MCRegister Reg) const {
   // ST0..ST7 are consecutive enum values.
   if (Reg >= X86::ST0 && Reg <= X86::ST7)
