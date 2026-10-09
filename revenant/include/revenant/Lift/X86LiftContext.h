@@ -250,30 +250,6 @@ public:
   /// 0x29 is __fastfail, 0x2c is __int2c, 3 is __debugbreak in C terms).
   /// The 0x29 call site is noreturn; other vectors can return.
   void intTrap(uint64_t Imm8);
-  // ---- intrinsic-backed families --------------------------------------------
-  /// Masked vector load/store (VMASKMOV*, *MASKMOVDQU). Mask lanes are
-  /// selected by the sign bit of each EltBits element.
-  Value *maskLoad(Value *Mask, Value *AddrI64, unsigned W, unsigned EltBits);
-  void maskStore(Value *Mask, Value *V, Value *AddrI64, unsigned W,
-                 unsigned EltBits);
-  /// AES-NI operation kind: enc|enclast|dec|declast|imc|keygen.
-  Value *aesOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
-  Value *pclmulOp(Value *A, Value *Bv, int64_t Imm);
-  Value *sha1Op(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
-  Value *sha256Op(StringRef Kind, Value *A, Value *Bv);
-  Value *fmaScalar(StringRef Kind, unsigned Form, Value *MergeOrMul1,
-                   Value *Mul2OrAdd, Value *AddOrMul2, bool NegMul,
-                   bool NegAdd);
-  Value *cmpScalar(bool IsSD, Value *Merge, Value *A, Value *Bv, int64_t Imm);
-  void pcmpXstrOp(StringRef Kind, Value *A, Value *Bv, int64_t Imm);
-  Value *rotCarryOp(bool IsLeft, Value *V, Value *Count);
-  Value *rngOp(StringRef Name, unsigned W);
-  void cpuidOp();
-  void xgetbvOp();
-  void ldmxcsrOp(const MCInst &MI, unsigned MIOpNo);
-  void stmxcsrOp(const MCInst &MI, unsigned MIOpNo);
-  void pauseOp();
-  void enterOp(uint64_t Frame, uint64_t Level);
 
   // ---- bulk memory -----------------------------------------------------------
   void memMove(Value *Dst, Value *Src, Value *Len);
