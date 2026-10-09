@@ -32,7 +32,7 @@ structure, matching the engine `--patterns` path. Type recovery
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
-| pre-like locals | `revenant-locals-to-slots` | argument spills, debug-backed/loop-carried PHI webs, return slots, after `revenant-types` |
+| pre-like locals | `revenant-locals-to-slots` | argument spills, one slot per PHI web, return slots, after `revenant-types` |
 | ssaout (post) | `revenant-ssaout` | mem2reg/sroa undo, pre-frontend |
 
 When SSA-out creates a function's first `DISubprogram`, it also gives any
@@ -154,6 +154,30 @@ leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
 **revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies, and requires matching operands except for equivalent constant data and trap-only stubs. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
+
+**revenant-locals-to-slots (owner: LunaLocalsToSlots).** Expects structured,
+type-recovered SSA. Restores the `-O0` storage shape: every parameter gets an
+entry-block `alloca` spilled in signature order, every PHI web coalesces into
+one slot (each incoming value stores at its definition or on the split critical
+edge, each use loads right before it), and a multi-return function stores and
+reloads through a shared `retval` slot. Slot names come from the web's register
+name (`v_<name>`); `retval` is reserved for the return slot. Guarantees one slot
+per non-interfering web, no PHIs left behind, `!revenant.va` copied onto every
+store/load/alloca from the value it replaces. A web whose members interfere
+(one member has a use besides the destination PHI) keeps separate slots rather
+than merging. Runs after `revenant-types` in the fidelity `ir-pre-like` stage,
+replacing `revenant-ssaout`.
+
+Rule selection was measured, not assumed. On all 64 `c-clang-o2` one-to-one
+chunks (per-chunk opcode-multiset Jaccard, the harness headline metric) the
+"every PHI web" rule scores 0.2127 and leaves 318 allocas / 0 PHIs against
+ir-pre's 301 / 3. The "DI-backed + loop + retval" rule scores 0.2061 with
+214 allocas / 125 PHIs, and adding cross-block temporary spills scores 0.2132
+with 613 allocas / 125 PHIs. The three Jaccards sit within 0.007, so the
+structural counts decide: clang `-O0` is pre-mem2reg, so ir-pre has no PHIs,
+and only the all-PHI-web rule reproduces that (0 residual PHIs, allocas 6%
+over instead of 29% under or 104% over). All three beat the `revenant-ssaout`
+baseline (0.1787, 58.9 average instruction delta); the winner sits at 39.0.
 
 ## Robustness
 
