@@ -10,24 +10,21 @@
 // Strategy notes per idiom family:
 //
 // - Magic division/modulo (MSVC `mul`+fixup and clang `imul`+sign-correct
-//   shapes): the pass *evaluates* the instruction DAG feeding each candidate
-//   root as a function q(x) of the unique non-constant leaf x (the Rust
-//   reference does this on revenant-ir; here the same evaluation runs on
-//   LLVM IR values), recovers |d| as the smallest positive input with a
-//   nonzero result, then verifies q(x) == x/d on a deterministic witness
-//   set covering quotient step boundaries and range extremes. Only fully
-//   verified rewrites become udiv/sdiv/urem/srem by a constant.
-// - abs/min/max/clamp: icmp+select (signed and unsigned, both operand
-//   orders) become llvm.abs/llvm.{s,u}{min,max} canonical intrinsics so the
-//   frontend prints min/max/abs. xor+sub negations fold to sub(0,x) too.
-// - Rotates: the lifter lowers rol/ror to (a<<c)|(a>>(w-c)); those shapes
-//   fold to llvm.fshl, which the frontend prints as a rotate.
-// - Byte-swap: shift-and-or byte shuffles become llvm.bswap.
-// - Strength-reduced multiplies: mul by a power of two folds to shl; mul
-//   by any other constant stays a mul (the canonical readable form).
-// - Compiler intrinsics: ctpop spellings already arrive as intrinsic
-//   calls and pass through; memset/memcpy loop recovery is owned by
-//   revenant-patterns, not this pass.
+//   shapes): identify the widened dividend and evaluate the arithmetic DAG
+//   as q(x), even when x is itself an instruction. Recover |d| from the
+//   first positive nonzero result, then exhaustively verify i8/i16 or check
+//   quotient boundaries and extrema for i32/i64 before rewriting.
+// - abs/min/max/clamp, three-way comparisons and unsigned saturation
+//   intrinsics return to source-level compare/subtract/select operations.
+//   Signed subtraction-flag chains also become comparisons/selects, never
+//   llvm.scmp.
+// - Kernighan popcount loops, rotate idioms and plain-C byte swaps remain
+//   loops or bitwise arithmetic. Builtin intrinsics such as llvm.bswap pass
+//   through unchanged.
+// - Bit tests already use the source-level `and`/`icmp` IR form.
+// - Multiplication strength reduction is not reversed speculatively:
+//   multiply and shift spellings can both be source-level C.
+// - Memset/memcpy loop recovery belongs to revenant-patterns, not this pass.
 
 #include "revenant/Transforms/Idioms/Idioms.h"
 
@@ -83,6 +80,7 @@ struct DagEval {
   unsigned DividendW = 0;
   bool WidthConflict = false;
   bool WideMul = false;
+  Value *Input = nullptr;
   unsigned Budget = 256;
   SmallPtrSet<Value *, 16> Visited;
   DenseMap<Value *, std::optional<std::pair<APInt, unsigned>>> Memo;
@@ -92,6 +90,14 @@ struct DagEval {
 };
 
 bool DagEval::evalOperand(Value *V, unsigned W, APInt &Out128) {
+  if (V == Input && Input) {
+    Dividend = Input;
+    DividendW = W;
+    Out128 = XVal.zextOrTrunc(W).zext(128);
+    return true;
+  }
+  if (Input && !isa<ConstantInt>(V) && !isa<Instruction>(V))
+    return false;
   if (auto *C = dyn_cast<ConstantInt>(V)) {
     Out128 = C->getValue().zextOrTrunc(W).zext(128);
     return true;
@@ -375,9 +381,11 @@ std::vector<APInt> witnesses(unsigned W, int64_t D) {
 std::optional<APInt> evalRoot(Instruction *Root, const APInt &X, unsigned W,
                               Value *&Dividend, bool &WideMul,
                               bool &WidthConflict,
-                              SmallVectorImpl<Value *> *Members) {
+                              SmallVectorImpl<Value *> *Members,
+                              Value *Input = nullptr) {
   DagEval E;
   E.XVal = X.zextOrTrunc(W);
+  E.Input = Input;
   APInt Out(128, 0);
   unsigned OutW = 0;
   if (!E.evalInst(Root, Out, OutW))
@@ -406,10 +414,35 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
   if (hasOpaque(Root))
     return std::nullopt;
 
+  // The numerator may itself be an instruction, such as (a - b) or (a | b).
+  // Treat the source of a W->2W extension as the symbolic dividend instead
+  // of requiring the full arithmetic DAG to have a single argument leaf.
+  SmallPtrSet<Value *, 4> CandidateSet;
+  SmallPtrSet<Value *, 32> Seen;
+  SmallVector<Value *, 32> Work{Root};
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !Seen.insert(V).second)
+      continue;
+    if (auto *CI = dyn_cast<CastInst>(I)) {
+      auto *SrcTy = dyn_cast<IntegerType>(CI->getSrcTy());
+      auto *DstTy = dyn_cast<IntegerType>(CI->getDestTy());
+      if (SrcTy && DstTy && SrcTy->getBitWidth() == W &&
+          DstTy->getBitWidth() == 2 * W)
+        CandidateSet.insert(CI->getOperand(0));
+    }
+    for (Value *Operand : I->operands())
+      Work.push_back(Operand);
+  }
+  if (CandidateSet.size() > 1)
+    return std::nullopt;
+  Value *DivInput = CandidateSet.empty() ? nullptr : *CandidateSet.begin();
+
   APInt Zero(W, 0);
   Value *Div = nullptr;
   bool Wide = false, Conflict = false;
-  auto V0 = evalRoot(Root, Zero, W, Div, Wide, Conflict, nullptr);
+  auto V0 = evalRoot(Root, Zero, W, Div, Wide, Conflict, nullptr, DivInput);
   if (!V0 || !V0->trunc(W).isZero() || Conflict || !Wide || !Div)
     return std::nullopt;
   if (Div->getType() && Div->getType()->isIntegerTy() &&
@@ -424,7 +457,7 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
     X.setBit(K);
     Value *D2 = nullptr;
     bool W2 = false, C2 = false;
-    auto V = evalRoot(Root, X, W, D2, W2, C2, nullptr);
+    auto V = evalRoot(Root, X, W, D2, W2, C2, nullptr, DivInput);
     if (!V)
       return std::nullopt;
     if (!V->trunc(W).isZero()) {
@@ -439,7 +472,7 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
     uint64_t Mid = (Lo + R) / 2;
     Value *D2 = nullptr;
     bool W2 = false, C2 = false;
-    auto V = evalRoot(Root, APInt(W, Mid), W, D2, W2, C2, nullptr);
+    auto V = evalRoot(Root, APInt(W, Mid), W, D2, W2, C2, nullptr, DivInput);
     if (!V)
       return std::nullopt;
     if (!V->trunc(W).isZero())
@@ -451,12 +484,25 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
     return std::nullopt;
   int64_t D = (int64_t)R;
 
+  // Small domains are cheap enough to check exhaustively. This makes the
+  // accepted i8/i16 forms proofs rather than heuristic matches. Wider
+  // integers use the quotient boundaries and signed/unsigned extrema above.
+  std::vector<APInt> Inputs;
+  if (W <= 16) {
+    uint32_t Limit = 1u << W;
+    Inputs.reserve(Limit);
+    for (uint32_t X = 0; X < Limit; ++X)
+      Inputs.emplace_back(W, X);
+  } else {
+    Inputs = witnesses(W, D);
+  }
+
   // Candidates: udiv d, sdiv +d, sdiv -d. First fully verified wins.
   for (int Cand = 0; Cand < 3; ++Cand) {
     bool Signed = Cand != 0;
     int64_t DD = (Cand == 2) ? -D : D;
     bool Ok = true;
-    for (const APInt &WX : witnesses(W, DD)) {
+    for (const APInt &WX : Inputs) {
       APInt Expected(W, 0);
       if (Signed) {
         int64_t SVal = WX.getSExtValue();
@@ -464,14 +510,14 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
           Ok = false;
           break;
         }
-        int64_t Q = SVal / DD;
-        Expected = APInt(W, (uint64_t)Q, true);
+        int64_t QV = SVal / DD;
+        Expected = APInt(W, (uint64_t)QV, true);
       } else {
         Expected = WX.udiv(APInt(W, (uint64_t)D));
       }
       Value *D2 = nullptr;
       bool W2 = false, C2 = false;
-      auto Got = evalRoot(Root, WX, W, D2, W2, C2, nullptr);
+      auto Got = evalRoot(Root, WX, W, D2, W2, C2, nullptr, DivInput);
       if (!Got || Got->trunc(W) != Expected) {
         Ok = false;
         break;
@@ -486,7 +532,8 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
       Q.W = W;
       Value *D3 = nullptr;
       bool W3 = false, C3 = false;
-      evalRoot(Root, APInt(W, (uint64_t)D), W, D3, W3, C3, &Q.Members);
+      evalRoot(Root, APInt(W, (uint64_t)D), W, D3, W3, C3, &Q.Members,
+               DivInput);
       return Q;
     }
   }
@@ -562,44 +609,69 @@ std::optional<Quotient> analyzeRem(BinaryOperator *Root) {
   return Q;
 }
 
-// (c ? -x : x) / (c ? x : -x) with a sign-test condition -> x.
-bool matchAbsFromSelect(SelectInst *SI, Value *&X) {
-  auto *IC = dyn_cast<ICmpInst>(SI->getCondition());
-  if (!IC)
+
+// Recover signed compare flags directly to source-level comparisons, never
+// to llvm.scmp, which is an optimizer representation rather than C source IR.
+bool matchSignedCompare(Value *V, Value *&LHS, Value *&RHS) {
+  auto *Add = dyn_cast<BinaryOperator>(V);
+  if (!Add || Add->getOpcode() != Instruction::Add)
     return false;
-  ICmpInst::Predicate P = IC->getPredicate();
-  Value *A = IC->getOperand(0), *B = IC->getOperand(1);
-  Value *T = SI->getTrueValue(), *F = SI->getFalseValue();
-  auto isNeg = [](Value *E, Value *V) {
-    return match(E, m_Sub(m_Zero(), m_Specific(V)));
-  };
-  auto isZero = [](Value *V) {
-    if (auto *C = dyn_cast<ConstantInt>(V))
-      return C->isZero();
-    return false;
-  };
-  auto isNegOne = [](Value *V) {
-    if (auto *C = dyn_cast<ConstantInt>(V))
-      return C->isMinusOne();
-    return false;
-  };
-  // x < 0 ? -x : x  and  x <= -1 ? -x : x.
-  if (((P == ICmpInst::ICMP_SLT && isZero(B)) ||
-       (P == ICmpInst::ICMP_SLE && isNegOne(B))) &&
-      isNeg(T, A) && F == A) {
-    X = A;
-    return true;
-  }
-  // x >= 0 ? x : -x  and  x > -1 ? x : -x.
-  if (((P == ICmpInst::ICMP_SGE && isZero(B)) ||
-       (P == ICmpInst::ICMP_SGT && isNegOne(B))) &&
-      T == A && isNeg(F, A)) {
-    X = A;
+  for (unsigned I = 0; I != 2; ++I) {
+    auto *Sign = dyn_cast<SExtInst>(Add->getOperand(I));
+    auto *Nonzero = dyn_cast<ZExtInst>(Add->getOperand(1 - I));
+    auto *Less = Sign ? dyn_cast<ICmpInst>(Sign->getOperand(0)) : nullptr;
+    auto *And = Nonzero ? dyn_cast<BinaryOperator>(Nonzero->getOperand(0))
+                        : nullptr;
+    if (!Less || !And || And->getOpcode() != Instruction::And ||
+        Less->getPredicate() != ICmpInst::ICMP_SLT)
+      continue;
+    auto *Gt = dyn_cast<ICmpInst>(And->getOperand(0));
+    auto *Ne = dyn_cast<ICmpInst>(And->getOperand(1));
+    if (!Gt || !Ne) {
+      Gt = dyn_cast<ICmpInst>(And->getOperand(1));
+      Ne = dyn_cast<ICmpInst>(And->getOperand(0));
+    }
+    auto *MinusOne = Gt ? dyn_cast<ConstantInt>(Gt->getOperand(1)) : nullptr;
+    if (!Gt || !Ne || Gt->getPredicate() != ICmpInst::ICMP_SGT ||
+        Ne->getPredicate() != ICmpInst::ICMP_NE || !MinusOne ||
+        !MinusOne->isMinusOne())
+      continue;
+    Value *A = Less->getOperand(0);
+    Value *B = Less->getOperand(1);
+    if (Ne->getOperand(0) != A || Ne->getOperand(1) != B)
+      continue;
+    auto *OverflowAdjusted = dyn_cast<BinaryOperator>(Gt->getOperand(0));
+    if (!OverflowAdjusted || OverflowAdjusted->getOpcode() != Instruction::Xor)
+      continue;
+    auto matchesXor = [](Value *V, Value *X, Value *Y) {
+      auto *Xor = dyn_cast<BinaryOperator>(V);
+      return Xor && Xor->getOpcode() == Instruction::Xor &&
+             ((Xor->getOperand(0) == X && Xor->getOperand(1) == Y) ||
+              (Xor->getOperand(0) == Y && Xor->getOperand(1) == X));
+    };
+    Value *Difference = nullptr;
+    Value *Overflow = nullptr;
+    for (unsigned K = 0; K != 2; ++K) {
+      auto *Sub = dyn_cast<BinaryOperator>(OverflowAdjusted->getOperand(K));
+      if (Sub && Sub->getOpcode() == Instruction::Sub &&
+          Sub->getOperand(0) == A && Sub->getOperand(1) == B) {
+        Difference = Sub;
+        Overflow = OverflowAdjusted->getOperand(1 - K);
+        break;
+      }
+    }
+    auto *OverflowAnd = dyn_cast<BinaryOperator>(Overflow);
+    if (!Difference || !OverflowAnd ||
+        OverflowAnd->getOpcode() != Instruction::And ||
+        !matchesXor(OverflowAnd->getOperand(0), A, B) ||
+        !matchesXor(OverflowAnd->getOperand(1), A, Difference))
+      continue;
+    LHS = A;
+    RHS = B;
     return true;
   }
   return false;
 }
-
 } // namespace
 
 PreservedAnalyses revenant::IdiomsPass::run(Function &F,
@@ -702,208 +774,87 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
     for (Instruction &I : make_early_inc_range(instructions(F))) {
       if (hasOpaque(&I))
         continue;
-      // -- mul by power of two -> shl. Mul by any other constant is
-      //    already the canonical readable form and stays.
-      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        if (BO->getOpcode() == Instruction::Mul) {
-          ConstantInt *C = dyn_cast<ConstantInt>(BO->getOperand(1));
-          Value *X = BO->getOperand(0);
-          if (!C || !C->getValue().isPowerOf2()) {
-            C = dyn_cast<ConstantInt>(BO->getOperand(0));
-            X = BO->getOperand(1);
+      if (auto *Call = dyn_cast<CallInst>(&I)) {
+          B.SetInsertPoint(Call);
+        Function *Callee = Call->getCalledFunction();
+        if (Callee && Callee->isIntrinsic()) {
+          Intrinsic::ID ID = Callee->getIntrinsicID();
+          Value *A = Call->getArgOperand(0);
+          Value *R = nullptr;
+          Value *Cond = nullptr;
+          if (ID == Intrinsic::scmp || ID == Intrinsic::ucmp) {
+            Value *Bv = Call->getArgOperand(1);
+            bool Signed = ID == Intrinsic::scmp;
+            Value *Less = B.CreateICmp(
+                Signed ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_ULT, A, Bv);
+            Value *Greater = B.CreateICmp(
+                Signed ? ICmpInst::ICMP_SGT : ICmpInst::ICMP_UGT, A, Bv);
+            Value *One = ConstantInt::get(Call->getType(), 1);
+            Value *MinusOne = ConstantInt::getSigned(Call->getType(), -1);
+            Value *Zero = ConstantInt::getNullValue(Call->getType());
+            R = B.CreateSelect(Less, MinusOne,
+                               B.CreateSelect(Greater, One, Zero));
+          } else if (ID == Intrinsic::smin || ID == Intrinsic::smax ||
+                     ID == Intrinsic::umin || ID == Intrinsic::umax) {
+            Value *Bv = Call->getArgOperand(1);
+            bool Signed = ID == Intrinsic::smin || ID == Intrinsic::smax;
+            bool Min = ID == Intrinsic::smin || ID == Intrinsic::umin;
+            Cond = B.CreateICmp(
+                Signed ? (Min ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_SGT)
+                       : (Min ? ICmpInst::ICMP_ULT : ICmpInst::ICMP_UGT),
+                A, Bv);
+            R = B.CreateSelect(Cond, A, Bv);
+          } else if (ID == Intrinsic::abs) {
+            Cond = B.CreateICmpSLT(
+                A, ConstantInt::getNullValue(A->getType()));
+            Value *Neg = B.CreateSub(ConstantInt::getNullValue(A->getType()),
+                                     A);
+            R = B.CreateSelect(Cond, Neg, A);
+          } else if (ID == Intrinsic::usub_sat) {
+            Value *Bv = Call->getArgOperand(1);
+            Cond = B.CreateICmpULT(A, Bv);
+            Value *Difference = B.CreateSub(A, Bv);
+            R = B.CreateSelect(Cond, ConstantInt::getNullValue(A->getType()),
+                               Difference);
+          } else if (ID == Intrinsic::uadd_sat) {
+            Value *Bv = Call->getArgOperand(1);
+            Value *Sum = B.CreateAdd(A, Bv);
+            Cond = B.CreateICmpULT(Sum, A);
+            R = B.CreateSelect(Cond, ConstantInt::getAllOnesValue(A->getType()),
+                               Sum);
           }
-          if (C && C->getValue().isPowerOf2() && !C->getValue().isOne()) {
-            B.SetInsertPoint(BO);
-            Value *Sh = ConstantInt::get(
-                BO->getType(), C->getValue().exactLogBase2());
-            Value *S = B.CreateShl(X, Sh);
-            auto *SI2 = cast<Instruction>(S);
-            copyProvenance(SI2, BO);
-            SI2->copyMetadata(*BO);
-            BO->replaceAllUsesWith(S);
-            S->takeName(BO);
-            BO->eraseFromParent();
+          if (R) {
+            auto *Replacement = cast<Instruction>(R);
+            copyProvenance(Replacement, Call);
+            Replacement->copyMetadata(*Call);
+            Call->replaceAllUsesWith(R);
+            R->takeName(Call);
+            Call->eraseFromParent();
             LocalChanged = true;
             continue;
           }
         }
       }
-      // -- select-based abs/min/max/clamp -> intrinsics.
-      if (auto *SI = dyn_cast<SelectInst>(&I)) {
-        Value *X = nullptr;
-        if (matchAbsFromSelect(SI, X)) {
-          B.SetInsertPoint(SI);
-          Function *Abs = Intrinsic::getOrInsertDeclaration(
-              F.getParent(), Intrinsic::abs, {SI->getType()});
-          Value *Call =
-              B.CreateCall(Abs, {X, ConstantInt::getFalse(Ctx)});
-          auto *CI = cast<Instruction>(Call);
-          copyProvenance(CI, SI);
-          CI->copyMetadata(*SI);
-          SI->replaceAllUsesWith(Call);
-          Call->takeName(SI);
-          SI->eraseFromParent();
-          LocalChanged = true;
-          continue;
-        }
-        // icmp+select min/max (signed and unsigned, either order).
-        if (auto *IC = dyn_cast<ICmpInst>(SI->getCondition())) {
-          ICmpInst::Predicate P = IC->getPredicate();
-          Value *A = IC->getOperand(0), *Bv = IC->getOperand(1);
-          Value *T = SI->getTrueValue(), *Fv = SI->getFalseValue();
-          bool TIsA = (T == A && Fv == Bv);
-          bool FIsA = (T == Bv && Fv == A);
-          if (TIsA || FIsA) {
-            Intrinsic::ID ID = Intrinsic::not_intrinsic;
-            switch (P) {
-            case ICmpInst::ICMP_SLT:
-            case ICmpInst::ICMP_SLE:
-              ID = TIsA ? Intrinsic::smin : Intrinsic::smax;
-              break;
-            case ICmpInst::ICMP_SGT:
-            case ICmpInst::ICMP_SGE:
-              ID = TIsA ? Intrinsic::smax : Intrinsic::smin;
-              break;
-            case ICmpInst::ICMP_ULT:
-            case ICmpInst::ICMP_ULE:
-              ID = TIsA ? Intrinsic::umin : Intrinsic::umax;
-              break;
-            case ICmpInst::ICMP_UGT:
-            case ICmpInst::ICMP_UGE:
-              ID = TIsA ? Intrinsic::umax : Intrinsic::umin;
-              break;
-            default:
-              break;
-            }
-            if (ID != Intrinsic::not_intrinsic) {
-              B.SetInsertPoint(SI);
-              Function *Decl = Intrinsic::getOrInsertDeclaration(
-                  F.getParent(), ID, {SI->getType()});
-              Value *Call = B.CreateCall(Decl, {A, Bv});
-              auto *CI = cast<Instruction>(Call);
-              copyProvenance(CI, SI);
-              CI->copyMetadata(*SI);
-              SI->replaceAllUsesWith(Call);
-              Call->takeName(SI);
-              SI->eraseFromParent();
-              LocalChanged = true;
-              continue;
-            }
-          }
-        }
-      }
-      // -- rotates: (x << c) | (x >> (w-c)) -> llvm.fshl. The ror mirror
-      //    (operands swapped) matches the same pattern; the frontend
-      //    prints whichever direction the shift amounts describe.
-      {
-        // Match (x<<c)|(x>>(w-c)) in either or-operand order; the ror
-        // mirror (x>>c)|(x<<(w-c)) matches with the shift roles swapped
-        // and folds to fshl(x,x,w-c) (== fshr(x,x,c)).
-        Value *ShlX = nullptr, *ShlC = nullptr;
-        Value *ShrX = nullptr, *ShrC = nullptr;
-        bool Rot = false;
-        Value *Amt = nullptr;
-        auto tryPair = [&](Value *A, Value *B) {
-          ShlX = ShlC = ShrX = ShrC = nullptr;
-          if (match(A, m_Shl(m_Value(ShlX), m_Value(ShlC))) &&
-              match(B, m_LShr(m_Value(ShrX), m_Value(ShrC))) &&
-              ShlX == ShrX && I.getType()->isIntegerTy()) {
-            unsigned W = I.getType()->getIntegerBitWidth();
-            Value *SubA = nullptr, *SubB = nullptr;
-            if (match(ShrC, m_Sub(m_Value(SubA), m_Value(SubB)))) {
-              if (auto *CW = dyn_cast<ConstantInt>(SubA))
-                if (CW->getZExtValue() == W && SubB == ShlC) {
-                  Rot = true; // rol: fshl(x,x,c).
-                  Amt = ShlC;
-                  return;
-                }
-            }
-            if (match(ShlC, m_Sub(m_Value(SubA), m_Value(SubB)))) {
-              if (auto *CW = dyn_cast<ConstantInt>(SubA))
-                if (CW->getZExtValue() == W && SubB == ShrC) {
-                  Rot = true; // ror: fshl(x,x,w-c).
-                  Amt = ShlC;
-                  return;
-                }
-            }
-          }
-        };
-        if (auto *BO = dyn_cast<BinaryOperator>(&I);
-            BO && BO->getOpcode() == Instruction::Or) {
-          tryPair(BO->getOperand(0), BO->getOperand(1));
-          if (!Rot)
-            tryPair(BO->getOperand(1), BO->getOperand(0));
-          if (Rot) {
-            B.SetInsertPoint(&I);
-            Function *Fshl = Intrinsic::getOrInsertDeclaration(
-                F.getParent(), Intrinsic::fshl, {I.getType()});
-            Value *Call = B.CreateCall(Fshl, {ShlX, ShlX, Amt});
-            auto *CI = cast<Instruction>(Call);
-            copyProvenance(CI, &I);
-            CI->copyMetadata(I);
-            I.replaceAllUsesWith(Call);
-            Call->takeName(&I);
-            I.eraseFromParent();
-            LocalChanged = true;
-            continue;
-          }
-        }
-      }
-      // -- byte-swap: shift-and-or byte shuffle -> llvm.bswap.
-      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        if (BO->getOpcode() == Instruction::Or) {
-          // Collect the OR tree leaves; expect one shift term per byte.
-          SmallVector<Value *, 8> Leaves;
-          SmallVector<Value *, 8> Stack{BO->getOperand(0),
-                                        BO->getOperand(1)};
-          while (!Stack.empty()) {
-            Value *V = Stack.pop_back_val();
-            if (auto *O = dyn_cast<BinaryOperator>(V);
-                O && O->getOpcode() == Instruction::Or) {
-              Stack.push_back(O->getOperand(0));
-              Stack.push_back(O->getOperand(1));
-            } else
-              Leaves.push_back(V);
-          }
-          if (auto *IntTy = dyn_cast<IntegerType>(I.getType())) {
-            unsigned W = IntTy->getBitWidth();
-            if (Leaves.size() * 8 == W &&
-                (W == 16 || W == 32 || W == 64)) {
-              Value *Base = nullptr;
-              bool Ok = true;
-              for (Value *L : Leaves) {
-                Value *Shifted = L;
-                if (!match(L, m_And(m_Value(Shifted), m_ConstantInt())))
-                  Shifted = L;
-                Value *SX = nullptr, *SAmt = nullptr;
-                if (match(Shifted, m_Shl(m_Value(SX), m_Value(SAmt))) ||
-                    match(Shifted, m_LShr(m_Value(SX), m_Value(SAmt)))) {
-                  if (!Base)
-                    Base = SX;
-                  else if (Base != SX)
-                    Ok = false;
-                } else {
-                  Ok = false;
-                  break;
-                }
-              }
-              if (Ok && Base) {
-                B.SetInsertPoint(BO);
-                Function *Bswap = Intrinsic::getOrInsertDeclaration(
-                    F.getParent(), Intrinsic::bswap, {I.getType()});
-                Value *Call = B.CreateCall(Bswap, {Base});
-                auto *CI = cast<Instruction>(Call);
-                copyProvenance(CI, BO);
-                CI->copyMetadata(*BO);
-                BO->replaceAllUsesWith(Call);
-                Call->takeName(BO);
-                BO->eraseFromParent();
-                LocalChanged = true;
-                continue;
-              }
-            }
-          }
-        }
+      Value *CmpLHS = nullptr;
+      Value *CmpRHS = nullptr;
+      if (matchSignedCompare(&I, CmpLHS, CmpRHS)) {
+        B.SetInsertPoint(&I);
+        Value *Less = B.CreateICmpSLT(CmpLHS, CmpRHS);
+        Value *Greater = B.CreateICmpSGT(CmpLHS, CmpRHS);
+        Value *MinusOne = ConstantInt::getSigned(I.getType(), -1);
+        Value *One = ConstantInt::get(I.getType(), 1);
+        Value *Zero = ConstantInt::getNullValue(I.getType());
+        Value *Result =
+            B.CreateSelect(Less, MinusOne,
+                           B.CreateSelect(Greater, One, Zero));
+        auto *ResultI = cast<Instruction>(Result);
+        copyProvenance(ResultI, &I);
+        ResultI->copyMetadata(I);
+        I.replaceAllUsesWith(Result);
+        Result->takeName(&I);
+        I.eraseFromParent();
+        LocalChanged = true;
+        continue;
       }
       // -- xor(x,-1)+1 -> sub(0,x), the abs building block.
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {

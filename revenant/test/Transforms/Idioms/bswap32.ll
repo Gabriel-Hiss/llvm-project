@@ -1,5 +1,5 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
-; bswap32: shift-and-or byte shuffle -> llvm.bswap.
+; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; Plain C shift/or byte shuffles remain source-level arithmetic operations.
 define i32 @bswap32(i32 %x) {
 entry:
   %a = lshr i32 %x, 24
@@ -14,4 +14,27 @@ entry:
   ret i32 %o3
 }
 ; CHECK-LABEL: define i32 @bswap32(
+; CHECK: lshr i32 %x, 24
+; CHECK: shl i32 %x, 24
+; CHECK: or i32 %o2, %d
+
+; A shift/or is not enough to prove a byte swap.
+define i16 @not_bswap(i16 %x) {
+entry:
+  %left = shl i16 %x, 1
+  %right = lshr i16 %x, 1
+  %combined = or i16 %left, %right
+  ret i16 %combined
+}
+; CHECK-LABEL: define i16 @not_bswap(
+; CHECK: shl i16 %x, 1
+; CHECK: lshr i16 %x, 1
+; CHECK-NOT: call i16 @llvm.bswap.i16
+
+define i32 @bswap_builtin(i32 %x) {
+entry:
+  %result = call i32 @llvm.bswap.i32(i32 %x)
+  ret i32 %result
+}
+; CHECK-LABEL: define i32 @bswap_builtin(
 ; CHECK: call i32 @llvm.bswap.i32(i32 %x)
