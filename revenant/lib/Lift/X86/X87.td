@@ -403,3 +403,111 @@ def : RVLift {
   dag Body = (rv_x87stset 0, (rv_ffdiv (rv_fld "i32" $src), (rv_x87st 0)));
 }
 
+// ---- compares ---------------------------------------------------------------
+// Operand-less forms use the disassembler's register: COM_FST0r/COMP_FST0r
+// carry (ins RSTi:$op); UCOM_Fr/UCOM_FPr the same; UCOM_FPPr/FCOMPP pop
+// ST(0) and ST(1) with no operands at all.
+
+def : RVLift {
+  let Insn = COM_FST0r;
+  dag Body = (rv_fcom (rv_x87idx $op));
+}
+def : RVLift {
+  let Insn = COMP_FST0r;
+  dag Body = (rv_seq (rv_fcom (rv_x87idx $op)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = UCOM_Fr;
+  dag Body = (rv_fcom (rv_x87idx $reg));
+}
+def : RVLift {
+  let Insn = UCOM_FPr;
+  dag Body = (rv_seq (rv_fcom (rv_x87idx $reg)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = UCOM_FPPr;
+  dag Body = (rv_seq (rv_fcom) (rv_x87pop) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FCOMPP;
+  dag Body = (rv_seq (rv_fcom) (rv_x87pop) (rv_x87pop));
+}
+
+// Memory compares: FCOM32m/64m (no pop), FCOMP32m/64m (pop), integer FICOM*.
+
+def : RVLift {
+  let Insn = FCOM32m;
+  dag Body = (rv_fcom $src);
+}
+def : RVLift {
+  let Insn = FCOM64m;
+  dag Body = (rv_fcom $src);
+}
+def : RVLift {
+  let Insn = FCOMP32m;
+  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FCOMP64m;
+  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FICOM16m;
+  dag Body = (rv_fcom $src);
+}
+def : RVLift {
+  let Insn = FICOMP16m;
+  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = FICOM32m;
+  dag Body = (rv_fcom $src);
+}
+def : RVLift {
+  let Insn = FICOMP32m;
+  dag Body = (rv_seq (rv_fcom $src) (rv_x87pop));
+}
+
+// FCOMI-family: (outs), (ins RSTi:$reg), Defs EFLAGS. Plain forms keep the
+// stack, P forms pop. fcomi raises #IA on QNaN, fucomi does not; the lifted
+// IR is the same unordered comparison either way.
+
+def : RVLift {
+  let Insn = COM_FIr;
+  dag Body = (rv_fcomi (rv_x87idx $reg));
+}
+def : RVLift {
+  let Insn = COM_FIPr;
+  dag Body = (rv_seq (rv_fcomi (rv_x87idx $reg)) (rv_x87pop));
+}
+def : RVLift {
+  let Insn = UCOM_FIr;
+  dag Body = (rv_fcomi (rv_x87idx $reg));
+}
+def : RVLift {
+  let Insn = UCOM_FIPr;
+  dag Body = (rv_seq (rv_fcomi (rv_x87idx $reg)) (rv_x87pop));
+}
+
+// ---- status and control words -----------------------------------------------
+// FNSTSW16r writes AX; FNSTSWm stores the word; FNSTCW/FLDCW round-trip the
+// control word through the context. FNINIT resets both; FNCLEX clears the
+// exception flags.
+
+def : RVLift {
+  let Insn = FNSTSW16r;
+  dag Body = (rv_set (rv_reg "AX"), (rv_fstsw));
+}
+def : RVLift {
+  let Insn = FNSTSWm;
+  dag Body = (rv_store $dst, (rv_fstsw));
+}
+def : RVLift {
+  let Insn = FNSTCW16m;
+  dag Body = (rv_fstcw $dst);
+}
+def : RVLift {
+  let Insn = FLDCW16m;
+  dag Body = (rv_fldcw $dst);
+}
+
