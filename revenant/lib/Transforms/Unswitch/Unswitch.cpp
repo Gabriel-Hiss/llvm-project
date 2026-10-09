@@ -181,14 +181,20 @@ std::optional<std::vector<Constant *>>
 readTable(GlobalVariable *GV, uint64_t ExpectSize) {
   if (!GV || !GV->isConstant() || !GV->hasInitializer())
     return std::nullopt;
-  auto *Arr = dyn_cast<ConstantArray>(GV->getInitializer());
-  if (!Arr || Arr->getNumOperands() != ExpectSize)
+  auto *Init = GV->getInitializer();
+  auto *ArrayTy = dyn_cast<ArrayType>(Init->getType());
+  if (!ArrayTy || ArrayTy->getNumElements() != ExpectSize)
+    return std::nullopt;
+  auto *Data = dyn_cast<ConstantDataSequential>(Init);
+  auto *Array = dyn_cast<ConstantArray>(Init);
+  if (!Data && !Array)
     return std::nullopt;
   std::vector<Constant *> Elems;
   Elems.reserve((size_t)ExpectSize);
-  for (Value *Op : Arr->operands()) {
-    auto *C = dyn_cast<Constant>(Op);
-    if (!C || isa<PoisonValue>(C) || isa<UndefValue>(C))
+  for (uint64_t I = 0; I < ExpectSize; ++I) {
+    Constant *C = Data ? Data->getElementAsConstant((unsigned)I)
+                       : cast<Constant>(Array->getOperand((unsigned)I));
+    if (isa<PoisonValue>(C) || isa<UndefValue>(C))
       return std::nullopt;
     Elems.push_back(C);
   }
@@ -276,8 +282,6 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
   if (!Phi || !Ld)
     return std::nullopt;
 
-  // The default incoming value must be a constant reachable from Head or
-  // Default (SimplifyCFG threads the default result through directly).
   Constant *Def = nullptr;
   for (unsigned I = 0, E = Phi->getNumIncomingValues(); I < E; ++I) {
     BasicBlock *Inc = Phi->getIncomingBlock(I);
@@ -386,6 +390,8 @@ bool buildSwitchFromTable(LookupShape &S) {
     BasicBlock *CB = BlockFor[R.Result];
     SI->addCase(ConstantInt::get(Ctx, R.Value), CB);
   }
+  for (auto &KV : BlockFor)
+    S.Phi->addIncoming(KV.first, KV.second);
 
   // Keep the incoming value for the new switch default edge.  When the
   // default destination is the join itself, that edge comes directly from
@@ -396,14 +402,13 @@ bool buildSwitchFromTable(LookupShape &S) {
   if (S.Default != S.Head && S.Default != Join)
     S.Phi->removeIncomingValue(S.Default);
 
-  S.RangeCheck->eraseFromParent();
   S.Head->getTerminator()->eraseFromParent();
+  S.RangeCheck->eraseFromParent();
 
-  // Erase the lookup block (load + gep + br).
-  Join->removePredecessor(S.Lookup);
   S.Lookup->dropAllReferences();
-  // EraseFromParent on the block drops remaining instructions.
   S.Lookup->eraseFromParent();
+  if (S.Table->use_empty())
+    S.Table->eraseFromParent();
   return true;
 }
 
@@ -775,9 +780,9 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
   }
   BasicBlock *Dest = BI->getSuccessor(0);
   BasicBlock *Other = BI->getSuccessor(1);
-  // Heuristic guard: only rebuild small ranges (the corpus folds are all
-  // tiny: luaB_close has 2 cases). Huge ranges bloat IR for no gain.
-  if (Size < 2 || Size > 64)
+  // Small ranges are indistinguishable from source-level interval checks.
+  // Only expand ranges large enough to plausibly be folded switch cases.
+  if (Size < 4 || Size > 64)
     return false;
   APInt MinE = Min.sextOrTrunc(CW);
   LLVMContext &Ctx = F.getContext();

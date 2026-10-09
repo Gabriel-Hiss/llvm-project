@@ -6,13 +6,23 @@
 @switch.table.switch_twolevel = private unnamed_addr constant [20 x i32] [i32 100, i32 100, i32 100, i32 100, i32 100, i32 200, i32 200, i32 200, i32 200, i32 200, i32 300, i32 300, i32 300, i32 300, i32 300, i32 400, i32 400, i32 400, i32 400, i32 400], align 4
 
 define i32 @twolevel(i32 %0) {
+; CHECK-NOT: @switch.table.switch_twolevel
 ; CHECK-LABEL: define i32 @twolevel(
 ; CHECK: switch i32 %0, label %[[DEF:.*]] [
-; CHECK-DAG: i32 0, label %[[C:.*]]
-; CHECK-DAG: i32 19, label %[[C]]
+; CHECK-DAG: i32 0, label %[[C100:.*]]
+; CHECK-DAG: i32 4, label %[[C100]]
+; CHECK-DAG: i32 5, label %[[C200:.*]]
+; CHECK-DAG: i32 10, label %[[C300:.*]]
+; CHECK-DAG: i32 15, label %[[C400:.*]]
+; CHECK-DAG: i32 19, label %[[C400]]
 ; CHECK: ]
-; The fallback edge reaches the join directly, so its phi input must survive.
-; CHECK: phi i32 [ %{{.*}}, %{{.*}} ], [ -1, %1 ],
+; CHECK-NOT: load i32
+; CHECK: phi i32
+; CHECK-DAG: [ -1, %1 ]
+; CHECK-DAG: [ 100, %[[C100]] ]
+; CHECK-DAG: [ 200, %[[C200]] ]
+; CHECK-DAG: [ 300, %[[C300]] ]
+; CHECK-DAG: [ 400, %[[C400]] ]
   %2 = icmp ult i32 %0, 20, !revenant.va !{i64 4096}
   br i1 %2, label %3, label %7
 
