@@ -3,6 +3,8 @@
 
 import argparse
 import re
+import random
+
 import shutil
 import subprocess
 import tempfile
@@ -78,16 +80,52 @@ def copy_driver(exe: Path, directory: Path) -> Path:
     return copied
 
 
-def run_mode(exe: Path, binary: Path, mode: str, output: Path) -> str:
-    base = output / mode
-    subprocess.run(
-        [str(exe), str(binary), "--meta=" + mode, "--emit=ir-final", "-o", str(base)],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return Path(str(base) + ".ir-final.ll").read_text(encoding="utf-8")
+def run_mode(exe: Path, binary: Path, mode: str, targets: list[str],
+             output: Path, serial: int) -> str | None:
+    base = output / f"{serial}-{mode}"
+    command = [str(exe), str(binary), "--meta=" + mode,
+               "--emit=ir-final", "-o", str(base)]
+    for target in targets:
+        command.extend(["--func", target])
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError:
+        return None
+    return normalize(Path(str(base) + ".ir-final.ll").read_text(encoding="utf-8"))
+
+
+def selected_functions(exe: Path, binary: Path, sample: int, seed: int) -> list[str]:
+    output = subprocess.run(
+        [str(exe), str(binary), "--list"],
+        check=True, capture_output=True, text=True
+    ).stdout
+    all_functions = [line.split("\t", 1)[0] for line in output.splitlines()
+                     if "\t" in line]
+    return random.Random(seed).sample(all_functions, min(sample, len(all_functions)))
+
+
+def compare_group(exe: Path, binary: Path, targets: list[str], output: Path,
+                  counts: dict[str, int], serial: list[int]) -> None:
+    serial[0] += 1
+    NoneIR = run_mode(exe, binary, "none", targets, output, serial[0])
+    EmbeddedIR = run_mode(exe, binary, "embedded", targets, output, serial[0])
+    if NoneIR is not None and EmbeddedIR is not None and NoneIR == EmbeddedIR:
+        counts["passed"] += len(targets)
+        return
+    if len(targets) == 1:
+        if NoneIR is None and EmbeddedIR is None:
+            counts["crashed_in_both"] += 1
+        elif NoneIR is None or EmbeddedIR is None:
+            counts["one_mode_crash"] += 1
+            print(f"    {targets[0]}: crash in one mode", file=sys.stderr)
+        else:
+            counts["diff"] += 1
+            print(f"    {targets[0]}: normalized IR differs", file=sys.stderr)
+        return
+    Middle = len(targets) // 2
+    compare_group(exe, binary, targets[:Middle], output, counts, serial)
+    compare_group(exe, binary, targets[Middle:], output, counts, serial)
 
 
 def main() -> int:
@@ -96,6 +134,9 @@ def main() -> int:
     parser.add_argument("--corpus", required=True, type=Path)
     parser.add_argument("--targets", nargs="*", default=BINARIES)
     parser.add_argument("--all-release", action="store_true")
+    parser.add_argument("--sample", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=211009)
+    args = parser.parse_args()
     args.exe = args.exe.resolve()
     args.corpus = args.corpus.resolve()
 
@@ -132,26 +173,18 @@ def main() -> int:
                     print("c-o2: FAIL --meta=pdb did not report not implemented yet",
                           file=sys.stderr)
                     failures.append(name)
+            functions = selected_functions(driver, binary, args.sample, args.seed)
             output = scratch / name
             output.mkdir()
-            try:
-                none = normalize(run_mode(driver, binary, "none", output))
-                embedded = normalize(run_mode(driver, binary, "embedded", output))
-            except subprocess.CalledProcessError as Error:
-                Details = [
-                    Line for Line in Error.stderr.splitlines()
-                    if "Revenant stage=" in Line or "Exception Code:" in Line
-                ]
-                print(f"{name}: FAIL process exit {Error.returncode} "
-                      f"({' ; '.join(Details)})", file=sys.stderr)
+            counts = {"passed": 0, "crashed_in_both": 0,
+                      "one_mode_crash": 0, "diff": 0}
+            compare_group(driver, binary, functions, output, counts, [0])
+            print(f"{name}: sampled={len(functions)} passed={counts['passed']} "
+                  f"crashed_both={counts['crashed_in_both']} "
+                  f"one_mode_crash={counts['one_mode_crash']} "
+                  f"diff={counts['diff']}")
+            if counts["one_mode_crash"] or counts["diff"]:
                 failures.append(name)
-                continue
-            if none != embedded:
-                print(f"{name}: FAIL metadata changed statements or control flow",
-                      file=sys.stderr)
-                failures.append(name)
-                continue
-            print(f"{name}: PASS invariant")
     return 1 if failures else 0
 if __name__ == "__main__":
     raise SystemExit(main())

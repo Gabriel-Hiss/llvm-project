@@ -57,18 +57,16 @@ embedded names and metadata, but retains data bytes and import names.
 Without `--func` every discovered function is decompiled; a Windows command
 line holds a few hundred `--func` arguments, so chunk large sets.
 
-`test/meta-mode/invariant.py` compares normalized final IR for `c-o2`,
-`cpp-o2`, `rust-o2` and `cpp-gcc-o2` in `none` and `embedded` modes. It keeps
-instructions and terminators intact while neutralizing identifiers and
-debug metadata.
-
-`test/meta-mode/recovery-report.py` compares recovered names with oracle PDB
-or map names after decompilation. Pass `--pdbutil` to inspect PDBs. Both
-scripts accept `--all-release` to include the optimized corpus targets.
+`test/meta-mode/invariant.py` samples 300 functions per release binary with
+seed 211009, normalizes identifiers and type names, then compares final IR
+for `none` and `embedded`. A function that crashes in both modes is counted
+separately and excluded; a one-mode crash or differing IR fails the check.
+`test/meta-mode/recovery-report.py` compares sampled real names with oracle
+PDB or map symbols. Both scripts accept `--all-release`.
 
 ```text
-python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity> --all-release
-python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe> --all-release
+python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity> --all-release --sample 300 --seed 211009
+python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe> --all-release --sample 300 --seed 211009
 ```
 
 ## Rust path

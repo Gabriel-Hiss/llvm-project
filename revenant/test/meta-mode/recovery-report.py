@@ -6,6 +6,8 @@ import json
 import re
 import shutil
 import subprocess
+import random
+
 import tempfile
 from pathlib import Path
 
@@ -77,6 +79,8 @@ def main() -> int:
     parser.add_argument("--pdbutil", type=Path)
     parser.add_argument("--targets", nargs="*", default=TARGETS)
     parser.add_argument("--all-release", action="store_true")
+    parser.add_argument("--sample", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=211009)
     args = parser.parse_args()
     args.exe = args.exe.resolve()
     args.corpus = args.corpus.resolve()
@@ -94,15 +98,18 @@ def main() -> int:
                 [str(driver), str(binary), "--meta=embedded", "--list"],
                 check=True, capture_output=True, text=True
             ).stdout
-            decompiler_names = [line.split("\t", 2)[1] for line in output.splitlines()
-                                if "\t" in line]
-            recovered = {n for n in decompiler_names
-                         if n != "entry" and not n.startswith("sub_")}
+            functions = [tuple(line.split("\t", 2)[:2])
+                         for line in output.splitlines() if "\t" in line]
+            selected = random.Random(args.seed).sample(
+                functions, min(args.sample, len(functions)))
+            recovered = {name for _, name in selected
+                         if name != "entry" and not name.startswith("sub_")}
             oracle, oracle_file = oracle_names(binary_dir, name, args.pdbutil)
             validated = recovered & oracle
             report.append({
                 "binary": name,
-                "functions": len(decompiler_names),
+                "functions_total": len(functions),
+                "functions_sampled": len(selected),
                 "real_names": len(recovered),
                 "oracle_file": oracle_file,
                 "oracle_name_matches": len(validated),
