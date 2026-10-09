@@ -76,6 +76,9 @@
 #if __has_include("revenant/Transforms/UnloopVec/UnloopVec.h")
 #include "revenant/Transforms/UnloopVec/UnloopVec.h"
 #endif
+#if __has_include("revenant/Transforms/Unoutline/Unoutline.h")
+#include "revenant/Transforms/Unoutline/Unoutline.h"
+#endif
 
 using namespace llvm;
 
@@ -197,6 +200,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Uninline/Uninline.h")
         if (Name == "revenant-uninline") {
           MPM.addPass(UninlinePass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/Unoutline/Unoutline.h")
+        if (Name == "revenant-unoutline") {
+          MPM.addPass(UnoutlinePass());
           return true;
         }
 #endif

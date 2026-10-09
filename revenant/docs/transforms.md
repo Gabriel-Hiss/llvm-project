@@ -140,3 +140,9 @@ Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
 runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
+
+**revenant-unoutline (owner: Swe2DeoptOutliner).** Module pass that restores
+small shared binary-derived fragments and direct-call thunks at their call
+sites. It requires multiple direct callers and a single straight-line block;
+uncertain functions remain calls. Runs explicitly with
+`-passes=revenant-unoutline`.
