@@ -242,6 +242,11 @@ void TypeInference::collect() {
           if (isa<Instruction>(Inc) || isa<Argument>(Inc))
             unite(&I, Inc);
       }
+      // Loads alias their pointer for signedness: the loaded value's type
+      // is the memory's type, so votes on the load read the slot's type.
+      // (Stores vote on the stored value, not the slot.)
+      if (const auto *LI = dyn_cast<LoadInst>(&I))
+        unite(&I, LI->getPointerOperand());
     }
   }
 
@@ -373,7 +378,7 @@ void TypeInference::collect() {
           unite(&I, GEP->getPointerOperand());
         continue;
       }
-      if (const auto *AI = dyn_cast<AllocaInst>(&I)) {
+      if (isa<AllocaInst>(&I)) {
         votePointer(&I);
         continue;
       }
