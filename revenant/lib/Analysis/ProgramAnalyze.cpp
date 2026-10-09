@@ -424,7 +424,8 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
             IsNoreturn, false, &OrphanClaims, Bound);
         SharedRipRefs.insert(Result.RipRefs.begin(), Result.RipRefs.end());
         if (analysis_detail::orphanFunctionOk(*P.Img, Result.F, BoundEnd,
-                                              Hooks)) {
+                                              Hooks) &&
+            !analysis_detail::rejectWeakFunction(*P.Img, Hooks, Result.F)) {
           setFunctionName(Result.F, *P.Names);
           Result.F.Orphan = true;
           Starts.insert(Cursor);
