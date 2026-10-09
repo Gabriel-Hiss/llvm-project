@@ -141,3 +141,15 @@ Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
 runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
+
+**revenant-unipo (owner: MuseDeoptIPO).** Module pass (not function):
+rewrites function signatures, snapshotting the function list first so
+erasure is safe. Undoes DeadArgElim return elimination (void back to the
+dead computed value, e.g. errfile/pushmode/luaK_codek/g_iofile,
+TIXML_SNPRINTF, xml_buffered_writer::flush, xpath_parser::error_oom),
+dead-argument removal named by DISubprogram/dbg.value records (e.g.
+rust-o3 dot4/vec_ops), and `.constprop.N`/`.isra.N`/`.specialized.N`/
+`.lto_priv`/`.llvm.N` clone fold-back. Runs explicitly via
+`-passes=revenant-unipo`, not in the default pipeline. Guarantees
+`!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM 22
+parseable output.
