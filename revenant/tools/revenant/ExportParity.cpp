@@ -87,6 +87,37 @@ static int writeAsmSidecar(
   return 0;
 }
 
+/// `revenant-funcs.tsv`, an opt-in debugging dump (`REVENANT_PARITY_FUNCS`):
+/// one row per recovered function with its pdata/orphan flags, instruction
+/// and block counts, unresolved indirect jumps, and chunk ranges (RVAs).
+static int writeFuncDump(const Program &Prog, StringRef OutDir) {
+  SmallString<256> Path(OutDir);
+  sys::path::append(Path, "revenant-funcs.tsv");
+  std::error_code Ec;
+  raw_fd_ostream Os(Path, Ec, sys::fs::OF_Text);
+  if (Ec) {
+    errs() << "revenant: " << Path << ": " << Ec.message() << "\n";
+    return 1;
+  }
+  Os << "start\tpdata\torphan\tinstrs\tblocks\tunresolved\tchunks\tname\n";
+  for (const auto &[Start, F] : Prog.Functions) {
+    Os << Twine::utohexstr(Start.Value - Prog.Img->Base.Value) << "\t"
+       << (F.HasPdata ? 1 : 0) << "\t" << (F.Orphan ? 1 : 0) << "\t"
+       << F.InstrRvas.size() << "\t" << F.Blocks.size() << "\t"
+       << F.UnresolvedIndirects.size() << "\t";
+    bool First = true;
+    for (const auto &[A, B] : F.Chunks) {
+      if (!First)
+        Os << ",";
+      First = false;
+      Os << Twine::utohexstr(A.Value - Prog.Img->Base.Value) << "-"
+         << Twine::utohexstr(B.Value - Prog.Img->Base.Value);
+    }
+    Os << "\t" << F.Name << "\n";
+  }
+  return 0;
+}
+
 /// The analyzed program is always fresh and the fork never loads a PDB.
 static Program analyzeForExport(const PeFile &Pe) {
   auto Hooks = createX86TargetHooks();
@@ -136,6 +167,10 @@ int exportParity(PeFile &Pe, StringRef OutDir) {
   if (sys::Process::GetEnv("REVENANT_PARITY_ASM"))
     if (int Rc = writeAsmSidecar(Prog, D, Items, OutDir))
       return Rc;
+  if (sys::Process::GetEnv("REVENANT_PARITY_FUNCS"))
+    if (int Rc = writeFuncDump(Prog, OutDir))
+      return Rc;
+
 
   FileMap Map = FileMap::build(Pe, Prog);
   SmallString<256> SpansPath(OutDir);

@@ -1,10 +1,10 @@
 //===- lib/Analysis/Orphan.h - Orphan-sweep helpers -------------*- C++ -*-==//
 //
-// Private header for this slice's translation units. Declares the two
-// helpers Discovery's driver calls: `orphanProbeRanges` (executable gap
-// carving) and `orphanFunctionOk` (bounded-probe acceptance). Mirrors
-// the orphan-sweep range arithmetic and `orphan_ok` in
-// crates/analysis/src/lib.rs.
+// Private header for this slice's translation units. Declares the helpers
+// the orphan sweep in `ProgramAnalyze.cpp` calls: `planOrphanSweep`
+// (executable gap carving plus the claimed-byte map) and
+// `orphanFunctionOk` (bounded-probe acceptance). Mirrors the orphan-sweep
+// range arithmetic and `orphan_ok` in crates/analysis/src/lib.rs.
 //
 //===----------------------------------------------------------------------===//
 
@@ -16,6 +16,7 @@
  #include "revenant/Core/Program.h"
  #include "revenant/Core/Va.h"
 
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -28,12 +29,20 @@ struct PeFile;
 
 namespace analysis_detail {
 
-/// Executable-section gaps minus `.pdata` ranges, function chunks, data
-/// ranges, inline-data barriers and Go blob barriers, clipped to each
-/// executable section's backed extent. Each returned `[lo, hi)` is usable
-/// directly as a `Builder::attempt` bound.
-std::vector<std::pair<Va, Va>>
-orphanProbeRanges(const PeFile &Pe, llvm::ArrayRef<Function> Functions);
+/// Where an orphan sweep probes and what it must not touch.
+struct OrphanSweep {
+  /// Executable-section gaps minus `.pdata` ranges, function chunks and
+  /// data ranges, clipped to each section's backed extent. Probe each
+  /// `[lo, hi)` in turn.
+  std::vector<std::pair<Va, Va>> Gaps;
+  /// Start -> end of every byte span a probe must skip: the merged
+  /// `.pdata`/chunk/data ranges plus inline-data and Go blob barriers.
+  /// Probes add the chunks and data ranges they accept.
+  std::map<Va, Va> Claimed;
+};
+
+OrphanSweep planOrphanSweep(const PeFile &Pe,
+                            llvm::ArrayRef<Function> Functions);
 
 /// TargetHooks-taking form: the opaque tail-call test comes from
 /// `Hooks.isOpaqueTailJmp`. The driver calls this one.

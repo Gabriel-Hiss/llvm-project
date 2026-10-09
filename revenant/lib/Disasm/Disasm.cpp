@@ -172,8 +172,10 @@ decodeWithPrefixes(const MCDisassembler &Dis, const MCInstrAnalysis &MIA,
   auto Body = decodeWithPrefixes(Dis, MIA, MII, STI,
                                  Addr.wrappingAdd(Prefix->Size),
                                  Bytes.drop_front(Prefix->Size));
+  // A prefix whose body does not decode is an invalid instruction (iced
+  // reports `Code::INVALID`), never a standalone prefix instruction.
   if (!Body)
-    return Prefix;
+    return std::nullopt;
   Body->Addr = Addr;
   Body->Size += Prefix->Size;
   Body->Inst.setFlags(Body->Inst.getFlags() | Flag);
