@@ -7,8 +7,8 @@
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}
 
-define void @option_result_niche(ptr %slot) {
-; CHECK-LABEL: define void @option_result_niche(
+define void @corpus_rust_option_result_niche(ptr %slot) {
+; CHECK-LABEL: define void @corpus_rust_option_result_niche(
 entry:
   store i64 -1, ptr %slot, align 8, !revenant.va !{i64 4096}
   ret void

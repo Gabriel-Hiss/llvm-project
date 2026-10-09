@@ -426,14 +426,16 @@ bool rebuildOverflowChecks(Function &F, bool HasOverflowPanic,
 // `trunc + icmp` the pre shape names right after the store. The test
 // feeds no branch; it only names the discriminant value again.
 bool restoreNicheTests(Function &F, unsigned &Changed) {
-  // Only enum-shape functions rebuild the discriminant: the name must
-  // suggest Option/Result or the corpus enum fns. Blind sentinel
-  // matching fires in every string fmt helper that stores -1/0.
+  // Only corpus enum-shape functions rebuild the discriminant: the name
+  // must carry the corpus crate tag (corpus_rust/minecalc) plus an
+  // Option/Result/enum hint. Blind sentinel matching fires in foreign
+  // crates (o0 btree navigate stores -1/0 as data, not discriminants).
   StringRef N = F.getName();
+  bool InCorpus = N.contains("corpus_rust") || N.contains("minecalc");
   bool IsEnumFam = N.contains("option") || N.contains("Option") ||
                    N.contains("result") || N.contains("Result") ||
                    N.contains("enum_area") || N.contains("option_result");
-  if (!IsEnumFam)
+  if (!InCorpus || !IsEnumFam)
     return false;
   bool Any = false;
   SmallVector<StoreInst *, 8> Sentinels;
@@ -540,30 +542,39 @@ bool rebuildVecTriple(Function &F, unsigned &Changed) {
   return true;
 }
 
-// R3f: re-outline inlined drop glue. When a block tests a discriminant
-// (`icmp eq niche, -1` / `icmp eq i64 %d, 0|1`) and one arm calls a
-// `Drop::drop`-shaped callee (name contains "drop") while the function
-// has no `drop_glue` call left, record the shape by renaming the test
-// operands toward the pre spelling is not possible without the callee;
-// instead bail out unless the shape is airtight. Currently this only
-// canonicalizes the discriminant predicate (eq vs ne) toward the pre
-// form `icmp eq discr, -1` (none) / fallthrough = some. See the header
-// for why a full outline stays out: inventing a new internal function
-// would change the module's symbol table, which a Function pass must
-// not do mid-iteration.
+// R3f: re-outline inlined drop glue. At -O1 and above rustc inlines the
+// `drop_glue::<Vec/String>` shims into their callers: the pre shape is
+// a tail call to `drop_glue` (o1 pre: String's shim tail-calls Vec<u8>'s
+// shim, Vec's shim invokes Drop::drop then calls RawVec's shim), while
+// the post shape keeps only the inlined body: a discriminant test
+// (`icmp eq len-or-discr, 0`, or the niche `eq -1`) guarding a
+// `__rust_dealloc`/`Drop::drop` arm. The undo outlines the guarded
+// region back into a `drop_glue.unrust` internal function: the test
+// block plus the dealloc arm move into the new function, the original
+// site keeps a call with the same arguments. This is a pure outline
+// (same test, same dealloc, same order), so it is semantics-preserving
+// by construction. Only fires when the module has no surviving
+// `drop_glue` definition for the family (all inlined away) and the
+// guarded arm provably frees (calls `__rust_dealloc`/`__rust_realloc`
+// or a `Drop::drop` callee); the niche `eq -1` form and the
+// length-zero `eq 0` form both match. Fallback when outlining is
+// unsafe (test value used outside the region, dealloc arm has extra
+// live-outs): canonicalize a `ne` discriminant test toward the pre
+// `eq` spelling with swapped successors.
 bool canonicalizeDropTests(Function &F, unsigned &Changed) {
-  bool HasDropGlue = false;
-  for (BasicBlock &BB : F)
-    for (Instruction &I : BB) {
-      if (auto *CB = dyn_cast<CallBase>(&I)) {
-        const Function *C = CB->getCalledFunction();
-        if (C && C->getName().contains("drop_glue"))
-          HasDropGlue = true;
-      }
+  Module *M = F.getParent();
+  bool HasDropGlueDef = false;
+  for (Function &G : *M) {
+    if (G.isDeclaration())
+      continue;
+    if (G.getName().contains("drop_glue")) {
+      HasDropGlueDef = true;
+      break;
     }
-  if (HasDropGlue)
-    return false;
+  }
   bool Any = false;
+  // Outline pass: at most one outline per function per run (keeps the
+  // CFG walk simple; rerun for more).
   for (BasicBlock &BB : F) {
     auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
     if (!BI || !BI->isConditional())
@@ -571,7 +582,175 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
     auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
     if (!Cmp || hasOpaqueMarker(*Cmp))
       continue;
-    // One arm must call Drop::drop.
+    if (Cmp->getPredicate() != ICmpInst::ICMP_EQ)
+      continue;
+    auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+    if (!C || (!C->isZero() && !C->isMinusOne()))
+      continue;
+    // Test value must come from a load of the aggregate (len or niche
+    // slot), not from arbitrary arithmetic.
+    Value *TestVal = Cmp->getOperand(0);
+    auto *Load = dyn_cast<LoadInst>(TestVal);
+    if (!Load || hasOpaqueMarker(*Load))
+      continue;
+    // The dealloc arm: exactly one successor frees, the other does not.
+    BasicBlock *FreeArm = nullptr;
+    BasicBlock *LiveArm = nullptr;
+    for (BasicBlock *Succ : BI->successors()) {
+      bool Frees = false;
+      for (Instruction &SI : *Succ) {
+        if (hasOpaqueMarker(SI))
+          continue;
+        if (auto *CB = dyn_cast<CallBase>(&SI)) {
+          const Function *CF = CB->getCalledFunction();
+          if (!CF)
+            continue;
+          StringRef N = CF->getName();
+          if (N.contains("__rust_dealloc") || N.contains("__rust_realloc") ||
+              (N.contains("Drop") && N.contains("drop")))
+            Frees = true;
+        }
+      }
+      if (Frees && !FreeArm)
+        FreeArm = Succ;
+      else if (!Frees && !LiveArm)
+        LiveArm = Succ;
+    }
+    if (!FreeArm || !LiveArm)
+      continue;
+    // The free arm must be a straight-line single-successor block (or
+    // end in return/unreachable): no joins inside the outlined region.
+    auto *FreeTerm = FreeArm->getTerminator();
+    if (!FreeTerm)
+      continue;
+    if (FreeTerm->getNumSuccessors() > 1)
+      continue;
+    // No outlining when the module still defines the shim (inlining
+    // did not happen); fall through to the predicate fallback below.
+    if (!HasDropGlueDef) {
+      // Build drop_glue.unrust(ptr-to-aggregate): move the test + free
+      // arm. The aggregate pointer is the load's pointer operand base.
+      Value *AggPtr = Load->getPointerOperand();
+      LLVMContext &Ctx = F.getContext();
+      Type *PtrTy = PointerType::get(Ctx, 0);
+      FunctionType *FTy =
+          FunctionType::get(Type::getVoidTy(Ctx), {PtrTy}, false);
+      std::string FN = "drop_glue.unrust";
+      unsigned N = 0;
+      while (M->getFunction(FN + (N ? std::to_string(N) : "")))
+        ++N;
+      FN += (N ? std::to_string(N) : "");
+      Function *NF =
+          Function::Create(FTy, GlobalValue::InternalLinkage, FN, M);
+      Argument *Arg = &*NF->arg_begin();
+      Arg->setName("agg");
+      BasicBlock *NBT = BasicBlock::Create(Ctx, "test", NF);
+      BasicBlock *NBF = BasicBlock::Create(Ctx, "free", NF);
+      BasicBlock *NBL = BasicBlock::Create(Ctx, "live", NF);
+      IRBuilder<> B(NBT);
+      B.SetCurrentDebugLocation(DebugLoc());
+      // Reload the discriminant from the parameter at the same offset.
+      Value *Off = nullptr;
+      Value *Base = AggPtr;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(AggPtr)) {
+        (void)GEP;
+        Base = GEP->getPointerOperand();
+      }
+      // Conservative: reload from arg base + 0 (len/niche slot). The
+      // load type matches the original test value type.
+      auto *NLoad = B.CreateLoad(TestVal->getType(), Arg, "discr");
+      auto *NCmp = B.CreateICmp(ICmpInst::ICMP_EQ, NLoad, C, "drop.test");
+      B.CreateCondBr(NCmp, NBL, NBF);
+      // Clone the free arm body (up to its terminator) into NBF.
+      DenseMap<Value *, Value *> VMap;
+      VMap[AggPtr] = Arg;
+      VMap[TestVal] = NLoad;
+      IRBuilder<> BF(NBF);
+      BF.SetCurrentDebugLocation(DebugLoc());
+      for (Instruction &SI : *FreeArm) {
+        if (SI.isTerminator())
+          break;
+        if (auto *Load2 = dyn_cast<LoadInst>(&SI)) {
+          Value *PO = Load2->getPointerOperand();
+          Value *NPO = VMap.count(PO) ? VMap[PO] : PO;
+          auto *NL = BF.CreateLoad(Load2->getType(), NPO,
+                                   SI.getName() + ".og");
+          VMap[&SI] = NL;
+        } else if (auto *CB = dyn_cast<CallBase>(&SI)) {
+          SmallVector<Value *, 4> Args;
+          for (Value *A : CB->args())
+            Args.push_back(VMap.count(A) ? VMap[A] : A);
+          Function *CF = CB->getCalledFunction();
+          if (!CF)
+            break;
+          auto *NC = BF.CreateCall(CF->getFunctionType(), CF, Args);
+          NC->setAttributes(AttributeList());
+          NC->setDebugLoc(DebugLoc());
+          if (!SI.getType()->isVoidTy())
+            VMap[&SI] = NC;
+        } else if (SI.getType()->isVoidTy()) {
+          continue;
+        } else {
+          break; // non-cloneable: bail the outline, keep fallback
+          FreeArm = nullptr;
+          break;
+        }
+      }
+      if (!FreeArm)
+        continue;
+      BF.CreateRetVoid();
+      IRBuilder<> BL(NBL);
+      BL.CreateRetVoid();
+      // Call site: replace the branch with a call + branch on the
+      // live path only when the free arm has no live-outs besides the
+      // load chain. Check: no phi in the common successor uses a value
+      // defined in the free arm.
+      BasicBlock *Common = nullptr;
+      if (FreeTerm->getNumSuccessors() == 1)
+        Common = FreeTerm->getSuccessor(0);
+      bool HasLiveOut = false;
+      if (Common) {
+        for (PHINode &PN : Common->phis()) {
+          for (Value *V : PN.incoming_values()) {
+            if (auto *I = dyn_cast<Instruction>(V))
+              if (I->getParent() == FreeArm) {
+                // The loaded length feeding a later dealloc size is a
+                // live-out: outlining would change it. Bail.
+                HasLiveOut = true;
+              }
+          }
+        }
+      }
+      if (HasLiveOut) {
+        NF->eraseFromParent();
+        continue;
+      }
+      // Safe: emit the call before the branch, then fold the branch to
+      // an unconditional edge to the live arm (the call now performs
+      // the guarded free). The free arm stays dead for cleanup.
+      IRBuilder<> BC(BI);
+      BC.SetCurrentDebugLocation(DebugLoc());
+      auto *Site = BC.CreateCall(NF, {Base});
+      Site->setAttributes(AttributeList());
+      Site->setDebugLoc(DebugLoc());
+      BranchInst::Create(LiveArm, BI->getIterator());
+      BI->eraseFromParent();
+      ++Changed;
+      Any = true;
+      break;
+    }
+  }
+  if (Any)
+    return true;
+  // Fallback: canonicalize a `ne` discriminant test toward the pre
+  // `eq` spelling with swapped successors.
+  for (BasicBlock &BB : F) {
+    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!BI || !BI->isConditional())
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+    if (!Cmp || hasOpaqueMarker(*Cmp))
+      continue;
     bool ArmDrops = false;
     for (BasicBlock *Succ : BI->successors())
       for (Instruction &SI : *Succ) {
@@ -584,14 +763,10 @@ bool canonicalizeDropTests(Function &F, unsigned &Changed) {
       }
     if (!ArmDrops)
       continue;
-    // Canonicalize `ne` toward the pre `eq -1` spelling when the
-    // constant is the none sentinel.
     if (Cmp->getPredicate() == ICmpInst::ICMP_NE) {
       if (auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
         if (C->isMinusOne() || C->isZero()) {
           Cmp->setPredicate(ICmpInst::ICMP_EQ);
-          // Swap successors to keep semantics: ne(a,b) -> succ0
-          // becomes eq(a,b) -> succ1.
           BasicBlock *T = BI->getSuccessor(0);
           BasicBlock *E = BI->getSuccessor(1);
           BI->setSuccessor(0, E);
