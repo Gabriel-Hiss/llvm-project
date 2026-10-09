@@ -448,6 +448,10 @@ private:
   clang::QualType buildFunctionType(clang::QualType Ret,
                                     ArrayRef<clang::QualType> Params,
                                     bool Variadic) {
+    // C has no `f(...)` without a named parameter before C23; the opaque
+    // revenant.asm.* declarations are unprototyped there instead.
+    if (Variadic && Params.empty() && !Ctx.isCPlusPlus())
+      return Ctx.ast().getFunctionNoProtoType(Ret);
     clang::FunctionProtoType::ExtProtoInfo EPI;
     EPI.Variadic = Variadic;
     return Ctx.ast().getFunctionType(Ret, Params, EPI);
@@ -555,6 +559,8 @@ private:
     if (const auto *B = dyn_cast<DIBasicType>(DI)) {
       uint64_t Bits = B->getSizeInBits();
       switch (B->getEncoding()) {
+      case dwarf::DW_ATE_address:
+        return Ctx.ast().getPointerType(voidTy());
       case dwarf::DW_ATE_boolean:
         return Ctx.ast().BoolTy;
       case dwarf::DW_ATE_float:

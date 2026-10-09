@@ -25,9 +25,6 @@
 
 // Per-pass headers. One include per pass, guarded so this file builds before
 // the pass agent lands.
-#if __has_include("revenant/Transforms/Lane0/Lane0.h")
-#include "revenant/Transforms/Lane0/Lane0.h"
-#endif
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
 #include "revenant/Transforms/Devectorize/Devectorize.h"
 #endif
@@ -43,8 +40,8 @@
 #if __has_include("revenant/Transforms/Patterns/Patterns.h")
 #include "revenant/Transforms/Patterns/Patterns.h"
 #endif
-#if __has_include("revenant/Transforms/Structure/Structure.h")
-#include "revenant/Transforms/Structure/Structure.h"
+#if __has_include("revenant/Structure/RevenantStructure.h")
+#include "revenant/Structure/RevenantStructure.h"
 #endif
 #if __has_include("revenant/Transforms/TypeRecovery/TypeRecovery.h")
 #include "revenant/Transforms/TypeRecovery/TypeRecovery.h"
@@ -85,12 +82,6 @@ void registerRevenantPasses(PassBuilder &PB) {
   PB.registerPipelineParsingCallback(
       [](StringRef Name, FunctionPassManager &FPM,
          ArrayRef<PassBuilder::PipelineElement>) {
-#if __has_include("revenant/Transforms/Lane0/Lane0.h")
-        if (Name == "revenant-lane0") {
-          FPM.addPass(Lane0Pass());
-          return true;
-        }
-#endif
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
         if (Name == "revenant-devectorize") {
           FPM.addPass(DevectorizePass());
@@ -125,9 +116,9 @@ void registerRevenantPasses(PassBuilder &PB) {
           return true;
         }
 #endif
-#if __has_include("revenant/Transforms/Structure/Structure.h")
+#if __has_include("revenant/Structure/RevenantStructure.h")
         if (Name == "revenant-structure") {
-          FPM.addPass(StructurePass());
+          FPM.addPass(RevenantStructurePass());
           return true;
         }
 #endif

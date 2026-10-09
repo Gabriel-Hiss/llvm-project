@@ -27,7 +27,7 @@ pre-emission; they are not in the default text, pass them explicitly.
 |---|---|---|
 | cleanup | `sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg<no-switch-to-lookup;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks>,gvn,dse,dce,sroa,instcombine<no-verify-fixpoint>` | `crates/lift/src/pipeline.rs` `CLEANUP_PASSES` |
 | idioms (IR) | `revenant-idioms` | `crates/idioms` `ir_passes()` |
-| unopt | `revenant-lane0,revenant-devectorize,revenant-reroll,revenant-unrotate,revenant-untailrec` | `crates/unopt` `passes()` |
+| unopt | `revenant-devectorize,revenant-reroll,revenant-unrotate,revenant-untailrec` | `crates/unopt` `passes()` |
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
@@ -69,14 +69,15 @@ on a witness set before rewriting; folds `x - (x/d)*d` spellings into
 put. AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax)
 run after structuring, outside this LLVM pipeline.
 
-**revenant-lane0 (owner: MuseTxDevec).** Expects cleaned IR with `i128`
-xmm webs. Propagates scalar lane-0 values through phis, transparent
-bitcasts and insert/extract pairs so scalar accumulators kept in the low
-xmm lane scalarize. Guarantees a web scalarizes only when every use reads
-lane 0 and all layouts agree; anything else keeps 128 bits. Runs first in
-unopt so devectorize sees plain scalar loops.
+**revenant-devectorize (owner: MuseTxDevec), phase 1: lane-0.** Expects
+cleaned IR with `i128` xmm webs. Propagates scalar lane-0 values through
+phis, transparent bitcasts and insert/extract pairs so scalar accumulators
+kept in the low xmm lane scalarize. Guarantees a web scalarizes only when
+every use reads lane 0 and all layouts agree; anything else keeps 128
+bits. Runs first inside devectorize so the later phases see plain scalar
+loops.
 
-**revenant-devectorize (owner: MuseTxDevec).** Expects lane0 output.
+**revenant-devectorize, phases 2-3.** Expects lane-0 output.
 Explodes auto-vectorized `i128`/`__v*` work into per-lane scalar ops:
 vector streams become per-element scalars in loops, reduction accumulators
 collapse to one scalar phi; straight-line slices scalarize for reroll.

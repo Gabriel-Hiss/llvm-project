@@ -21,13 +21,12 @@ add_llvm_library(RevenantTransformPipeline
   # the pass side (BUILD_SHARED_LIBS OFF / STATIC). This stanza only
   # lists targets that exist at configure time.
   LINK_LIBS
-  $<$<TARGET_EXISTS:RevenantTransformLane0>:RevenantTransformLane0>
   $<$<TARGET_EXISTS:RevenantTransformDevectorize>:RevenantTransformDevectorize>
   $<$<TARGET_EXISTS:RevenantTransformReroll>:RevenantTransformReroll>
   $<$<TARGET_EXISTS:RevenantTransformUnrotate>:RevenantTransformUnrotate>
   $<$<TARGET_EXISTS:RevenantTransformIdioms>:RevenantTransformIdioms>
   $<$<TARGET_EXISTS:RevenantTransformPatterns>:RevenantTransformPatterns>
-  $<$<TARGET_EXISTS:RevenantTransformStructure>:RevenantTransformStructure>
+  $<$<TARGET_EXISTS:RevenantStructure>:RevenantStructure>
   $<$<TARGET_EXISTS:RevenantTransformTypeRecovery>:RevenantTransformTypeRecovery>
   $<$<TARGET_EXISTS:RevenantTransformSsaOut>:RevenantTransformSsaOut>
   $<$<TARGET_EXISTS:RevenantTransformUnabi>:RevenantTransformUnabi>
