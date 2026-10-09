@@ -93,6 +93,16 @@ def rv_aes : RVOp;
 def rv_crc32 : RVOp;
 def rv_mxcsr : RVOp;
 def rv_fmaaddsub : RVOp;
+// AVX-512 masked forms (k registers, {k}/{z} masking, embedded rounding).
+def rv_kst    : RVOp; // (rv_kst $m, $k): KMOV mk, store k to memory
+def rv_kvstore : RVOp; // (rv_kvstore $m, $v, $k): masked vector store
+def rv_kmov   : RVOp; // (rv_kmov "b|w|d|q", src): read a k register/mem/gpr
+def rv_kcmp   : RVOp; // (rv_kcmp "u|s", pred, $a, $b): VPCMPx -> k register
+def rv_kselect: RVOp; // (rv_kselect $k, t, f): per-lane select over iW vectors
+def rv_kmasked: RVOp; // (rv_kmasked $k, src, merge): masked move (VMOVDQU*)
+def rv_kload  : RVOp; // (rv_kload $k, addr, merge, W, ebits): masked load
+def rv_kstore : RVOp; // (rv_kstore $k, addr, src, W, ebits): masked store
+def rv_kfma   : RVOp; // (rv_kfma "op", $k, a, b, c, merge, W, ebits, rc)
 def rv_rng : RVOp;
 def rv_pclmul : RVOp;
 def rv_fneg    : RVOp;

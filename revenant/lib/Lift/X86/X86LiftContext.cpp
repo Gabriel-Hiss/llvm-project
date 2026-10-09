@@ -127,12 +127,19 @@ void X86LiftContext::regBitsWrite(MCRegister Reg, Value *V) {
 Value *X86LiftContext::regRead(MCRegister Reg, Type *Ty) {
   if (Reg == X86::RIP || Reg == X86::EIP)
     return fromInt(resolveVAI64(NextVA), Ty);
+  // Mask registers have their own i64 file; K0 is hardwired all-ones.
+  if (Reg >= X86::K0 && Reg <= X86::K7)
+    return fromInt(kregRead(Reg), Ty);
   return fromInt(regBitsRead(Reg), Ty);
 }
 
 void X86LiftContext::regWrite(MCRegister Reg, Value *V) {
   if (Reg == X86::RIP || Reg == X86::EIP)
     return;
+  if (Reg >= X86::K0 && Reg <= X86::K7) {
+    kregWrite(Reg, V);
+    return;
+  }
   regBitsWrite(Reg, V);
 }
 
