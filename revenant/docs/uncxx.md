@@ -16,22 +16,22 @@ For MSVC, a string-size candidate at +16 is accepted only when the same object a
 
 ## Regression coverage
 
-`test/Transforms/Uncxx/field-disambiguation.ll` checks a genuine first/last empty comparison and rejects both an iterator-versus-end comparison and an MSVC vector end-field load as `string.size`. The test runs the standalone plugin through stock `opt` and FileCheck.
+`test/Transforms/Uncxx/field-disambiguation.ll` checks a genuine first/last empty comparison and rejects iterator-versus-end comparisons, vector end-field `string.size` misclassification, and a null-data fallback being mistaken for an SSO selector. It also checks vector `back` recovery with a last-pointer-minus-one load.
 
 ## Corpus coverage
 
-Running the standalone pass on all 78 `ir-post` translation units for the
-requested clang C++ corpus IDs produced helper calls in 16 modules. The pass
-completed on 72 units and crashed on all 6 pugixml variants. Among successful
-runs it emitted 1,965 calls: vector data 1,071, string data 422, string size
-401, vector push_back 39, vector empty 19, string destructor 8, vector size
-3, and vector back 2.
+The standalone pass completed on all 78 `ir-post` translation units for the
+requested clang C++ corpus IDs, emitting helper calls in 22 modules. It
+recovered 2,322 calls: vector data 1,355, string size 452, string data 442
+(including four overload-suffixed helpers), vector push_back 39, vector empty
+19, string destructor 10, vector size 3, and vector back 2.
 
-The remark-ranked groups are source call events, while these are all helper
-call sites in module IR. They are not a one-to-one recall score. In particular,
-the 325 vector-back remarks are ranked candidates, and only 2 back calls were
-recovered in these runs. The 672 string-destructor remarks compare with 8
-`string_dtor` helper calls. This gap is the main next recovery target.
+The inline-remark groups are source call events, while these are helper call
+sites in module IR. They are not a one-to-one recall score. The 325 vector-back
+remarks compare with 2 `vector.back` helper calls; the 672 string-destructor
+remarks compare with 10 `string_dtor` calls. The other ranked comparisons are
+140 vector-empty remarks vs 19 recovered calls and 323 string-size remarks vs
+452 helper calls.
 
 The existing `revenant-decompile` accepts `--emit ir-raw|ir-clean|ir-final`,
 not `--emit ir`. On `cpp-o2.exe`, `--emit ir-final` succeeded, but applying

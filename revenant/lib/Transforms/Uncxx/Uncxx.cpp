@@ -462,23 +462,24 @@ bool matchStringData(const DataLayout &DL, Value *V, CxxFlavor Fl,
       Str = S;
     else
       return false;
-    // Condition sanity: an icmp over a capacity load of the same base.
+    // An SSO selector must test this string's capacity against the
+    // layout's inline-capacity threshold. A null check on a data pointer
+    // (for example, an error-string fallback) is not a string accessor.
     auto *Cmp = dyn_cast<ICmpInst>(C);
     if (!Cmp)
       return false;
+    bool HasCapacity = false;
+    bool HasThreshold = false;
     for (Value *Op : {Cmp->getOperand(0), Cmp->getOperand(1)}) {
       if (auto *L = dyn_cast<LoadInst>(stripPtr(Op))) {
         auto R = rootOff(DL, L->getPointerOperand());
-        if (R && R->first == Str && R->second == SL.Cap)
-          return true;
+        HasCapacity |= R && R->first == Str && R->second == SL.Cap;
       }
-      if (auto *C0 = dyn_cast<ConstantInt>(Op))
-        if (C0->getZExtValue() == (uint64_t)SL.SsoCap)
-          continue;
+      if (auto *CI = dyn_cast<ConstantInt>(Op))
+        HasThreshold |= CI->getValue().getLimitedValue() ==
+                        static_cast<uint64_t>(SL.SsoCap);
     }
-    // Accept if at least the base matched; the constant check above is
-    // best-effort (the compare may be `ugt cap, 15` or `ult 16, cap`).
-    return true;
+    return HasCapacity && HasThreshold;
   }
   if (auto *L = dyn_cast<LoadInst>(V)) {
     if (!L->getType()->isPointerTy())

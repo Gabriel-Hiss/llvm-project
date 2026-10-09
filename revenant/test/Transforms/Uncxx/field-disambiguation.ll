@@ -67,3 +67,17 @@ entry:
   ret i32 %result
 }
 declare void @"?vector@std@@"()
+; CHECK-LABEL: define ptr @string_null_fallback
+; CHECK-NOT: revenant.cxx.string.data
+; CHECK: select i1 %is.null, ptr @fallback, ptr %data
+
+@fallback = private constant [5 x i8] c"error"
+
+define ptr @string_null_fallback(ptr %s) {
+entry:
+  %data.addr = getelementptr i8, ptr %s, i64 0
+  %data = load ptr, ptr %data.addr, align 8
+  %is.null = icmp eq ptr %data, null
+  %result = select i1 %is.null, ptr @fallback, ptr %data
+  ret ptr %result
+}
