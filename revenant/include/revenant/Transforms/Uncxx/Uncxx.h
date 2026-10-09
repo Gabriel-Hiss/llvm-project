@@ -20,10 +20,8 @@
 // Flavor gating: the layout differs per STL implementation (MSVC STL
 // vector/string share the 3-pointer layout, libstdc++ string keeps its
 // pointer field with an inline buffer union, libc++ uses the packed-bit
-// layout). The pass takes the STL flavor from the `-revenant-uncxx-stl`
-// flag (or `REVENANT_UNCXX_STL`, plugin path); `auto` infers it from
-// module symbols (MSVC mangled names like `?vector@`, Itanium `_ZSt`
-// spellings, `std::__1` for libc++). Unknown flavor runs only the
+// layout). The engine may provide the STL flavor detected by CompilerProfile;
+// `Auto` falls back to module-symbol inference. Unknown flavor runs only the
 // flavor-independent shapes (CAS loops, refcount atomics, guarded delete).
 //
 // Guarantees: only airtight matches rewrite (every memory access in the
@@ -41,11 +39,14 @@
 
 namespace revenant {
 
-/// STL implementation flavor. `Auto` infers from module symbols.
+/// STL implementation flavor. `Auto` infers from module symbols and target.
 enum class CxxFlavor { Auto, Msvc, Gnu, Libcxx };
 
 class UncxxPass : public llvm::PassInfoMixin<UncxxPass> {
+  CxxFlavor Flavor = CxxFlavor::Auto;
+
 public:
+  explicit UncxxPass(CxxFlavor F = CxxFlavor::Auto) : Flavor(F) {}
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &FAM);
   static bool isRequired() { return false; }
