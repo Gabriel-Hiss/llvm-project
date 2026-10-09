@@ -116,6 +116,13 @@ struct PeFile {
   /// Certificate table file range (SECURITY directory's address field is
   /// a FILE OFFSET, unlike every other directory) — `[offset, end)`.
   std::optional<std::pair<uint64_t, uint64_t>> Certificate;
+  /// Control Flow Guard function-pointer slots from the load config
+  /// directory (IMAGE_LOAD_CONFIG_DIRECTORY64): `call [slot]` invokes the
+  /// stored handler. `_guard_check_icall` checks the call target carried in
+  /// rcx; `_guard_dispatch_icall` tail-jumps to the target in rax. Non-CFG
+  /// images leave both empty.
+  std::optional<Va> GuardCFCheckPtr;
+  std::optional<Va> GuardCFDispatchPtr;
   /// The Go linker's build-id blob inside `.text`, when present. Doubles
   /// as the Go-binary flag for analysis rules that only Go's codegen
   /// warrants.

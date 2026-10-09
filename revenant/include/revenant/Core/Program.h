@@ -406,6 +406,12 @@ struct Program {
   std::shared_ptr<std::map<Va, Extern>> Externs;
   /// VA -> display name (functions, data, imports).
   std::shared_ptr<std::map<Va, std::string>> Names;
+  /// Control Flow Guard slots from the load config directory (see
+  /// `PeFile::GuardCFCheckPtr`): `call [GuardCFDispatchPtr]` is an indirect
+  /// call through the target in rax; `call [GuardCFCheckPtr]` is a
+  /// validation-only call before a real `call rcx`.
+  std::optional<Va> GuardCFCheckPtr;
+  std::optional<Va> GuardCFDispatchPtr;
   /// The shared resolver for disasm formatting.
   std::shared_ptr<const NameProvider> Resolver;
 };

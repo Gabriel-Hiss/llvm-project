@@ -9,7 +9,7 @@
 #include "revenant/Object/PeFile.h"
 
 #include <algorithm>
-#include <cstring>
+#include <cstddef>
 #include <set>
 
 #include "llvm/Object/COFF.h"
@@ -518,6 +518,27 @@ Expected<PeFile> PeFile::parse(ArrayRef<uint8_t> Bytes) {
       uint64_t End = std::min(Off + Size, Pe.FileSize);
       if (Off < End)
         Pe.Certificate = {Off, End};
+    }
+  }
+
+  // Load config directory: Control Flow Guard function-pointer slots.
+  // `call [GuardCFCheckFunctionPointer]` wraps a real indirect call through
+  // rcx; `call [GuardCFDispatchFunctionPointer]` tail-jumps to rax.
+  if (const data_directory *LC =
+          Obj->getDataDirectory(COFF::LOAD_CONFIG_TABLE)) {
+    constexpr size_t Need = offsetof(coff_load_configuration64,
+                                     GuardCFFunctionCount) +
+                            sizeof(uint64_t);
+    if (auto Raw = Img->read(Va(Base.Value + LC->RelativeVirtualAddress),
+                             Need)) {
+      auto *Cfg =
+          reinterpret_cast<const coff_load_configuration64 *>(Raw->data());
+      if (Cfg->Size >= Need) {
+        if (Cfg->GuardCFCheckFunction)
+          Pe.GuardCFCheckPtr = Va(Cfg->GuardCFCheckFunction);
+        if (Cfg->GuardCFCheckDispatch)
+          Pe.GuardCFDispatchPtr = Va(Cfg->GuardCFCheckDispatch);
+      }
     }
   }
 

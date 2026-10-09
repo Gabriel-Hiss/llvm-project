@@ -324,9 +324,15 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
   return verifyStage(Stage, *M);
 }
 
-/// ir-clean: normalize lifted stack/address/width shapes, then cleanup + idioms.
+/// ir-clean: normalize lifted stack/address/width shapes, then cleanup +
+/// idioms, then the module-level ABI/struct recovery passes plus one
+/// cleanup round to fold the ptrtoint/inttoptr seams they introduce.
 std::string cleanPipeline() {
-  return formatv("function({0},{1})", CleanupPipeline, IdiomsPipeline).str();
+  return formatv("function({0},{1}),revenant-lift-abi,"
+                 "function(instcombine<no-verify-fixpoint>,early-cse,"
+                 "revenant-lift-normalize),revenant-lift-structs",
+                 CleanupPipeline, IdiomsPipeline)
+      .str();
 }
 
 /// ir-final: deoptimization, structuring, type recovery, SSA-out.
