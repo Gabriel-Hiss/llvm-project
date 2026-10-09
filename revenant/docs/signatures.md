@@ -7,14 +7,18 @@ its widest observed read, and whether the value came from an XMM register.
 Return presence and width require both a value definition on every returning
 path and evidence that a direct caller reads that register after the call.
 
-The `revenant-sigs-check` utility is an oracle-side diagnostic, not part of the
-decompiler pipeline. It builds a temporary `Program` from primary `.pdata`
-entries, linearly decodes each range, and splits blocks at branch targets and
-fallthroughs. It writes recovered counts and return kinds to CSV, with a fourth
-`pdb_param_count` column from LLVM's CodeView procedure and member-function
-type records. Entries without a matching type record are left blank. This
-temporary CFG omits switch resolution and discovery outside `.pdata`; use the
-normal discovery pass for the complete program once it is available.
+`revenant-sigs-check` is an oracle-side diagnostic, not part of the
+decompiler pipeline. It runs the same `Program::analyze` discovery path used
+by the driver, then compares recovered parameter counts with LLVM CodeView
+procedure and member-function records. It writes per-function results to CSV.
+Entries without a matching type record are left blank.
+
+Varargs detection requires all four Win64 register-home spills plus evidence
+that a pointer to the home area is consumed through a `va_list`, such as an
+indirect read or use as a register or stack argument to a call. Ordinary
+argument homing is not sufficient. Straight-line direct tail jumps propagate
+target parameters when register moves map them to incoming Win64 argument
+registers; caller-prefix evidence is used separately for direct callers.
 
 ```text
 revenant-sigs-check <binary.exe> <matching.pdb> <signatures.csv>

@@ -190,20 +190,25 @@ static unsigned widenWrite(unsigned R) {
 /// operand of such an instruction counts as a register read.
 static bool isDeadReadIdiom(StringRef Name, const MCInst &I,
                             const McTables &T) {
-  if (I.getNumOperands() != 3)
-    return false;
   bool Xor = Name.starts_with("XOR") || Name.starts_with("PXOR") ||
              Name.starts_with("XORP") || Name.starts_with("VPXOR");
   bool Sub = Name.starts_with("SUB") || Name.starts_with("SBB");
   if (Xor || Sub) {
-    // Register-register form with all operands identical. Immediate
-    // forms ([def, tied-use, imm]) always read the destination.
+    // Register-register form with all operands identical. Immediate forms
+    // ([def, tied-use, imm]) always read the destination.
+    if (I.getNumOperands() != 3)
+      return false;
+    unsigned N = I.getNumOperands();
     const MCOperand &A = I.getOperand(0);
-    const MCOperand &B = I.getOperand(1);
-    const MCOperand &C = I.getOperand(2);
-    return A.isReg() && B.isReg() && C.isReg() && A.getReg() != 0 &&
-           A.getReg() == B.getReg() && B.getReg() == C.getReg();
+    for (unsigned i = 1; i < N; ++i) {
+      const MCOperand &O = I.getOperand(i);
+      if (!O.isReg() || !A.isReg() || O.getReg() != A.getReg())
+        return false;
+    }
+    return A.isReg() && A.getReg() != 0;
   }
+  if (I.getNumOperands() != 3)
+    return false;
   const MCOperand &A = I.getOperand(0);
   const MCOperand &B = I.getOperand(1);
   const MCOperand &C = I.getOperand(2);
@@ -225,6 +230,7 @@ static bool isDeadReadIdiom(StringRef Name, const MCInst &I,
     return Imm == 0;
   return false;
 }
+
 
 /// The cbw/cwd/cdq/cqo accumulator family: LLVM marks the accumulator
 /// as an implicit def too; iced reports it as a pure read.
@@ -339,6 +345,7 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
         if (i == 0)
           Emit(widenWrite(Reg), false, true);
       } else if (i < NumDefs) {
+
         // Def side: the write (widened, iced `add_register`).
         Emit(widenWrite(Reg), false, true);
       } else {
@@ -961,8 +968,80 @@ struct VarArgsInfo {
   HomeSpillReads Spills;
 };
 
-/// Detect the Win64 va_start setup that saves each register argument in its
-/// corresponding home slot.
+/// True when a pointer to a Win64 home slot is used as a va_list, rather
+/// than merely taking the address of an unrelated stack object.
+static bool consumesHomeArea(const Function &F, const McTables &T,
+                             const FrameModel &Frame) {
+  SmallSet<unsigned, 8> VaRegs;
+  SmallSet<int64_t, 8> VaSlots;
+  for (const Instr &Ins : F.Instrs) {
+    SmallSet<unsigned, 8> NewVaRegs;
+    const MCInst &MI = Ins.Inst;
+    StringRef Name = T.MII->getName(MI.getOpcode());
+    InsnInfo II = insnInfo(MI, T);
+
+    if (Name.starts_with("LEA") && MI.getNumOperands() > 0 &&
+        MI.getOperand(0).isReg()) {
+      for (const MemOp &M : II.Mems) {
+        std::optional<int64_t> Off;
+        if (M.Index != 0)
+          continue;
+        if (M.Base == X86::RSP || M.Base == X86::ESP)
+          Off = Frame.rspOff(Ins.Addr, M.Disp);
+        else if (M.Base == X86::RBP || M.Base == X86::EBP)
+          Off = Frame.rbpOff(M.Disp);
+        if (Off && *Off >= 8 && *Off <= 32)
+          NewVaRegs.insert(grp(MI.getOperand(0).getReg()));
+      }
+    }
+
+    for (const MemOp &M : II.Mems) {
+      std::optional<int64_t> Off;
+      if (M.Index == 0 && (M.Base == X86::RSP || M.Base == X86::ESP))
+        Off = Frame.rspOff(Ins.Addr, M.Disp);
+      else if (M.Index == 0 && (M.Base == X86::RBP || M.Base == X86::EBP))
+        Off = Frame.rbpOff(M.Disp);
+
+      if (II.MemRead &&
+          (VaRegs.count(grp(M.Base)) || VaRegs.count(grp(M.Index))))
+        return true;
+      if (!Off || II.Mems.size() != 1)
+        continue;
+      if (II.MemWrite) {
+        for (const RegUse &U : II.Regs)
+          if (U.Read && VaRegs.count(grp(U.Reg))) {
+            VaSlots.insert(*Off);
+          }
+      }
+      if (II.MemRead && VaSlots.count(*Off) && MI.getNumOperands() > 0 &&
+          MI.getOperand(0).isReg())
+        NewVaRegs.insert(grp(MI.getOperand(0).getReg()));
+    }
+
+    if (Name.starts_with("MOV") && MI.getNumOperands() >= 2 &&
+        MI.getOperand(0).isReg() && MI.getOperand(1).isReg() &&
+        VaRegs.count(grp(MI.getOperand(1).getReg())))
+      NewVaRegs.insert(grp(MI.getOperand(0).getReg()));
+    if (Ins.Flow == FlowKind::Call) {
+      for (unsigned R : GRP)
+        if (VaRegs.count(R))
+          return true;
+      int64_t StackArg = 0x20 - Frame.deltaAt(Ins.Addr);
+      for (unsigned I = 0; I < 32; ++I, StackArg += 8)
+        if (VaSlots.count(StackArg))
+          return true;
+    }
+    for (const RegUse &U : II.Regs)
+      if (U.Write)
+        VaRegs.erase(grp(U.Reg));
+    for (unsigned R : NewVaRegs)
+      VaRegs.insert(R);
+  }
+  return false;
+}
+
+/// Detect Win64 varargs home spills only when the home area is consumed
+/// through a va_list pointer.
 static VarArgsInfo detectVarArgs(const Function &F, const McTables &T,
                                  const FrameModel *Frame) {
   VarArgsInfo Info;
@@ -992,8 +1071,9 @@ static VarArgsInfo detectVarArgs(const Function &F, const McTables &T,
       }
     }
   }
-  Info.Detected = std::all_of(std::begin(Seen), std::end(Seen),
-                              [](bool V) { return V; });
+  Info.Detected =
+      std::all_of(std::begin(Seen), std::end(Seen), [](bool V) { return V; }) &&
+      consumesHomeArea(F, T, *Frame);
   if (!Info.Detected)
     Info.Spills.clear();
   return Info;
@@ -1271,6 +1351,99 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
     Sig.SigSource = Signature::Source::Inferred;
     Out.Funcs[Start] = std::move(Sig);
   }
+
+// A direct tail jump forwards ABI argument registers the function leaves
+// untouched. Propagate target signatures through chains of simple thunks.
+bool ThunkChanged;
+do {
+  ThunkChanged = false;
+  for (auto &[Start, Sig] : Out.Funcs) {
+    const Function *F = Fns.get(Start);
+    if (!F || F->Instrs.empty())
+      continue;
+    const Instr &Jump = F->Instrs.back();
+    if (Jump.Flow != FlowKind::Branch || !Jump.HasTarget)
+      continue;
+    bool Simple = true;
+    for (size_t I = 0; I + 1 < F->Instrs.size(); ++I)
+      if (F->Instrs[I].Flow != FlowKind::None) {
+        Simple = false;
+        break;
+      }
+    if (!Simple)
+      continue;
+    auto Target = Out.Funcs.find(Jump.Target);
+    if (Target == Out.Funcs.end() || Target->second.Params.empty())
+      continue;
+    bool Added = false;
+    for (const Param &P_ : Target->second.Params) {
+      if (P_.Loc.Tag != ParamLoc::Kind::Reg)
+        break;
+      unsigned Arg = 4;
+      for (unsigned K = 0; K < 4; ++K)
+        if (P_.Loc.Reg == GRP[K])
+          Arg = K;
+      if (Arg == 4)
+        break;
+
+      unsigned Input = P_.Loc.Reg;
+      bool Mapped = true;
+      for (size_t I = F->Instrs.size() - 1; I > 0; --I) {
+        const MCInst &MI = F->Instrs[I - 1].Inst;
+        InsnInfo II = insnInfo(MI, T);
+        bool WritesInput = false;
+        for (const RegUse &U : II.Regs)
+          WritesInput |= U.Write && grp(U.Reg) == grp(Input);
+        if (!WritesInput)
+          continue;
+        if (!T.MII->getName(MI.getOpcode()).starts_with("MOV") ||
+            MI.getNumOperands() != 2 || !MI.getOperand(0).isReg() ||
+            !MI.getOperand(1).isReg() ||
+            grp(MI.getOperand(0).getReg()) != grp(Input)) {
+          Mapped = false;
+          break;
+        }
+        Input = grp(MI.getOperand(1).getReg());
+      }
+      if (!Mapped)
+        continue;
+      unsigned SourceSlot = 4;
+      for (unsigned K = 0; K < 4; ++K)
+        if (grp(Input) == GRP[K])
+          SourceSlot = K;
+      if (SourceSlot == 4)
+        continue;
+      Param Forwarded = P_;
+      Forwarded.Loc = ParamLoc::reg(GRP[SourceSlot]);
+      bool Have = false;
+      for (const Param &Q : Sig.Params)
+        if (Q.Loc == Forwarded.Loc)
+          Have = true;
+      if (!Have) {
+        Sig.Params.push_back(Forwarded);
+        Added = true;
+      }
+    }
+    if (!Added)
+      continue;
+    Sig.HasRet = Target->second.HasRet;
+    Sig.Ret = Target->second.Ret;
+    Sig.Noreturn = Target->second.Noreturn;
+    Sig.VarArgs = Target->second.VarArgs;
+    std::stable_sort(Sig.Params.begin(), Sig.Params.end(),
+                     [](const Param &A, const Param &B) {
+                       auto Slot = [](const Param &P_) {
+                         for (unsigned K = 0; K < 4; ++K)
+                           if (P_.Loc.Tag == ParamLoc::Kind::Reg &&
+                               P_.Loc.Reg == GRP[K])
+                             return K;
+                         return 4u;
+                       };
+                       return Slot(A) < Slot(B);
+                     });
+    ThunkChanged = true;
+  }
+} while (ThunkChanged);
 
 // Caller-prefix backfill: when every voting direct caller sets up the
 // same register-argument prefix and the callee inferred fewer integer
