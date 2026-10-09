@@ -1,0 +1,7 @@
+-3.741572e+00 catchswitch-keep.ll
+-3.704493e+00 funclet-bundle.ll
+-3.851622e+00 merged-cleanup-nofire.ll
+-4.058367e+00 mingw-landingpad-keep.ll
+-4.843616e-01 nopersonality-nofire.ll
+-3.604839e+00 rust-cleanup-keep.ll
+-3.560825e+00 seh-keep.ll
