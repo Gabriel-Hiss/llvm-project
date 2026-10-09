@@ -1,4 +1,5 @@
 revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
+  NoreturnTest.cpp
   PaddingTest.cpp
   )
 

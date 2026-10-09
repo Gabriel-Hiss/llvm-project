@@ -1,4 +1,5 @@
 add_llvm_library(RevenantAnalysis
+  Noreturn.cpp
   Padding.cpp
 
   LINK_COMPONENTS
