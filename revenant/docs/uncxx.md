@@ -40,6 +40,11 @@ rewrite, and a `revenant.lang = "c"` module flag disables Uncxx entirely. Both
 normalizer output is also tagged `"c"` by the old detector and is gated; the
 C++ detection fix must land before measuring Uncxx on that binary again.
 
+The current normalized `cpp-o2` module is also tagged `"c"` by the old
+detector, so the language gate skips it. Changing only that scratch module
+flag to `"cpp"` yielded one `vector.size` helper in `sub_140001630`; rerun the
+actual decompiler after C++ detection lands.
+
 The existing `revenant-decompile` accepts `--emit ir-raw|ir-clean|ir-final`,
 not `--emit ir`. On `cpp-o2.exe`, `--emit ir-final` succeeded, but applying
 `revenant-uncxx` to that lifted IR emitted no helper calls. On `json-cl-o2.exe`,
