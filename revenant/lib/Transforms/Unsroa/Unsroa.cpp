@@ -1473,8 +1473,80 @@ bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
     bool Veto = false;
     uint64_t Lo = Fields.front().Off;
     uint64_t Hi = Fields.back().Off + Fields.back().Width;
+    // A large byte-array frame is a set of unrelated local objects. Carve
+    // small neighboring runs rather than treating the entire frame as one
+    // aggregate; only touch fields in the chosen run.
+    if (isa<AllocaInst>(Root)) {
+      size_t BestStart = 0, BestEnd = 0;
+      for (size_t Start = 0; Start < Fields.size();) {
+        size_t End = Start + 1;
+        while (End < Fields.size() &&
+               Fields[End].Off - (Fields[End - 1].Off +
+                                   Fields[End - 1].Width) <= 16)
+          ++End;
+        if (End - Start > BestEnd - BestStart) {
+          BestStart = Start;
+          BestEnd = End;
+        }
+        Start = End;
+      }
+      if (BestEnd > BestStart && BestEnd - BestStart < Fields.size()) {
+        SmallVector<Field, 8> Local;
+        for (size_t I = BestStart; I < BestEnd; ++I)
+          Local.push_back(std::move(Fields[I]));
+        Fields = std::move(Local);
+      }
+    }
+    Lo = Fields.front().Off;
+    Hi = Fields.back().Off + Fields.back().Width;
     if (Hi - Lo > 256)
       continue;
+    if (isa<AllocaInst>(Root)) {
+      bool CalleeConfirms = false;
+      for (BasicBlock &CallBB : F)
+        for (Instruction &CallI : CallBB) {
+          auto *CB = dyn_cast<CallBase>(&CallI);
+          Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+          if (!Callee || Callee->isDeclaration())
+            continue;
+          for (unsigned AI = 0; AI < CB->arg_size(); ++AI) {
+            uint64_t CallOff = 0;
+            const Value *CallRoot = resolveFootprintBase(
+                skipCopies(CB->getArgOperand(AI)), DL, CallOff);
+            if (CallRoot != Root || CallOff != Lo ||
+                AI >= Callee->arg_size())
+              continue;
+            Argument *CA = Callee->getArg(AI);
+            bool AllFieldsSeen = true;
+            for (const Field &Fd : Fields) {
+              bool Seen = false;
+              for (BasicBlock &CBB : *Callee)
+                for (Instruction &CI : CBB) {
+                  Value *Ptr = nullptr;
+                  Type *AT = nullptr;
+                  if (auto *LI = dyn_cast<LoadInst>(&CI)) {
+                    Ptr = LI->getPointerOperand();
+                    AT = LI->getType();
+                  } else if (auto *SI = dyn_cast<StoreInst>(&CI)) {
+                    Ptr = SI->getPointerOperand();
+                    AT = SI->getValueOperand()->getType();
+                  }
+                  if (!Ptr || AT != Fd.Ty)
+                    continue;
+                  uint64_t AccessOff = 0;
+                  if (resolveFootprintBase(skipCopies(Ptr), DL, AccessOff) ==
+                          CA &&
+                      AccessOff == Fd.Off - Lo)
+                    Seen = true;
+                }
+              AllFieldsSeen &= Seen;
+            }
+            CalleeConfirms |= AllFieldsSeen;
+          }
+        }
+      if (!CalleeConfirms)
+        continue;
+    }
     // Struct-likeness: veto a dense uniform run of >=3 offsets (an
     // unrolled array) and an adjacent same-type pair.
     if (Fields.size() >= 3) {
@@ -1492,24 +1564,6 @@ bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
     } else {
       const Field &A = Fields[0], &Bf = Fields[1];
       if (Bf.Off == A.Off + A.Width && A.Ty == Bf.Ty)
-        continue;
-    }
-    // Do not combine a local object with a disjoint frame cookie or
-    // unrelated local. Such accesses are not byte padding inside it.
-    if (isa<AllocaInst>(Root)) {
-      bool ForeignWindow = false;
-      for (unsigned I : Idxs) {
-        const Access &A = Accesses[I];
-        if (A.Off >= Lo && A.Off < Hi)
-          continue;
-        const auto *SI = A.Store ? dyn_cast<StoreInst>(A.Inst) : nullptr;
-        if ((SI && isStackCookieStore(*SI, DL)) ||
-            A.Off + A.Width > Hi) {
-          ForeignWindow = true;
-          break;
-        }
-      }
-      if (ForeignWindow)
         continue;
     }
     // Alloca windows: foreign accesses (non-scalar or demoted members)
