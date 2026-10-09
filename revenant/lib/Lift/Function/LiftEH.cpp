@@ -184,8 +184,10 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     } else if (Handler && (EH.Model == EHModel::MSVC ||
                            EH.Model == EHModel::SEH)) {
       // catchswitch/catchpad skeleton copied from clang -cc1 lowering.
-      auto *SW = CatchSwitchInst::Create(nullptr, nullptr, 1, "eh.catchswitch",
-                                         Dispatch);
+      // Top-level dispatch: parent pad is the none token (never null:
+      // the instruction derives its type from the parent pad).
+      auto *SW = CatchSwitchInst::Create(ConstantTokenNone::get(C), nullptr, 1,
+                                         "eh.catchswitch", Dispatch);
       HandlerBB = BasicBlock::Create(C, "eh.catch", &Fn, Normal);
       SW->addHandler(HandlerBB);
       CatchPadInst *PadI = nullptr;
@@ -215,7 +217,8 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     } else if (Cleanup) {
       // Unwind-only: cleanuppad/cleanupret to the normal edge.
       // cleanupret unwinds to caller: the pad runs dtors then resumes.
-      auto *PadI = CleanupPadInst::Create(nullptr, {}, "eh.cleanup", Dispatch);
+      auto *PadI = CleanupPadInst::Create(ConstantTokenNone::get(C), {},
+                                          "eh.cleanup", Dispatch);
       auto *Ret = CleanupReturnInst::Create(PadI, nullptr, Dispatch);
       ir::copyInstructionVA(*CI, *PadI);
       ir::copyInstructionVA(*CI, *Ret);

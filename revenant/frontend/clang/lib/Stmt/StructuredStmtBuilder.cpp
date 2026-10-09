@@ -28,6 +28,7 @@
 #include "revenant/Clang/TypeBuilder.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/StmtCXX.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -152,6 +153,11 @@ private:
   Stmt *emitIf(Region &R, const Region *Outer);
   Stmt *emitLoop(Region &R, const Region *Outer);
   Stmt *emitSwitch(Region &R, const Region *Outer);
+  /// Try/catch from native LLVM EH pads (no region annotation needed).
+  /// Null when BB does not end in an invoke into a catchswitch or
+  /// landingpad/cleanuppad dispatch.
+  Stmt *tryTry(BasicBlock *BB);
+  void emitCatchBlockStmts(BasicBlock *BB, SmallVectorImpl<Stmt *> &Out);
   Expr *condOf(BranchInst *BI, BasicBlock *ContinueSucc);
   Expr *inverted(Value *V);
   /// Canonical for-shape: match `init = store -> IV` in the preheader and
@@ -181,8 +187,9 @@ private:
   /// Instructions consumed by a for-init or for-step; skipped during leaf
   /// emission.
   DenseSet<Instruction *> ForClaimed;
+  /// Invoke blocks already emitted inside a try statement.
+  SmallPtrSet<BasicBlock *, 8> EHClaimed;
 };
-
 LabelDecl *StructuredStmtBuilder::labelFor(BasicBlock *BB) {
   auto It = Labels.find(BB);
   if (It != Labels.end())
@@ -960,6 +967,139 @@ Stmt *StructuredStmtBuilder::emitRegionHeader(Region &R,
   llvm_unreachable("unknown region kind");
 }
 
+/// Catch/cleanup handler block statements: pad instructions are structural
+/// (no C spelling), catchret/cleanupret/resume terminators are control
+/// flow consumed by the try construct. Everything else emits normally.
+void StructuredStmtBuilder::emitCatchBlockStmts(
+    BasicBlock *BB, SmallVectorImpl<Stmt *> &Out) {
+  for (Instruction &I : *BB) {
+    if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I))
+      continue;
+    if (isa<CatchPadInst>(I) || isa<CleanupPadInst>(I) ||
+        isa<LandingPadInst>(I))
+      continue;
+    if (auto *CI = dyn_cast<CallInst>(&I)) {
+      if (Function *Callee = CI->getCalledFunction()) {
+        StringRef N = Callee->getName();
+        if (N == "llvm.eh.exceptioncode" || N == "llvm.eh.typeid.for")
+          continue;
+      }
+    }
+    if (Stmt *S = Exprs->instr(I, *Scope))
+      Out.push_back(S);
+  }
+}
+
+/// Try statement from an invoke whose unwind edge reaches EH pads.
+/// Shapes (mirroring clang -cc1 lowering, x86_64-pc-windows-msvc):
+/// - MSVC/Itanium catch: dispatch holds catchswitch (or landingpad with
+///   catch clauses); each handler block holds a catchpad. Emits
+///   `try { invoke-call } catch (...) { handler }`.
+/// - SEH: dispatch holds catchswitch, handler catchpad has a single null
+///   selector. Personality __C_specific_handler selects __try/__except;
+///   the filter expression stays opaque (constant 1).
+/// - Cleanup-only (cleanuppad/cleanupret, landingpad cleanup): one
+///   catch-all handler spelling the unwind-only semantics.
+Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
+  auto *II = dyn_cast<InvokeInst>(BB->getTerminator());
+  if (!II)
+    return nullptr;
+  BasicBlock *Dispatch = II->getUnwindDest();
+  if (!Dispatch || EHClaimed.contains(BB))
+    return nullptr;
+  // Dispatch must hold exactly one EH pad instruction.
+  CatchSwitchInst *SW = nullptr;
+  LandingPadInst *LP = nullptr;
+  CleanupPadInst *CP = nullptr;
+  for (Instruction &I : *Dispatch) {
+    if (isa<CatchSwitchInst>(I))
+      SW = cast<CatchSwitchInst>(&I);
+    else if (isa<LandingPadInst>(I))
+      LP = cast<LandingPadInst>(&I);
+    else if (isa<CleanupPadInst>(I))
+      CP = cast<CleanupPadInst>(&I);
+  }
+  unsigned Pads = (SW ? 1 : 0) + (LP ? 1 : 0) + (CP ? 1 : 0);
+  if (Pads != 1)
+    return nullptr;
+
+  // Collect handler blocks: catchswitch handlers, or the single pad
+  // block for landingpad/cleanuppad dispatches.
+  SmallVector<BasicBlock *, 2> Handlers;
+  if (SW) {
+    for (BasicBlock *H : SW->handlers())
+      Handlers.push_back(H);
+  } else {
+    Handlers.push_back(Dispatch);
+  }
+  if (Handlers.empty())
+    return nullptr;
+
+  // Personality decides the spelling: __C_specific_handler -> SEH.
+  bool IsSEH = false;
+  if (Fn && Fn->hasPersonalityFn()) {
+    if (const auto *GV = dyn_cast<GlobalValue>(
+            Fn->getPersonalityFn()->stripPointerCasts()))
+      IsSEH = GV->getName() == "__C_specific_handler";
+  }
+
+  // Try body: spell the invoke's call through a scratch CallInst so
+  // ExprBuilder (which only takes CallInst) prints the real call.
+  SmallVector<Stmt *, 8> TryBody;
+  {
+    // Unparented scratch call: never inserted into the function, so no
+    // CFG or dominator invalidation. Deleted after spelling.
+    SmallVector<Value *, 8> Args(II->args());
+    CallInst *ScratchCall = CallInst::Create(
+        II->getFunctionType(), II->getCalledOperand(), Args);
+    ScratchCall->setCallingConv(II->getCallingConv());
+    ScratchCall->setAttributes(II->getAttributes());
+    if (Stmt *S = Exprs->instr(*ScratchCall, *Scope))
+      TryBody.push_back(S);
+    delete ScratchCall;
+  }
+
+  EHClaimed.insert(BB);
+  for (BasicBlock *H : Handlers)
+    EHClaimed.insert(H);
+  EHClaimed.insert(Dispatch);
+
+  if (IsSEH) {
+    SmallVector<Stmt *, 4> HandlerBody;
+    for (BasicBlock *H : Handlers)
+      emitCatchBlockStmts(H, HandlerBody);
+    if (HandlerBody.empty())
+      HandlerBody.push_back(new (*AST) NullStmt(SourceLocation(), false));
+    CompoundStmt *TryC = CompoundStmt::Create(
+        *AST, TryBody, FPOptionsOverride(), SourceLocation(), SourceLocation());
+    CompoundStmt *HC = CompoundStmt::Create(
+        *AST, HandlerBody, FPOptionsOverride(), SourceLocation(),
+        SourceLocation());
+    // Filter expression is opaque (real filters stay asm calls); emit 1.
+    Expr *Filter = IntegerLiteral::Create(*AST, APInt(32, 1), AST->IntTy,
+                                          SourceLocation());
+    Stmt *Handler = SEHExceptStmt::Create(*AST, SourceLocation(), Filter, HC);
+    return SEHTryStmt::Create(*AST, false, SourceLocation(), TryC, Handler);
+  }
+
+  // C++ try/catch (MSVC catchpad, MinGW landingpad, cleanuppad): one
+  // catch-all handler per handler block.
+  SmallVector<Stmt *, 2> CatchStmts;
+  for (BasicBlock *H : Handlers) {
+    SmallVector<Stmt *, 4> HandlerBody;
+    emitCatchBlockStmts(H, HandlerBody);
+    if (HandlerBody.empty())
+      HandlerBody.push_back(new (*AST) NullStmt(SourceLocation(), false));
+    CompoundStmt *HC = CompoundStmt::Create(
+        *AST, HandlerBody, FPOptionsOverride(), SourceLocation(),
+        SourceLocation());
+    CatchStmts.push_back(new (*AST) CXXCatchStmt(SourceLocation(), nullptr, HC));
+  }
+  CompoundStmt *TryC = CompoundStmt::Create(
+      *AST, TryBody, FPOptionsOverride(), SourceLocation(), SourceLocation());
+  return CXXTryStmt::Create(*AST, SourceLocation(), TryC, CatchStmts);
+}
+
 CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
                                              ExprBuilder &Exprs,
                                              ExprScope &Scope) {
@@ -974,6 +1114,7 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
   Regions.clear();
   ScTags.clear();
   ForClaimed.clear();
+  EHClaimed.clear();
 
   for (BasicBlock &BB : F)
     Blocks.push_back(&BB);
@@ -985,6 +1126,16 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
 
   SmallVector<Stmt *, 32> Stmts;
   for (BasicBlock *BB : Blocks) {
+    // Native LLVM EH pads print as try/catch before region logic runs:
+    // they carry no region annotation and must not degrade to labels.
+    if (!EHClaimed.contains(BB)) {
+      if (Stmt *Try = tryTry(BB)) {
+        Stmts.push_back(Try);
+        continue;
+      }
+    } else {
+      continue; // dispatch/handler block already inside a try statement
+    }
     if (Region *R = regionOf(BB); R && !R->Degraded) {
       // Region headers only emit at the top level when they are not
       // nested inside another region's member set.
