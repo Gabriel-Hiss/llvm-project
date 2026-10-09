@@ -57,6 +57,11 @@ public:
   virtual std::optional<std::string> nameFor(Va Addr, RefKind Kind) const {
     return std::nullopt;
   }
+  virtual std::string
+  decorateLine(const Instr &I, llvm::StringRef Line,
+               llvm::ArrayRef<std::pair<Va, RefKind>> Refs) const {
+    return Line.str();
+  }
 };
 
 /// Shared resolver handle.
@@ -95,6 +100,9 @@ public:
   /// Format a whole sequence (shared printer).
   std::vector<std::string> formatAll(llvm::ArrayRef<Instr> Instrs,
                                      const SharedNames &Names = {}) const;
+
+  /// Whether the decoded instruction may write to memory.
+  bool isStore(const Instr &I) const;
 
   /// Raw operand targets analysis needs: near branch target, RIP-relative
   /// memory target, and the ref kind.
