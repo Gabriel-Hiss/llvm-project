@@ -454,6 +454,43 @@ def : RVMatch {
   dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
 }
 
+// Memory-source forms of the float-to-int conversions: the memory cell is
+// exactly the scalar element width, so readOp loads the same bits the
+// register lane carries and the register body applies verbatim (x86
+// out-of-range/NaN results are the hardware's 0x80..0 indefinite).
+def : RVMatch {
+  string Glob = "CVTTSS2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTTSS2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTTSD2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTTSD2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSD2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSD2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f64 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSS2SIrm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 32, (rv_xlane0f32 (rv_op 0))));
+}
+def : RVMatch {
+  string Glob = "CVTSS2SI64rm_Int";
+  dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+
 // ---- scalar float compares (flags only) --------------------------------------
 def : RVMatch {
   string Glob = "COMISSrr";
@@ -767,3 +804,4 @@ def : RVMatch {
   string Glob = "PCMPISTRMrri";
   dag Body = (rv_pcmpistest "istrm", (rv_op 0), (rv_op 1), (rv_op 2));
 }
+

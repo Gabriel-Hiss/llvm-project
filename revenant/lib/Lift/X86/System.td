@@ -328,7 +328,9 @@ def : RVLift {
 //   RDTSC:   (outs), (ins), Defs [RAX,RDX]
 //   RDTSCP:  (outs), (ins), Defs [RAX,RCX,RDX]
 //   XGETBV:  (outs), (ins), Uses [ECX], Defs [EDX,EAX]
-//   INT:     (outs), (ins u8imm:$trap), pattern int_x86_int -> rv_opaque
+//   INT:     (outs), (ins u8imm:$trap) -> rv_int emits llvm.x86.int($trap);
+//            int 0x29 (__fastfail) is noreturn, matching the analysis
+//            trap classification. INT3 shares the same body as (rv_int 3).
 //   SYSCALL: (outs), (ins), no Defs/Uses in the .td (implicit RCX/R11)
 //   SYSRET:  (outs), (ins), SYSRET64 twin
 //   PAUSE:   (outs), (ins), pattern int_x86_sse2_pause; hardware hint,
@@ -345,8 +347,8 @@ def : RVLift {
 //   RDTSCP covered above; RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE carry
 //   int_x86_* patterns and invert for free (real semantics, not opaque).
 //   INVEPT64/INVVPID64: (ins GR64:$src1, i128mem:$src2) -> opaque.
-//   INT3/INTO stay out: INT3 is llvm.debugtrap per the Rust reference,
-//   INTO is 32-bit-only (Requires Not64BitMode).
+//   INT3/INTO stay out: INT3 lifts through (rv_int 3) next to ENDBR in
+//   X86Lift.td; INTO is 32-bit-only (Requires Not64BitMode).
 
 def : RVLift {
   let Insn = CPUID;
@@ -366,7 +368,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = INT;
-  dag Body = (rv_opaque);
+  dag Body = (rv_int $trap);
 }
 def : RVLift {
   let Insn = SYSCALL;
