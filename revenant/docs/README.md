@@ -60,5 +60,5 @@ revenant --export-parity <pe> <dir>   revenant-items.bin + file-spans.tsv
                                       + meta.json (contract format)
 ```
 
-Until analysis lands, the export lists no functions: the byte map still
-partitions the file (headers/sections/unknown/certificate/overlay).
+The parity export runs full program analysis without loading a PDB; the
+per-binary command and results are tracked in `parity.md`.

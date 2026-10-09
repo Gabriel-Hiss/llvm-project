@@ -48,7 +48,8 @@ sys.path.insert(0, str(HARNESS))
 from paritylib import parse_pe, rva_to_off  # noqa: E402
 
 from iced_x86 import (  # noqa: E402
-    Decoder, Formatter, FormatterSyntax, FlowControl, OpKind,
+    Decoder, FlowControl, Formatter, FormatterSyntax, Mnemonic, OpKind,
+    Register,
 )
 
 
@@ -82,36 +83,104 @@ def load_meta(path):
     return out
 
 
-_HEX0X = re.compile(r"0x[0-9a-fA-F]+")
-_HEXLIT = re.compile(r"\b0*([0-9a-fA-F]+)h\b")
-_RIPBR = re.compile(r"\[\s*rip\s*\+\s*(?:\.\.\.|0x[0-9a-fA-F]+|[0-9a-fA-F]+h)\s*\]")
+_RIPBR = re.compile(r"\[\s*rip\s*(?:\+|-)\s*(?:\.\.\.|0x[0-9a-fA-F]+|[0-9a-fA-F]+h)\s*\]")
 _BAREABS = re.compile(r"\[\s*(?:0x[0-9a-fA-F]+|[0-9a-fA-F]+h)\s*\]")
 _PAREN = re.compile(r"\s*\([^)]*\)\s*$")
 _WS = re.compile(r"\s+")
+_PTR = re.compile(
+    r"\b(?:byte|word|dword|qword|tbyte|fword|xmmword|ymmword|zmmword|oword)\s+ptr\s+")
+_SCALE = re.compile(r"(?<![a-z0-9_])(\d+)\s*\*\s*([a-z][a-z0-9]*)\b")
+_NUMBER = re.compile(
+    r"(?<![a-z0-9_#])(?:0x[0-9a-f]+|[0-9a-f]+h|\d+)(?![a-z0-9_])")
+_REG = re.compile(
+    r"\b(?:[er]?(?:ax|bx|cx|dx|si|di|bp|sp)|"
+    r"(?:al|ah|bl|bh|cl|ch|dl|dh|spl|bpl|sil|dil)|"
+    r"r(?:1[0-5]|[89])(?:[bwd])?)\b")
+_IMMEDIATE_WIDTH = {
+    "byte": 8, "word": 16, "dword": 32, "qword": 64,
+}
 
 
-def canon(text, near_branch=False, ip_rel_memory=False):
-    """Normalize formatting without hiding unrelated numeric operands."""
+def _number_value(token):
+    if token.startswith("0x"):
+        return int(token[2:], 16)
+    if token.endswith("h"):
+        return int(token[:-1], 16)
+    return int(token, 10)
+
+
+def _operand_width(text):
+    ptr = re.search(r"\b(byte|word|dword|qword)\s+ptr\b", text)
+    if ptr:
+        return _IMMEDIATE_WIDTH[ptr.group(1)]
+    widths = []
+    for match in _REG.finditer(text):
+        reg = match.group(0)
+        if reg.endswith("b") or reg in {
+                "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh",
+                "spl", "bpl", "sil", "dil"}:
+            widths.append(8)
+        elif reg.endswith("w") or reg in {
+                "ax", "bx", "cx", "dx", "si", "di", "bp", "sp"}:
+            widths.append(16)
+        elif reg.startswith("e") or reg.endswith("d"):
+            widths.append(32)
+        else:
+            widths.append(64)
+    return max(widths, default=None)
+
+
+def canon(text, near_branch=False, ip_rel_memory=False,
+          symbol_memory=False, memory_index=None, memory_scale=1):
+    """Normalize printer-only Intel differences and preserve operand identity."""
     t = _PAREN.sub("", text).strip().lower()
     if ip_rel_memory:
         t = _RIPBR.sub("[@]", t)
-        # Some compiler records contain the unrelocated object literal
-        # instead of a RIP expression. The final-binary decode identified
-        # this as the RIP-relative memory operand.
+        # The oracle may contain an unrelocated object literal; the final
+        # binary decode established that this bracket operand is RIP-relative.
         t = _BAREABS.sub("[@]", t)
+    elif symbol_memory:
+        expr = "[@"
+        if memory_index is not None:
+            expr += "+" + memory_index
+            if memory_scale != 1:
+                expr += "*" + str(memory_scale)
+        expr += "]"
+        t = re.sub(r"\[[^\]]*\]", expr, t, count=1)
     if near_branch:
-        # A direct near branch has one destination operand. Its identity
-        # is compared separately, so symbol spelling and address syntax
-        # do not affect the text metric.
-        t = re.sub(r"^(\S+)\s+.*$", r"\1@", t)
-    t = _HEX0X.sub(lambda m: f"{int(m.group(0), 16)}h", t)
-    t = _HEXLIT.sub(lambda m: f"{m.group(1).lower()}h", t)
+        mnemonic = t.split(None, 1)[0] if t else ""
+        return mnemonic + "@"
+    string = re.match(
+        r"^(rep(?:e|ne)?\s+)?(movs|cmps|scas|stos|lods)(b|w|d|q)\b", t)
+    if string and (string.group(1) or not re.search(r"\b[xyz]mm\d", t)):
+        return _WS.sub("", (string.group(1) or "") +
+                        string.group(2) + string.group(3))
+    if re.fullmatch(r"xchg\s+([a-z0-9]+)\s*,\s*\1", t):
+        return "nop"
+    width = _operand_width(t)
+    def mask_negative_immediate(match):
+        value = -_number_value(match.group(1))
+        if width is not None:
+            value %= 1 << width
+        return ",#" + str(value)
+    t = re.sub(r",\s*-(0x[0-9a-f]+|[0-9a-f]+h|\d+)\b",
+               mask_negative_immediate, t)
+    t = _PTR.sub("", t)
+    t = _SCALE.sub(r"\2*\1", t)
+    t = _NUMBER.sub(lambda m: f"#{_number_value(m.group(0))}", t)
     t = _WS.sub("", t)
+    t = re.sub(r"^movabs", "mov", t)
+    shift = re.fullmatch(r"(shl|shr|sal|sar|rol|ror|rcl|rcr)([^,]+)", t)
+    if shift:
+        t = f"{shift.group(1)}{shift.group(2)},#1"
+    imul = re.fullmatch(r"imul([^,]+),([^,]+)", t)
+    if imul:
+        t = f"imul{imul.group(1)},{imul.group(1)},{imul.group(2)}"
     return t
 
 
 def oracle_refs(ins):
-    """Resolved target RVAs, kept separate for branch and RIP memory."""
+    """Resolved direct-branch and RIP-relative memory target RVAs."""
     target = ins.near_branch_target if (
         ins.flow_control in (FlowControl.UNCONDITIONAL_BRANCH,
                              FlowControl.CONDITIONAL_BRANCH,
@@ -119,6 +188,30 @@ def oracle_refs(ins):
         and ins.op0_kind == OpKind.NEAR_BRANCH64) else None
     mem = ins.ip_rel_memory_address if ins.is_ip_rel_memory_operand else None
     return target, mem
+
+
+def register_family(register, formatter):
+    if register == Register.NONE:
+        return None
+    name = formatter.format_register(register).lower()
+    aliases = {
+        "rax": ("rax", "eax", "ax", "al", "ah"),
+        "rbx": ("rbx", "ebx", "bx", "bl", "bh"),
+        "rcx": ("rcx", "ecx", "cx", "cl", "ch"),
+        "rdx": ("rdx", "edx", "dx", "dl", "dh"),
+        "rsi": ("rsi", "esi", "si", "sil"),
+        "rdi": ("rdi", "edi", "di", "dil"),
+        "rbp": ("rbp", "ebp", "bp", "bpl"),
+        "rsp": ("rsp", "esp", "sp", "spl"),
+    }
+    for family, names in aliases.items():
+        if name in names:
+            return family
+    match = re.fullmatch(r"(r(?:[89]|1[0-5]))(?:[bwd])?", name)
+    return match.group(1) if match else None
+def is_image_rva(sections, rva):
+    return any(section.rva <= rva < section.rva + section.vsize
+               for section in sections)
 
 
 def asm_metric(bindir: Path, revdir: Path, binary: Path):
@@ -133,33 +226,100 @@ def asm_metric(bindir: Path, revdir: Path, binary: Path):
     for line in side.read_text().splitlines():
         rec = json.loads(line)
         rev[(rec["rva"], rec["len"])] = rec
-    fmt = Formatter(FormatterSyntax.INTEL)
+    formatter = Formatter(FormatterSyntax.INTEL)
     checked = mism = 0
     mismatches = []
+    register_values = {}
+    last_owner = None
+    next_rva = None
     for key, rec in rev.items():
-        o = meta.get(key)
-        if not o:
-            continue  # boundary metric owns conflict/extra
-        rva, ln = key
-        o_target = o_mem = None
-        if off is not None:
-            ins = next(iter(Decoder(64, raw[off:off + ln], ip=rva)), None)
-            if ins is not None:
-                o_target, o_mem = oracle_refs(ins)
-        r_target, r_mem = rec.get("target"), rec.get("mem")
-        want = canon(o_text, near_branch=o_target is not None,
-                     ip_rel_memory=o_mem is not None)
-        got = canon(rec.get("asm", ""), near_branch=r_target is not None,
-                    ip_rel_memory=r_mem is not None)
-        ok = (got == want and o_target == r_target and o_mem == r_mem)
-        checked += 1
-        if not ok:
-            mism += 1
-            mismatches.append({"rva": rva, "len": ln,
-                               "revenant": rec.get("asm"),
-                               "oracle": o_text,
-                               "o_refs": o_refs, "r_refs": r_refs,
-                               "owner": o.get("owner", "?")})
+        oracle = meta.get(key)
+        rva, length = key
+        owner = oracle.get("owner") if oracle else None
+        if rva != next_rva or (owner is not None and owner != last_owner):
+            register_values.clear()
+        off = rva_to_off(sections, rva)
+        ins = (next(iter(Decoder(
+            64, raw[off:off + length], ip=rva)), None) if off is not None else None)
+        oracle_target = oracle_mem = None
+        symbol_mem = None
+        memory_index = None
+        memory_scale = 1
+        if ins is not None:
+            oracle_target, oracle_mem = oracle_refs(ins)
+            if oracle_mem is None:
+                base = ins.memory_base
+                index = ins.memory_index
+                displacement = ins.memory_displacement
+                displacement_size = ins.memory_displ_size
+                if displacement_size:
+                    bits = displacement_size * 8
+                    if displacement & (1 << (bits - 1)):
+                        displacement -= 1 << bits
+                base_family = register_family(base, formatter)
+                base_value = register_values.get(base_family)
+                if base == Register.NONE and index == Register.NONE:
+                    candidate = displacement
+                elif base_value is not None:
+                    candidate = base_value + displacement
+                elif (displacement >= 0x1000 and
+                      (index != Register.NONE or ins.mnemonic == Mnemonic.LEA)):
+                    candidate = displacement
+                else:
+                    candidate = None
+                if candidate is not None and is_image_rva(sections, candidate):
+                    symbol_mem = candidate
+                    oracle_mem = candidate
+                    if index != Register.NONE:
+                        memory_index = formatter.format_register(index).lower()
+                        memory_scale = ins.memory_index_scale
+
+        revenant_target = rec.get("target")
+        revenant_mem = rec.get("mem")
+        if revenant_mem is None:
+            revenant_mem = symbol_mem
+        if oracle:
+            oracle_text = canon(
+                oracle["asm"], near_branch=oracle_target is not None,
+                ip_rel_memory=oracle_mem is not None and symbol_mem is None,
+                symbol_memory=symbol_mem is not None,
+                memory_index=memory_index, memory_scale=memory_scale)
+            revenant_text = canon(
+                rec.get("asm", ""), near_branch=revenant_target is not None,
+                ip_rel_memory=revenant_mem is not None and symbol_mem is None,
+                symbol_memory=symbol_mem is not None,
+                memory_index=memory_index, memory_scale=memory_scale)
+            ok = (revenant_text == oracle_text and
+                  oracle_target == revenant_target and oracle_mem == revenant_mem)
+            checked += 1
+            if not ok:
+                mism += 1
+                mismatches.append({"rva": rva, "len": length,
+                                   "revenant": rec.get("asm"),
+                                   "oracle": oracle["asm"],
+                                   "oracle_target": oracle_target,
+                                   "oracle_mem": oracle_mem,
+                                   "revenant_target": revenant_target,
+                                   "revenant_mem": revenant_mem,
+                                   "owner": oracle.get("owner", "?")})
+
+        if ins is not None and ins.op0_kind == OpKind.REGISTER:
+            destination = register_family(ins.op0_register, formatter)
+            if destination:
+                register_values.pop(destination, None)
+                if (ins.mnemonic == Mnemonic.LEA and
+                        ins.is_ip_rel_memory_operand):
+                    register_values[destination] = ins.ip_rel_memory_address
+                elif (ins.mnemonic == Mnemonic.MOV and
+                      ins.op1_kind == OpKind.REGISTER):
+                    source = register_family(ins.op1_register, formatter)
+                    if source in register_values:
+                        register_values[destination] = register_values[source]
+        if ins is not None and ins.flow_control != FlowControl.NEXT:
+            register_values.clear()
+        next_rva = rva + length
+        if owner is not None:
+            last_owner = owner
     return {"asm_checked": checked, "asm_text_mismatch": mism,
             "asm_mismatches": mismatches[:200]}
 
@@ -194,6 +354,36 @@ def merge_asm(parity_root, tag, only):
     return rows
 
 
+def update_parity_doc(tag, summary):
+    path = Path(__file__).resolve().parents[2] / "docs" / "parity.md"
+    text = path.read_text()
+    start = "<!-- parity-results:start -->"
+    end = "<!-- parity-results:end -->"
+    start_at = text.index(start) + len(start)
+    end_at = text.index(end, start_at)
+    lines = [
+        f"Latest C/C++ scan (`{tag}`): {summary['binaries']} binaries, "
+        f"{summary['clean']} clean; missing={summary['total_missing']}, "
+        f"conflicts={summary['total_conflicts']}, "
+        f"ASM mismatches={summary['total_asm_text_mismatch']}.",
+        "",
+        "| Binary | Status | Missing | Conflicts | Extra | ASM checked | ASM mismatch |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    def show(value):
+        return "-" if value is None else f"{value:,}"
+
+    for row in summary["rows"]:
+        lines.append(
+            f"| {row['id']} | {row['status'] or '-'} | "
+            f"{show(row['missing'])} | {show(row['conflicts'])} | "
+            f"{show(row['extra'])} | {show(row['asm_checked'])} | "
+            f"{show(row['asm_text_mismatch'])} |")
+    path.write_text(text[:start_at] + "\n" + "\n".join(lines) +
+                    "\n" + text[end_at:])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--revenant-dir", required=True, type=Path,
@@ -206,6 +396,7 @@ def main():
                     help="skip compare.py; only (re)compute asm metrics")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
+    full_ccpp_scan = args.only is None and not args.all_kinds
 
     exporter = args.revenant_dir / "export-parity.cmd"
     if not exporter.exists() or not (args.revenant_dir / "revenant.exe").exists():
@@ -271,10 +462,17 @@ def main():
                          "asm_checked": r.get("asm_checked"),
                          "asm_text_mismatch": r.get("asm_text_mismatch")}
                         for r in rows]}
-    print(json.dumps({k: v for k, v in summary.items() if k != "rows"},
-                     indent=2))
+
+    if full_ccpp_scan:
+        update_parity_doc(args.tag, summary)
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))
+        concise = {k: v for k, v in summary.items()
+                   if k not in ("rows", "evidence_by_function_symbol")}
+        print(json.dumps(concise, indent=2))
+        print(f"full per-binary results and evidence: {args.out}")
+    else:
+        print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
