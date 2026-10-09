@@ -217,7 +217,7 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   DICompileUnit &CU = ir::getOrCreateCompileUnit(*M, DIB, "revenant.ll");
   DISubprogram *SP = F.getSubprogram();
   if (!SP)
-    SP = ir::createSubprogramFor(F, DIB, CU);
+    SP = &ir::createSubprogramFor(F, DIB, CU);
   DIFile *File = SP->getFile();
   DIScope *Scope = SP;
 
