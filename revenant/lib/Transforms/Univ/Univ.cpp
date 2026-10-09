@@ -346,7 +346,13 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       return false;
     if (GI->getSourceElementType()->isIntegerTy(8))
       return false; // unscaled byte GEP: unknown stride
-    if (!isLoopInvariant(GI->getPointerOperand(), Header, Latch))
+    // Lifting may materialize an invariant base pointer as an inttoptr in
+    // the loop header. Its integer source must still be loop-invariant.
+    Value *Base = GI->getPointerOperand();
+    auto *BaseCast = dyn_cast<IntToPtrInst>(Base);
+    if (!isLoopInvariant(Base, Header, Latch) &&
+        (!BaseCast ||
+         !isLoopInvariant(BaseCast->getOperand(0), Header, Latch)))
       return false;
     GEPs.push_back(GI);
   }
