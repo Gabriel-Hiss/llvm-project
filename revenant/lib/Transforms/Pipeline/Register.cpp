@@ -51,6 +51,9 @@
 #if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
 #include "revenant/Transforms/SsaOut/SsaOut.h"
 #endif
+#if __has_include("revenant/Transforms/LocalSlots/LocalSlots.h")
+#include "revenant/Transforms/LocalSlots/LocalSlots.h"
+#endif
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
 #include "revenant/Transforms/Unabi/Unabi.h"
 #endif
@@ -157,6 +160,12 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/SsaOut/SsaOut.h")
         if (Name == "revenant-ssaout") {
           FPM.addPass(SsaOutPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/LocalSlots/LocalSlots.h")
+        if (Name == "revenant-locals-to-slots") {
+          FPM.addPass(LocalSlotsPass());
           return true;
         }
 #endif

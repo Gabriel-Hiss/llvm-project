@@ -20,8 +20,9 @@ function(<cleanup>,revenant-idioms,<unopt>,revenant-structure)
 
 `defaultPipeline(true)` inserts `revenant-patterns` between unopt and
 structure, matching the engine `--patterns` path. Type recovery
-(`revenant-types`) and SSA-out (`revenant-ssaout`) run post-structure,
-pre-emission; they are not in the default text, pass them explicitly.
+(`revenant-types`) and SSA-out (`revenant-ssaout`) run post-structure in
+`ir-final`. The fidelity-only `ir-pre-like` stage uses
+`revenant-locals-to-slots` after type recovery instead of SSA-out.
 
 | stage | passes | source |
 |---|---|---|
@@ -31,6 +32,7 @@ pre-emission; they are not in the default text, pass them explicitly.
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
+| pre-like locals | `revenant-locals-to-slots` | argument spills, debug-backed/loop-carried PHI webs, return slots, after `revenant-types` |
 | ssaout (post) | `revenant-ssaout` | mem2reg/sroa undo, pre-frontend |
 
 ## Registration convention
