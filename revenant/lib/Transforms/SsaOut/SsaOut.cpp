@@ -123,7 +123,10 @@ bool inlineableByKind(Instruction *I, unsigned Uses) {
 // instruction. Opaque markers (`!revenant.opaque`) live on the original
 // call and are never moved; new stores/loads need no marker.
 void copyProvenance(const Instruction *Src, Instruction *Dst) {
-  Dst->copyMetadata(*Src);
+  // Copy only revenant.va and dbg; nonnull/noundef on the source describe
+  // the original pointer/value and are invalid on a fresh alloca or store.
+  if (MDNode *VA = Src->getMetadata("revenant.va"))
+    Dst->setMetadata("revenant.va", VA);
   Dst->setDebugLoc(Src->getDebugLoc());
 }
 
