@@ -383,8 +383,8 @@ std::string cleanPipeline(bool EnableStructDI) {
 
 /// ir-final: deoptimization, structuring, type recovery, SSA-out.
 std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
-  return formatv("function({0}{1}{2},revenant-structure,revenant-types,"
-                 "revenant-ssaout)",
+  return formatv("function({0}{1}{2},revenant-unhotcold,revenant-structure,"
+                 "revenant-types,revenant-ssaout)",
                  IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
                  Patterns ? ",revenant-patterns" : "")
       .str();
