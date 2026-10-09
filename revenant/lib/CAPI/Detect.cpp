@@ -94,6 +94,170 @@ static void scanStrings(const Image &Img, function_ref<void(StringRef)> Hit) {
   }
 }
 
+/// MSVC x64 RTTI: a type descriptor's ".?AV"/".?AU" name must be named
+/// by a complete-object locator (signature 1, matching type and self RVAs),
+/// and that locator must be referenced by a vftable's prefix slot.
+static bool isMsvcRuntimeType(StringRef Name) {
+  return Name == ".?AVtype_info@@" || Name.starts_with(".?AVbad_") ||
+         Name.starts_with(".?AVexception@std@@") ||
+         Name.starts_with(".?AVlogic_error@std@@") ||
+         Name.starts_with(".?AVruntime_error@std@@") ||
+         Name.starts_with(".?AVlength_error@std@@") ||
+         Name.starts_with(".?AVout_of_range@std@@") ||
+         Name.starts_with(".?AVinvalid_argument@std@@") ||
+         Name.starts_with(".?AVoverflow_error@std@@") ||
+         Name.starts_with(".?AVregex_error@std@@") ||
+         Name.starts_with(".?AVDNameNode@@") ||
+         Name.starts_with(".?AVDNameStatusNode@@") ||
+         Name.starts_with(".?AVcharNode@@") ||
+         Name.starts_with(".?AVpDNameNode@@") ||
+         Name.starts_with(".?AVpairNode@@") ||
+         Name.starts_with(".?AVpcharNode@@");
+}
+
+static bool hasMsvcRtti(const Image &Img) {
+  for (const Section &Names : Img.Sections) {
+    if (Names.Data.size() < 17)
+      continue;
+    StringRef Bytes(reinterpret_cast<const char *>(Names.Data.data()),
+                    Names.Data.size());
+    size_t Pos = 0;
+    while ((Pos = Bytes.find(".?A", Pos)) != StringRef::npos) {
+      Va NameVa = Names.SecVa.wrappingAdd(Pos);
+      auto Name = Img.readCstr(NameVa, 256);
+      if (!Name || !(StringRef(*Name).starts_with(".?AV") ||
+                     StringRef(*Name).starts_with(".?AU")) ||
+          isMsvcRuntimeType(*Name)) {
+        ++Pos;
+        continue;
+      }
+      if (NameVa.Value < Img.Base.Value + 16) {
+        ++Pos;
+        continue;
+      }
+      Va TypeDesc = NameVa - 16;
+      auto TypeRva = TypeDesc.offsetFrom(Img.Base);
+      if (!TypeRva || *TypeRva > UINT32_MAX) {
+        ++Pos;
+        continue;
+      }
+      for (const Section &Data : Img.Sections) {
+        if (Data.Data.size() < 24)
+          continue;
+        for (size_t I = 0; I + 24 <= Data.Data.size(); ++I) {
+          const uint8_t *P = Data.Data.data() + I;
+          if (support::endian::read32le(P) != 1 ||
+              support::endian::read32le(P + 12) != *TypeRva)
+            continue;
+          Va ColVa = Data.SecVa.wrappingAdd(I);
+          auto ColRva = ColVa.offsetFrom(Img.Base);
+          uint32_t ClassRva = support::endian::read32le(P + 16);
+          if (!ColRva || *ColRva > UINT32_MAX ||
+              support::endian::read32le(P + 20) != *ColRva ||
+              !Img.sectionOf(Img.Base.wrappingAdd(ClassRva)))
+            continue;
+          for (const Section &Vtables : Img.Sections) {
+            if (Vtables.Data.size() < 8)
+              continue;
+            for (size_t V = 0; V + 8 <= Vtables.Data.size(); ++V)
+              if (support::endian::read64le(Vtables.Data.data() + V) ==
+                  ColVa.Value)
+                return true;
+          }
+        }
+      }
+      ++Pos;
+    }
+  }
+  return false;
+}
+
+/// User C++ exception tables surviving the link: for each .pdata unwind
+/// record with UNW_FLAG_EHANDLER, the language-handler data is either a
+/// FuncInfo3 record (magic 0x19930520-0x19930524) or an RVA to a
+/// `$cppxdata` table (FuncInfo4 flag-byte form). CRT tables of both
+/// shapes exist in every MSVC binary, but only user C++ (throw/catch,
+/// ctor/dtor cleanups with try regions) carries a TRY map: FuncInfo3
+/// with tryCount != 0, or FuncInfo4 with a TryDisp. SEH scope tables
+/// (a small count dword) never qualify.
+static uint8_t fh4Length(uint8_t First) {
+  static constexpr uint8_t Lengths[16] = {1, 2, 1, 3, 1, 2, 1, 4,
+                                          1, 2, 1, 3, 1, 2, 1, 5};
+  return Lengths[First & 0x0f];
+}
+
+static bool hasCppExceptionTables(const PeFile &Pe) {
+  if (!Pe.Img || Pe.Pdata.empty())
+    return false;
+  const Image &Img = *Pe.Img;
+  for (const RuntimeFunction &R : Pe.Pdata) {
+    if (R.ChainedTo)
+      continue;
+    auto Head = Img.readAtMost(R.Unwind, 4);
+    if (!Head || Head->size() != 4)
+      continue;
+    uint8_t Flags = (*Head)[0] >> 3;
+    if (Flags & 4) // CHAININFO: no language handler of its own.
+      continue;
+    if (!(Flags & 1)) // UNW_FLAG_EHANDLER only.
+      continue;
+    uint64_t Count = (*Head)[2];
+    uint64_t DataOff = 4 + ((Count + 1u) & ~1u) * 2u;
+    Va Data = R.Unwind.wrappingAdd(DataOff + 4);
+    auto First = Img.readU32(Data);
+    if (!First)
+      continue;
+    // Inline FuncInfo3: magic LED, try count at +12.
+    if (*First >= 0x19930520 && *First <= 0x19930524) {
+      auto TryCount = Img.readU32(Data.wrappingAdd(12));
+      auto TryRva = Img.readU32(Data.wrappingAdd(16));
+      if (TryCount && *TryCount < 4096 && TryRva && *TryRva)
+        return true;
+      continue;
+    }
+    // Otherwise Data holds an RVA to the `$cppxdata` table: FuncInfo4
+    // when the target starts with a flag byte (high bit clear, one of
+    // the low disp bits set). SEH scope counts are small dwords that
+    // never resolve into a mapped table with that shape.
+    if (*First < 0x10000)
+      continue;
+    Va Target = Img.vaOfRva(*First);
+    // The target is either magic-led FuncInfo3 (clang output) or
+    // flag-byte FuncInfo4 (cl output).
+    if (auto Magic = Img.readU32(Target);
+        Magic && *Magic >= 0x19930520 && *Magic <= 0x19930524) {
+      auto TryCount = Img.readU32(Target.wrappingAdd(12));
+      auto TryRva = Img.readU32(Target.wrappingAdd(16));
+      if (TryCount && *TryCount < 4096 && TryRva && *TryRva)
+        return true;
+      continue;
+    }
+    auto FlagBytes = Img.dataAt(Target, 1);
+    if (FlagBytes.empty())
+      continue;
+    uint8_t H = FlagBytes[0];
+    if ((H & 0x80) || !(H & 0x78))
+      continue;
+    // FuncInfo4 header: optional compressed int, then unwind/try/IP
+    // relative dwords. Any TryDisp proves a try/catch region.
+    Va P = Target.wrappingAdd(1);
+    if (H & 0x04) {
+      auto FlagByte = Img.dataAt(P, 1);
+      if (FlagByte.empty())
+        continue;
+      P = P.wrappingAdd(fh4Length(FlagByte[0]));
+    }
+    if (H & 0x08)
+      P = P.wrappingAdd(4);
+    if (H & 0x10) {
+      auto TryDisp = Img.readU32(P);
+      if (TryDisp && *TryDisp)
+        return true;
+    }
+  }
+  return false;
+}
+
 CompilerInfo detectProducer(const PeFile &Pe,
                             ArrayRef<std::string> SymbolNames,
                             const Image &Img) {
@@ -158,16 +322,26 @@ CompilerInfo detectProducer(const PeFile &Pe,
       else if (S.starts_with(".?AV") || S.starts_with(".?AU"))
         Cpp.push_back(("RTTI " + S).str());
     }
+    scanStrings(Img, [&](StringRef Text) {
+      if (Text.starts_with("typeinfo for ") ||
+          Text.starts_with("typeinfo name for "))
+        Cpp.push_back("GCC RTTI " + Text.str());
+    });
     for (const Import &Imp : Pe.Imports) {
       StringRef N = Imp.Name ? StringRef(*Imp.Name) : StringRef();
       std::string Dll = Imp.Dll;
       std::transform(Dll.begin(), Dll.end(), Dll.begin(),
                      [](unsigned char C) { return toLower(C); });
       if (N.starts_with("__CxxFrameHandler") ||
-          StringRef(Dll).starts_with("msvcp") ||
-          StringRef(Dll).starts_with("vcruntime"))
+          N.starts_with("__gxx_personality") || N.starts_with("??2") ||
+          N.starts_with("??3") || StringRef(Dll).starts_with("msvcp") ||
+          StringRef(Dll).starts_with("libstdc++"))
         Cpp.push_back("import " + Imp.Dll + "!" + N.str());
     }
+    if (hasCppExceptionTables(Pe))
+      Cpp.push_back("MSVC C++ exception tables ($cppxdata FuncInfo)");
+    if (hasMsvcRtti(Img))
+      Cpp.push_back("MSVC RTTI complete-object locator/vftable");
     llvm::sort(Cpp);
     Cpp.erase(std::unique(Cpp.begin(), Cpp.end()), Cpp.end());
     if (!Cpp.empty()) {

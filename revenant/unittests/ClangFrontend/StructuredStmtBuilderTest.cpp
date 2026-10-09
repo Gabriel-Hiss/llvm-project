@@ -239,6 +239,58 @@ TEST(StructuredStmtBuilderTest, Switch) {
   EXPECT_NE(S.find("switch"), std::string::npos);
   EXPECT_NE(S.find("case"), std::string::npos);
 }
+TEST(StructuredStmtBuilderTest, ExternalGotoToRegionHeaderHasLabel) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_region_entry", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_region_entry", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_8000", F);
+  llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_8010", F);
+  llvm::BasicBlock *Then = BasicBlock::Create(C, "bb_8020", F);
+  llvm::BasicBlock *Bridge = BasicBlock::Create(C, "bb_8030", F);
+  llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_8040", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), Header,
+                 Bridge);
+  B.SetInsertPoint(Header);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), Then,
+                 Follow);
+  B.SetInsertPoint(Then);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(Bridge);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Follow);
+  B.CreateRet(X);
+  tagRegion(Header->getTerminator(), "if", {indexOf(*F, Follow)});
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("goto L_bb_8010"), std::string::npos);
+  EXPECT_NE(S.find("L_bb_8010:"), std::string::npos);
+}
+TEST(StructuredStmtBuilderTest, SanitizedLabelsStayUnique) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_label_names", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_label_names", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_entry", F);
+  llvm::BasicBlock *Dash = BasicBlock::Create(C, "bb-1", F);
+  llvm::BasicBlock *Underscore = BasicBlock::Create(C, "bb_1", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), Dash,
+                 Underscore);
+  B.SetInsertPoint(Dash);
+  B.CreateRet(llvm::ConstantInt::get(I32, 1));
+  B.SetInsertPoint(Underscore);
+  B.CreateRet(llvm::ConstantInt::get(I32, 2));
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("L_bb_1:"), std::string::npos);
+  EXPECT_NE(S.find("L_bb_1_1:"), std::string::npos);
+}
 
 TEST(StructuredStmtBuilderTest, GotoFallback) {
   LLVMContext &C = ctx();
