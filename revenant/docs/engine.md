@@ -34,16 +34,26 @@ rolled back. Function-pass adaptors still retain per-function isolation.
 ## Driver
 
 ```text
-revenant-decompile <pe> [--func <va|name>]... [--lang c|cpp|rust]
+revenant-decompile <pe> [--func <va|name>]... [--func-file <path>]
+                        [--lang c|cpp|rust]
                         [--emit asm|ir-raw|ir-clean|ir-final|source]
-                        [-o <base>] [--patterns] [--list] [--time]
+                        [-o <base>] [--patterns] [--list [--classify]]
+                        [--libdb <path>] [--time]
 ```
+
+`--list --classify --libdb=<path>` prints `user-entry<TAB><va>` followed by
+one row per function with its name and `user`, `library`, or `startup`
+classification. It follows direct calls and address-taken function pointers
+from the discovered user entry, stopping at library matches. An adjacent
+`libdb.json` is optional by default; an explicitly supplied missing database
+is an error. `--func-file=<path>` reads one function selector per line.
 
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
 (only the stages that ran). `--time` prints the elapsed time of each stage.
 Without `--func` every discovered function is decompiled; a Windows command
-line holds a few hundred `--func` arguments, so chunk large sets.
+line holds a few hundred `--func` arguments, so chunk large sets or use
+`--func-file`.
 
 ## Rust path
 
