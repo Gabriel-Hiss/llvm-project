@@ -693,6 +693,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                 ContinueVA = Value->getZExtValue();
         if (!ContinueVA)
           ContinueVA = continuationVA(*Funclet);
+        llvm::Instruction *Ret = BB.getTerminator();
         if (!Ret)
           continue;
         llvm::IRBuilder<> Builder(Ret);
