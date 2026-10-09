@@ -3,7 +3,7 @@
 ; A single-offset pointer base stays a scalar pointer (no struct); the
 ; opaque inttoptr call keeps its !revenant.opaque marker.
 
-declare ptr @revenant.asm.lea(ptr) !revenant.opaque
+declare ptr @revenant.asm.lea(ptr)
 
 define i32 @sub_140003000(i64 %a0) !revenant.va !0 {
 ; CHECK-LABEL: define i32 @sub_140003000(
