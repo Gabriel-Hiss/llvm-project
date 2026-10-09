@@ -10,14 +10,10 @@ combining. No failed match changes the module.
 The scripts under `test/Transforms/Uninline` consume the read-only parity
 artifact indices. `measure.py` runs this slice's plugin followed by LLVM's
 verifier on each available clang-cl O2, O3, LTO and rustc O3 post-optimization
-translation unit. It records one CSV row per missing pre-optimization direct
-call and writes a summary by compiler group. It excludes deleted callers,
-recursive calls, intrinsics, external declarations and noinline callees.
-
-A missing call is only a candidate inline event. Dead-code elimination and
-constant folding can remove the same call without leaving an inlined region.
-Repeated calls to the same target cannot be assigned to source sites from a
-call-count difference. The CSV marks these ambiguities explicitly.
+translation unit. With `--remarks` it records one CSV row per compiler inline
+record; without it, one row per missing pre-optimization direct call. It
+writes a summary by compiler group and excludes deleted callers, recursive
+calls, intrinsics, external declarations and noinline callees.
 
 `capture_remarks.py` replays each target's compile-only `artifacts.cmd` recipe
 with inline optimization records enabled, in an isolated scratch directory.
@@ -25,25 +21,29 @@ It never executes the recipe's move commands or links a binary. Rust uses the
 artifact generator's edition, crate name, target, optimization and debug flags.
 The capture index first compares the resulting IR against the existing
 ir-post file, ignoring only the ModuleID comment. Clang optimization records
-enable line-table debug info even for an otherwise debug-free build. The
-measurement reader therefore also compares both modules after LLVM's
-`strip-debug` pass. Exact equality of that normalized IR is required, and both
-normalized hashes are retained in `verified-index.json`. Differences in code,
-attributes or semantic metadata reject the records rather than treating a
-recompile as evidence about a different corpus module.
+enable line-table debug info even for an otherwise debug-free build, so the
+replay carries `!dbg` attachments the corpus ir-post never had. The
+measurement reader (`remarks.py`) therefore compares both modules after
+LLVM's `strip-debug` pass and accepts the records only when every body line
+agrees up to metadata/attribute numbering; both normalized hashes are
+retained in `verified-index.json`. Rejections stay out of the denominator
+rather than treating a recompile as evidence about a different corpus module.
 
-The initial candidate classifier uses these definitions:
-
-- Full means the original direct-call boundary was restored. It does not mean
-  that allocas, debug records or other unrelated optimizations match ir-pre.
-- Partial means the call boundary was only partly recovered. Because the pass
-  makes atomic, proved rewrites, it never emits a partially restored boundary.
-- None means no direct call was restored.
-
-Detailed rows and compiler records are produced under the supplied output and
-scratch paths. They are machine-local measurement artifacts, not test fixtures.
-There is no prebuilt rustc O2 IR pair in this corpus. Rust O3 is the available
-optimized reference; do not invent O2 results.
+With verified records the denominator is exact: 36,249 compiler-reported
+inline events across 39 translation units (15 clang TUs in the main index
+plus the 16 re-captured library TUs whose recipes the corpus generator had
+overwritten, plus rust-o3). Current recovery: 105 full (all with the callee
+definition retained), 0 partial, 36,144 none. The pass makes atomic, proved
+rewrites, so partial never fires. Examples of recovered sites: miniz
+`mz_compress2 -> mz_deflateInit`, tinyxml2 `XMLElement::Attribute ->
+XMLAttribute::Value`, pugixml `eval_node_set -> xpath_variable::get_node_set`.
+Unrecovered events are dominated by callees whose bodies the later optimizer
+passes simplified beyond exact matching, or that no longer exist as
+definitions in ir-post. Detailed rows and compiler records are produced
+under the supplied output and scratch paths. They are machine-local
+measurement artifacts, not test fixtures. There is no prebuilt rustc O2 IR
+pair in this corpus. Rust O3 is the available optimized reference; do not
+invent O2 results.
 
 Example, from the assigned worktree:
 
