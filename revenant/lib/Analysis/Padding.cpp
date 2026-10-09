@@ -106,12 +106,6 @@ bool isFiller(const Instr &I, const Image &Img) {
     return true;
   if (Name.starts_with("XCHG") && isAxXchg(I))
     return true;
-  // `call $+5` (`E8 00 00 00 00`): a direct 5-byte call whose target is
-  // the next instruction. Only the `E8 disp32=0` encoding satisfies all
-  // three at once.
-  if (I.Flow == FlowKind::Call && I.HasTarget && I.Size == 5 &&
-      I.Target == I.nextVa())
-    return true;
   return false;
 }
 
@@ -123,7 +117,15 @@ bool isFiller(const Instr &I) {
     return true;
   if (Name.starts_with("XCHG") && isAxXchg(I))
     return true;
-  // Decoder-only call form: same self-call test, no byte context.
+  return false;
+}
+
+bool isFillerExt(const Instr &I) {
+  if (isFiller(I))
+    return true;
+  // `call $+5` (`E8 00 00 00 00`): a direct 5-byte call whose target is
+  // the next instruction. Only the `E8 disp32=0` encoding satisfies all
+  // three at once. Opt-in only; the decode path never calls this.
   if (I.Flow == FlowKind::Call && I.HasTarget && I.Size == 5 &&
       I.Target == I.nextVa())
     return true;
