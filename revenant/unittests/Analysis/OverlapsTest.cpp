@@ -45,6 +45,13 @@ public:
   std::optional<int64_t> stackDelta(const Instr &) const override {
     return std::nullopt;
   }
+  StackSlots stackSlots(const Instr &) const override { return {}; }
+  FpEstablish fpEstablish(const Instr &) const override { return {}; }
+  bool restoresSpFromFp(const Instr &) const override { return false; }
+  std::optional<int64_t> movEaxImm(const Instr &) const override {
+    return std::nullopt;
+  }
+  bool writesSpDynamically(const Instr &) const override { return false; }
   std::optional<JumpTableInfo>
   matchJumpTable(const Image &, llvm::ArrayRef<std::pair<Va, Va>>,
                  llvm::ArrayRef<BasicBlock>, llvm::ArrayRef<Instr>, size_t,
