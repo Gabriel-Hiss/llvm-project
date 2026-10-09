@@ -76,6 +76,7 @@ def : RVLift { let Insn = I; dag Body = (rv_set $dst, (rv_op 0)); }
 foreach I = [MOVDQUmr, MOVDQAmr] in
 def : RVLift { let Insn = I; dag Body = (rv_store (rv_addr $dst), (rv_op 1)); }
 def : RVMatch { string Glob = "MOVDQArr"; dag Body = (rv_set $dst, (rv_op 0)); }
+def : RVMatch { string Glob = "MOVDQUrr"; dag Body = (rv_set $dst, (rv_op 0)); }
 def : RVMatch { string Glob = "MOVAPSrr"; dag Body = (rv_set $dst, (rv_op 0)); }
 def : RVMatch { string Glob = "MOVAPDrr"; dag Body = (rv_set $dst, (rv_op 0)); }
 def : RVMatch { string Glob = "MOVUPSrr"; dag Body = (rv_set $dst, (rv_op 0)); }
@@ -84,8 +85,7 @@ def : RVMatch { string Glob = "VMOVDQArr*"; dag Body = (rv_setz $dst, (rv_op 0))
 def : RVMatch { string Glob = "VMOVAPSrr"; dag Body = (rv_setz $dst, (rv_op 0)); }
 def : RVMatch { string Glob = "VMOVAPDrr*"; dag Body = (rv_setz $dst, (rv_op 0)); }
 def : RVMatch { string Glob = "VMOVUPSrr"; dag Body = (rv_setz $dst, (rv_op 0)); }
-def : RVMatch { string Glob = "VMOVDQUYrr"; dag Body = (rv_nop); }
-def : RVMatch { string Glob = "VMOVDQAYm*"; dag Body = (rv_nop); }
+// YMM-only: low 128 unmodeled, upper lanes untouched by this slice.
 
 // ---- movd/movq lane moves ---------------------------------------------------
 // movd/movq xmm<->gpr/mem: zero-extend into the xmm, truncate out of it.
@@ -698,14 +698,6 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "SHUFPDrri";
   dag Body = (rv_set $dst, (rv_shufpd (rv_op 0), (rv_op 1), (rv_op 2)));
-}
-def : RVMatch {
-  string Glob = "VSHUFPSYrri";
-  dag Body = (rv_nop);
-}
-def : RVMatch {
-  string Glob = "VSHUFPDYrri";
-  dag Body = (rv_nop);
 }
 def : RVMatch {
   string Glob = "PSHUFBrr";
