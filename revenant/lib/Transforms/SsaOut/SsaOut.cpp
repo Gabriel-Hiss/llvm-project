@@ -368,10 +368,10 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   // its own edge. Region annotations ride along to the new terminator.
   for (BasicBlock &BB : F) {
     SmallVector<BasicBlock *, 4> Succs(succ_begin(&BB), succ_end(&BB));
-    if (Succs.size() < 2)
+    if (Succs.size() < 2 || BB.isEHPad())
       continue;
     for (BasicBlock *Succ : Succs) {
-      if (Succ->phis().empty())
+      if (Succ->phis().empty() || Succ->isEHPad())
         continue;
       if (BasicBlock *EdgeBB = SplitCriticalEdge(&BB, Succ)) {
         // `!revenant.region` operands are block-list indices; inserting

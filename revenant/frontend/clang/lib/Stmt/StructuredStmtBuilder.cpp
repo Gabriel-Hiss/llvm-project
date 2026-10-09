@@ -1259,6 +1259,53 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
       }
     SmallVector<Stmt *, 4> HandlerBody;
     emitCatchBlockStmts(H, HandlerBody);
+    if (auto *CR = dyn_cast<CatchReturnInst>(H->getTerminator())) {
+      BasicBlock *Continuation = CR->getSuccessor();
+      for (Instruction &I : *Continuation) {
+        auto *ReturnValue = dyn_cast<PHINode>(&I);
+        if (!ReturnValue)
+          continue;
+        bool Returned = false;
+        for (User *U : ReturnValue->users())
+          if (auto *RI = dyn_cast<ReturnInst>(U))
+            Returned |= RI->getReturnValue() == ReturnValue;
+        int Index = ReturnValue->getBasicBlockIndex(H);
+        if (!Returned || Index < 0)
+          continue;
+        Expr *Value = Exprs->retVal(ReturnValue->getIncomingValue(Index),
+                                    *Scope);
+        HandlerBody.push_back(
+            ReturnStmt::Create(*AST, SourceLocation(), Value, nullptr));
+        break;
+      }
+    }
+    if (auto *CR = dyn_cast<CatchReturnInst>(H->getTerminator())) {
+      BasicBlock *Continuation = CR->getSuccessor();
+      SmallPtrSet<BasicBlock *, 8> Seen;
+      for (unsigned Depth = 0; Continuation && Depth != 8 &&
+                               Seen.insert(Continuation).second;
+           ++Depth) {
+        auto *RI = dyn_cast<ReturnInst>(Continuation->getTerminator());
+        if (RI) {
+          Value *ReturnValue = RI->getReturnValue();
+          if (auto *Load = dyn_cast<LoadInst>(ReturnValue))
+            for (Instruction &I : *H)
+              if (auto *Store = dyn_cast<StoreInst>(&I);
+                  Store && Store->getPointerOperand() ==
+                               Load->getPointerOperand())
+                ReturnValue = Store->getValueOperand();
+          if (ReturnValue)
+            HandlerBody.push_back(ReturnStmt::Create(
+                *AST, SourceLocation(), Exprs->retVal(ReturnValue, *Scope),
+                nullptr));
+          break;
+        }
+        auto *BI = dyn_cast<BranchInst>(Continuation->getTerminator());
+        if (!BI || BI->isConditional())
+          break;
+        Continuation = BI->getSuccessor(0);
+      }
+    }
     if (HandlerBody.empty())
       HandlerBody.push_back(new (*AST) NullStmt(SourceLocation(), false));
     CompoundStmt *HC = CompoundStmt::Create(

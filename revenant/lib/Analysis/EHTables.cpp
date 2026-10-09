@@ -402,7 +402,7 @@ void readFuncInfo4(const Image &I, FunctionEH &F, Va Data) {
           if (!Catch)
             break;
           uint8_t ContinuationCount = (Flags >> 4) & 3;
-          SmallVector<Va, 2> ContinuationVAs;
+          std::vector<Va> ContinuationVAs;
           for (uint8_t K = 0; K < ContinuationCount; ++K) {
             if (Flags & 8) {
               auto Continuation = relativeDword(I, H);
