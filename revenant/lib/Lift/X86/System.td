@@ -29,38 +29,29 @@
 //   PAUSE carries an int_x86_sse2_pause pattern but stays rv_opaque here:
 //   it is a hardware hint with no IR semantics, and the contract routes
 //   no-semantics instructions to call @revenant.asm.<mnemonic>.
-//   INT carries int_x86_int but stays rv_opaque for the same reason
-//   (INT3 is separate: llvm.debugtrap per the Rust reference).
-//   RORX/SHLX/SHRX/SARX _EVEX and _NF variants carry no pattern; the base
-//   VEX rr/ri/mi forms match RORX_Pats/ShiftX_Pats and invert for free.
-//   Only the no-pattern forms get RVMatch below.
-//   ANDN/BEXTR/BZHI/PDEP/PEXT rr/rm carry X86*_flag/X86* patterns;
-//   the _EVEX/_NF twins carry null_frag and need RVMatch below.
+//   RORX/SHLX/SHRX/SARX base rr/ri forms invert or use RVLift; the rm
+//   forms and _EVEX twins carry no pattern and get RVMatch below.
+//   ANDN/BEXTR/BZHI/BLSI/BLSR/BLSMSK/MULX/ADCX/ADOX carry codegen Pat<>s
+//   or null_frag only; every form gets RVMatch below.
 //
 // Reference: crates/lift/src/bitops.rs (lift_bt, lift_bitcount,
 // lift_extend) and crates/lift/src/opaque.rs (lift_opaque) in the
 // h-merge tree. Port is 1:1 first, per wave-2 rules.
 //
-// Emitter hooks this file needs (flagged for LunaLiftGen2):
-//   rv_pdep/rv_pext      parallel deposit/extract (no ISD equivalent,
-//                        X86ISD::PDEP/PEXT today)
-//   rv_bextr             BMI1 field extract with ZF/CF/OF (X86ISD::BEXTR)
-//   rv_bzhi              BMI2 zero-high-bits with CF-on-overflow (X86ISD::BZHI)
+// Emitter hooks this file uses (all implemented):
 //   rv_bls               BLSR/BLSMSK/BLSI with polarity-correct CF
-//                        (X86ISD lowering exists only rr-side; rm + EVEX/NF
-//                        twins need the hook)
+//   rv_bextr             BMI1 field extract with ZF/CF/OF
+//   rv_bzhi              BMI2 zero-high-bits with CF-on-overflow
 //   rv_shiftx            SHLX/SHRX/SARX with masked count, flags untouched
-//                        (rotr/shl/srl pattern inversion covers base VEX;
-//                        _EVEX/_NF + rm forms need the hook)
 //   rv_rorx              RORX with masked imm8, flags untouched
-//   rv_mulx              MULX full multiply, flags untouched (no ISD node)
+//   rv_mulx              MULX full multiply, flags untouched
 //   rv_adcx/rv_adox      ADCX/ADOX split carry chains (CF-only / OF-only)
 //   rv_opaque            force emitOpaque for one def (name defaults to the
 //                        lowercased mnemonic)
-// Until those land, the bodies below use only ops X86Lift.td already
-// declares. Bodies that cannot be written without a new hook stay as
-// comments naming the hook, so this file parses today and fills in
-// without renames once the emitter catches up.
+// Still unimplemented (opaque by omission):
+//   rv_pdep/rv_pext      parallel deposit/extract (no ISD equivalent)
+//   rv_rdrand/rv_rdseed  flag contract for the hardware RNG
+//   BLSIC*/BEXTRI*       TBM forms (not in scope)
 //
 //===----------------------------------------------------------------------===//
 
@@ -243,60 +234,129 @@ def : RVLift {
   let Insn = XLAT;
   dag Body = (rv_set (rv_reg "AL"), (rv_load 8, (rv_add (rv_reg "RBX"), (rv_zext 64, (rv_reg "AL")))));
 }
-// ---- BLSR/BLSMSK/BLSI: no pattern, need rv_bls ----------------------------
-// Bls<"blsr"...> defs carry no pattern (the Bls_Pats Pat<>s invert the
-// base rr forms for free, but _EVEX/_NF twins and rm forms need the
-// hook). Flags per SDM: BLSI CF=(src!=0); BLSR/BLSMSK CF=(src==0);
+// ---- BLSR/BLSMSK/BLSI ------------------------------------------------------
+// Bls<"blsr"...> defs carry no pattern (the Bls_Pats Pat<>s match codegen
+// shapes like (and x, (add_su x, -1)), not a node the instruction itself
+// produces). Flags per SDM: BLSI CF=(src!=0); BLSR/BLSMSK CF=(src==0);
 // OF=0; ZF/SF from result; AF/PF undefined.
 // Operand shape rr: (outs GRN:$dst), (ins GRN:$src1).
-// Operand shape rm: (outs GRN:$dst), (ins x86memop:$src).
-// NEEDS-HOOK rv_bls ("blsr"|"blsmsk"|"blsi", $src1).
+// Operand shape rm: (outs GRN:$dst), (ins x86memop:$src1).
+def : RVMatch {
+  let Glob = "BLSR*";
+  dag Body = (rv_set $dst, (rv_bls "blsr", $src1));
+}
+def : RVMatch {
+  let Glob = "BLSMSK*";
+  dag Body = (rv_set $dst, (rv_bls "blsmsk", $src1));
+}
+def : RVMatch {
+  let Glob = "BLSI3*";
+  dag Body = (rv_set $dst, (rv_bls "blsi", $src1));
+}
+def : RVMatch {
+  let Glob = "BLSI6*";
+  dag Body = (rv_set $dst, (rv_bls "blsi", $src1));
+}
 
-// ---- ANDN: base VEX inverts, twins need the same body ---------------------
-// ANDN32rr/rm carry (X86and_flag (not...)) patterns; Andn_Pats covers
-// them. _EVEX/_NF twins carry null_frag. Same operand shape as BinOpRR/RM:
-// (outs GRN:$dst), (ins GRN:$src1, GRN:$src2 / MemOperand:$src2).
-// NEEDS-HOOK rv_fandn? Cheaper: (rv_fand (rv_not $src1), $src2) once the
-// emitter supports nesting rv_not inside a flag producer. Flagged.
+// ---- ANDN: ~src1 & src2 with logic flags ------------------------------------
+// The Andn_Pats Pat<>s are codegen patterns, not instruction patterns, so
+// every ANDN form (base, _EVEX, _NF) goes through the DSL. ANDN sets the
+// standard logic-op flags (CF=OF=0, ZF/SF/PF from result, AF undefined);
+// rv_fand matches that contract.
+// Operand shape: (outs GRN:$dst), (ins GRN:$src1, GRN:$src2 / mem:$src2).
+def : RVMatch {
+  let Glob = "ANDN3*";
+  dag Body = (rv_set $dst, (rv_fand (rv_not $src1), $src2));
+}
+def : RVMatch {
+  let Glob = "ANDN6*";
+  dag Body = (rv_set $dst, (rv_fand (rv_not $src1), $src2));
+}
 
- // ---- BEXTR/BZHI: base inverts, twins need hooks --------------------------
- // BEXTR32rr/rm carry (X86bextr ...); BZHI32rr/rm carry (X86bzhi ...).
- // _EVEX/_NF twins carry null_frag. Flags per SDM: BEXTR ZF=(res==0),
- // CF=OF=0, AF/SF/PF undef; BZHI ZF/SF from result, CF=(index>width-1),
- // OF=0, AF/PF undef.
- // Operand shape: (outs GRN:$dst), (ins GRN:$src1, GRN:$src2).
- // NEEDS-HOOK rv_bextr ($src1, $src2); rv_bzhi ($src1, $src2).
+// ---- BEXTR/BZHI --------------------------------------------------------------
+// BEXTR32rr/rm carry (X86bextr ...) and BZHI32rr/rm carry (X86bzhi ...)
+// patterns, but those SDNodes have no IR mapping, so all forms (base,
+// _EVEX, _NF) use the DSL. Flags per SDM: BEXTR ZF=(res==0), CF=OF=0,
+// AF/SF/PF undef; BZHI ZF/SF from result, CF=(index>=width), OF=0,
+// AF/PF undef.
+// Operand shape: (outs GRN:$dst), (ins GRN:$src1, GRN:$src2); $src2 is the
+// control register for BEXTR and the index for BZHI.
+// BEXTRI* (TBM) stays opaque: the immediate is a packed control word, not
+// start/len operands, and the task list does not include it.
+def : RVMatch {
+  let Glob = "BEXTR3*";
+  dag Body = (rv_set $dst, (rv_bextr $src1, $src2));
+}
+def : RVMatch {
+  let Glob = "BEXTR6*";
+  dag Body = (rv_set $dst, (rv_bextr $src1, $src2));
+}
+def : RVMatch {
+  let Glob = "BZHI*";
+  dag Body = (rv_set $dst, (rv_bzhi $src1, $src2));
+}
 
- // ---- PDEP/PEXT: base inverts, twins need hooks ----------------------------
- // PDEP32rr/rm carry (X86pdep ...); PEXT32rr/rm carry (X86pext ...).
- // _EVEX twins have identical patterns and invert the same way, so no
- // DSL is needed for them either. No _NF variants exist. Flags: none
- // affected. Nothing to write here; comment records the decision.
- // (If a future APX twin drops its pattern, add rv_pdep/rv_pext matches.)
+// ---- PDEP/PEXT: base inverts, twins need hooks ----------------------------
+// PDEP32rr/rm carry (X86pdep ...); PEXT32rr/rm carry (X86pext ...).
+// _EVEX twins have identical patterns and invert the same way, so no
+// DSL is needed for them either. No _NF variants exist. Flags: none
+// affected. Nothing to write here; comment records the decision.
+// (If a future APX twin drops its pattern, add rv_pdep/rv_pext matches.)
 
- // ---- SHLX/SHRX/SARX/RORX: base VEX inverts, rest needs hooks -------------
- // Base rr/rm/ri/mi match ShiftX_Pats/RORX_Pats (shl/srl/sra/rotr) and
- // invert for free. _EVEX twins carry no pattern. Counts mask to 5/6
- // bits; flags untouched (unlike SHL/SHR/SAR/ROR). RORX count is imm8.
- // Operand shapes: ShiftX rr (ins GRN:$src1, GRN:$src2), rm (ins
- // MemOperand:$src1, GRN:$src2); RorX ri (ins GRN:$src1, u8imm:$src2),
- // mi (ins MemOperand:$src1, u8imm:$src2).
- // NEEDS-HOOK rv_shiftx ("shlx"|"shrx"|"sarx", $src1, $src2);
- // NEEDS-HOOK rv_rorx ($src1, $src2).
+// ---- SHLX/SHRX/SARX/RORX -----------------------------------------------------
+// The base rr forms have RVLift defs in X86Lift.td; these globs cover the
+// rm forms and the _EVEX twins (which carry no pattern). Counts mask to
+// width-1; flags untouched. RORX count is imm8.
+// Operand shapes: ShiftX rr (ins GRN:$src1, GRN:$src2), rm (ins
+// MemOperand:$src1, GRN:$src2); RorX ri (ins GRN:$src1, u8imm:$src2),
+// mi (ins MemOperand:$src1, u8imm:$src2).
+def : RVMatch {
+  let Glob = "SHLX*";
+  dag Body = (rv_set $dst, (rv_shiftx "shl", $src1, $src2));
+}
+def : RVMatch {
+  let Glob = "SHRX*";
+  dag Body = (rv_set $dst, (rv_shiftx "shr", $src1, $src2));
+}
+def : RVMatch {
+  let Glob = "SARX*";
+  dag Body = (rv_set $dst, (rv_shiftx "sar", $src1, $src2));
+}
+def : RVMatch {
+  let Glob = "RORX*";
+  dag Body = (rv_set $dst, (rv_rorx $src1, $src2));
+}
 
-// ---- MULX: no pattern anywhere, needs rv_mulx ------------------------------
+// ---- MULX: no pattern anywhere ----------------------------------------------
 // MulX rr: (outs GRN:$dst1, GRN:$dst2), (ins GRN:$src), Uses [EDX/RDX]
 // (implicit high multiplicand). rm folds the load. mulx_args prints
 // "{$src, $dst2, $dst1|$dst1, $dst2, $src}". Semantics: unsigned
 // EDX:EAX (RDX:RAX) * src -> dst2:dst1, flags untouched, so MULX never
 // disturbs an ADCX/ADOX carry chain. 913 + 172 hits in the corpus.
-// NEEDS-HOOK rv_mulx ($src) writing $dst1 (low) + $dst2 (high).
+// The MULX*H* pseudos keep their opaque fallback (isCodeGenOnly, never
+// decoded).
+def : RVMatch {
+  let Glob = "MULX32r*";
+  dag Body = (rv_mulx $dst1, $dst2, $src);
+}
+def : RVMatch {
+  let Glob = "MULX64r*";
+  dag Body = (rv_mulx $dst1, $dst2, $src);
+}
 
-// ---- ADCX/ADOX: null_frag patterns, split carry chains ---------------------
+// ---- ADCX/ADOX: null_frag patterns, split carry chains -----------------------
 // ADCX32rr: (outs GR32:$dst), (ins GR32:$src1, GR32:$src2),
 // Uses/Defs [EFLAGS]. Semantics: dst = src1 + src2 + CF; only CF
 // written, OF/SF/ZF/AF/PF preserved. ADOX identical with the OF chain.
-// NEEDS-HOOK rv_adcx ($src1, $src2); rv_adox ($src1, $src2).
+// The _ND twins have the same logical operands and lift identically.
+def : RVMatch {
+  let Glob = "ADCX*";
+  dag Body = (rv_set $dst, (rv_adcx $src1, $src2));
+}
+def : RVMatch {
+  let Glob = "ADOX*";
+  dag Body = (rv_set $dst, (rv_adox $src1, $src2));
+}
 
 // ---- RDRAND/RDSEED: X86rdrand/X86rdseed nodes, need flag detail ------------
 // RDRAND32r: (outs GR32:$dst), (ins), Defs [EFLAGS]. CF = success,

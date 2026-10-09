@@ -157,6 +157,13 @@ def rv_tzcnt : RVOp;
 def rv_lzcnt : RVOp;
 def rv_popcnt: RVOp;
 def rv_bswap : RVOp;
+def rv_bls   : RVOp; // (rv_bls "blsr"|"blsmsk"|"blsi", src): BMI1 low-bit ops
+def rv_bextr : RVOp; // (rv_bextr src, control): BMI1 bit-field extract
+def rv_bzhi  : RVOp; // (rv_bzhi src, index): BMI2 zero-high-bit
+def rv_shiftx: RVOp; // (rv_shiftx "shl|shr|sar", src, count), no flags
+def rv_adcx  : RVOp; // (rv_adcx dst, src): CF carry chain only
+def rv_adox  : RVOp; // (rv_adox dst, src): OF carry chain only
+def rv_mulx  : RVOp; // (rv_mulx $dst1, $dst2, $src): RDX*src -> hi:lo
 def rv_rorx  : RVOp;  // (rv_rorx val, cnt): rotate right, no flags
 // prefix state (separate MCInsts, tracked across instructions)
 def rv_prefix  : RVOp; // (rv_prefix "lock|rep|repe|repne|seg"[, rv_reg "FS"])
@@ -537,29 +544,28 @@ foreach I = [SHRD16mri8, SHRD32mri8, SHRD64mri8,
     let Insn = I;
     dag Body = (rv_set $src1, (rv_fshift2 "shrd", $src1, $src2, $src3));
   }
-// BMI2 shifts (no flags). Count operand is masked by the emitter-side
-// semantics; here a plain shift suffices since over-width counts are
-// meaningless on BMI forms anyway.
+// BMI2 shifts (no flags). rv_shiftx masks the count to the operand width;
+// rm and EVEX twins come from the RVMatch globs in System.td.
 foreach I = [SHLX32rr, SHLX64rr] in
   def : RVLift {
     let Insn = I;
-    dag Body = (rv_set $dst, (rv_shl $src1, (rv_and $src2, 63)));
+    dag Body = (rv_set $dst, (rv_shiftx "shl", $src1, $src2));
   }
 foreach I = [SHRX32rr, SHRX64rr] in
   def : RVLift {
     let Insn = I;
-    dag Body = (rv_set $dst, (rv_lshr $src1, (rv_and $src2, 63)));
+    dag Body = (rv_set $dst, (rv_shiftx "shr", $src1, $src2));
   }
 foreach I = [SARX32rr, SARX64rr] in
   def : RVLift {
     let Insn = I;
-    dag Body = (rv_set $dst, (rv_ashr $src1, (rv_and $src2, 63)));
+    dag Body = (rv_set $dst, (rv_shiftx "sar", $src1, $src2));
   }
 // RORX: rotate right, no flags.
 foreach I = [RORX32ri, RORX64ri, RORX32mi, RORX64mi] in
   def : RVLift {
     let Insn = I;
-    dag Body = (rv_set $dst, (rv_rorx $src, $src2));
+    dag Body = (rv_set $dst, (rv_rorx $src1, $src2));
   }
 
 // ---- mov / lea / extensions -----------------------------------------------------
