@@ -227,6 +227,32 @@ TEST(SignaturesTest, TailJumpThunkInheritsTargetParameters) {
   EXPECT_EQ(Sig->Params[0].Bits, 32u);
 }
 
+TEST(SignaturesTest, LibraryMatchIgnoresTrailingArchiveAlignmentPadding) {
+  constexpr uint64_t Base = 0x140009000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 6;
+  Text.Flags = SectionFlags::rx();
+  Text.Data = {0x8B, 0xC1, 0xC3, 0x90, 0x90, 0x90};
+  P.Img->Sections.push_back(std::move(Text));
+  Va Start(Base);
+  P.Functions.emplace(Start, record(Start, 0, 3, {0, 2}));
+
+  LibraryDatabase DB;
+  LibraryFunction F;
+  F.Name = "aligned_function";
+  F.Size = 6;
+  F.Bytes = {0x8B, 0xC1, 0xC3, 0x90, 0x90, 0x90};
+  DB.Functions.push_back(F);
+  EXPECT_EQ(matchLibraryFunctions(P, DB).size(), 1u);
+
+  DB.Functions[0].Bytes[5] = 0x01;
+  EXPECT_TRUE(matchLibraryFunctions(P, DB).empty());
+}
 TEST(SignaturesTest, LibraryPrototypeOverridesInferredSignature) {
   constexpr uint64_t Base = 0x140007000;
   Program P;

@@ -272,19 +272,39 @@ std::vector<LibraryMatch> matchLibraryFunctions(const Program &P,
     if (Record.Chunks.size() != 1 || Record.Chunks[0].first != Start)
       continue;
     uint64_t Size = Record.Chunks[0].second - Start;
-    auto Candidates = BySize.find(Size);
-    if (Candidates == BySize.end() || Size > SIZE_MAX)
+    if (Size > SIZE_MAX)
       continue;
     auto Raw = P.Img->dataAt(Start, static_cast<size_t>(Size));
     if (Raw.size() != Size)
       continue;
-    for (uint32_t Index : Candidates->second) {
-      const LibraryFunction &F = DB.Functions[Index];
-      std::vector<uint8_t> Candidate(Raw.begin(), Raw.end());
-      for (uint32_t Offset : F.MaskedRelocations)
-        Candidate[Offset] = 0;
-      if (Candidate == F.Bytes)
-        Matches.push_back({Start, Index});
+    for (auto It = BySize.lower_bound(Size);
+         It != BySize.end() && It->first - Size <= 15; ++It) {
+      for (uint32_t Index : It->second) {
+        const LibraryFunction &F = DB.Functions[Index];
+        if (F.Size != F.Bytes.size())
+          continue;
+        if (std::any_of(F.MaskedRelocations.begin(),
+                        F.MaskedRelocations.end(),
+                        [&](uint32_t Offset) { return Offset >= Size; }))
+          continue;
+        bool AlignedPadding = std::all_of(
+            F.Bytes.begin() + Size, F.Bytes.end(),
+            [](uint8_t Byte) { return Byte == 0x90 || Byte == 0xCC; });
+        if (!AlignedPadding)
+          continue;
+        bool Equal = true;
+        for (uint64_t I = 0; I < Size; ++I) {
+          bool Masked = std::binary_search(F.MaskedRelocations.begin(),
+                                           F.MaskedRelocations.end(),
+                                           static_cast<uint32_t>(I));
+          if (!Masked && Raw[I] != F.Bytes[I]) {
+            Equal = false;
+            break;
+          }
+        }
+        if (Equal)
+          Matches.push_back({Start, Index});
+      }
     }
   }
   return Matches;
