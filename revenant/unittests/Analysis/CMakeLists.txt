@@ -11,6 +11,7 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   StringsTest.cpp
   XrefsTest.cpp
   SignaturesTest.cpp
+  EHTablesTest.cpp
 )
 
 target_link_libraries(RevenantAnalysisTests PRIVATE
