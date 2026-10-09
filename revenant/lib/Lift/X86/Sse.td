@@ -717,11 +717,11 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VPSHUFBrr";
-  dag Body = (rv_setz $dst, (rv_pshufb (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_pshufb (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "VPSHUFBrm";
-  dag Body = (rv_setz $dst, (rv_pshufb (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_pshufb (rv_op 0), (rv_op 1)));
 }
 
 // ---- packed shifts ---------------------------------------------------------------
@@ -759,27 +759,27 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VPSRLWri";
-  dag Body = (rv_setz $dst, (rv_vshift "psrl", 16, (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_vshift "psrl", 16, (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "VPSRLDri";
-  dag Body = (rv_setz $dst, (rv_vshift "psrl", 32, (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_vshift "psrl", 32, (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "VPSRLQri";
-  dag Body = (rv_setz $dst, (rv_vshift "psrl", 64, (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_vshift "psrl", 64, (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "VPSLLDri";
-  dag Body = (rv_setz $dst, (rv_vshift "psll", 32, (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_vshift "psll", 32, (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "VPSRAWri";
-  dag Body = (rv_setz $dst, (rv_vshift "psra", 16, (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_vshift "psra", 16, (rv_op 0), (rv_op 1)));
 }
 def : RVMatch {
   string Glob = "VPSRADri";
-  dag Body = (rv_setz $dst, (rv_vshift "psra", 32, (rv_op 1), (rv_op 2)));
+  dag Body = (rv_setz $dst, (rv_vshift "psra", 32, (rv_op 0), (rv_op 1)));
 }
 // Whole-register byte shifts: imm8 byte count as an i128 logical shift.
 def : RVMatch {
@@ -836,7 +836,7 @@ def : RVMatch {
 }
 def : RVMatch {
   string Glob = "VPMOVMSKBrr";
-  dag Body = (rv_set $dst, (rv_zext 32, (rv_pmovmskb (rv_op 1))));
+  dag Body = (rv_set $dst, (rv_zext 32, (rv_pmovmskb (rv_op 0))));
 }
 def : RVMatch {
   string Glob = "MOVMSKPSrr";
