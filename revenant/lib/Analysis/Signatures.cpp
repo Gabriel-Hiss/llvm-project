@@ -181,6 +181,51 @@ static unsigned widenWrite(unsigned R) {
   return R;
 }
 
+/// iced reports the zeroing idiom (`xor r,r`, vector `pxor`/`xorp*` with
+/// identical registers) as write-only: the destination does not depend
+/// on its old value. The same holds for `sub r,r`, `sbb r,r` (whose
+/// result is `-carry`, independent of the old value) and immediates
+/// that force a constant result (`or r,-1`, `and r,0`). The
+/// disassembler spells register RMW as [def, tied-use, src], so no
+/// operand of such an instruction counts as a register read.
+static bool isDeadReadIdiom(StringRef Name, const MCInst &I,
+                            const McTables &T) {
+  if (I.getNumOperands() != 3)
+    return false;
+  bool Xor = Name.starts_with("XOR") || Name.starts_with("PXOR") ||
+             Name.starts_with("XORP") || Name.starts_with("VPXOR");
+  bool Sub = Name.starts_with("SUB") || Name.starts_with("SBB");
+  if (Xor || Sub) {
+    // Register-register form with all operands identical. Immediate
+    // forms ([def, tied-use, imm]) always read the destination.
+    const MCOperand &A = I.getOperand(0);
+    const MCOperand &B = I.getOperand(1);
+    const MCOperand &C = I.getOperand(2);
+    return A.isReg() && B.isReg() && C.isReg() && A.getReg() != 0 &&
+           A.getReg() == B.getReg() && B.getReg() == C.getReg();
+  }
+  const MCOperand &A = I.getOperand(0);
+  const MCOperand &B = I.getOperand(1);
+  const MCOperand &C = I.getOperand(2);
+  if (!A.isReg() || A.getReg() == 0 || !B.isReg() ||
+      B.getReg() != A.getReg() || !C.isImm())
+    return false;
+  const MCInstrDesc &D = T.MII->get(I.getOpcode());
+  unsigned Sz = X86II::getSizeOfImm(D.TSFlags);
+  int64_t Imm = C.getImm();
+  if (Sz == 1)
+    Imm = (int64_t)(int8_t)Imm;
+  else if (Sz == 2)
+    Imm = (int64_t)(int16_t)Imm;
+  else if (Sz == 4)
+    Imm = (int64_t)(int32_t)Imm;
+  if (Name.starts_with("OR"))
+    return Imm == -1;
+  if (Name.starts_with("AND"))
+    return Imm == 0;
+  return false;
+}
+
 /// The cbw/cwd/cdq/cqo accumulator family: LLVM marks the accumulator
 /// as an implicit def too; iced reports it as a pure read.
 static bool isSignExtendFamily(StringRef Name) {
@@ -289,7 +334,11 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
     }
     if (Op.isReg() && Op.getReg() != 0) {
       unsigned Reg = Op.getReg();
-      if (i < NumDefs) {
+      if (isDeadReadIdiom(Name, I, T)) {
+        // Constant-result idiom: only the destination write counts.
+        if (i == 0)
+          Emit(widenWrite(Reg), false, true);
+      } else if (i < NumDefs) {
         // Def side: the write (widened, iced `add_register`).
         Emit(widenWrite(Reg), false, true);
       } else {
@@ -706,12 +755,22 @@ static void blockGenKill(const Function &F, const McTables &T,
     for (size_t i = B.InstrsBegin;
          i < B.InstrsEnd && i < F.Instrs.size(); ++i) {
       InsnInfo II = insnInfo(F.Instrs[i].Inst, T);
+      // Reads before writes within one instruction: the disassembler
+      // reports an RMW destination as two entries (widened write first,
+      // then the tied read), while iced reports a single ReadWrite whose
+      // read half counts toward gen. A same-instruction write must not
+      // mask the read.
       for (const RegUse &U : II.Regs) {
         unsigned R = grp(U.Reg);
         if (!Watch.count(R))
           continue;
         if (U.Read && !K.count(R))
           G.insert(R);
+      }
+      for (const RegUse &U : II.Regs) {
+        unsigned R = grp(U.Reg);
+        if (!Watch.count(R))
+          continue;
         if (U.Write)
           K.insert(R);
       }

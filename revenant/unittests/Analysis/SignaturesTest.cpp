@@ -119,6 +119,40 @@ TEST(SignaturesTest, RecognizesVarArgsHomeSpillsWithoutInventingParameters) {
   EXPECT_EQ(Sig->Params[0].Bits, 32u);
 }
 
+TEST(SignaturesTest, RmwDestinationReadCountsAsParameter) {
+  constexpr uint64_t Base = 0x140004000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x20;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  const uint8_t Code[] = {
+      0x83, 0xE1, 0x3F, // and ecx, 0x3f
+      0xC1, 0xE1, 0x18, // shl ecx, 24
+      0x33, 0xD2,       // xor edx, edx (zeroing idiom, not a param)
+      0x8B, 0xC1,       // mov eax, ecx
+      0xC3,             // ret
+  };
+  std::copy(std::begin(Code), std::end(Code), Text.Data.begin());
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va Start(Base);
+  P.Functions.emplace(Start, record(Start, 0x0, 0xB, {0, 3, 6, 8, 0xA}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(Start);
+  ASSERT_NE(Sig, nullptr);
+  // `and`/`shl` read their destination: rcx is a parameter.
+  ASSERT_EQ(Sig->Params.size(), 1u);
+  EXPECT_EQ(Sig->Params[0].Bits, 32u);
+}
+
 TEST(SignaturesTest, LookupUsesFunctionStart) {
   Signatures S;
   Signature Sig;
