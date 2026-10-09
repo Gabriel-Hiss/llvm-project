@@ -894,9 +894,11 @@ revenant::UncxxPass::run(llvm::Function &F, llvm::FunctionAnalysisManager &) {
     if (!Name || Name->getString() != "cpp")
       return llvm::PreservedAnalyses::all();
   }
-  const llvm::DataLayout &DL = F.getParent()->getDataLayout();
-  CxxFlavor Fl = uncxx::flavorOf(*F.getParent());
+  CxxFlavor Fl = Flavor == CxxFlavor::Auto
+                     ? uncxx::flavorOf(*F.getParent())
+                     : Flavor;
   unsigned N = 0;
+  const llvm::DataLayout &DL = F.getParent()->getDataLayout();
   // Block idioms first: they consume calls (grow/reallocate) the scalar
   // folder must not see as plain code.
   N += uncxx::runBlockIdioms(F, DL, Fl);

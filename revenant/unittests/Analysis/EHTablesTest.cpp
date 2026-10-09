@@ -51,14 +51,23 @@ PeFile makePE(bool Cxx) {
     put32(D, 16, 0);
     put32(D, 20, 1);
     put32(D, 24, 0x1200);
-    put32(D, 28, 0);
-    put32(D, 32, 0);
+    put32(D, 28, 4);
+    put32(D, 32, 0x1300);
     // One try record and one handler type entry.
-    put32(D, 0x200, 0);
-    put32(D, 0x204, 0);
+    put32(D, 0x200, 1);
+    put32(D, 0x204, 1);
     put32(D, 0x208, 0);
     put32(D, 0x20c, 1);
     put32(D, 0x210, 0x1220);
+    // Two adjacent IP-map entries have the active try state.
+    put32(D, 0x300, 0x100);
+    put32(D, 0x304, 0);
+    put32(D, 0x308, 0x110);
+    put32(D, 0x30c, 1);
+    put32(D, 0x310, 0x118);
+    put32(D, 0x314, 1);
+    put32(D, 0x318, 0x120);
+    put32(D, 0x31c, 0);
     put32(D, 0x220, 0);
     put32(D, 0x224, 0x1240);
     put32(D, 0x228, 0);
@@ -101,9 +110,34 @@ TEST(EHTablesTest, DecodesFuncInfo3CatchHandlerAndTypeName) {
   ASSERT_EQ(EH.size(), 1u);
   EXPECT_EQ(EH[0].Model, EHModel::MSVC);
   ASSERT_EQ(EH[0].TryRegions.size(), 1u);
+  ASSERT_EQ(EH[0].TryRegions[0].Handlers.size(), 1u);
+  EXPECT_EQ(EH[0].TryRegions[0].Handlers[0], 0u);
   ASSERT_EQ(EH[0].Handlers.size(), 1u);
   EXPECT_EQ(EH[0].Handlers[0].Address, Va(0x2300));
   EXPECT_EQ(EH[0].Handlers[0].TypeName, ".H");
+  EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1110));
+  EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1120));
+}
+TEST(EHTablesTest, DecodesCleanupOnlyFuncInfo3RangesFromIPStates) {
+  PeFile PE = makePE(true);
+  auto &D = PE.Img->Sections[1].Data;
+  put32(D, 12, 0);
+  put32(D, 16, 0x1280);
+  put32(D, 20, 0);
+  put32(D, 24, 0);
+  put32(D, 28, 4);
+  put32(D, 32, 0x1300);
+  put32(D, 0x280, 0);
+  put32(D, 0x284, 0x1300);
+
+  auto EH = decodeEHTables(PE);
+  ASSERT_EQ(EH.size(), 1u);
+  ASSERT_EQ(EH[0].Cleanups.size(), 1u);
+  ASSERT_EQ(EH[0].TryRegions.size(), 2u);
+  EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1100));
+  EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1110));
+  EXPECT_EQ(EH[0].TryRegions[1].Begin, Va(0x1120));
+  EXPECT_EQ(EH[0].TryRegions[1].End, Va(0x1180));
 }
 
 TEST(EHTablesTest, DecodesSehScopeRangeAndFinally) {
@@ -114,6 +148,8 @@ TEST(EHTablesTest, DecodesSehScopeRangeAndFinally) {
   EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1100));
   EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1180));
   ASSERT_EQ(EH[0].Handlers.size(), 1u);
+  ASSERT_EQ(EH[0].TryRegions[0].Handlers.size(), 1u);
+  EXPECT_EQ(EH[0].TryRegions[0].Handlers[0], 0u);
   EXPECT_EQ(EH[0].Handlers[0].Kind, HandlerKind::Finally);
   ASSERT_EQ(EH[0].Cleanups.size(), 1u);
 }
@@ -131,12 +167,41 @@ TEST(EHTablesTest, DecodesExceptionMetadataFromCorpus) {
     auto Loaded = PeFile::load(Path);
     ASSERT_TRUE(!!Loaded) << Path;
     auto EH = decodeEHTables(*Loaded);
+    if (llvm::StringRef(Path) == REVENANT_TEST_CPP_O2) {
+      const FunctionEH *Exceptions = nullptr;
+      for (const FunctionEH &F : EH)
+        if (F.Function == Va(0x140003200))
+          Exceptions = &F;
+      ASSERT_NE(Exceptions, nullptr);
+      EXPECT_EQ(Exceptions->Model, EHModel::MSVC);
+      EXPECT_EQ(Exceptions->TryRegions.size(), 1u);
+      ASSERT_EQ(Exceptions->Handlers.size(), 2u);
+      EXPECT_EQ(Exceptions->Handlers[0].Address, Va(0x14006fb00));
+      EXPECT_EQ(Exceptions->Handlers[0].TypeName, ".?AVruntime_error@std@@");
+      EXPECT_EQ(Exceptions->Handlers[1].Address, Va(0x14006fae0));
+      EXPECT_EQ(Exceptions->Handlers[1].TypeName, ".?AVexception@std@@");
+      ASSERT_EQ(Exceptions->Handlers[0].Continuations.size(), 1u);
+      EXPECT_EQ(Exceptions->Handlers[0].Continuations[0], Va(0x140003219));
+      ASSERT_EQ(Exceptions->Handlers[1].Continuations.size(), 1u);
+      EXPECT_EQ(Exceptions->Handlers[1].Continuations[0], Va(0x14000320f));
+    }
     EXPECT_FALSE(EH.empty()) << Path;
     size_t WithContent = 0;
     for (const FunctionEH &F : EH) {
       if (!F.TryRegions.empty() || !F.Handlers.empty() ||
           !F.Cleanups.empty() || !F.CallSites.empty())
         ++WithContent;
+      EXPECT_FALSE(F.TryRegions.empty() && F.Handlers.empty() &&
+                   F.Cleanups.empty() && F.CallSites.empty());
+      for (const EHTryRegion &T : F.TryRegions) {
+        EXPECT_LT(T.Begin, T.End) << Path;
+        EXPECT_GE(T.Begin, F.Function) << Path;
+        EXPECT_LE(T.End, F.End) << Path;
+      }
+      for (const EHHandler &H : F.Handlers)
+        EXPECT_NE(Loaded->Img->sectionOf(H.Address), nullptr) << Path;
+      for (const EHCleanup &C : F.Cleanups)
+        EXPECT_NE(Loaded->Img->sectionOf(C.Address), nullptr) << Path;
     }
     llvm::errs() << Path << " entries=" << EH.size()
                  << " withcontent=" << WithContent << "\n";

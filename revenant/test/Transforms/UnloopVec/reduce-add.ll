@@ -61,7 +61,8 @@ define i32 @sum_vec(ptr noundef readonly captures(none) %0, i32 noundef %1) {
 declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
 
 ; The wide body and middle reduce are gone, the dispatch folds to scalar.
+; CHECK-LABEL: define{{.*}}i32 @sum_vec
 ; CHECK-NOT: <4 x i32>
 ; CHECK-NOT: call i32 @llvm.vector.reduce
-; CHECK: br label
-; CHECK: ret i32
+; CHECK: load i32
+; CHECK: }

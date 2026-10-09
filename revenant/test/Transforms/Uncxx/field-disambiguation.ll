@@ -122,3 +122,5 @@ entry:
   %equal = icmp eq i32 %first, %last
   ret i1 %equal
 }
+!llvm.module.flags = !{!0}
+!0 = !{i32 4, !"revenant.lang", !"cpp"}

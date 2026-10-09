@@ -273,13 +273,22 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
       if (D->isImplicit())
         continue;
       auto *FD = llvm::dyn_cast<c::FunctionDecl>(D);
+      bool IsNamespace = llvm::isa<c::NamespaceDecl>(D);
       bool IsRecord = llvm::isa<c::RecordDecl>(D);
+      bool IsRecordContainer = IsRecord || IsNamespace;
       bool IsPrototype = FD && !FD->doesThisDeclarationHaveABody();
-      if ((Pass == 0 && !IsRecord) || (Pass == 1 && !IsPrototype) ||
-          (Pass == 2 && (IsRecord || IsPrototype)))
+      if ((Pass == 0 && !IsRecordContainer) || (Pass == 1 && !FD) ||
+          (Pass == 2 && (IsRecordContainer || IsPrototype)))
         continue;
+      c::Stmt *SavedBody = nullptr;
+      if (Pass == 1 && FD && !IsPrototype) {
+        SavedBody = FD->getBody();
+        FD->setBody(nullptr);
+      }
       D->print(OS, Policy, /*Indentation=*/0, /*PrintInstantiation=*/true);
-      if (!FD || IsPrototype)
+      if (SavedBody)
+        FD->setBody(SavedBody);
+      if (!FD || IsPrototype || Pass == 1)
         OS << ";";
       OS << "\n";
     }

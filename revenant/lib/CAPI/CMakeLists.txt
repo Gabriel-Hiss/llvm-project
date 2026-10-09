@@ -12,6 +12,7 @@ add_llvm_library(RevenantCAPI
   Passes
   Support
   TargetParser
+  TransformUtils
 
   LINK_LIBS
   RevenantObject
@@ -24,4 +25,7 @@ add_llvm_library(RevenantCAPI
   RevenantClangCore
 )
 target_include_directories(RevenantCAPI PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../frontend/clang/include)
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../frontend/clang/include"
+  "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86"
+  "${LLVM_BINARY_DIR}/lib/Target/X86"
+  "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/X86/MCTargetDesc")

@@ -5,10 +5,12 @@
 // See UnloopVec.h for the firing shape and the soundness argument.
 //
 // Pass structure: scan for dispatch candidates D (cond br where one
-// successor S has a single-block scalar self-loop latch and the other
-// side reaches a wide-loop region R that feeds S's resume phi from its
-// own block, or where both D successors reach such a region). Validate
-// R and the scalar tail structurally, then:
+// successor S is the scalar tail -- either an entry block with a
+// single-block scalar self-loop latch under it, or the loop header
+// itself in the dispatch-to-header form the normalized lifter emits
+// -- and the other side reaches a wide-loop region R that feeds S's
+// resume phi from its own block, or where both D successors reach
+// such a region). Validate R and the scalar tail structurally, then:
 //   1. fold D to the scalar edge (keep S's incoming from D),
 //   2. drop R-block incomings from non-S outsider phis,
 //   3. erase dead R blocks (wide body, middle reduce/combine, epilogue
@@ -23,12 +25,18 @@
 //     the tiered tail below S dispatches on N congruences and remaining
 //     counts, all satisfiable at resume 0, and every counted tier loop
 //     covers exactly its checked range). So S-from-D-start computes the
-//     same value as S-from-R-resume on every path that reaches it.
+//     same value as S-from-R-resume on every path that reaches it. In
+//     the versioned/no-resume form (GCC) S is a full-trip copy of the
+//     loop and no resume values flow in at all.
 //   - middle.reduce erasure: combine + llvm.vector.reduce feeds only the
 //     tail accumulator seed and the direct-exit value; both are dead
 //     once the tail iterates from 0.
 //   - memcheck erasure: pure ptrtoint/sub ICMP chain whose only true use
 //     is routing into R; dead once D folds to S.
+//   - dispatch-to-header: when S is the loop header, its phis carry
+//     loop state directly; the IV phi must be a resume phi (start
+//     edges feed 0, R incomings bound-derived), accumulator phis feed
+//     nothing but the latch/exit and restart at their start value.
 // Refinement-free because no kept instruction changes: kept blocks keep
 // their instructions, operands, and flags; only branch targets and dead
 // code change.
@@ -53,7 +61,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/IRBuilder.h"
 #include <algorithm>
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Debug.h"
 
 using namespace llvm;
 
@@ -329,6 +337,17 @@ Value *stripCountDerivation(Value *V, const Function &F, unsigned Depth = 8) {
     case Instruction::Trunc:
       V = I->getOperand(0);
       continue;
+    case Instruction::Shl:
+    case Instruction::LShr: {
+      // Byte-scaled forms (shl(zext(lshr(N, K)), M)) still derive
+      // from the same trip-count root.
+      auto *C1 = dyn_cast<ConstantInt>(I->getOperand(1));
+      if (C1) {
+        V = I->getOperand(0);
+        continue;
+      }
+      return V;
+    }
     case Instruction::And:
     case Instruction::Sub:
     case Instruction::Add: {
@@ -354,6 +373,70 @@ Value *stripCountDerivation(Value *V, const Function &F, unsigned Depth = 8) {
     }
   }
   return V;
+}
+
+// Scaled byte-count bound: the normalized lifter expresses the vector
+// trip count in bytes as shl(zext(lshr(N, K)), M), i.e. (N >> K) whole
+// groups of (1 << M) bytes (corpus fill_vec: (N >> 3) groups of 32
+// bytes). Value facts used (all exact unsigned arithmetic, N >= 0 on
+// the folded path where the dispatch already checked N >= 1):
+//   - byteBound == (N >> K) * (1 << M), so the loop covers exactly
+//     (N >> K) * ((1 << M) / ElemBytes) elements when (1 << M) is a
+//     multiple of the tail element size ElemBytes;
+//   - that element count equals the and-mask n.vec (N with low E bits
+//     cleared) when E == K and ((1 << M) / ElemBytes) == (1 << K).
+// Returns the covered element step (1 << K) * TailStep... actually
+// the element step per vector iteration: ((1 << M) / ElemBytes).
+// Fills ElemStepOut and KOut on success, else 0.
+uint64_t matchScaledVecBound(Value *VecBound, Value *N, uint64_t ElemBytes,
+                             uint64_t &ElemStepOut, unsigned &KOut) {
+  ElemStepOut = 0;
+  KOut = 0;
+  if (ElemBytes == 0)
+    return 0;
+  auto *Shl = dyn_cast<BinaryOperator>(VecBound);
+  if (!Shl || Shl->getOpcode() != Instruction::Shl)
+    return 0;
+  auto *M = dyn_cast<ConstantInt>(Shl->getOperand(1));
+  if (!M)
+    return 0;
+  uint64_t MVal = M->getZExtValue();
+  if (MVal >= 63)
+    return 0;
+  uint64_t Scale = 1ULL << MVal;
+  // The byte scale must be an exact multiple of one tail element.
+  if (Scale < ElemBytes || Scale % ElemBytes != 0)
+    return 0;
+  Value *Z = Shl->getOperand(0);
+  // Peel a zext/sext (the lifter widens the group count to i64).
+  if (auto *Cast = dyn_cast<CastInst>(Z)) {
+    if (Cast->getOpcode() != Instruction::ZExt &&
+        Cast->getOpcode() != Instruction::SExt)
+      return 0;
+    Z = Cast->getOperand(0);
+  }
+  auto *Lshr = dyn_cast<BinaryOperator>(Z);
+  if (!Lshr || Lshr->getOpcode() != Instruction::LShr)
+    return 0;
+  auto *K = dyn_cast<ConstantInt>(Lshr->getOperand(1));
+  if (!K)
+    return 0;
+  unsigned KVal = (unsigned)K->getZExtValue();
+  if (KVal == 0 || KVal >= 63)
+    return 0;
+  const Function &F =
+      *cast<Instruction>(VecBound)->getParent()->getParent();
+  Value *RootN = stripCountDerivation(N, F);
+  if (stripCountDerivation(Lshr->getOperand(0), F) != RootN)
+    return 0;
+  // Element step per vector iteration must itself clear exactly the
+  // low KVal element bits: Scale / ElemBytes == (1 << KVal).
+  uint64_t ElemStep = Scale / ElemBytes;
+  if (ElemStep != (1ULL << KVal))
+    return 0;
+  ElemStepOut = ElemStep;
+  KOut = KVal;
+  return ElemStep;
 }
 
 // n.vec check: vector bound is N with low bits cleared (and N, Mask
@@ -501,17 +584,31 @@ void collectResumePhis(BasicBlock *S,
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
       BasicBlock *IB = Phi.getIncomingBlock(I);
       Value *Inc = Phi.getIncomingValue(I);
-      if (Starts.count(IB)) {
+      // Header mode (S == L): the backedge incoming is the latched
+      // value, not a start or a resume feed.
+      if (IB == S)
+        continue;
+      if (R.count(IB)) {
+        // R feeds: resume values (bound-derived, incl. the vector
+        // body's own IV.next which equals n.vec on its exit edge) or
+        // restarts at the same zero the start edges feed.
+        if (Inc == Bound || Inc == IVNext ||
+            stripCountDerivation(Inc, F) == RootB) {
+          Fed = true;
+        } else if (auto *CZ = dyn_cast<ConstantInt>(Inc)) {
+          if (!CZ->isZero())
+            OK = false;
+        } else {
+          OK = false;
+        }
+      } else if (Starts.count(IB)) {
         auto *CZ = dyn_cast<ConstantInt>(Inc);
         if (!CZ || !CZ->isZero())
           OK = false;
         else
           DZero = true;
-      } else if (!R.count(IB)) {
+      } else {
         OK = false;
-      } else if (Inc == Bound || Inc == IVNext ||
-                 stripCountDerivation(Inc, F) == RootB) {
-        Fed = true;
       }
     }
     if (OK && DZero && Fed)
@@ -521,20 +618,69 @@ void collectResumePhis(BasicBlock *S,
 
 // Shared tail checks: S entered from D (and R in strict mode), S phis
 // agree, S-routing S-phi deps are recorded for the resume post check,
-// and the single-block scalar self-loop L sits directly under S with
-// preds exactly {S, L}.
+// and the single-block scalar self-loop L sits directly under S (or IS
+// S itself in the dispatch-to-header form) with preds exactly {S, L}
+// plus the start edges.
+//
+// DFS from From to To without entering R blocks. Used to prove the
+// non-S successor of an R pred of S (the continue edge of a resume
+// guard, or the middle block's direct loop-exit edge) stays a live
+// post-tail block once R is erased. Reachability through erased chain
+// blocks also counts: if the only paths were dead, the target is dead
+// too and its phis' R incomings are dropped by the same surgery.
+bool reachableSkippingRegion(BasicBlock *From, BasicBlock *To,
+                             const DenseSet<BasicBlock *> &R) {
+  if (From == To)
+    return true;
+  SmallVector<BasicBlock *, 16> Work{From};
+  DenseSet<BasicBlock *> Seen{From};
+  while (!Work.empty()) {
+    BasicBlock *BB = Work.pop_back_val();
+    for (BasicBlock *Su : successors(BB)) {
+      if (Su == To)
+        return true;
+      if (R.count(Su) || !Seen.insert(Su).second)
+        continue;
+      Work.push_back(Su);
+    }
+    if (Seen.size() > 512)
+      return false;
+  }
+  return false;
+}
+
+// preds exactly {S, L} plus the start edges.
 bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
                     const DenseSet<BasicBlock *> &R, bool StrictPreds,
                     bool AllowNoR = false) {
-  // S preds are the primary dispatch, R resume blocks, and optionally
-  // a small-trip guard that also enters S with a zero resume value.
-  bool HasD = false, HasR = false;
+  // S preds are: S itself when the scalar tail is a dispatch-to-header
+  // loop (S == L, the normalized lifter jumps straight into the loop
+  // header), the primary dispatch D, dispatch-chain blocks that fall
+  // out to the scalar side (GCC's alias-guard restart), R resume
+  // blocks, and optionally a small-trip guard that also enters S with
+  // a fresh start value.
+  bool HasD = false, HasR = false, Header = false;
+  for (BasicBlock *Su : successors(S))
+    if (Su == S)
+      Header = true;
   C.Starts.clear();
   C.Starts.insert(D);
   for (BasicBlock *P : predecessors(S)) {
-    if (P == D)
+    if (P == S) {
+      if (!Header)
+        return false;
+      continue;
+    }
+    if (P == D) {
       HasD = true;
-    else if (R.count(P)) {
+      continue;
+    }
+    if (R.count(P)) {
+      // R preds feed resume values; the OTHER successor of their
+      // terminator must stay a live block after R is erased: another
+      // R block (resume chain), D or a chain block (both erased), or
+      // a post-tail block still reachable without R (the middle
+      // block's direct loop-exit edge).
       auto *PB = dyn_cast<BranchInst>(P->getTerminator());
       BasicBlock *Other = nullptr;
       if (PB && PB->isConditional()) {
@@ -543,11 +689,21 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
         else if (PB->getSuccessor(1) == S)
           Other = PB->getSuccessor(0);
       }
-      if (!Other || (!R.count(Other) && Other != D))
+      if (!Other)
+        return false;
+      if (!R.count(Other) && Other != D && !C.Chain.count(Other) &&
+          !reachableSkippingRegion(S, Other, R))
         return false;
       HasR = true;
+      continue;
+    }
+    if (C.Chain.count(P)) {
+      // Dispatch-chain fall-out (an alias/memcheck guard that failed
+      // inside the chain): restarts the tail exactly like D does.
       C.Starts.insert(P);
-    } else if (StrictPreds) {
+      continue;
+    }
+    if (StrictPreds) {
       auto *PB = dyn_cast<BranchInst>(P->getTerminator());
       bool StartsAtZero = PB && PB->isConditional() &&
                           ((PB->getSuccessor(0) == D &&
@@ -561,20 +717,23 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
   }
   if (!HasD || (StrictPreds && !HasR && !AllowNoR))
     return false;
-  // Every predecessor that starts at S must feed zero into each phi.
+  // Every start-edge incoming to an S phi must carry the same value:
+  // the restart is one fresh start, whether it arrives through D, a
+  // chain fall-out, or a small-trip guard. R incomings (resume feeds)
+  // and the backedge in header mode are not start edges.
   if (StrictPreds) {
     for (PHINode &Phi : S->phis()) {
+      Value *V0 = nullptr;
       for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
         BasicBlock *IB = Phi.getIncomingBlock(I);
-        if (C.Starts.count(IB)) {
-          auto *CZ = dyn_cast<ConstantInt>(Phi.getIncomingValue(I));
-          if (!CZ || !CZ->isZero())
-            return false;
-          continue;
-        }
-        if (R.count(IB))
+        if (IB == S || R.count(IB))
           continue;
         if (!C.Starts.count(IB))
+          return false;
+        Value *Inc = Phi.getIncomingValue(I);
+        if (!V0)
+          V0 = Inc;
+        else if (Inc != V0)
           return false;
       }
     }
@@ -611,13 +770,20 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
     }
   }
   // L: single successor latch of S that is a single-block self-loop
-  // with preds exactly {S, L}. In loose mode (R unknown) any
-  // successor may be L; the strict pass re-validates after R is
-  // collected.
+  // with preds exactly {S, L} (start edges aside); in header mode S is
+  // itself that loop. In loose mode (R unknown) any successor may be
+  // L; the strict pass re-validates after R is collected.
   for (BasicBlock *Succ : successors(S)) {
     if (R.count(Succ))
       continue;
     ScalarLoopInfo L;
+    if (Succ == S) {
+      if (!matchScalarLoop(S, L))
+        continue;
+      C.L = S;
+      C.TailLoop = L;
+      return true;
+    }
     if (!matchScalarLoop(Succ, L))
       continue;
     bool PredsOK = true;
@@ -633,7 +799,6 @@ bool matchTailShape(BasicBlock *S, BasicBlock *D, Candidate &C,
   }
   return false;
 }
-
 // Loose: find L under S before R is known (D edge only).
 bool matchScalarTailLoose(BasicBlock *S, BasicBlock *D, Candidate &C) {
   DenseSet<BasicBlock *> Empty;
@@ -689,9 +854,31 @@ bool matchTierBound(BasicBlock *B, ScalarLoopInfo &V, Candidate &C,
           NAlt = Op0Res ? Op1 : Op0;
       }
     }
-    if (!NAlt || !matchVecBound(Bound, NAlt, Found)) {
-      // Bound may be (N mod form) chain; try the operands.
-      return false;
+    Value *NBase = NAlt ? NAlt : NTail;
+    if (!matchVecBound(Bound, NBase, Found)) {
+      // Scaled byte bound (normalized lifter): the vector trip count
+      // in bytes, shl(zext(lshr(N, K)), M). The element count it
+      // covers equals the and-mask n.vec when (1 << M) / ElemBytes
+      // == (1 << K), i.e. one vector iteration strides exactly one
+      // whole group of tail elements.
+      const DataLayout &DL = F.getParent()->getDataLayout();
+      uint64_t ElemBytes = 0;
+      for (Instruction &I : *C.TailLoop.Header) {
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          Type *ET = GEP->getSourceElementType();
+          if (ET->isSized() && !ET->isAggregateType()) {
+            uint64_t EB = DL.getTypeStoreSize(ET).getFixedValue();
+            if (EB && (!ElemBytes || EB < ElemBytes))
+              ElemBytes = EB;
+          }
+        }
+      }
+      uint64_t ElemStep = 0;
+      unsigned KVal = 0;
+      if (!ElemBytes ||
+          !matchScaledVecBound(Bound, NBase, ElemBytes, ElemStep, KVal))
+        return false;
+      Found = ElemStep;
     }
   }
   // Interleaved groups: the latch step and the mask step must divide
@@ -744,8 +931,28 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
   const DenseSet<const PHINode *> *Resume = &C.Resume;
   if (!Secondary) {
     collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, C.Resume);
-    if (C.Resume.empty())
-      return false;
+    if (C.Resume.empty()) {
+      // No-resume (versioned) form: the scalar side is a full-trip
+      // fallback loop on the same N, not a resumed remainder, so S
+      // reads nothing from R. Accepted only when the versioned flag
+      // held (every R pred of S is a conditional restart guard), no
+      // R value flows into S at all, and R is memory-only: loads,
+      // stores, and pure computation with no calls (the memory-only
+      // body rule -- reductions route values through intrinsics or
+      // chains this rule rejects).
+      bool SReadsR = false;
+      for (PHINode &Phi : C.S->phis())
+        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+          if (C.R.count(Phi.getIncomingBlock(I)))
+            SReadsR = true;
+      bool HasCalls = false;
+      for (BasicBlock *BB : C.R)
+        for (Instruction &I : *BB)
+          if (isa<CallBase>(&I) && !isa<DbgInfoIntrinsic>(&I))
+            HasCalls = true;
+      if (!C.Versioned || SReadsR || HasCalls)
+        return false;
+    }
   } else if (C.Resume.empty()) {
     collectResumePhis(C.S, C.Starts, C.R, Bound, IVNext, F, Local);
     Resume = &Local;
@@ -760,15 +967,13 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
 // R is everything reachable from the other successor without passing
 // through S, L, or L's exit.
 
-#ifndef NDEBUG
+#define DEBUG_TYPE "unloopvec"
 #define ULV_BAIL()                                                           \
   do {                                                                       \
-    ::llvm::errs() << "unloopvec bail " << __LINE__ << " in "                \
-                   << F.getName() << "\n";                                   \
+    LLVM_DEBUG(::llvm::dbgs() << "unloopvec bail " << __LINE__ << " in "      \
+                              << F.getName() << "\n");                       \
   } while (0)
-#else
-#define ULV_BAIL() ((void)0)
-#endif
+
 Value *broadcastScalar(Value *V);
 bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F);
 
@@ -803,6 +1008,8 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     Cand.L = nullptr;
     bool HasRegionPredecessor = false;
     for (BasicBlock *P : predecessors(S)) {
+      if (P == S)
+        continue; // header mode: the backedge is not a region entry
       if (!Cand.R.count(P))
         continue;
       auto *PB = dyn_cast<BranchInst>(P->getTerminator());
@@ -1041,8 +1248,10 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       }
     }
     // Tail IV starts at an S phi whose D-incoming is constant 0;
-    // other tail phis start at S phis or outside-R values.
-    {
+    // other tail phis start at S phis or outside-R values. In header
+    // mode (S == L) the S-phi rules above plus the resume post check
+    // after the body match cover this, so this block is skipped.
+    if (Cand.L != Cand.S) {
       bool IVOK = false;
       for (unsigned I = 0; I < Cand.TailLoop.IV->getNumIncomingValues(); ++I) {
         BasicBlock *IB = Cand.TailLoop.IV->getIncomingBlock(I);
@@ -1141,6 +1350,14 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
         ULV_BAIL();
         goto next_pick;
       }
+    }
+    // Header mode (S == L): the loop IV is itself an S phi, so it
+    // must be a proven resume phi -- start edges feed 0 and every R
+    // incoming is bound-derived -- otherwise the restart at element 0
+    // is unproven and we bail.
+    if (Cand.L == Cand.S && !Cand.Resume.count(Cand.TailLoop.IV)) {
+      ULV_BAIL();
+      goto next_pick;
     }
 
     // S-routing post check: every S phi the tail dispatch routes on
@@ -1478,28 +1695,157 @@ Value *broadcastScalar(Value *V) {
   return Insert->getOperand(1);
 }
 
+bool lowerUniformStoreUnroll(Function &F) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    ScalarLoopInfo Loop;
+    if (!matchScalarLoop(&BB, Loop))
+      continue;
+    auto *Step = dyn_cast<ConstantInt>(Loop.Step);
+    if (!Step || Step->isZero() || Step->getValue().getActiveBits() > 63)
+      continue;
+    uint64_t ByteStep = Step->getZExtValue();
+    PHINode *PtrPhi = nullptr;
+    GetElementPtrInst *PtrNext = nullptr;
+    for (PHINode &Phi : BB.phis()) {
+      if (!Phi.getType()->isPointerTy())
+        continue;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+        if (Phi.getIncomingBlock(I) != &BB)
+          continue;
+        auto *GEP = dyn_cast<GetElementPtrInst>(Phi.getIncomingValue(I));
+        if (!GEP || GEP->getPointerOperand() != &Phi)
+          continue;
+        APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+        if (!GEP->accumulateConstantOffset(DL, Offset) ||
+            Offset.getActiveBits() > 63 || Offset.getZExtValue() != ByteStep)
+          continue;
+        PtrPhi = &Phi;
+        PtrNext = GEP;
+        break;
+      }
+      if (PtrPhi)
+        break;
+    }
+    if (!PtrPhi)
+      continue;
+
+    SmallVector<std::pair<StoreInst *, int64_t>, 8> Stores;
+    Value *StoredValue = nullptr;
+    uint64_t ElemBytes = 0;
+    bool SafeBody = true;
+    for (Instruction &I : BB) {
+      if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        if (Store->isVolatile() || Store->isAtomic() ||
+            !Store->getValueOperand()->getType()->isSized()) {
+          SafeBody = false;
+          break;
+        }
+        TypeSize Size = DL.getTypeStoreSize(Store->getValueOperand()->getType());
+        if (Size.isScalable()) {
+          SafeBody = false;
+          break;
+        }
+        uint64_t EB = Size.getFixedValue();
+        if (!EB || (ElemBytes && ElemBytes != EB) ||
+            (StoredValue && StoredValue != Store->getValueOperand())) {
+          SafeBody = false;
+          break;
+        }
+        ElemBytes = EB;
+        StoredValue = Store->getValueOperand();
+        Value *Ptr = Store->getPointerOperand();
+        APInt Total(DL.getIndexTypeSizeInBits(PtrPhi->getType()), 0);
+        while (Ptr != PtrPhi) {
+          auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+          if (!GEP) {
+            SafeBody = false;
+            break;
+          }
+          APInt Part(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+          if (!GEP->accumulateConstantOffset(DL, Part) ||
+              Part.getBitWidth() != Total.getBitWidth()) {
+            SafeBody = false;
+            break;
+          }
+          Total += Part;
+          Ptr = GEP->getPointerOperand();
+        }
+        if (!SafeBody || Total.getActiveBits() > 63) {
+          SafeBody = false;
+          break;
+        }
+        Stores.push_back({Store, Total.getSExtValue()});
+        continue;
+      }
+      if (isa<PHINode>(&I) || isa<BranchInst>(&I) ||
+          isa<GetElementPtrInst>(&I) || isa<ICmpInst>(&I) ||
+          isa<CastInst>(&I))
+        continue;
+      auto *BO = dyn_cast<BinaryOperator>(&I);
+      if (!BO || BO->getOpcode() != Instruction::Add) {
+        SafeBody = false;
+        break;
+      }
+    }
+    if (!SafeBody || Stores.size() < 2 || !ElemBytes ||
+        ByteStep % ElemBytes || Stores.size() != ByteStep / ElemBytes)
+      continue;
+    std::sort(Stores.begin(), Stores.end(),
+              [](const auto &A, const auto &B) {
+                return A.second < B.second;
+              });
+    bool LanesMatch = true;
+    for (unsigned I = 0; I < Stores.size(); ++I)
+      if (Stores[I].second != static_cast<int64_t>(I * ElemBytes))
+        LanesMatch = false;
+    if (!LanesMatch)
+      continue;
+
+    auto *StepUpdate =
+        dyn_cast<BinaryOperator>(Loop.IV->getIncomingValueForBlock(&BB));
+    if (!StepUpdate)
+      continue;
+    unsigned StepOperand = StepUpdate->getOperand(0) == Step ? 0 : 1;
+    if (StepUpdate->getOperand(StepOperand) != Step)
+      continue;
+    for (unsigned I = 1; I < Stores.size(); ++I)
+      Stores[I].first->eraseFromParent();
+    StepUpdate->setOperand(
+        StepOperand,
+        ConstantInt::get(Step->getType(), ByteStep / Stores.size()));
+    APInt NextOffset(DL.getIndexTypeSizeInBits(PtrNext->getType()),
+                     ByteStep / Stores.size());
+    PtrNext->setOperand(
+        PtrNext->getNumOperands() - 1,
+        ConstantInt::get(F.getContext(), NextOffset));
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool scalarizeCountedWideMemory(Function &F) {
   SmallVector<StoreInst *, 8> Stores;
   SmallVector<std::pair<LoadInst *, StoreInst *>, 8> Copies;
   for (BasicBlock &BB : F) {
     auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!Br || !Br->isConditional() ||
-        (Br->getSuccessor(0) != &BB && Br->getSuccessor(1) != &BB))
-      continue;
     ScalarLoopInfo Loop;
-    if (!matchScalarLoop(&BB, Loop))
-      continue;
+    bool CountedLoop = Br && Br->isConditional() &&
+                       (Br->getSuccessor(0) == &BB ||
+                        Br->getSuccessor(1) == &BB) &&
+                       matchScalarLoop(&BB, Loop);
     for (Instruction &I : BB) {
       auto *Store = dyn_cast<StoreInst>(&I);
-      if (!Store)
-        continue;
-      if (Store->isVolatile() || Store->isAtomic())
+      if (!Store || Store->isVolatile() || Store->isAtomic())
         continue;
       if (isa<FixedVectorType>(Store->getValueOperand()->getType()) &&
           broadcastScalar(Store->getValueOperand())) {
         Stores.push_back(Store);
         continue;
       }
+      if (!CountedLoop)
+        continue;
       auto *Load = dyn_cast<LoadInst>(Store->getValueOperand());
       if (Load && Load->hasOneUse() &&
           Load->getType()->isIntegerTy(128) &&
@@ -1564,8 +1910,28 @@ bool scalarizeCountedWideMemory(Function &F) {
   return Changed;
 }
 
+bool eraseDeadValues(Function &F) {
+  bool Changed = false;
+  SmallVector<Instruction *, 16> Dead;
+  do {
+    Dead.clear();
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if ((isVectorTyped(I.getType()) || isa<GetElementPtrInst>(&I)) &&
+            I.use_empty() && !I.mayHaveSideEffects() &&
+            !I.getMetadata("revenant.opaque") &&
+            !I.getMetadata("revenant.region"))
+          Dead.push_back(&I);
+    for (Instruction *I : Dead)
+      I->eraseFromParent();
+    Changed |= !Dead.empty();
+  } while (!Dead.empty());
+  return Changed;
+}
+
 bool runOnFunction(Function &F) {
   bool Changed = scalarizeCountedWideMemory(F);
+  Changed |= lowerUniformStoreUnroll(F);
   SmallVector<Candidate, 4> Cands;
   // Collect-then-rewrite: matching never mutates.
   for (BasicBlock &BB : F) {
@@ -1578,7 +1944,6 @@ bool runOnFunction(Function &F) {
     if (matchDispatch(&BB, F, C))
       Cands.push_back(std::move(C));
   }
-  // Drop overlapping candidates (shared R blocks): keep the first.
   DenseSet<BasicBlock *> Taken;
   SmallVector<Candidate, 4> Work;
   for (Candidate &C : Cands) {
@@ -1744,6 +2109,8 @@ bool runOnFunction(Function &F) {
       BB->eraseFromParent();
     Changed = true;
   }
+  if (Changed)
+    Changed |= eraseDeadValues(F);
   return Changed;
 }
 
@@ -1767,6 +2134,7 @@ PreservedAnalyses UnloopVecPass::run(Function &F, FunctionAnalysisManager &) {
 // Windows needs the explicit dllexport; without it opt fails with
 // "Plugin entry point not found".
 #ifdef REVENANT_BUILD_PLUGIN
+#undef DEBUG_TYPE // PassBuilder.h headers re-#define it per header
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 

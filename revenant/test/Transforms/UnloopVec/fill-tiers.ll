@@ -82,10 +82,11 @@ define dso_local void @fill_vec(ptr noundef writeonly captures(none) %0, i32 nou
 }
 
 ; Both vector tiers are gone; the scalar loop remains.
+; CHECK-LABEL: define{{.*}}void @fill_vec
 ; CHECK-NOT: <8 x i32>
 ; CHECK-NOT: <4 x i32>
-; CHECK: br label
-; CHECK: ret void
+; CHECK: store i32
+; CHECK: }
 
 !19 = !{!"branch_weights", i32 1, i32 100}
 !26 = distinct !{!26}

@@ -492,6 +492,57 @@ class RevenantLiftEmitter {
                    ? std::string()
                    : (Twine("LC.rorxOp(") + V + ", " + Count + ")").str();
       }
+      if (Name == "rv_bextr" && D->getNumArgs() == 2) {
+        std::string V =
+            expression(D->getArg(0), Inst, Width, D->getArgNameStr(0));
+        std::string C =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        return V.empty() || C.empty()
+                   ? std::string()
+                   : (Twine("LC.bextrOp(") + V + ", " + C + ")").str();
+      }
+      if (Name == "rv_bzhi" && D->getNumArgs() == 2) {
+        std::string V =
+            expression(D->getArg(0), Inst, Width, D->getArgNameStr(0));
+        std::string C =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        return V.empty() || C.empty()
+                   ? std::string()
+                   : (Twine("LC.bzhiOp(") + V + ", " + C + ")").str();
+      }
+      if (Name == "rv_bls" && D->getNumArgs() == 2) {
+        const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
+        std::string V =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        return !Kind || V.empty()
+                   ? std::string()
+                   : (Twine("LC.blsOp(\"") + Kind->getValue() + "\", " + V +
+                      ")")
+                         .str();
+      }
+      if (Name == "rv_shiftx" && D->getNumArgs() == 3) {
+        const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
+        std::string V =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        std::string C =
+            expression(D->getArg(2), Inst, Width, D->getArgNameStr(2));
+        return !Kind || V.empty() || C.empty()
+                   ? std::string()
+                   : (Twine("LC.shiftXOp(\"") + Kind->getValue() + "\", " +
+                      V + ", " + C + ")")
+                         .str();
+      }
+      if ((Name == "rv_adcx" || Name == "rv_adox") && D->getNumArgs() == 2) {
+        std::string A =
+            expression(D->getArg(0), Inst, Width, D->getArgNameStr(0));
+        std::string B =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        return A.empty() || B.empty()
+                   ? std::string()
+                   : (Twine("LC.carryAddOp(") + A + ", " + B +
+                      (Name == "rv_adox" ? ", true)" : ", false)"))
+                         .str();
+      }
       if (Name == "rv_bt" && D->getNumArgs() == 3) {
         const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
         auto BaseOp = operandNo(Inst, D->getArgNameStr(1));
@@ -1642,6 +1693,17 @@ class RevenantLiftEmitter {
          << "    Value *XAddSum = LC.xaddVal(MI, " << *Dst << ", " << *Src
          << ", XAddA, XAddB);\n"
          << "    LC.writeOp(MI, " << *Dst << ", XAddSum);\n";
+      return true;
+    }
+    if (Name == "rv_mulx" && Body.getNumArgs() == 3) {
+      // mulx_args operand order is $dst1(hi), $dst2(lo), $src.
+      auto Hi = operandNo(Inst, Body.getArgNameStr(0));
+      auto Lo = operandNo(Inst, Body.getArgNameStr(1));
+      auto Src = operandNo(Inst, Body.getArgNameStr(2));
+      if (!Hi || !Lo || !Src)
+        return false;
+      OS << "    LC.mulxOp(MI, " << *Hi << ", " << *Lo << ", " << *Src
+         << ", " << Width << ");\n";
       return true;
     }
     if (Name == "rv_cmpxchgr" && Body.getNumArgs() == 2) {
