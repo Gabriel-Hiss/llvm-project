@@ -7,6 +7,7 @@ add_llvm_library(RevenantAnalysis
   JumpTable.cpp
   Candidates.cpp
   Overlaps.cpp
+  StackPtr.cpp
 
   LINK_COMPONENTS
   MC
