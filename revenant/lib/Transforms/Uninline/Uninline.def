@@ -1,0 +1,3 @@
+LIBRARY RevenantTransformUninline
+EXPORTS
+  llvmGetPassPluginInfo
