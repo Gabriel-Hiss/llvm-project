@@ -8,6 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LiftTestUtil.h"
 #include "revenant/Analysis/Analysis.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
@@ -17,6 +18,7 @@
 
 #include "gtest/gtest.h"
 
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
@@ -37,6 +39,8 @@
 
 namespace {
 using namespace revenant;
+using lifttest::emptyProgram;
+using lifttest::singleBlockFunc;
 
 
 struct Fixture {
@@ -85,39 +89,6 @@ static std::vector<Instr> linearBlock(const Disasm &D, Va Start,
       break;
   }
   return Out;
-}
-
-static FuncRecord singleBlockFunc(const Program &P,
-                                  const std::vector<Instr> &Block) {
-  FuncRecord R;
-  R.Start = Block.front().Addr;
-  R.End = Block.back().nextVa();
-  auto RvaOf = [&](Va V) -> Rva { return *P.Img->rvaOf(V); };
-  for (const Instr &I : Block)
-    R.InstrRvas.push_back(RvaOf(I.Addr));
-  for (uint32_t K = 0; K < Block.size(); ++K)
-    R.Sorted.push_back(K);
-  BlockRec BR;
-  BR.Start = RvaOf(Block.front().Addr);
-  BR.End = RvaOf(Block.back().nextVa());
-  BR.InstrsBegin = 0;
-  BR.InstrsEnd = (uint32_t)Block.size();
-  BR.EdgesBegin = 0;
-  BR.EdgesEnd = 0;
-  BR.EndKind = BlockEnd::Return;
-  R.Blocks.push_back(BR);
-  R.Chunks.push_back({R.Start, R.End});
-  return R;
-}
-
-static Program emptyProgram(std::shared_ptr<Image> Img) {
-  Program P;
-  P.Img = std::move(Img);
-  P.Strings = std::make_shared<std::map<Va, std::string>>();
-  P.Externs = std::make_shared<std::map<Va, Extern>>();
-  P.Names = std::make_shared<std::map<Va, std::string>>();
-  P.Resolver = std::make_shared<NoNames>();
-  return P;
 }
 
 TEST(LiftFunction, LeafBlockOverRealBytes) {
@@ -194,7 +165,11 @@ TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
                 {"cpp-o2", REVENANT_TEST_CPP_O2},
                 {"c-clang-o2", REVENANT_TEST_C_CLANG_O2},
                 {"c-gcc-o2", REVENANT_TEST_C_GCC_O2}};
+  const char *Only = std::getenv("REVENANT_LIFT_ONLY");
+  const char *DumpVa = std::getenv("REVENANT_LIFT_DUMP_VA");
   for (const auto &Input : Inputs) {
+    if (Only && llvm::StringRef(Only) != Input.Name)
+      continue;
     auto Fx = open(Input.Path);
     ASSERT_TRUE(Fx.has_value()) << Input.Path;
     auto Hooks = createX86TargetHooks();
@@ -245,6 +220,18 @@ TEST(LiftFunction, FullCfgCorpusSamplesVerify) {
         continue;
       }
       ++Verified;
+    }
+    if (DumpVa) {
+      uint64_t Want = 0;
+      llvm::StringRef(DumpVa).getAsInteger(16, Want);
+      uint64_t Best = 0;
+      for (const auto &[Start, Record] : P.Functions)
+        if (Start.Value <= Want)
+          Best = Start.Value;
+      for (llvm::Function &Fn : M)
+        if (!Fn.isDeclaration() &&
+            revenant::ir::getFunctionVA(Fn).value_or(0) == Best)
+          Fn.print(llvm::errs());
     }
     bool ModuleVerified = !verifyModule(M, &llvm::errs());
     unsigned Total = P.Functions.size();
