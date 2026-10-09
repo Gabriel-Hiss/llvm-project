@@ -1390,10 +1390,19 @@ public:
         Emitted.insert(Entry.first);
         ++PatternCount;
       }
+    for (const auto &Entry : Instructions)
+      if (!Emitted.count(Entry.first)) {
+        OS << "  case X86::" << Entry.first->getName() << ": {\n"
+           << "    LC.emitOpaque(MI, \"" << Entry.first->getName()
+           << "\");\n"
+           << "    return true;\n  }\n";
+        Emitted.insert(Entry.first);
+      }
+    unsigned OpaqueCount = Instructions.size() - DSLCount - PatternCount;
+
     OS << "// Lift coverage: " << Emitted.size() << "/" << Instructions.size()
-       << " instructions, " << DSLCount << " DSL, " << PatternCount
-       << " direct patterns, " << (Instructions.size() - Emitted.size())
-       << " unsupported.\n";
+       << " instructions handled, " << DSLCount << " DSL, " << PatternCount
+       << " direct patterns, " << OpaqueCount << " opaque.\n";
 
 
     OS << "  default: return false;\n"

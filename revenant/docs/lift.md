@@ -4,7 +4,7 @@
 
 `X86Lift.td` owns shared DSL operators and scalar/system semantics. `X87.td`, `StringAtomic.td`, `System.td`, `Sse.td`, and `Avx.td` add family semantics through `RevenantX86.td`. The emitter lowers supported expression and statement DAGs to IRBuilder calls and X86 context hooks. Direct pattern inversion currently accepts one-result, no-implicit-def patterns whose source DAG fits the supported SelectionDAG expression set.
 
-The generated footer reports the table census. At this revision, the X86 target contains 21,973 instruction records. The dispatcher emits semantics for 1,441 of them: 1,353 DSL cases and 88 direct-pattern cases. The remaining 20,532 return `false` for the caller's opaque path. These are table counts, not corpus instruction coverage, and the large fallback count means the generated lifter is not yet complete for the X86 target.
+The generated footer reports the table census. At this revision, the X86 target contains 21,973 instruction records. The dispatcher handles all of them: 1,353 DSL cases and 88 direct-pattern cases emit IR semantics; the remaining 20,532 emit opaque calls. These are table counts, not corpus instruction coverage. Dispatch is complete, but most X86 opcodes still lack non-opaque lifting semantics.
 
 Build the generated dispatcher and context implementations, then run the provenance test:
 
