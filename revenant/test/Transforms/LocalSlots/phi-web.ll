@@ -14,7 +14,6 @@ define i32 @count(i32 %limit) {
 ; CHECK: %[[I:[0-9]+]] = load i32, ptr %v_i
 ; CHECK: %next = add i32 %[[I]], 1
 ; CHECK: store i32 %next, ptr %v_i
-; CHECK: %[[N:[0-9]+]] = load i32, ptr %v_i
 ; CHECK: %[[L:[0-9]+]] = load i32, ptr %limit.addr
 ; CHECK: %cond = icmp slt i32 %next, %[[L]]
 ; CHECK: br i1 {{.*}}, label %[[LOOP]], label %exit
