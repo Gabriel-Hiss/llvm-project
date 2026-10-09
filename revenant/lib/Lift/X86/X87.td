@@ -500,7 +500,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FNSTSWm;
-  dag Body = (rv_store (rv_addr $dst), (rv_fstsw));
+  dag Body = (rv_store $dst, (rv_fstsw));
 }
 def : RVLift {
   let Insn = FNSTCW16m;
@@ -508,7 +508,7 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FLDCW16m;
-  dag Body = (rv_fldcw $src);
+  dag Body = (rv_fldcw $dst);
 }
 
 // ---- conditional moves ------------------------------------------------------
@@ -580,20 +580,18 @@ def : RVLift {
 }
 
 // ---- unary ------------------------------------------------------------------
-// CHS_F/ABS_F/SQRT_F match any stack register form disassembled as a bare
-// mnemonic (the MC opcodes alias all ST(i) spellings); the context applies
-// them to ST(0) like the hardware's implicit-operand forms.
+// CHS_F/ABS_F/SQRT_F are operand-less: the hardware applies them to ST(0).
 
-def : RVMatch {
-  let Glob = "CHS_F*";
+def : RVLift {
+  let Insn = CHS_F;
   dag Body = (rv_x87stset 0, (rv_x87math "chs", (rv_x87st 0)));
 }
-def : RVMatch {
-  let Glob = "ABS_F*";
+def : RVLift {
+  let Insn = ABS_F;
   dag Body = (rv_x87stset 0, (rv_x87math "abs", (rv_x87st 0)));
 }
-def : RVMatch {
-  let Glob = "SQRT_F*";
+def : RVLift {
+  let Insn = SQRT_F;
   dag Body = (rv_x87stset 0, (rv_x87math "sqrt", (rv_x87st 0)));
 }
 def : RVLift {
@@ -619,21 +617,15 @@ def : RVLift {
 }
 def : RVLift {
   let Insn = FYL2X;
-  dag Body = (rv_seq
-    (rv_x87stset 1, (rv_x87math "yl2x", (rv_x87st 1), (rv_x87st 0)))
-    (rv_x87pop));
+  dag Body = (rv_x87math "yl2x", (rv_x87st 1), (rv_x87st 0));
 }
 def : RVLift {
   let Insn = FYL2XP1;
-  dag Body = (rv_seq
-    (rv_x87stset 1, (rv_x87math "yl2xp1", (rv_x87st 1), (rv_x87st 0)))
-    (rv_x87pop));
+  dag Body = (rv_x87math "yl2xp1", (rv_x87st 1), (rv_x87st 0));
 }
 def : RVLift {
   let Insn = FPTAN;
-  dag Body = (rv_seq
-    (rv_x87stset 0, (rv_x87math "tan", (rv_x87st 0)))
-    (rv_x87push (rv_x87fldconst "1")));
+  dag Body = (rv_x87math "tan", (rv_x87st 0));
 }
 def : RVLift {
   let Insn = FPATAN;
