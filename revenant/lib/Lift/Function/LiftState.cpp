@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LiftState.h"
+#include "LiftX86.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 
@@ -204,9 +205,16 @@ std::vector<LogOp> lift::logicalOps(const MCInst &MI, const MCInstrDesc &Desc) {
   unsigned NumDefs = Desc.getNumDefs();
   unsigned MIPos = 0;
 
+  // lea64mem and friends carry no OPERAND_MEMORY type; the address group is
+  // the second descriptor operand.
+  unsigned Opc = MI.getOpcode();
+  bool IsLea = Opc == X86::LEA16r || Opc == X86::LEA32r || Opc == X86::LEA64r ||
+               Opc == X86::LEA64_32r;
   auto kindAt = [&](unsigned DescOp) -> LogOpKind {
     if (DescOp >= Desc.NumOperands)
       return LogOpKind::Invalid;
+    if (IsLea && DescOp == 1)
+      return LogOpKind::Mem;
     uint8_t OT = Desc.operands()[DescOp].OperandType;
     if (OT == MCOI::OPERAND_REGISTER)
       return LogOpKind::Reg;
@@ -235,11 +243,16 @@ std::vector<LogOp> lift::logicalOps(const MCInst &MI, const MCInstrDesc &Desc) {
     if (K == LogOpKind::Mem)
       D += X86::AddrNumOperands - 1;
   }
-  // MCInst operands include tied inputs on decoded instructions, so account
-  // for each descriptor operand even when LLVM marks it tied to a def.
+  // Decoded MCInsts carry tied inputs ($src1 = $dst) as real operands; they
+  // name the same register as their def, so they merge into it and the
+  // logical view matches the iced one (`add rax, rcx` is two operands).
   for (unsigned D = NumDefs; D < Desc.NumOperands; ++D) {
     if (MIPos >= MI.getNumOperands())
       break;
+    if (Desc.getOperandConstraint(D, MCOI::TIED_TO) != -1) {
+      ++MIPos;
+      continue;
+    }
     LogOpKind K = logicalKindAt(D);
     Out.push_back({K, MIPos});
     MIPos += (K == LogOpKind::Mem) ? X86::AddrNumOperands : 1;

@@ -119,6 +119,11 @@ public:
   void memWrite(const MCInst &MI, unsigned MIOpNo, Value *V);
   Value *memReadAddr(Value *AddrI64, Type *Ty);
   void memWriteAddr(Value *AddrI64, Value *V);
+  /// i64 address -> pointer used by every memory access. The default is an
+  /// inttoptr; a subclass that knows which pointers it turned into integers
+  /// (frame slots, image globals) returns the original pointer instead so
+  /// the access keeps its provenance.
+  virtual Value *addrToPtr(Value *AddrI64);
 
   /// Read any operand at \p MIOpNo as \p Ty (reg -> regRead, imm -> constant,
   /// mem -> memRead). For memory this is a load; use memAddr for lea.
