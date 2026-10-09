@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Scalarized struct copy back to memcpy, gated on aggregate evidence:
 ; the run must be explainable as one source struct copy (whole object or

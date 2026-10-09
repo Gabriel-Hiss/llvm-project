@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Straight-line fully-unrolled sum (4 windows of gep/load/add over constant
 ; indices) synthesizes a counted loop. Ports reroll_straight_line_synth.
 

@@ -1,5 +1,5 @@
-; RUN: revenant-opt -passes=function(revenant-ssaout) -S %s | FileCheck %s
-; RUN: revenant-opt -passes=function(revenant-ssaout),always-inline,verify -disable-output %s
+; RUN: %revenant-opt -passes=function(revenant-ssaout) -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=function(revenant-ssaout),always-inline,verify -disable-output %s
 ;
 ; SSA-out creates the first DISubprogram when revenant-types is disabled.
 ; Calls must still have locations so the inliner can verify the module.

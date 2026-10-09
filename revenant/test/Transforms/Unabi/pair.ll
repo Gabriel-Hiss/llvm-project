@@ -2,7 +2,7 @@
 ; aggregates to a single integer in RAX (Win64). The annotation names the
 ; source struct; the width check (store size == old return width) guards it.
 ; Corpus: audio-nodegraph-clang-o1 ?inputPortPos (PortPos{float,float} -> i64).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unabi -verify-each -S %s | %FileCheck %s
 
 %struct.PortPos = type { float, float }
 

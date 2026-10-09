@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Bitmap (SimplifyCFG SwitchReplacement::BitMapKind) back to a switch:
 ; `zext; mul by width; lshr bitmap; trunc` under a range check.
 ; Table i64 0x282212 (= 2,3,1,2 little-endian bytes) over [0,4).

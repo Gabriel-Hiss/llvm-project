@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -S %s | %FileCheck %s
 
 ; Void loop with per-argument header phis becomes a recursive void call.
 ; The latch computes both next values itself.

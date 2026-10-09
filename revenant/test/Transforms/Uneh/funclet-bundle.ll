@@ -2,7 +2,7 @@
 ; lost its [ "funclet"(token %pad) ] bundle gets it back. Corpus:
 ; target/parity/cpp-clang-o1/artifacts/main.pre.ll
 ; @"?string_ops@@YA_KPEBD@Z" block %11: cleanuppad + dtor call with bundle.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uneh -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uneh -S %s | %FileCheck %s
 
 declare i32 @__CxxFrameHandler3(...)
 declare void @dtor(ptr)

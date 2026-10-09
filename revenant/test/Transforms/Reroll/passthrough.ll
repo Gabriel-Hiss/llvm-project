@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Smoke test: the pass loads under the name revenant-reroll and leaves
 ; scalar code alone.
 

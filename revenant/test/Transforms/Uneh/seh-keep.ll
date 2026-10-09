@@ -1,7 +1,7 @@
 ; SEH shape survival: __try/__except under __C_specific_handler passes
 ; through unchanged; the filter call stays a plain opaque call (filters are
 ; not lifted to IR). Shape from LLVM's seh-catch-all test.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uneh -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uneh -S %s | %FileCheck %s
 
 declare i32 @__C_specific_handler(...)
 declare i32 @llvm.eh.exceptioncode(token)

@@ -1,4 +1,4 @@
-; RUN: revenant-idioms-test %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; neg: xor(x,-1)+1 -> sub(0,x), the abs building block.
 define i32 @negxor(i32 %x) {
 entry:

@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-locals-to-slots -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-locals-to-slots -S %s | %FileCheck %s
 ;
 ; A recovered -O0-style function spills every incoming parameter and uses a
 ; shared retval slot when the function has more than one return path.

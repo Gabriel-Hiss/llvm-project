@@ -1,7 +1,7 @@
 ; Straight-line SLP: a vector load feeding a lane-wise add, consumed by
 ; a lane-0 extract, explodes into scalar loads + a scalar add. Ports
 ; crates/unopt devectorize_straight_line.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 define i32 @slp_add(ptr %p0) {
 entry:

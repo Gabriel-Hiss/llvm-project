@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unipo,verify -S %s | %FileCheck %s
 ; Constant Win64 register stores do not prove source formals. Keep the original
 ; signatures and call arguments rather than inferring them from call-site state.
 target triple = "x86_64-pc-windows-msvc"

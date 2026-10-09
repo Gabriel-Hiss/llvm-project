@@ -1,7 +1,7 @@
 ; Corpus: miniz-clang-o3/artifacts/miniz.post.ll, mz_zip_set_last_error.
 ; Actual null-check/load/store/return-PHI body, with normalized SSA names.
 ; Caller contexts and metadata are controlled proof/provenance regressions.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uninline,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uninline,verify -S %s | %FileCheck %s
 
 define i32 @mz_zip_set_last_error(ptr %p, i32 %error) {
 entry:

@@ -2,7 +2,7 @@
 ; __gxx_personality_seh0 passes through unchanged. Corpus: cpp-gcc-o0 map
 ; (__gxx_personality_seh0 + .gcc_except_table); IR shape from LLVM's own
 ; win-mixed-ehpersonality test (landingpad/cleanup/catch/typeid/resume).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-uneh -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-uneh -S %s | %FileCheck %s
 
 declare i32 @__gxx_personality_seh0(...)
 declare i32 @llvm.eh.typeid.for(ptr) readnone nounwind

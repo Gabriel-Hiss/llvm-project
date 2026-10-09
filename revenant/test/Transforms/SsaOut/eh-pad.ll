@@ -1,5 +1,5 @@
 ; SSA-out keeps exceptional dispatch and catchret edges in their EH blocks.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-ssaout,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-ssaout,verify -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define i32 @catch_phi
 ; CHECK: catchswitch within none [label %catch] unwind to caller

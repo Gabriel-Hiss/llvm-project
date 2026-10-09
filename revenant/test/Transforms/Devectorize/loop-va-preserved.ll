@@ -1,6 +1,6 @@
 ; Provenance survives the loop rewrite: !revenant.va on the acc phi and
 ; the vector load rides onto the scalar phi, scalar loads and chain adds.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
 

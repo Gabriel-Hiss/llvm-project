@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unhoist -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unhoist -S %s | %FileCheck %s
 ;
 ; Phase 2: GVN deletes a reload after a store and rewrites its uses to
 ; the stored value, leaving the load dead. The pass re-arms the dead

@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Rebuilder E vetoes, all taken from c-o2 lifted shapes:
 ;  - a dense uniform run (unrolled array window, not a struct),

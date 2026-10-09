@@ -1,7 +1,7 @@
 ; Lifted from c-gcc-o3 fill_vec in corpus/src/c/main.c:205-207.
 ; GCC O3 uses a counted loop of repeated <4 x i32> stores. Expand the
 ; store lanes without changing the counted-loop coverage.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define void @fill_vec(ptr %dst, i32 %value, i64 %count) {
 entry:

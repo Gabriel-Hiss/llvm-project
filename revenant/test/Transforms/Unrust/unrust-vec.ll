@@ -2,7 +2,7 @@
 ; `{ptr, cap, len}` triple allocas with the grow_one invoke; post SROAs
 ; the triple into scalar phis. The pass rebuilds a 24-byte frame when a
 ; buffer GEP survives without one.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unrust -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unrust -S %s | %FileCheck %s
 
 !llvm.module.flags = !{!0}
 !0 = !{i32 4, !"revenant.lang", !"rust"}

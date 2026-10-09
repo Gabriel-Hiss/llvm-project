@@ -1,6 +1,6 @@
 ; Corpus: c-clang-o1 artifacts/main.post.ll @minmax (ir-pre: ternary
 ; min/max/abs if-ladders in main.pre.ll). llvm.smax expands to cmp+select.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unselect -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unselect -S %s | %FileCheck %s
 
 declare i32 @llvm.smax.i32(i32, i32)
 

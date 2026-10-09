@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Plain C shift/or byte shuffles remain source-level arithmetic operations.
 define i32 @bswap32(i32 %x) {
 entry:

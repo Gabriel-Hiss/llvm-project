@@ -1,5 +1,5 @@
-; RUN: revenant-opt -passes='function(revenant-lift-normalize),verify' -S %s | FileCheck %s
-; RUN: revenant-opt -passes='function(revenant-lift-normalize,sroa,mem2reg,instcombine,revenant-lift-normalize),verify' -S %s | FileCheck %s --check-prefix=CLEAN
+; RUN: %revenant-opt -passes='function(revenant-lift-normalize),verify' -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes='function(revenant-lift-normalize,sroa,mem2reg,instcombine,revenant-lift-normalize),verify' -S %s | %FileCheck %s --check-prefix=CLEAN
 ; Reduced from c-clang-o2 sub_140024848 ir-clean: base + 48/64/72,
 ; i64 register phi, trunc i64 -> i32, and byte-addressed stores.
 target datalayout = "e-p:64:64-i64:64-n8:16:32:64"

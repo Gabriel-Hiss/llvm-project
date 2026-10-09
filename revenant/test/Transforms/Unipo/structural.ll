@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unipo,verify -S %s | %FileCheck %s
 ; Same bodies after constant substitution are not proof of a shared source
 ; function. Keep both signatures and preserve their direct calls.
 target triple = "x86_64-pc-windows-msvc"

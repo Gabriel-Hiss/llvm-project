@@ -3,7 +3,7 @@
 ; resume feed passes through a trunc of n.vec. All three are accepted
 ; only through resume phis (D-incoming 0, R-incomings Bound-derived).
 ; Corpus shape: c-clang-o2 copy_bytes.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define dso_local i32 @copy_bytes(ptr noundef %0, ptr noundef readonly captures(none) %1, i32 noundef %2) local_unnamed_addr #10 {
   %4 = icmp sgt i32 %2, 0

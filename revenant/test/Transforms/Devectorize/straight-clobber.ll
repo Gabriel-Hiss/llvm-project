@@ -2,7 +2,7 @@
 ; the scalar lanes materialize at the load (before the call), so the
 ; read is not moved past the write. Ports
 ; straight_load_stays_before_clobber_call.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 declare void @clobber(ptr)
 

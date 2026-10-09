@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-idioms -S %s -o - | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-idioms -S %s -o - | %FileCheck %s
 ; Real c-clang-o2 lift, corpus src/c/main.c:arith, VA 0x140001000.
 ; The multiply-high and signed correction chain computes (a-b)/7; the
 ; quotient-times-minus-seven residual computes (a-b)%7.

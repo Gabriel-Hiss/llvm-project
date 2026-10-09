@@ -1,7 +1,7 @@
 ; MachineOutliner-like shared fragment and call thunk, modeled on the
 ; OUTLINED_FUNCTION call pattern emitted by clang -Oz (tested in the
 ; Swe2DeoptOutliner probe from 2026-10-09). No symbol names drive matching.
-; RUN: %opt -load-pass-plugin=%plugin -passes='revenant-unoutline,verify' -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes='revenant-unoutline,verify' -S %s | %FileCheck %s
 
 define i32 @outlined_fragment(i32 %x) {
 entry:

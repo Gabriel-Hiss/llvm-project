@@ -1,7 +1,7 @@
 ; A memcmp-like loop body with no anchor call must not rewrite: the
 ; hand-built c::memcmp pattern needs a memcmp/strcmp direct call, and a
 ; bare loop is not one. Extra code never creates a match.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-patterns -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-patterns -S %s | %FileCheck %s
 
 define i64 @sum_loop(ptr %p, i64 %n) {
 entry:

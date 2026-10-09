@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-locals-to-slots -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-locals-to-slots -S %s | %FileCheck %s
 ;
 ; -O0 gives every named local a slot, including a merge value that lives in an
 ; acyclic code. Any PHI web therefore becomes one memory slot with a store on

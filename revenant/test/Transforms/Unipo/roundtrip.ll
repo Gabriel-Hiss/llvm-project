@@ -1,7 +1,7 @@
 ; Forward round-trip: stock deadargelim turns the pre shape (unused i32
 ; return, dead at every caller) into the post shape (void), and
 ; revenant-unipo inverts it back.
-; RUN: %opt -passes=deadargelim -S %s -o - | %opt -load-pass-plugin=%plugin -passes=revenant-unipo -S - | %FileCheck %s
+; RUN: %opt -passes=deadargelim -S %s -o - | %revenant-opt -passes=revenant-unipo -S - | %FileCheck %s
 
 ; CHECK: define internal i32 @roundtrip(ptr %a, i32 %n)
 ; CHECK: ret i32 %v

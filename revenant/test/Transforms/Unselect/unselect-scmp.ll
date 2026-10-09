@@ -2,7 +2,7 @@
 ; `if (a<b) return -1; if (a>b) return 1; return 0` ladder in main.pre.ll).
 ; llvm.scmp unfolds to the nested select the ladder lowers to, and each
 ; level becomes a diamond in the same fixed-point run.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unselect -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unselect -S %s | %FileCheck %s
 
 declare i32 @llvm.scmp.i32.i32(i32, i32)
 

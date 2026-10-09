@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnrotate.dll -passes=revenant-untailrec -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untailrec -S %s | %FileCheck %s
 
 ; Pre-opt recursive shape (from c-clang-o2 main.pre.ll @tail_gcd): the
 ; function already calls itself, so the pass must leave it untouched.

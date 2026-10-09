@@ -1,7 +1,7 @@
 ; Corpus: c-clang-o1 artifacts/main.post.ll @cmp_unsigned (ir-pre: nested
 ; if/return ladder in main.pre.ll). The chained selects become diamonds
 ; with merge phis; provenance survives on the forks.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unselect -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unselect -S %s | %FileCheck %s
 
 define i32 @cmp_unsigned(i32 %a, i32 %b) {
 ; CHECK-LABEL: define i32 @cmp_unsigned(

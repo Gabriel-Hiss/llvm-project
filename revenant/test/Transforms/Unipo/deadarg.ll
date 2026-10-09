@@ -1,7 +1,7 @@
 ; Dead-arg restore via explicit debug-value markers: rust-o3 `dot4` keeps
 ; `llvm.dbg.value(ptr poison, !DILocalVariable(arg: N))` for the lost formals.
 ; DISubprogram arity alone is deliberately not evidence.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unipo -verify-each -S %s | %FileCheck %s
 
 ; CHECK-LABEL: define internal i32 @dot4_like(ptr %ipa0, ptr %ipa1)
 ; CHECK: ret i32 70

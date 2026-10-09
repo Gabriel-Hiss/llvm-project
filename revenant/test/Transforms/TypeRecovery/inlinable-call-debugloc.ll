@@ -1,4 +1,4 @@
-; RUN: revenant-opt -passes=revenant-types -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-types -S %s | %FileCheck %s
 ;
 ; Type recovery adds a location before replay can inline a generated call
 ; whose lifted IR had no !dbg.

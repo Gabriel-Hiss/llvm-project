@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Epilogue shape (-O3 unroll-by-N with remainder): a 4x main loop over
 ; sum_vec plus a scalar remainder loop must fold the main loop to step 1
 ; and leave the remainder loop alone.

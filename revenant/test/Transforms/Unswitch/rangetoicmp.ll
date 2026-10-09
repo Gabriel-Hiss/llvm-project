@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Short range comparisons are ambiguous with source-level interval checks.
 ; Leave this two-value condition in branch form rather than guessing switch.
 ; CHECK-LABEL: define i32 @ranged(

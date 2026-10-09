@@ -2,7 +2,7 @@
 ; vector_push_back shape (len==cap guard + grow call + store/len bump
 ; across three blocks). The oracle catalog matches it at full coverage,
 ; but the region spans blocks, so the pass must leave it untouched.
-; RUN: env REVENANT_PATTERNS_CATALOG=%S/Inputs %opt -load-pass-plugin=%plugin -passes=revenant-patterns -S %s | %FileCheck %s
+; RUN: env REVENANT_PATTERNS_CATALOG=%S/Inputs %revenant-opt -passes=revenant-patterns -S %s | %FileCheck %s
 declare ptr @"??$_Emplace_reallocate@AEBH@?$vector@HV?$allocator@H@std@@@std@@AEAAPEAHQEAHAEBH@Z"(ptr, ptr, ptr)
 
 define void @push_like(ptr %0, i32 %1) {

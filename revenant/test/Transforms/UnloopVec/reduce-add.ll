@@ -3,7 +3,7 @@
 ; scalar tail. UnloopVec folds the dispatch to the scalar edge and erases
 ; the vector tiers, leaving the scalar loop. Corpus shape: c-clang-o2
 ; main.post.ll @sum_vec, scalar tail block %30.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec -S %s | %FileCheck %s
 
 define i32 @sum_vec(ptr noundef readonly captures(none) %0, i32 noundef %1) {
   %3 = icmp sgt i32 %1, 0

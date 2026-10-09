@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unsroa -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unsroa -S %s | %FileCheck %s
 ;
 ; Corpus: c-o2 sub_140001B00 (`struct_access(struct Point *p)`),
 ; Point = { i32 x, i32 y, const char *tag }. The caller constructs the

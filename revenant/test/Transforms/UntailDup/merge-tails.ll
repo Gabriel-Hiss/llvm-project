@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-untaildup -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-untaildup -S %s | %FileCheck %s
 ; Corpus: c-clang-o2 `early_returns` (ir-pre) has four `store+br` return
 ; leaves; simplifycfg tail merging folds them. Here two identical return
 ; tails merge back into one join.

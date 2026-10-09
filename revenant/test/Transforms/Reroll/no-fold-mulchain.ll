@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-reroll -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-reroll -S %s | %FileCheck %s
 ; Corpus-derived negative: @hash_vec's 4x scalar-unrolled main loop (%29)
 ; from target/parity/c-clang-o2/artifacts/main.post.ll (clang-cl -O2).
 ; Each window's add feeds a shared mul-chain, so the windows never tile
