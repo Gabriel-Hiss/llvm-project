@@ -167,7 +167,8 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
   if (*IPRva) {
     Va IP = I.vaOfRva(*IPRva);
     for (uint32_t N = 0; N < *IPCount; ++N, IP = IP.wrappingAdd(8)) {
-      auto Offset = u32(I, IP), State = i32(I, IP.wrappingAdd(4));
+      auto Offset = u32(I, IP);
+      auto State = i32(I, IP.wrappingAdd(4));
       if (!Offset || !State)
         break;
       F.CallSites.push_back({I.vaOfRva(*Offset), *State});
