@@ -6,7 +6,7 @@
 ; guarded arm reads a[0..N) exactly once and replaces it with the scalar
 ; counted loop the vectorizer started from, keeping the exit merge.
 ; Corpus shape: c-gcc-o3 sum_vec (target/parity/c-gcc-o3), sub_140001f90.
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
 define i64 @sum_vec(ptr %0, i64 %1) {
 bb_140001f90:
