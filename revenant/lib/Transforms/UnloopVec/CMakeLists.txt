@@ -28,7 +28,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
 endif()
 
-set(UNLOOPVEC_SOURCES UnloopVec.cpp UnvecMaps.cpp)
+set(UNLOOPVEC_SOURCES UnloopVec.cpp UnvecMaps.cpp UnloopVecWidths.cpp)
 if(COMMAND add_llvm_library)
   add_llvm_library(RevenantTransformUnloopVec STATIC ${UNLOOPVEC_SOURCES}
     LINK_LIBS LLVMCore LLVMSupport LLVMAnalysis
