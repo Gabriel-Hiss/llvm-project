@@ -98,12 +98,18 @@ every use reads lane 0 and all layouts agree; anything else keeps 128
 bits. Runs first inside devectorize so the later phases see plain scalar
 loops.
 
-**revenant-devectorize, phases 2-3.** Expects lane-0 output.
+**revenant-devectorize, phases 2-4.** Expects lane-0 output.
 Explodes auto-vectorized `i128`/`__v*` work into per-lane scalar ops:
 vector streams become per-element scalars in loops, reduction accumulators
 collapse to one scalar phi; straight-line slices scalarize for reroll.
-Guarantees conservative bail-outs: ymm/zmm upper lanes, cross-lane ops,
-unrecognized vector phis stay vector.
+The straight-line phase also explodes cross-width lane splits (`<2 x i64>`
+to `<4 x i32>`), lane-0 broadcasts (insertelement / zext+bitcast + shuffle),
+and manual i128 shift/bitcast/add horizontal folds, with per-lane alignment
+(common alignment of vector alignment and lane offset) and exact float lane
+constants. A final pair-split phase turns scalar-i128 copy webs (constant /
+load / phi webs feeding only stores) into i64 halves. Guarantees
+conservative bail-outs: ymm/zmm upper lanes, cross-lane ops, unrecognized
+vector phis, i128 arithmetic webs, and shared copy webs stay vector.
 
 **revenant-reroll (owner: MuseTxReroll).** Expects scalarized loops.
 Folds unrolled iteration copies back into one induction-variable step
@@ -135,21 +141,21 @@ the plugin loads under stock `opt`, the pass also reads
 Guarantees tolerance of commuted operands and extra code, and no change
 when the pattern set is missing or empty or confidence is low.
 
-**revenant-structure (owner: Swe2Structure).** Expects unopt (or patterns)
-output. Regions become `if`/`while`/`dowhile`/`for`/`switch` with
-`!revenant.region` on header terminators (block-list indices, `-1` none);
-irreducible edges get `!revenant.region !{!"goto", target}`. Guarantees a
-frontend ignoring annotations still emits correct code via labels + `goto`.
+**revenant-types (owner: MuseTypeRecovery, after unopt).** Expects deoptimized
+IR. Recovers locals/parameters and struct/class/vtable/enum shapes, expressed
+as DI (`DILocalVariable`, `DIBasicType`, `DIDerivedType`, `DICompositeType`)
+via RevenantIR helpers. It does not require region annotations.
 
-**revenant-types (owner: MuseTypeRecovery, post-structure).** Expects
-structured IR with region annotations. Recovers locals/parameters and
-struct/class/vtable/enum shapes, expressed as DI (`DILocalVariable`,
-`DIBasicType`, `DIDerivedType`, `DICompositeType`) via RevenantIR helpers.
-Guarantees region annotations and provenance survive; types only refine.
+**revenant-ssaout (owner: MuseSsaOut, after types).** Expects typed SSA. Undoes
+mem2reg/sroa into named `alloca`s with DI for the frontends. It may add
+critical-edge blocks for phi copies.
 
-**revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
-structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the
-frontends. Guarantees stable `bb_<va>` names and intact annotations.
+**revenant-structure (owner: LunaShapeCtrlR, terminal).** Expects typed SSA-out
+IR and runs after critical-edge splitting so descriptors use indices into the
+final block list. Regions become `if`/`while`/`dowhile`/`for`/`switch` with
+`!revenant.region` on header terminators (block-list indices, `-1` means none);
+irreducible edges get `!revenant.region !{!"goto", target}`. A frontend that
+ignores annotations still emits correct code with labels and `goto`.
 
 **revenant-unabi (owner: MuseDeoptAbi).** Module pass (not function): rewrites
 function signatures, snapshotting the function list first so erasure is safe.

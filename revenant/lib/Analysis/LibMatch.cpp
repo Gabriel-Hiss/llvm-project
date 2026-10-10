@@ -14,6 +14,7 @@
 #include "revenant/Core/Program.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <string>
@@ -138,6 +139,26 @@ static std::string nameKey(StringRef Name) {
     if (isAlnum(C) || C == '_')
       Key.push_back(C);
   return Key;
+}
+
+/// Name-collision key: the domain the lifter's `sanitizeName` produces, where
+/// alphanumerics, `_` and `.` carry over and every other byte becomes `_XX`
+/// hex. Uniqueness has to be decided on that spelling: the raw names can
+/// collide only after sanitization, and the lifter refuses to define two
+/// functions with the same IR name.
+static std::string sanitizedKey(StringRef Name) {
+  std::string Key;
+  Key.reserve(Name.size() * 3);
+  for (char C : Name) {
+    if (isAlnum(C) || C == '_' || C == '.') {
+      Key.push_back(C);
+    } else {
+      char Buf[4];
+      snprintf(Buf, sizeof(Buf), "_%02x", (unsigned char)C);
+      Key += Buf;
+    }
+  }
+  return Key.empty() ? std::string("f") : Key;
 }
 
 static uint32_t parseTypeBits(StringRef Type, uint32_t Fallback) {
@@ -381,7 +402,7 @@ void applyLibraryMatches(Program &P, Signatures &Sigs,
   std::set<std::string> UsedNames;
   for (const auto &[Address, Name] : *P.Names)
     if (!Chosen.count(Address) || !StringRef(Name).starts_with("sub_"))
-      UsedNames.insert(nameKey(Name));
+      UsedNames.insert(sanitizedKey(Name));
 
   for (const auto &[Start, Index] : Chosen) {
     const LibraryFunction &F = DB.Functions[Index];
@@ -390,15 +411,15 @@ void applyLibraryMatches(Program &P, Signatures &Sigs,
                        StringRef(Existing->second).starts_with("sub_");
     if (ReplaceName) {
       std::string Name = F.Name;
-      if (UsedNames.count(nameKey(Name)))
+      if (UsedNames.count(sanitizedKey(Name)))
         Name += "__" + utohexstr(Start.Value, true);
-      UsedNames.insert(nameKey(Name));
+      UsedNames.insert(sanitizedKey(Name));
       (*P.Names)[Start] = Name;
       auto RecordIt = P.Functions.find(Start);
       if (RecordIt != P.Functions.end())
         RecordIt->second.Name = std::move(Name);
     } else {
-      UsedNames.insert(nameKey(Existing->second));
+      UsedNames.insert(sanitizedKey(Existing->second));
     }
     auto SigIt = Sigs.Funcs.find(Start);
     if (SigIt == Sigs.Funcs.end() || !F.Prototype)
@@ -427,15 +448,15 @@ void applyLibraryMatches(Program &P, Signatures &Sigs,
   std::set<std::string> EmittedNames;
   for (const auto &[Address, Name] : *P.Names)
     if (!P.Functions.count(Address))
-      EmittedNames.insert(nameKey(Name));
+      EmittedNames.insert(sanitizedKey(Name));
   for (auto &[Start, Record] : P.Functions) {
     std::string &Name = (*P.Names)[Start];
     if (Name.empty())
       Name = Record.Name;
-    std::string Key = nameKey(Name);
+    std::string Key = sanitizedKey(Name);
     if (EmittedNames.count(Key)) {
       Name += "__" + utohexstr(Start.Value, true);
-      Key = nameKey(Name);
+      Key = sanitizedKey(Name);
     }
     EmittedNames.insert(Key);
     Record.Name = Name;

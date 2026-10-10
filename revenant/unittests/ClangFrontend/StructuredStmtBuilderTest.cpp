@@ -570,4 +570,169 @@ TEST(StructuredStmtBuilderTest, SehTryFinally) {
   EXPECT_NE(S.find("cleanup_finally"), std::string::npos);
 }
 
+TEST(StructuredStmtBuilderTest, EarlyReturnRegionUsesStructuredIf) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_early_return", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_early_return", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_b000", F);
+  llvm::BasicBlock *Return = BasicBlock::Create(C, "bb_b010", F);
+  llvm::BasicBlock *Continue = BasicBlock::Create(C, "bb_b020", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)), Return,
+                 Continue);
+  B.SetInsertPoint(Return);
+  B.CreateRet(llvm::ConstantInt::get(I32, 7));
+  B.SetInsertPoint(Continue);
+  B.CreateRet(B.CreateAdd(X, llvm::ConstantInt::get(I32, 1)));
+
+  SmallVector<Metadata *, 2> Ops{
+      MDString::get(C, "if"),
+      ConstantAsMetadata::get(llvm::ConstantInt::getSigned(
+          llvm::Type::getInt32Ty(C), -1))};
+  Entry->getTerminator()->setMetadata("revenant.region", MDNode::get(C, Ops));
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("if"), std::string::npos);
+  EXPECT_NE(S.find("return 7"), std::string::npos);
+  EXPECT_NE(S.find("return"), std::string::npos);
+  EXPECT_EQ(S.find("goto"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, SwitchDefaultAndCaseShareBody) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_switch_shared_default", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_switch_shared_default", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_c000", F);
+  llvm::BasicBlock *Case = BasicBlock::Create(C, "bb_c010", F);
+  llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_c020", F);
+  llvm::IRBuilder<> B(Entry);
+  auto *SW = B.CreateSwitch(X, Case, 1);
+  SW->addCase(llvm::ConstantInt::get(I32, 0), Case);
+  B.SetInsertPoint(Case);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(Follow);
+  B.CreateRet(X);
+  tagRegion(Entry->getTerminator(), "switch", {indexOf(*F, Follow)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("switch"), std::string::npos);
+  EXPECT_NE(S.find("case 0"), std::string::npos);
+  EXPECT_NE(S.find("default"), std::string::npos);
+  EXPECT_EQ(S.find("goto"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, SharedReturnSlotBecomesBranchReturns) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_shared_return", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_shared_return", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_d000", F);
+  llvm::BasicBlock *ReturnOne = BasicBlock::Create(C, "bb_d010", F);
+  llvm::BasicBlock *ReturnTwo = BasicBlock::Create(C, "bb_d020", F);
+  llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_d030", F);
+  llvm::IRBuilder<> B(Entry);
+  llvm::AllocaInst *Slot = B.CreateAlloca(I32, nullptr, "return.slot");
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)),
+                 ReturnOne, ReturnTwo);
+  B.SetInsertPoint(ReturnOne);
+  B.CreateStore(llvm::ConstantInt::get(I32, 1), Slot);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(ReturnTwo);
+  B.CreateStore(llvm::ConstantInt::get(I32, 2), Slot);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(Follow);
+  B.CreateRet(B.CreateLoad(I32, Slot));
+  tagRegion(Entry->getTerminator(), "if", {indexOf(*F, Follow)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("return 1"), std::string::npos);
+  EXPECT_NE(S.find("return 2"), std::string::npos);
+  EXPECT_EQ(S.find("goto"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, NestedReturnArmsDoNotNeedGotoEdges) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_nested_shared_return", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_nested_shared_return", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_e000", F);
+  llvm::BasicBlock *Nested = BasicBlock::Create(C, "bb_e010", F);
+  llvm::BasicBlock *ReturnZero = BasicBlock::Create(C, "bb_e020", F);
+  llvm::BasicBlock *ReturnOne = BasicBlock::Create(C, "bb_e030", F);
+  llvm::BasicBlock *ReturnTwo = BasicBlock::Create(C, "bb_e040", F);
+  llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_e050", F);
+  llvm::IRBuilder<> B(Entry);
+  llvm::AllocaInst *Slot = B.CreateAlloca(I32, nullptr, "return.slot");
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)), Nested,
+                 ReturnZero);
+  B.SetInsertPoint(Nested);
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 1)),
+                 ReturnOne, ReturnTwo);
+  B.SetInsertPoint(ReturnZero);
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), Slot);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(ReturnOne);
+  B.CreateStore(llvm::ConstantInt::get(I32, 1), Slot);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(ReturnTwo);
+  B.CreateStore(llvm::ConstantInt::get(I32, 2), Slot);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(Follow);
+  B.CreateRet(B.CreateLoad(I32, Slot));
+  tagRegion(Entry->getTerminator(), "if", {indexOf(*F, Follow)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("return 0"), std::string::npos);
+  EXPECT_NE(S.find("return 1"), std::string::npos);
+  EXPECT_NE(S.find("return 2"), std::string::npos);
+  EXPECT_EQ(S.find("goto"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_generic_loop", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_generic_loop", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_f000", F);
+  llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_f010", F);
+  llvm::BasicBlock *Body = BasicBlock::Create(C, "bb_f020", F);
+  llvm::BasicBlock *BreakTest = BasicBlock::Create(C, "bb_f030", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_f040", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Header);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 0)), Body,
+                 BreakTest);
+  B.SetInsertPoint(Body);
+  B.CreateBr(Header);
+  B.SetInsertPoint(BreakTest);
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)), Exit,
+                 Body);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(X);
+  tagRegion(Header->getTerminator(), "loop",
+            {indexOf(*F, Header), indexOf(*F, Body), indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("while"), std::string::npos);
+  EXPECT_NE(S.find("break"), std::string::npos);
+}
+
 } // namespace

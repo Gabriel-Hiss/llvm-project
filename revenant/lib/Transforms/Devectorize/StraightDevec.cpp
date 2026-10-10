@@ -20,19 +20,18 @@
 // producers bail the block. Killed values must have no uses outside the
 // block. The CFG never changes.
 //
-// New values use direct Create/new calls into their block (no IRBuilder);
-// float lane constants are UndefValue (ConstantFP::get faults the APFloat
-// printer under the plugin build).
+// New values use direct Create/new calls into their block (no IRBuilder).
 //
 //===----------------------------------------------------------------------===//
 
 #include "StraightDevec.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 
@@ -54,6 +53,18 @@ void inheritMeta(const Instruction *Src, Instruction *Dst) {
   if (MDNode *N = Src->getMetadata(OPAQUE_MD))
     Dst->setMetadata(OPAQUE_MD, N);
   Dst->setDebugLoc(Src->getDebugLoc());
+}
+// Alignment guaranteed at a lane's byte offset from a vector access with
+// alignment A: the common alignment of A and the offset. Lane 0 keeps A;
+// lane j > 0 is only as aligned as its offset allows (e.g. align 16 at
+// offset 8 is really align 8). Never exceeds the element ABI alignment.
+static Align laneAlign(MaybeAlign A, uint64_t Off, unsigned ElemABI) {
+  uint64_t Known = A ? A->value() : 1;
+  uint64_t Common = std::gcd(Known, Off);
+  unsigned Clamped = (unsigned)std::min<uint64_t>(Common, ElemABI);
+  if (Clamped == 0)
+    Clamped = 1;
+  return Align(Clamped);
 }
 
 bool vecParts(Type *T, unsigned &Lanes, Type *&Elem) {
@@ -95,12 +106,18 @@ bool isLaneOp(unsigned Opcode) {
   }
 }
 
+// One lane of a vector-typed constant as an Elem-typed scalar. Reuses the
+// existing constant values (never synthesizes float constants): a splat
+// reuses its element, a per-lane vector reuses lane L. Poison lanes stay
+// poison (not undef): uses that trap on poison must keep trapping.
 Value *laneConst(Constant *C, Type *Elem, unsigned Lane) {
   if (isa<UndefValue>(C))
     return UndefValue::get(Elem);
+  if (isa<PoisonValue>(C))
+    return PoisonValue::get(Elem);
   if (isa<ConstantAggregateZero>(C)) {
     if (Elem->isFloatingPointTy())
-      return UndefValue::get(Elem);
+      return ConstantFP::getZero(Elem);
     return ConstantInt::get(Elem, 0);
   }
   if (auto *CV = dyn_cast<ConstantVector>(C)) {
@@ -118,11 +135,38 @@ Value *laneConst(Constant *C, Type *Elem, unsigned Lane) {
         return ConstantInt::get(
             Elem, CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits()));
       }
+      if (auto *CF = dyn_cast<ConstantFP>(L)) {
+        if (!Elem->isFloatingPointTy())
+          return nullptr;
+        if (CF->getType() == Elem)
+          return CF;
+        return nullptr;
+      }
       return nullptr;
     }
   }
-  if (Elem->isFloatingPointTy())
-    return UndefValue::get(Elem);
+  if (auto *CDV = dyn_cast<ConstantDataVector>(C)) {
+    Constant *Splat = CDV->getSplatValue();
+    if (Splat && Splat->getType() == Elem)
+      return Splat;
+    if (Lane >= CDV->getNumElements())
+      return nullptr;
+    Constant *L = CDV->getElementAsConstant(Lane);
+    if (L->getType() == Elem)
+      return L;
+    if (auto *CI = dyn_cast<ConstantInt>(L)) {
+      if (!Elem->isIntegerTy())
+        return nullptr;
+      return ConstantInt::get(
+          Elem, CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits()));
+    }
+    return nullptr;
+  }
+  if (auto *CF = dyn_cast<ConstantFP>(C)) {
+    if (CF->getType() == Elem)
+      return CF;
+    return nullptr;
+  }
   if (auto *CI = dyn_cast<ConstantInt>(C))
     return ConstantInt::get(
         Elem, CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits()));
@@ -200,9 +244,11 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
       if (LI->isVolatile() || !LI->isSimple())
         return Fail();
       unsigned Esz = E->getScalarSizeInBits() / 8;
+      unsigned ElemABI = F.getParent()->getDataLayout().getABITypeAlign(E).value();
       SmallVector<Value *, 4> Ls;
       for (unsigned j = 0; j < L; ++j) {
-        auto *Off = ConstantInt::get(I64, (uint64_t)(j * Esz));
+        uint64_t ByteOff = (uint64_t)j * Esz;
+        auto *Off = ConstantInt::get(I64, ByteOff);
         auto *G = GetElementPtrInst::Create(
             I8, LI->getPointerOperand(), Off, LI->getName() + ".p",
             LI->getIterator());
@@ -210,6 +256,7 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
         auto *Ln = new LoadInst(E, G, LI->getName() + ".l",
                                 LI->isVolatile(), LI->getIterator());
         inheritMeta(LI, Ln);
+        Ln->setAlignment(laneAlign(LI->getAlign(), ByteOff, ElemABI));
         LocalEmitted.push_back(G);
         LocalEmitted.push_back(Ln);
         ++Cx.Changed;
@@ -217,6 +264,42 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
       }
       Cx.Lanes[LI] = Ls;
       Cx.Kill.push_back(LI);
+      continue;
+    }
+    // Scalar i128 lane shift (GCC SLP horizontal-fold shape): an i128 that
+    // already carries lanes (bitcast from a laned total-128-bit vector)
+    // shifted right by a whole-lane multiple permutes lanes, zero-filling
+    // the top. Only lane-multiple shifts model exactly; anything else, or
+    // an unlaned operand, is left alone. Must run before the BinaryOperator
+    // branch below (scalar i128 is not a vector type, so that branch would
+    // skip it).
+    if (I.getOpcode() == Instruction::LShr && I.getType()->isIntegerTy(128)) {
+      auto *BO = cast<BinaryOperator>(&I);
+      auto *Amt = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!Amt)
+        continue;
+      uint64_t Sh = Amt->getZExtValue();
+      auto It = Cx.Lanes.find(BO->getOperand(0));
+      if (It == Cx.Lanes.end() || It->second.empty())
+        continue;
+      Type *LaneTy = It->second[0]->getType();
+      unsigned LaneBits = LaneTy->getScalarSizeInBits();
+      for (Value *Ln : It->second)
+        if (Ln->getType() != LaneTy)
+          LaneBits = 0;
+      if (LaneBits == 0 || Sh % LaneBits != 0 || Sh >= 128)
+        continue;
+      unsigned N = It->second.size();
+      unsigned K = (unsigned)(Sh / LaneBits);
+      Value *Zero = LaneTy->isFloatingPointTy()
+                        ? (Value *)UndefValue::get(LaneTy)
+                        : (Value *)ConstantInt::get(LaneTy, 0);
+      SmallVector<Value *, 4> Ls;
+      for (unsigned j = 0; j < N; ++j)
+        Ls.push_back(j + K < N ? It->second[j + K] : Zero);
+      Cx.Lanes[BO] = Ls;
+      Cx.Kill.push_back(BO);
+      ++Cx.Changed;
       continue;
     }
     if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
@@ -246,12 +329,78 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
       continue;
     }
     if (auto *BI = dyn_cast<BitCastInst>(&I)) {
+      // i128 <-> total-128-bit vector lane forwarding (horizontal-fold and
+      // zext-broadcast shapes): a bitcast between i128 and a laned vector
+      // whose primitive size is 128 bits carries the same lanes. Lane count
+      // and lane types must match on the i128 -> vector direction.
+      // Unlaned i128 operands keep the old behavior (skip / bail below).
+      if (BI->getDestTy()->isIntegerTy(128)) {
+        auto *SrcVT = dyn_cast<FixedVectorType>(BI->getSrcTy());
+        if (!SrcVT || SrcVT->getPrimitiveSizeInBits() != 128)
+          continue;
+        unsigned SL = SrcVT->getNumElements();
+        Type *SE = SrcVT->getElementType();
+        SmallVector<Value *, 4> AV;
+        if (!Cx.lanesOf(BI->getOperand(0), SL, SE, AV))
+          return Fail();
+        Cx.Lanes[BI] = AV;
+        Cx.Kill.push_back(BI);
+        ++Cx.Changed;
+        continue;
+      }
       unsigned L = 0;
       Type *E = nullptr;
       if (!vecParts(BI->getDestTy(), L, E))
         continue;
-      if (BI->getDestTy() != BI->getSrcTy())
-        return Fail();
+      if (BI->getSrcTy()->isIntegerTy(128)) {
+        auto It = Cx.Lanes.find(BI->getOperand(0));
+        if (It == Cx.Lanes.end() || It->second.size() != L)
+          return Fail();
+        for (Value *Ln : It->second)
+          if (Ln->getType() != E)
+            return Fail();
+        Cx.Lanes[BI] = It->second;
+        Cx.Kill.push_back(BI);
+        ++Cx.Changed;
+        continue;
+      }
+      if (BI->getDestTy() != BI->getSrcTy()) {
+        // Cross-width lane split (GCC dot4 shape): <2 x i64> -> <4 x i32>
+        // exposes each i64 lane as low/high i32 (trunc + lshr/trunc). Only
+        // the 2:1 integer narrowing is modeled; other widths bail.
+        auto *SrcVT = dyn_cast<FixedVectorType>(BI->getSrcTy());
+        Type *SE = SrcVT ? SrcVT->getElementType() : nullptr;
+        if (!SrcVT || !SE || !SE->isIntegerTy() || !E->isIntegerTy() ||
+            SE->getScalarSizeInBits() != 2 * E->getScalarSizeInBits() ||
+            SrcVT->getNumElements() * 2 != L)
+          return Fail();
+        SmallVector<Value *, 4> AV;
+        if (!Cx.lanesOf(BI->getOperand(0), SrcVT->getNumElements(), SE, AV))
+          return Fail();
+        unsigned HalfBits = E->getScalarSizeInBits();
+        SmallVector<Value *, 4> Ls;
+        for (unsigned j = 0, N = SrcVT->getNumElements(); j < N; ++j) {
+          auto *Lo = new TruncInst(AV[j], E, BI->getName() + ".lo",
+                                   BI->getIterator());
+          inheritMeta(BI, Lo);
+          auto *Sh = BinaryOperator::CreateLShr(
+              AV[j], ConstantInt::get(SE, HalfBits), BI->getName() + ".hi.s",
+              BI->getIterator());
+          inheritMeta(BI, Sh);
+          auto *Hi = new TruncInst(Sh, E, BI->getName() + ".hi",
+                                   BI->getIterator());
+          inheritMeta(BI, Hi);
+          LocalEmitted.push_back(Lo);
+          LocalEmitted.push_back(Sh);
+          LocalEmitted.push_back(Hi);
+          Cx.Changed += 3;
+          Ls.push_back(Lo);
+          Ls.push_back(Hi);
+        }
+        Cx.Lanes[BI] = Ls;
+        Cx.Kill.push_back(BI);
+        continue;
+      }
       SmallVector<Value *, 4> AV;
       if (!Cx.lanesOf(BI->getOperand(0), L, E, AV))
         return Fail();
@@ -317,13 +466,16 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
       if (!Cx.lanesOf(SI->getValueOperand(), L, E, AS))
         return Fail();
       unsigned Esz = E->getScalarSizeInBits() / 8;
+      unsigned ElemABI = F.getParent()->getDataLayout().getABITypeAlign(E).value();
       for (unsigned j = 0; j < L; ++j) {
-        auto *Off = ConstantInt::get(I64, (uint64_t)(j * Esz));
+        uint64_t ByteOff = (uint64_t)j * Esz;
+        auto *Off = ConstantInt::get(I64, ByteOff);
         auto *G = GetElementPtrInst::Create(I8, SI->getPointerOperand(),
                                             Off, SI->getName() + ".p",
                                             SI->getIterator());
         inheritMeta(SI, G);
-        auto *NS = new StoreInst(AS[j], G, SI->isVolatile(), SI->getAlign(),
+        auto *NS = new StoreInst(AS[j], G, SI->isVolatile(),
+                                 laneAlign(SI->getAlign(), ByteOff, ElemABI),
                                  SI->getIterator());
         inheritMeta(SI, NS);
         LocalEmitted.push_back(G);
@@ -334,10 +486,61 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
       ++Cx.Changed;
       continue;
     }
+    // Lane-0 broadcast (zlib SLP shape): a scalar zero-extended to i128 is
+    // the low lane of a <2 x i64> broadcast. Models as lanes [s, undef] so
+    // the later shuffle/add/store split scalarizes lane 0. Only narrow
+    // integer sources; anything else is left alone.
+    if (auto *ZI = dyn_cast<ZExtInst>(&I)) {
+      if (!ZI->getDestTy()->isIntegerTy(128))
+        continue;
+      if (!ZI->getSrcTy()->isIntegerTy(8) &&
+          !ZI->getSrcTy()->isIntegerTy(16) &&
+          !ZI->getSrcTy()->isIntegerTy(32) &&
+          !ZI->getSrcTy()->isIntegerTy(64))
+        continue;
+      Type *I64 = Type::getInt64Ty(Ctx);
+      Value *Op = ZI->getOperand(0);
+      Value *Lo = Op;
+      if (!Op->getType()->isIntegerTy(64)) {
+        Lo = new ZExtInst(Op, I64, ZI->getName() + ".b.lo",
+                           ZI->getIterator());
+        inheritMeta(ZI, cast<Instruction>(Lo));
+        LocalEmitted.push_back(cast<Instruction>(Lo));
+        ++Cx.Changed;
+      }
+      SmallVector<Value *, 4> Ls;
+      Ls.push_back(Lo);
+      Ls.push_back(UndefValue::get(I64));
+      Cx.Lanes[ZI] = Ls;
+      Cx.Kill.push_back(ZI);
+      ++Cx.Changed;
+      continue;
+    }
     unsigned IL = 0;
     Type *IE = nullptr;
-    if (isa<InsertElementInst>(&I) && vecParts(I.getType(), IL, IE))
-      return Fail();
+    // Lane-0 broadcast (zlib SLP shape): insertelement of a scalar into
+    // lane 0 of a poison/undef/zero base models as lanes [s, undef, ...].
+    // Other insertelement shapes still bail the block.
+    if (auto *II = dyn_cast<InsertElementInst>(&I)) {
+      if (!vecParts(II->getType(), IL, IE))
+        continue;
+      auto *Idx = dyn_cast<ConstantInt>(II->getOperand(2));
+      auto *Base = dyn_cast<Constant>(II->getOperand(0));
+      bool BaseEmpty =
+          Base && (isa<UndefValue>(Base) || isa<PoisonValue>(Base) ||
+                   isa<ConstantAggregateZero>(Base));
+      if (!Idx || !Idx->isZero() || !BaseEmpty ||
+          II->getOperand(1)->getType() != IE)
+        return Fail();
+      SmallVector<Value *, 4> Ls;
+      Ls.push_back(II->getOperand(1));
+      for (unsigned j = 1; j < IL; ++j)
+        Ls.push_back(UndefValue::get(IE));
+      Cx.Lanes[II] = Ls;
+      Cx.Kill.push_back(II);
+      ++Cx.Changed;
+      continue;
+    }
     if (auto *CI = dyn_cast<CallInst>(&I)) {
       if (isa<FixedVectorType>(CI->getType()))
         return Fail();
@@ -369,13 +572,20 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
   // outside BB; otherwise roll back. Uses *inside* later blocks are only
   // acceptable for scalar aliases (extract dsts): the function-wide pass
   // below rewires them. Vector defs used outside stay vector: fail.
+  // Killed i128 lane carriers (fold bitcasts/shifts) must die whole: every
+  // use must be another killed def in this block, else a live i128 consumer
+  // (arithmetic, store, return) would dangle and the block rolls back.
+  DenseSet<Instruction *> KillSet(Cx.Kill.begin(), Cx.Kill.end());
   for (Instruction *K : Cx.Kill) {
     // Scalar aliases (extracts) may be used outside; vector defs may not.
     if (Cx.Subs.contains(K))
       continue;
+    bool IsI128 = K->getType()->isIntegerTy(128);
     for (const Use &U : K->uses()) {
       auto *UI = dyn_cast<Instruction>(U.getUser());
       if (!UI || UI->getParent() != BB)
+        return false;
+      if (IsI128 && !KillSet.contains(UI))
         return false;
     }
   }
@@ -425,6 +635,18 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
     if (K->getParent() == nullptr || !K->use_empty())
       continue;
     K->eraseFromParent();
+  }
+  // Sweep emitted lane scalars left use-free (dead fold lanes, unselected
+  // shuffle lanes). Stores are never swept: a store with no uses is still
+  // observable. Reverse order erases consumers before their lane inputs.
+  for (auto It = LocalEmitted.rbegin(); It != LocalEmitted.rend(); ++It) {
+    Instruction *K = *It;
+    if (K->getParent() == nullptr || !K->use_empty())
+      continue;
+    if (isa<StoreInst>(K) || K->isTerminator())
+      continue;
+    K->eraseFromParent();
+    ++Cx.Changed;
   }
   ChangedOut += Cx.Changed;
   EmittedOut.append(LocalEmitted.begin(), LocalEmitted.end());
