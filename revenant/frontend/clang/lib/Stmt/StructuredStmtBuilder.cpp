@@ -61,6 +61,11 @@ struct Region {
   BasicBlock *Header = nullptr;
   BasicBlock *Follow = nullptr; // merge/exit block, outside the region
   BasicBlock *Latch = nullptr;  // loops only
+  BasicBlock *Preheader = nullptr;
+  bool ForShape = false;
+  Stmt *ForInit = nullptr;
+  Expr *ForStep = nullptr;
+  bool ForPiecesAttempted = false;
   /// Members: for if/switch, blocks dominated by Header and post-dominated
   /// by Follow; for loops, dominated by Header and able to reach Latch
   /// without passing through Follow. Header itself is always a member for
@@ -171,6 +176,7 @@ private:
   /// `step = store (binop load IV, k) -> IV` in the latch; on match claim
   /// the instructions and build the init statement and step expression.
   Stmt *tryForPieces(Region &R, Expr *&Step);
+  void prepareForLoop(Region &R);
   /// Does the member list end in a statement that already transfers
   /// control (return/break/continue/goto)?
   static bool endsTerminal(ArrayRef<Stmt *> SS);
@@ -425,6 +431,19 @@ void StructuredStmtBuilder::collectRegions() {
       computeLoopMembers(R);
     else
       computeIfMembers(R);
+    if (isLoopKind(R.Kind)) {
+      for (BasicBlock *P : predecessors(R.Header)) {
+        auto *BI = dyn_cast<BranchInst>(P->getTerminator());
+        if (!R.Members.contains(P) && BI && BI->isUnconditional() &&
+            BI->getSuccessor(0) == R.Header) {
+          if (R.Preheader) {
+            R.Preheader = nullptr;
+            break;
+          }
+          R.Preheader = P;
+        }
+      }
+    }
     Regions[&BB] = std::make_unique<Region>(std::move(R));
   }
   for (BasicBlock *BB : Blocks)
@@ -694,13 +713,29 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     Region *Loop = ActiveLoops.back();
     if (Target == Loop->Follow)
       return new (*AST) BreakStmt(SourceLocation());
-    if (Target != Loop->Header && Target != Loop->Latch)
+    if (Target == Loop->Header)
+      return new (*AST) ContinueStmt(SourceLocation());
+    if (Target != Loop->Latch)
       return nullptr;
-    for (Instruction &I : *Target)
-      if (!I.isTerminator() && !isa<PHINode>(I) &&
-          !isa<DbgInfoIntrinsic>(I))
-        return nullptr;
+    for (Instruction &I : *Target) {
+      if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
+          ForClaimed.contains(&I))
+        continue;
+      return nullptr;
+    }
     return new (*AST) ContinueStmt(SourceLocation());
+  };
+  auto inlineLoopFollowIf = [&](BasicBlock *Target) -> Stmt * {
+    if (ActiveLoops.empty())
+      return nullptr;
+    Region *Loop = ActiveLoops.back();
+    Region *Nested = regionOf(Target);
+    if (!Nested || Nested->Kind != RegionKind::If || Nested->Degraded ||
+        Nested->Follow != Loop->Follow)
+      return nullptr;
+    if (Emitted.contains(Target))
+      return gotoTo(Target);
+    return emitRegionHeader(*Nested, Loop);
   };
   auto loopTrampolineTransfer = [&](BasicBlock *Target) -> Stmt * {
     if (ActiveLoops.empty() || pred_size(Target) != 1)
@@ -713,6 +748,10 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     if (!Edge || !Edge->isUnconditional())
       return nullptr;
     Stmt *Transfer = loopTransfer(Edge->getSuccessor(0));
+    if (Stmt *Nested = inlineLoopFollowIf(Edge->getSuccessor(0))) {
+      Emitted.insert(Target);
+      return Nested;
+    }
     if (Transfer)
       Emitted.insert(Target);
     return Transfer;
@@ -748,6 +787,8 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       }
       if (Stmt *Transfer = loopTransfer(S))
         return Transfer;
+      if (Stmt *Nested = inlineLoopFollowIf(S))
+        return Nested;
       if (Stmt *Transfer = loopTrampolineTransfer(S))
         return Transfer;
       return gotoTo(S);
@@ -776,6 +817,8 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       }
       if (Stmt *Transfer = loopTransfer(S))
         return Transfer;
+      if (Stmt *Nested = inlineLoopFollowIf(S))
+        return Nested;
       if (Stmt *Transfer = loopTrampolineTransfer(S))
         return Transfer;
       return gotoTo(S);
@@ -836,11 +879,56 @@ void StructuredStmtBuilder::emitMembers(
   for (BasicBlock *BB : Blocks) {
     if (!Set.contains(BB))
       continue;
+    bool DeferIntoLoop = false;
+    for (auto &KV : Regions) {
+      Region *Loop = KV.second.get();
+      if (Loop->Kind != RegionKind::Loop || Loop->Degraded ||
+          !Loop->Preheader || !Set.contains(Loop->Preheader) ||
+          Emitted.contains(Loop->Preheader) || !Loop->Members.contains(BB))
+        continue;
+      auto BlockIt = llvm::find(Blocks, BB);
+      auto PreheaderIt = llvm::find(Blocks, Loop->Preheader);
+      if (BlockIt != Blocks.end() && PreheaderIt > BlockIt) {
+        DeferIntoLoop = true;
+        break;
+      }
+    }
+    if (DeferIntoLoop)
+      continue;
+    Region *Nested = regionOf(BB);
+    Region *PreheaderLoop = nullptr;
+    for (auto &KV : Regions) {
+      Region *Candidate = KV.second.get();
+      if (Candidate->Kind == RegionKind::Loop &&
+          Candidate->Preheader == BB && !Candidate->Degraded &&
+          Set.contains(Candidate->Header)) {
+        PreheaderLoop = Candidate;
+        break;
+      }
+    }
+    if (PreheaderLoop) {
+      prepareForLoop(*PreheaderLoop);
+      if (!Emitted.insert(BB).second)
+        continue;
+      bool Labeled = NeededLabels.contains(BB);
+      size_t Start = Out.size();
+      emitBlockStmts(BB, Out);
+      if (Labeled) {
+        SmallVector<Stmt *, 8> Inner(Out.begin() + Start, Out.end());
+        Out.resize(Start);
+        CompoundStmt *CS =
+            CompoundStmt::Create(*AST, Inner, FPOptionsOverride(),
+                                 SourceLocation(), SourceLocation());
+        Out.push_back(new (*AST) LabelStmt(SourceLocation(), labelFor(BB), CS));
+      }
+      Out.push_back(emitRegionHeader(*PreheaderLoop, &R));
+      continue;
+    }
     if (BB == R.Header || BB == R.Latch)
       continue; // header/latch code is consumed by the construct
-    // Each block prints once per function: nested regions sharing a
+    // Each block prints once per function: nested if regions sharing one
     // follow all claim the shared tail.
-    if (Region *Nested = regionOf(BB); Nested && !Nested->Degraded) {
+    if (Nested && !Nested->Degraded) {
       if (!Emitted.insert(BB).second)
         continue;
       Out.push_back(emitRegionHeader(*Nested, &R));
@@ -955,7 +1043,6 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
     return CompoundStmt::Create(*AST, Head, FPOptionsOverride(),
                                 SourceLocation(), SourceLocation());
   };
-
   auto emitArm = [&](BasicBlock *Arm,
                      const SmallPtrSetImpl<BasicBlock *> &Mem) -> Stmt * {
     if (!ActiveLoops.empty() && Arm != R.Follow && pred_size(Arm) == 1) {
@@ -973,6 +1060,12 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
         Emitted.insert(Arm);
         return new (*AST) BreakStmt(SourceLocation());
       }
+    }
+    if (Outer && isLoopKind(Outer->Kind) && R.Follow == Outer->Follow) {
+      if (Arm == R.Follow)
+        return new (*AST) BreakStmt(SourceLocation());
+      if (Outer->ForShape && Arm == Outer->Latch)
+        return new (*AST) ContinueStmt(SourceLocation());
     }
     if (Arm == R.Follow || Mem.empty())
       return nullptr;
@@ -1046,6 +1139,7 @@ Stmt *StructuredStmtBuilder::tryForPieces(Region &R, Expr *&Step) {
   }
   if (!Pre || !R.Latch)
     return nullptr;
+  R.Preheader = Pre;
 
   auto lastStore = [](BasicBlock *BB) -> StoreInst * {
     for (Instruction &I : llvm::reverse(*BB)) {
@@ -1058,27 +1152,49 @@ Stmt *StructuredStmtBuilder::tryForPieces(Region &R, Expr *&Step) {
     return nullptr;
   };
   StoreInst *StepStore = lastStore(R.Latch);
-  StoreInst *InitStore = lastStore(Pre);
   auto *HBI = dyn_cast<BranchInst>(R.Header->getTerminator());
   ICmpInst *Cmp =
       (HBI && HBI->isConditional()) ? dyn_cast<ICmpInst>(HBI->getCondition())
                                     : nullptr;
-  if (!StepStore || !InitStore || !Cmp)
+  if (!StepStore || !Cmp)
     return nullptr;
   auto *Upd = dyn_cast<llvm::BinaryOperator>(StepStore->getValueOperand());
   if (!Upd || (Upd->getOpcode() != Instruction::Add &&
                Upd->getOpcode() != Instruction::Sub))
     return nullptr;
   Value *IV = StepStore->getPointerOperand();
-  if (InitStore->getPointerOperand() != IV)
-    return nullptr;
   auto *StepLd = dyn_cast<LoadInst>(Upd->getOperand(0));
   if (!StepLd || StepLd->getPointerOperand() != IV)
     return nullptr;
+  StoreInst *InitStore = nullptr;
+  for (Instruction &I : *Pre)
+    if (auto *Store = dyn_cast<StoreInst>(&I);
+        Store && Store->getPointerOperand() == IV) {
+      if (InitStore)
+        return nullptr;
+      InitStore = Store;
+    }
+  if (!InitStore)
+    return nullptr;
+
   bool RefsIV = false;
+  SmallPtrSet<const Value *, 8> Seen;
+  SmallVector<const Value *, 8> Work;
   for (Value *Op : Cmp->operands())
-    if (auto *L = dyn_cast<LoadInst>(Op))
+    Work.push_back(Op);
+  while (!Work.empty() && !RefsIV) {
+    const Value *V = Work.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    if (auto *L = dyn_cast<LoadInst>(V)) {
       RefsIV |= L->getPointerOperand() == IV;
+      continue;
+    }
+    if (auto *I = dyn_cast<Instruction>(V))
+      if (I->getParent() == R.Header && !I->mayHaveSideEffects())
+        for (const Use &Op : I->operands())
+          Work.push_back(Op.get());
+  }
   if (!RefsIV)
     return nullptr;
 
@@ -1108,6 +1224,15 @@ Stmt *StructuredStmtBuilder::tryForPieces(Region &R, Expr *&Step) {
   }
   return Init;
 }
+void StructuredStmtBuilder::prepareForLoop(Region &R) {
+  if (R.ForPiecesAttempted ||
+      (R.Kind != RegionKind::For && R.Kind != RegionKind::Loop))
+    return;
+  R.ForInit = tryForPieces(R, R.ForStep);
+  R.ForPiecesAttempted = true;
+  R.ForShape = R.Kind == RegionKind::Loop && R.ForInit && R.ForStep;
+}
+
 
 bool StructuredStmtBuilder::endsTerminal(ArrayRef<Stmt *> SS) {
   if (SS.empty())
@@ -1124,8 +1249,9 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   SmallVector<Stmt *, 8> Body;
   SmallVector<Stmt *, 8> Tail; // latch statements for do-while
 
-  if (R.Kind == RegionKind::For)
-    Init = tryForPieces(R, Step);
+  prepareForLoop(R);
+  Init = R.ForInit;
+  Step = R.ForStep;
 
   if (R.Kind == RegionKind::DoWhile) {
     // Body first, test last: condition comes from the latch's conditional
@@ -1195,8 +1321,10 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   // Generic loops run until an explicit break; other loop kinds test at the header.
   auto *BI = dyn_cast<BranchInst>(R.Header->getTerminator());
   if (R.Kind == RegionKind::Loop) {
-    Cond = IntegerLiteral::Create(*AST, APInt(32, 1), AST->IntTy,
-                                  SourceLocation());
+    Cond = R.ForShape
+               ? nullptr
+               : IntegerLiteral::Create(*AST, APInt(32, 1), AST->IntTy,
+                                        SourceLocation());
     emitBlockStmts(R.Header, Body);
     if (Stmt *T = emitTerminator(R.Header, &R))
       Body.push_back(T);
@@ -1255,7 +1383,7 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   Stmt *B = CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                  SourceLocation(), SourceLocation());
   Stmt *Loop = nullptr;
-  if (R.Kind == RegionKind::For)
+  if (R.Kind == RegionKind::For || R.ForShape)
     Loop = new (*AST)
         ForStmt(*AST, Init, Cond, nullptr, Step, B, SourceLocation(),
                 SourceLocation(), SourceLocation());

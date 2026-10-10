@@ -740,6 +740,51 @@ TEST(StructuredStmtBuilderTest, NestedReturnArmsDoNotNeedGotoEdges) {
   EXPECT_EQ(S.find("goto"), std::string::npos);
 }
 
+TEST(StructuredStmtBuilderTest, ForContinueEdgesEnterTheLatch) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_for_latch_continue", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32, I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_for_latch_continue", M);
+  llvm::Argument *N = F->getArg(0);
+  llvm::Argument *Skip = F->getArg(1);
+  llvm::BasicBlock *Pre = BasicBlock::Create(C, "bb_f100", F);
+  llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_f110", F);
+  llvm::BasicBlock *Body = BasicBlock::Create(C, "bb_f120", F);
+  llvm::BasicBlock *Work = BasicBlock::Create(C, "bb_f130", F);
+  llvm::BasicBlock *Latch = BasicBlock::Create(C, "bb_f140", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_f150", F);
+  llvm::IRBuilder<> B(Pre);
+  llvm::AllocaInst *IV = B.CreateAlloca(I32, nullptr, "i");
+  llvm::AllocaInst *Sum = B.CreateAlloca(I32, nullptr, "sum");
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), IV);
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), Sum);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Header);
+  llvm::Value *I = B.CreateLoad(I32, IV);
+  B.CreateCondBr(B.CreateICmpSLT(I, N), Body, Exit);
+  B.SetInsertPoint(Body);
+  B.CreateCondBr(B.CreateICmpEQ(Skip, llvm::ConstantInt::get(I32, 0)),
+                 Latch, Work);
+  B.SetInsertPoint(Work);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, Sum), I), Sum);
+  B.CreateBr(Latch);
+  B.SetInsertPoint(Latch);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, IV),
+                            llvm::ConstantInt::get(I32, 1)),
+                IV);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(B.CreateLoad(I32, Sum));
+  tagRegion(Header->getTerminator(), "for",
+            {indexOf(*F, Header), indexOf(*F, Latch), indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("for"), std::string::npos);
+  EXPECT_NE(S.find("continue"), std::string::npos);
+}
+
 TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
   LLVMContext &C = ctx();
   llvm::Module M("t_generic_loop", C);
@@ -752,6 +797,8 @@ TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
   llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_f010", F);
   llvm::BasicBlock *Body = BasicBlock::Create(C, "bb_f020", F);
   llvm::BasicBlock *BreakTest = BasicBlock::Create(C, "bb_f030", F);
+  llvm::BasicBlock *ExitEdge = BasicBlock::Create(C, "bb_f038", F);
+  llvm::BasicBlock *ContinueEdge = BasicBlock::Create(C, "bb_f039", F);
   llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_f040", F);
   llvm::IRBuilder<> B(Entry);
   B.CreateBr(Header);
@@ -759,18 +806,24 @@ TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
   B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 0)), Body,
                  BreakTest);
   B.SetInsertPoint(Body);
-  B.CreateBr(Header);
+  B.CreateBr(ContinueEdge);
   B.SetInsertPoint(BreakTest);
-  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)), Exit,
-                 Body);
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)),
+                 ExitEdge, Body);
+  B.SetInsertPoint(ExitEdge);
+  B.CreateBr(Exit);
+  B.SetInsertPoint(ContinueEdge);
+  B.CreateBr(Header);
   B.SetInsertPoint(Exit);
   B.CreateRet(X);
   tagRegion(Header->getTerminator(), "loop",
-            {indexOf(*F, Header), indexOf(*F, Body), indexOf(*F, Exit)});
+            {indexOf(*F, Header), indexOf(*F, ContinueEdge),
+             indexOf(*F, Exit)});
 
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("while"), std::string::npos);
   EXPECT_NE(S.find("break"), std::string::npos);
+  EXPECT_NE(S.find("continue"), std::string::npos);
 }
 
 TEST(StructuredStmtBuilderTest, IfHeaderLeafStatementsEmitBeforeBranch) {
