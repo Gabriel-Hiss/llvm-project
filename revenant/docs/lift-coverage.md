@@ -7,14 +7,23 @@ a PE artifact, so these figures are not directly comparable to the prior
 instructions across 1,622 distinct opcodes; the counter reported 40,730
 decode failures.
 
-The generated dispatcher marks 336,499 occurrences opaque (0.81%). Using the
+The generated dispatcher marks 331,658 occurrences opaque (0.80%). Using the
 same mnemonic-prefix grouping for control flow as the previous census,
-8,960,412 instructions are control flow, including 305,583 opaque indirect
+8,960,411 instructions are control flow, including 305,582 opaque indirect
 branches/calls, traps and far returns. Excluding those instructions leaves
-32,505,741 non-control instructions, of which 30,916 are opaque (0.095%); the
-other 32,474,825 (99.905%) use a DSL or supported direct-pattern case.
+32,505,742 non-control instructions, of which 26,076 are opaque (0.080%); the
+other 32,479,666 (99.920%) use a DSL or supported direct-pattern case. This
+remeasurement adds AVX-512 masked operations and mask-register moves
+(`VMOVDQU8Z*`, `VPSUBQZ256rmk`, `VPCMPUQZ256rmi`, `KMOVQkm`, ...), which lift
+as a k-register `<N x i1>` select over `llvm.fma` / the plain vector op, and
+the x87 environment, save/restore and BCD forms (`FNSTENV`/`FLDENV`,
+`FSAVE`/`FRSTOR`, `FXSAVE`/`FXRSTOR`, `FBLD`/`FBSTP`), which lift as
+memory-modeling calls over the modeled control/status words and x87 stack.
+Together these families account for 162,082 corpus instructions (216 AVX-512
+opcodes, 6 x87 opcodes); the non-control opaque count fell from 30,916 to
+26,076 instructions.
 
-The current `NEG8m`/`NEG16m`/`NEG32m`/`NEG64m` locked forms use an internal
+The `NEG8m`/`NEG16m`/`NEG32m`/`NEG64m` locked forms use an internal
 sequentially consistent compare-exchange loop. The differential suite checks
 the memory result and condition flags for locked 64-bit NEG.
 

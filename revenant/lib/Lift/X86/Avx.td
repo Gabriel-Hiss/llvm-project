@@ -387,6 +387,38 @@ foreach M = ["VMOVNTDQ", "VMOVNTPS", "VMOVNTPD"] in
   foreach W = ["", "Y"] in
     def : RVMatch { string Glob = M # W # "mr"; dag Body = (rv_store (rv_addr $dst), (rv_op 1)); }
 
+// AVX-512 EVEX full-vector moves. The unmasked forms carry no ISel pattern
+// (NoRMPattern/NoMRPattern) so they are spelled out here; the masked forms
+// come from the pattern inverter as a k-register select. Each width is
+// enumerated so a glob cannot capture the masked twin and drop the mask.
+foreach M = ["VMOVDQU8", "VMOVDQU16", "VMOVDQU32", "VMOVDQU64",
+             "VMOVDQA32", "VMOVDQA64", "VMOVAPS", "VMOVAPD",
+             "VMOVUPS", "VMOVUPD"] in
+  foreach W = ["Z128", "Z256", "Z"] in {
+    def : RVMatch {
+      string Glob = M # W # "rm";
+      dag Body = (rv_setz $dst, (rv_op 0));
+    }
+    def : RVMatch {
+      string Glob = M # W # "mr";
+      dag Body = (rv_store (rv_addr $dst), (rv_op 1));
+    }
+    def : RVMatch {
+      string Glob = M # W # "rr";
+      dag Body = (rv_setz $dst, (rv_op 0));
+    }
+  }
+
+// Masked EVEX stores: store only the lanes the k register selects.
+foreach M = ["VMOVDQU8", "VMOVDQU16", "VMOVDQU32", "VMOVDQU64",
+             "VMOVDQA32", "VMOVDQA64", "VMOVAPS", "VMOVAPD",
+             "VMOVUPS", "VMOVUPD"] in
+  foreach W = ["Z128", "Z256", "Z"] in
+    def : RVMatch {
+      string Glob = M # W # "mrk";
+      dag Body = (rv_kvstore $dst, $src, $mask);
+    }
+
 // FMA3's three encodings permute the tied destination and source operands.
 def : RVMatch {
   string Glob = "VFMADD213*";
@@ -446,3 +478,44 @@ foreach Op = ["VFMADDSUB132", "VFMADDSUB213", "VFMADDSUB231",
         dag Body = (rv_setz $dst,
                     (rv_fmaaddsub Op, $src1, $src2, $src3));
       }
+
+// ---- AVX-512 mask registers and the instructions the pattern inverter
+// does not cover ---------------------------------------------------------
+//
+// The masked vector forms (VMOVDQU*, the arithmetic ops, VFMADD*, ...) come
+// from inverted patterns with the k register read as an i64 (see vecExpr).
+// What is left is the k-register file itself and the mask-writing compares,
+// whose result is a k register rather than a vector.
+
+// KMOV k<->k/m/gpr. $src is the k register, memory or gpr source; the
+// destination k register merge-writes the low bits (the emitter decides the
+// width from the operand register class).
+foreach K = ["KMOVB", "KMOVW", "KMOVD", "KMOVQ"] in {
+  def : RVMatch { string Glob = K # "kk*"; dag Body = (rv_kmov $dst, $src); }
+  def : RVMatch { string Glob = K # "km*"; dag Body = (rv_kmov $dst, $src); }
+  def : RVMatch { string Glob = K # "kr*"; dag Body = (rv_kmov $dst, $src); }
+  def : RVMatch { string Glob = K # "mk*"; dag Body = (rv_kst $dst, $src); }
+  def : RVMatch { string Glob = K # "rk*"; dag Body = (rv_set $dst, $src); }
+}
+
+// VPCMPx: compare two vectors into a k register (predicate = $cc). Operand
+// order is ($dst, $src1, $src2, imm); the masked forms AND with $mask.
+foreach Suffix = ["B", "W", "D", "Q"] in
+  foreach W = ["", "Z", "Z128", "Z256"] in {
+    def : RVMatch {
+      string Glob = "VPCMP" # Suffix # W # "rr*";
+      dag Body = (rv_kcmp "s", $dst, $src1, $src2, $cc);
+    }
+    def : RVMatch {
+      string Glob = "VPCMPU" # Suffix # W # "rr*";
+      dag Body = (rv_kcmp "u", $dst, $src1, $src2, $cc);
+    }
+    def : RVMatch {
+      string Glob = "VPCMP" # Suffix # W # "rm*";
+      dag Body = (rv_kcmp "s", $dst, $src1, $src2, $cc);
+    }
+    def : RVMatch {
+      string Glob = "VPCMPU" # Suffix # W # "rm*";
+      dag Body = (rv_kcmp "u", $dst, $src1, $src2, $cc);
+    }
+  }

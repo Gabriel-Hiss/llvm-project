@@ -320,4 +320,42 @@ TEST(LiftFunction, SoftwareInterruptsLift) {
   EXPECT_FALSE(DebugTrap->doesNotReturn());
 }
 
+TEST(LiftFunction, CalleeClobberPreservesLoopIv) {
+  // c-gcc-o2 map_call_vec (0x140001ea0) keeps its loop induction variable in
+  // r8/r9 across a call to the local leaf sub_140001cc0, which only writes
+  // eax/ecx. A call that clobbered every volatile register would leave the
+  // loop's `cmp r8, r9` branch condition undefined.
+  auto Fx = open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Va Start(0x140001ea0);
+  auto It = P.Functions.find(Start);
+  ASSERT_NE(It, P.Functions.end()) << "map_call_vec not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("callee_clobber", C);
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, nullptr,
+                                   nullptr, /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  // The call to the leaf must not store undef into r8/r9 (the loop IV).
+  const llvm::Function *Leaf = M.getFunction("sub_140001CC0");
+  ASSERT_NE(Leaf, nullptr);
+  for (const llvm::User *U : Leaf->users())
+    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U))
+      for (const llvm::User *CU : CI->users())
+        if (const auto *SI = llvm::dyn_cast<llvm::StoreInst>(CU))
+          ASSERT_FALSE(llvm::isa<llvm::UndefValue>(SI->getValueOperand()))
+              << "call clobbered a register the leaf does not write";
+
+  // No conditional branch may test an undefined condition.
+  for (const llvm::BasicBlock &BB : *Lifted->Fn)
+    if (const auto *BI = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator()))
+      if (BI->isConditional())
+        ASSERT_FALSE(llvm::isa<llvm::UndefValue>(BI->getCondition()))
+            << "branch on undef in " << BB.getName().str();
+}
+
 } // end anonymous namespace

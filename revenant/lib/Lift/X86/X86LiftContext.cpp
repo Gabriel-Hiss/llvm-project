@@ -127,12 +127,19 @@ void X86LiftContext::regBitsWrite(MCRegister Reg, Value *V) {
 Value *X86LiftContext::regRead(MCRegister Reg, Type *Ty) {
   if (Reg == X86::RIP || Reg == X86::EIP)
     return fromInt(resolveVAI64(NextVA), Ty);
+  // Mask registers have their own i64 file; K0 is hardwired all-ones.
+  if (Reg >= X86::K0 && Reg <= X86::K7)
+    return fromInt(kregRead(Reg), Ty);
   return fromInt(regBitsRead(Reg), Ty);
 }
 
 void X86LiftContext::regWrite(MCRegister Reg, Value *V) {
   if (Reg == X86::RIP || Reg == X86::EIP)
     return;
+  if (Reg >= X86::K0 && Reg <= X86::K7) {
+    kregWrite(Reg, V);
+    return;
+  }
   regBitsWrite(Reg, V);
 }
 
@@ -1660,18 +1667,6 @@ Value *X86LiftContext::x87Math(StringRef Name, Value *A, Value *B_) {
                   {B.CreateIntrinsic(Intrinsic::floor, {F80}, {Fb})}));
   }
   return UndefValue::get(F80);
-}
-
-void X86LiftContext::x87Env(StringRef Dir, Value *Addr) {
-  // Only the control/status words map onto modeled state; the ip/opcode/tag
-  // fields are opaque to us either direction.
-  if (Dir == "st") {
-    memWriteAddr(Addr, x87ControlWord());
-    memWriteAddr(B.CreateAdd(Addr, constI(2, 64)), x87StatusWord());
-  } else {
-    x87SetControlWord(memReadAddr(Addr, iN(16)));
-    x87SetStatusWord(memReadAddr(B.CreateAdd(Addr, constI(2, 64)), iN(16)));
-  }
 }
 
 unsigned X86LiftContext::x87IndexOf(MCRegister Reg) const {
