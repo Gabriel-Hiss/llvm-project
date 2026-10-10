@@ -231,48 +231,12 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       return 0;
   }
 
-  // Merged scalar init: fold lane-0 splat inits with the reduction op.
-  Value *MergedInit = nullptr;
-  {
-    Value *Fold = nullptr;
-    for (auto &A : Accs) {
-      Value *L0 = splatInit(A.Init, Elem, Lanes);
-      if (!L0)
-        return 0;
-      auto *LC = dyn_cast<Constant>(L0);
-      auto *FC = Fold ? dyn_cast<Constant>(Fold) : nullptr;
-      if (Fold && (!LC || !FC))
-        return 0;
-      if (!Fold) {
-        Fold = L0;
-        continue;
-      }
-      auto *LCa = cast<ConstantInt>(LC);
-      auto *FCa = cast<ConstantInt>(FC);
-      APInt R = FCa->getValue();
-      APInt V = LCa->getValue();
-      switch (Opcode) {
-      case Instruction::Add:
-        R = R + V;
-        break;
-      case Instruction::Mul:
-        R = R * V;
-        break;
-      case Instruction::And:
-        R = R & V;
-        break;
-      case Instruction::Or:
-        R = R | V;
-        break;
-      case Instruction::Xor:
-        R = R ^ V;
-        break;
-      default:
-        return 0;
-      }
-      Fold = ConstantInt::get(Elem, R);
-    }
-    MergedInit = Fold;
+  // Per-acc splat init check: every acc init must fold to one Elem lane
+  // value. The emit stage seeds each scalar phi from its own acc's init
+  // (no cross-acc merging: independent reductions keep independent sums).
+  for (auto &A : Accs) {
+    if (!splatInit(A.Init, Elem, Lanes))
+      return 0;
   }
 
   // Outside-use precheck: every outside use of an acc phi, backedge, or
@@ -319,13 +283,16 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         Reduces.push_back(CI);
         continue;
       }
-      // One lane-wise add combining acc backs in the exit block is part
-      // of the reduction (merged_val in the reference); record it for
-      // erasure after aliasing, still no other outside uses allowed.
+      // One lane-wise combine of acc backs in the exit block is part of the
+      // reduction (merged_val in the reference); record it for erasure after
+      // aliasing, still no other outside uses allowed. The combine opcode
+      // must equal the reduction opcode: reduce distributes over a lane-wise
+      // combine only when both apply the same operation (add over add); a
+      // mul-reduction over an add-combine has no chain-end form.
       auto *BO = dyn_cast<BinaryOperator>(const_cast<Instruction *>(UI));
       unsigned CL = 0;
       Type *CE = nullptr;
-      if (BO && BO->getOpcode() == Instruction::Add &&
+      if (BO && BO->getOpcode() == Opcode &&
           isIntVec128(BO->getType(), CL, CE) && CL == Lanes && CE == Elem &&
           AccTree(BO->getOperand(0), 0) && AccTree(BO->getOperand(1), 0)) {
         Combines.push_back(BO);
@@ -334,7 +301,35 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       return 0;
     }
   }
-  // Vector-typed exit PHIs fed from H also block.
+  // Reduces over an exit-block combine: the combine lives outside H so the
+  // loop above never visits its users. Every combine must feed at least one
+  // matching reduce (else the scalar chains would not cover its value), and
+  // no other outside use is allowed. (devectorize-mixed-reduce-roots.ll: the
+  // second reduce over acc+acc was missed here, left on the severed vector
+  // PHI, and returned 16 instead of 24.)
+  DenseSet<const Instruction *> SeenReduce;
+  for (Instruction *R : Reduces)
+    SeenReduce.insert(R);
+  for (BinaryOperator *C : Combines) {
+    bool FedReduce = false;
+    for (User *U : C->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() == H)
+        return 0;
+      auto *CI = dyn_cast<CallInst>(UI);
+      auto *II = CI ? dyn_cast<IntrinsicInst>(CI) : nullptr;
+      if (II && II->getIntrinsicID() == reduceIntrinsic(Opcode) &&
+          AccTree(II->getOperand(0), 0)) {
+        if (SeenReduce.insert(CI).second)
+          Reduces.push_back(CI);
+        FedReduce = true;
+        continue;
+      }
+      return 0;
+    }
+    if (!FedReduce)
+      return 0;
+  }
   for (BasicBlock *S : Br->successors()) {
     if (S == H)
       continue;
@@ -431,17 +426,106 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         return 0;
     }
   }
+  // Pre-mutation explodability check (multi-acc-dependency.ll): Ex below
+  // has no PHI case, so any stream whose lane tree touches an accumulator
+  // PHI/back would fail AFTER scalar PHIs exist and old edges are severed
+  // (verifier abort on half-built s.unopt PHIs). Prove everything
+  // explodable here, before creating any IR.
+  std::function<bool(Value *, unsigned)> CanExplode =
+      [&](Value *V, unsigned Depth) -> bool {
+    if (Depth > 32)
+      return false;
+    if (AccVals.contains(V))
+      return false;
+    if (auto *C = dyn_cast<Constant>(V)) {
+      for (unsigned j = 0; j < Lanes; ++j)
+        if (!laneConst(C, Elem, j))
+          return false;
+      return true;
+    }
+    if (isa<UndefValue>(V))
+      return true;
+    if (auto *LI = dyn_cast<LoadInst>(V))
+      return LI->getParent() == H;
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getParent() != H || !isLaneBinop(BO->getOpcode()))
+        return false;
+      return CanExplode(BO->getOperand(0), Depth + 1) &&
+             CanExplode(BO->getOperand(1), Depth + 1);
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(V)) {
+      if (BI->getDestTy() != BI->getSrcTy())
+        return false;
+      return CanExplode(BI->getOperand(0), Depth + 1);
+    }
+    return false;
+  };
+  for (auto &A : Accs)
+    if (!CanExplode(A.Stream, 0))
+      return 0;
+  for (Instruction &I : *H) {
+    if (AccBacks.contains(&I) || isa<PHINode>(&I))
+      continue;
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (isa<FixedVectorType>(LI->getType()) && !CanExplode(LI, 0))
+        return 0;
+      continue;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (isa<FixedVectorType>(BO->getType()) && !CanExplode(BO, 0))
+        return 0;
+      continue;
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(&I)) {
+      if (isa<FixedVectorType>(BI->getDestTy()) &&
+          !CanExplode(BI->getOperand(0), 0))
+        return 0;
+      continue;
+    }
+  }
+  // Reduce-root shape check before mutation: each reduce aliases to one
+  // acc chain end, or to one lane-wise exit-block add of two acc chain
+  // ends. AccTree above already proved this shape; re-check the exact emit
+  // cases so the defensive bail below never fires post-mutation.
+  for (Instruction *R : Reduces) {
+    Value *Root = cast<IntrinsicInst>(R)->getOperand(0);
+    auto IsAcc = [&](Value *V) {
+      for (auto &A : Accs)
+        if (V == A.Phi || V == A.Back)
+          return true;
+      return false;
+    };
+    if (IsAcc(Root))
+      continue;
+    auto *BO = dyn_cast<BinaryOperator>(Root);
+    if (!BO || BO->getOpcode() != Instruction::Add ||
+        !isa<FixedVectorType>(BO->getType()) || BO->getParent() == H ||
+        !IsAcc(BO->getOperand(0)) || !IsAcc(BO->getOperand(1)))
+      return 0;
+  }
 
-  // Emit: scalar acc phi first (init edge only; backedge closes below).
+  // Emit: one scalar acc phi per vector acc phi (init edge only; backedges
+  // close below). Each vector reduction keeps its own accumulator: sharing
+  // one chain across independent reductions would merge their sums and any
+  // outer add of two reduces would double the total (multi-reduce.ll).
   LLVMContext &Ctx = F.getContext();
   Type *I8 = Type::getInt8Ty(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx);
   unsigned Esz = Elem->getScalarSizeInBits() / 8;
-  PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
-  S->addIncoming(MergedInit, InitBB);
-  // Provenance: the merged acc represents every vector acc phi. Copy
-  // from the first acc in classification order (= header phi order).
-  inheritMeta(Accs[0].Phi, S);
+  SmallVector<Value *, 4> Inits;
+  for (auto &A : Accs) {
+    Value *L0 = splatInit(A.Init, Elem, Lanes);
+    if (!L0)
+      return 0; // pre-mutation: no scalar PHI created yet, nothing to clean
+    Inits.push_back(L0);
+  }
+  SmallVector<PHINode *, 4> SS;
+  for (unsigned a = 0; a < Accs.size(); ++a) {
+    PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
+    S->addIncoming(Inits[a], InitBB);
+    inheritMeta(Accs[a].Phi, S);
+    SS.push_back(S);
+  }
 
   DenseMap<const Value *, Value *> Subs;
   DenseMap<const Value *, SmallVector<Value *, 4>> LaneMemo;
@@ -483,6 +567,7 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     } else if (auto *LI = dyn_cast<LoadInst>(V)) {
       if (LI->getParent() == H) {
         Ok = true;
+        MaybeAlign BaseAlign = LI->getAlign();
         for (unsigned j = 0; j < Lanes && Ok; ++j) {
           auto *Off = ConstantInt::get(I64, (uint64_t)(j * Esz));
           auto *G = GetElementPtrInst::Create(
@@ -492,6 +577,14 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
           auto *L = new LoadInst(Elem, G, LI->getName() + ".l",
                                  LI->isVolatile(), LI->getIterator());
           inheritMeta(LI, L);
+          // Lane alignment = MinAlign(base, lane offset): lane 0 keeps the
+          // vector's alignment (fault-symmetric with the original on
+          // under-aligned inputs), later lanes only what their offset
+          // proves. Dropping alignment entirely would erase UB the source
+          // program promised and diverge fault behavior (fuzz trial 1).
+          if (BaseAlign)
+            L->setAlignment(
+                commonAlignment(*BaseAlign, (uint64_t)j * (uint64_t)Esz));
           Ls.push_back(L);
         }
       }
@@ -527,24 +620,26 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   (void)Explode;
   (void)Empty;
 
-  // Subs for acc phis (scalar phi) and valid lane-0 acc extracts.
-  for (auto &A : Accs)
-    Subs[A.Phi] = S;
+  // Subs for acc phis (own scalar phi each) and valid lane-0 acc extracts.
+  for (unsigned a = 0; a < Accs.size(); ++a)
+    Subs[Accs[a].Phi] = SS[a];
   for (Instruction &I : *H) {
     auto *EI = dyn_cast<ExtractElementInst>(&I);
     if (!EI)
       continue;
-    for (auto &A : Accs)
-      if (EI->getVectorOperand() == A.Phi) {
-        Subs[&I] = S;
+    for (unsigned a = 0; a < Accs.size(); ++a)
+      if (EI->getVectorOperand() == Accs[a].Phi) {
+        Subs[&I] = SS[a];
         Kill.push_back(&I);
       }
   }
 
-  // Walk in order: explode streams, extend the scalar chain at acc
-  // updates. Chain operations append before the update instruction so
+  // Walk in order: explode streams, extend each acc's own scalar chain at
+  // its update. Chain operations append before the update instruction so
   // intra-block SSA order holds.
-  Value *Chain = S;
+  SmallVector<Value *, 4> Chains;
+  for (auto *S : SS)
+    Chains.push_back(S);
   SmallVector<Instruction *, 16> Walk;
   for (Instruction &I : *H)
     Walk.push_back(&I);
@@ -553,23 +648,26 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     if (isa<PHINode>(&I))
       continue;
     if (AccBacks.contains(&I)) {
-      // Acc update: explode the stream side, fold lanes into the chain.
-      // The vector update itself dies: sever its phi edge FIRST so the
-      // old acc phi no longer references it (else phi<->update pin each
-      // other live and neither erases).
-      for (auto &A : Accs)
-        if (A.Back == &I)
-          for (unsigned k = 0, KN = A.Phi->getNumIncomingValues(); k < KN; ++k)
-            if (A.Phi->getIncomingBlock(k) == H)
-              A.Phi->setIncomingValue(
-                  k, llvm::UndefValue::get(A.Phi->getType()));
-      Value *Stream = nullptr;
-      for (auto &A : Accs)
-        if (A.Back == &I)
-          Stream = A.Stream;
+      // Acc update: explode the stream side FIRST, fold lanes into that
+      // acc's own chain. The pre-mutation check above proved this explode
+      // succeeds; even so, sever the old phi edge only after the explode
+      // so a surprise failure leaves no half-built state for this update.
+      // (Severing first is what stranded half-built s.unopt PHIs and
+      // aborted the verifier on multi-acc-dependency.ll.)
+      unsigned Idx = 0;
+      for (unsigned a = 0; a < Accs.size(); ++a)
+        if (Accs[a].Back == &I)
+          Idx = a;
+      Value *Stream = Accs[Idx].Stream;
       auto *Ls = Ex(Resolve(Stream));
       if (!Ls)
-        return 0; // precheck promised success; defensive, no partial emit
+        return 0; // unreachable: pre-mutation CanExplode proved success
+      for (unsigned k = 0, KN = Accs[Idx].Phi->getNumIncomingValues();
+           k < KN; ++k)
+        if (Accs[Idx].Phi->getIncomingBlock(k) == H)
+          Accs[Idx].Phi->setIncomingValue(
+              k, llvm::UndefValue::get(Accs[Idx].Phi->getType()));
+      Value *Chain = Chains[Idx];
       for (unsigned j = 0; j < Lanes; ++j) {
         auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
                                          Chain, (*Ls)[j],
@@ -577,6 +675,7 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         inheritMeta(&I, N);
         Chain = N;
       }
+      Chains[Idx] = Chain;
       Subs[&I] = Chain;
       Kill.push_back(&I);
       continue;
@@ -609,15 +708,66 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     }
   }
 
-  // Close the scalar backedge. The old vector acc phis keep their own
+  // Close each scalar backedge. The old vector acc phis keep their own
   // (vector-typed) backedge slots untouched: they die by erasure below
   // once use-free, never by type-breaking slot rewrite.
-  S->addIncoming(Chain, H);
-  for (auto &A : Accs)
-    Subs[A.Back] = Chain;
+  for (unsigned a = 0; a < Accs.size(); ++a) {
+    SS[a]->addIncoming(Chains[a], H);
+    Subs[Accs[a].Back] = Chains[a];
+  }
+  // Each reduce aliases to its own accumulator's chain end. The precheck's
+  // AccTree proves which acc(s) feed each reduce operand; with one acc per
+  // chain the operand's acc set decides the replacement. A reduce over a
+  // two-acc combine (Combines) keeps the old merged behavior: sum the two
+  // chain ends with the same opcode.
   unsigned NReduce = 0;
   for (Instruction *R : Reduces) {
-    R->replaceAllUsesWith(Chain);
+    auto *II = cast<IntrinsicInst>(R);
+    Value *Root = II->getOperand(0);
+    // Peel one lane-wise combine of acc backs (the exit-block merge). The
+    // opcode must match the precheck's combine rule (== reduction Opcode).
+    Value *AddL = nullptr, *AddR = nullptr;
+    if (auto *BO = dyn_cast<BinaryOperator>(Root)) {
+      if (BO->getOpcode() == Opcode &&
+          isa<FixedVectorType>(BO->getType()) && BO->getParent() != H) {
+        AddL = BO->getOperand(0);
+        AddR = BO->getOperand(1);
+      }
+    }
+    // Scalar image of an acc-rooted value: the backedge (post-update) maps
+    // to the scalar chain end; the PHI (pre-update value on the exit edge)
+    // maps to the scalar accumulator PHI itself, which holds the
+    // start-of-iteration value. Conflating them includes the last body
+    // update in a PHI-rooted reduce (devectorize-preupdate-reduce.ll:
+    // one iteration over four ones returned 4 instead of 0).
+    auto ImageOf = [&](Value *V) -> Value * {
+      for (unsigned a = 0; a < Accs.size(); ++a) {
+        if (V == Accs[a].Back)
+          return Chains[a];
+        if (V == Accs[a].Phi)
+          return SS[a];
+      }
+      return nullptr;
+    };
+    Value *Repl = nullptr;
+    if (!AddL) {
+      Repl = ImageOf(Root);
+      if (!Repl)
+        return 0; // precheck promised acc-rooted; defensive
+    } else {
+      // reduce distributes over the lane-wise combine (same opcode, checked
+      // in the precheck): reduce(a+b) = reduce(a) OP reduce(b). Each side
+      // maps through its own scalar image (PHI->phi, Back->chain end), so a
+      // combine of pre-update values stays pre-update.
+      Value *IL = ImageOf(AddL), *IR = ImageOf(AddR);
+      if (!IL || !IR)
+        return 0;
+      auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode, IL, IR,
+                                       "s.unopt.m", R->getIterator());
+      inheritMeta(R, N);
+      Repl = N;
+    }
+    R->replaceAllUsesWith(Repl);
     if (R->use_empty()) {
       R->eraseFromParent();
       ++NReduce;
