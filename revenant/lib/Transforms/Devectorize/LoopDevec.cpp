@@ -567,6 +567,7 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     } else if (auto *LI = dyn_cast<LoadInst>(V)) {
       if (LI->getParent() == H) {
         Ok = true;
+        MaybeAlign BaseAlign = LI->getAlign();
         for (unsigned j = 0; j < Lanes && Ok; ++j) {
           auto *Off = ConstantInt::get(I64, (uint64_t)(j * Esz));
           auto *G = GetElementPtrInst::Create(
@@ -576,6 +577,14 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
           auto *L = new LoadInst(Elem, G, LI->getName() + ".l",
                                  LI->isVolatile(), LI->getIterator());
           inheritMeta(LI, L);
+          // Lane alignment = MinAlign(base, lane offset): lane 0 keeps the
+          // vector's alignment (fault-symmetric with the original on
+          // under-aligned inputs), later lanes only what their offset
+          // proves. Dropping alignment entirely would erase UB the source
+          // program promised and diverge fault behavior (fuzz trial 1).
+          if (BaseAlign)
+            L->setAlignment(
+                commonAlignment(*BaseAlign, (uint64_t)j * (uint64_t)Esz));
           Ls.push_back(L);
         }
       }
