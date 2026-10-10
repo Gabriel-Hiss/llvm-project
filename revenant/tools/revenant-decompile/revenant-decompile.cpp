@@ -187,7 +187,12 @@ int main(int Argc, char **Argv) {
       auto Lib = Classification.LibraryNames.find(Start);
       if (Lib != Classification.LibraryNames.end())
         Name = Lib->second;
-      outs() << format_hex(Start.Value, 0) << "\t" << Name << "\t";
+      // The startup-traced entry carries its real spelling even though it
+      // is user code, so downstream renaming and the C emitter's main
+      // normalization fire without a PDB.
+      if (Classification.UserEntry && Start == *Classification.UserEntry &&
+          Classification.UserEntryName)
+        Name = *Classification.UserEntryName;
       if (!ClassifyFuncs)
         outs() << Rec.InstrRvas.size() << " instrs\n";
       else if (Classification.UserReachable.count(Start))
