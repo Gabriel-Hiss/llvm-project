@@ -116,8 +116,15 @@ struct Absolute {
 
   /// The image-backed object covering V, or nullptr.
   Constant *forAddress(uint64_t V) const {
-    if (auto It = Functions.find(V); It != Functions.end())
-      return It->second;
+    // ~0 and ~0-1 are real register values a lifted constant can carry (the
+    // classic -1 sentinel), but they are also the DenseMap empty/tombstone
+    // keys: find() would stop at an untouched bucket and return its
+    // uninitialized value. No image object ever lives there, so skip the
+    // lookup.
+    if (V != DenseMapInfo<uint64_t>::getEmptyKey() &&
+        V != DenseMapInfo<uint64_t>::getTombstoneKey())
+      if (auto It = Functions.find(V); It != Functions.end())
+        return It->second;
     auto It = std::upper_bound(
         Globals.begin(), Globals.end(), V,
         [](uint64_t V, const std::pair<uint64_t, GlobalVariable *> &G) {
@@ -142,14 +149,33 @@ struct Absolute {
 };
 
 /// `C` with every inttoptr-of-image-VA replaced by its global object.
+/// Always returns C itself or a Constant of the same type owned by C's
+/// context, so callers can install the result into a Use unconditionally.
 Constant *resolveConstant(Constant *C, const Absolute &Abs) {
   auto *CE = dyn_cast<ConstantExpr>(C);
   if (!CE)
     return C;
   if (CE->getOpcode() == Instruction::IntToPtr)
     if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+      // Only an image-backed address in the same address space resolves.
+      // A sentinel such as -1 names no object; leave the inttoptr alone.
       if (Constant *R = Abs.forAddress(CI->getZExtValue()))
-        return R;
+        return R->getType() == C->getType() ? R : C;
+  // getWithOperands only supports casts, select/binop/vector ops and GEP;
+  // anything else keeps its operands as they are.
+  switch (CE->getOpcode()) {
+  case Instruction::InsertElement:
+  case Instruction::ExtractElement:
+  case Instruction::ShuffleVector:
+  case Instruction::GetElementPtr:
+    break;
+  default:
+    if (!CE->isCast() &&
+        !(Instruction::isBinaryOp(CE->getOpcode()) &&
+          CE->getNumOperands() == 2))
+      return C;
+    break;
+  }
   SmallVector<Constant *, 8> Ops;
   bool Any = false;
   for (unsigned K = 0; K < CE->getNumOperands(); ++K) {
@@ -160,7 +186,12 @@ Constant *resolveConstant(Constant *C, const Absolute &Abs) {
   }
   if (!Any)
     return C;
-  return CE->getWithOperands(Ops, C->getType(), true);
+  // OnlyIfReduced may decline to rebuild; and never take a result whose
+  // type drifted from C's (e.g. an addrspace-mismatched replacement).
+  Constant *R = CE->getWithOperands(Ops, C->getType(), true);
+  if (!R || R->getType() != C->getType())
+    return C;
+  return R;
 }
 
 /// Point `CB` at F, rebuilding the call when the site's function type no
