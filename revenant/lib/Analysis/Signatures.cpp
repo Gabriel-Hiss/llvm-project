@@ -1146,7 +1146,8 @@ static bool mustDefine(const Function &F, const McTables &T,
 }
 
 /// Direct call sites by callee: (caller start, index of the call in its
-/// instrs).
+/// instrs). Unconditional direct jumps to another function start (tail
+/// calls) vote too: their register setup is the callee's arguments.
 using CallSites = std::map<Va, SmallVector<std::pair<Va, uint32_t>, 2>>;
 
 static CallSites callSites(const Program &P, FnCache &Fns) {
@@ -1155,7 +1156,16 @@ static CallSites callSites(const Program &P, FnCache &Fns) {
     const Function *G = Fns.get(Start);
     for (size_t I = 0; G && I < G->Instrs.size(); ++I) {
       const Instr &Ins = G->Instrs[I];
-      if (Ins.Flow != FlowKind::Call)
+      // Direct calls vote with their register setup. Unconditional direct
+      // jumps to another function start are tail calls: the registers are
+      // the arguments, and the jump ends its block, so the setup prefix
+      // unambiguously belongs to this target (the CRT hands argc/argv/envp
+      // to main through such a jump). Conditional branches keep flowing to
+      // the fallthrough, so their setup may belong past the jump.
+      bool IsCall = Ins.Flow == FlowKind::Call;
+      bool IsTailJump = Ins.Flow == FlowKind::Branch && Ins.HasTarget &&
+                        Ins.Target != Start && P.Functions.count(Ins.Target);
+      if (!IsCall && !IsTailJump)
         continue;
       if (Ins.HasTarget)
         Out[Ins.Target].push_back({Start, (uint32_t)I});
@@ -1451,15 +1461,18 @@ do {
 // (homed without reload, or folded). Only call sites that are the last
 // call of their block vote: otherwise the setup may belong to a later
 // call in the same block. Varargs callees are excluded: callers
-// legitimately pass more than the fixed parameters.
+// legitimately pass more than the fixed parameters. Tail-jump voters
+// only ever extend a unanimous direct prefix, never veto it: the jump
+// ends its block so its setup unambiguously targets this callee, but a
+// short tail prefix may leave registers the callee ignores unset.
 for (auto &[Start, Sig] : Out.Funcs) {
   if (Sig.VarArgs)
     continue;
   auto Sit = Sites.find(Start);
   if (Sit == Sites.end() || Sit->second.empty())
     continue;
-  unsigned Min = 4, Max = 0;
-  bool AnyVote = false;
+  unsigned MinDir = 4, MaxDir = 0, MinTail = 4, MaxTail = 0;
+  bool AnyDir = false, AnyTail = false;
   for (auto [CallerStart, Ii] : Sit->second) {
     const Function *G = Fns.get(CallerStart);
     if (!G || Ii >= G->Instrs.size())
@@ -1479,13 +1492,34 @@ for (auto &[Start, Sig] : Out.Funcs) {
     if (LaterCall)
       continue;
     unsigned N = callsiteArgs(*G, T, Site);
-    Min = std::min(Min, N);
-    Max = std::max(Max, N);
-    AnyVote = true;
+    if (G->Instrs[Ii].Flow == FlowKind::Branch) {
+      AnyTail = true;
+      MinTail = std::min(MinTail, N);
+      MaxTail = std::max(MaxTail, N);
+    } else {
+      AnyDir = true;
+      MinDir = std::min(MinDir, N);
+      MaxDir = std::max(MaxDir, N);
+    }
   }
-  if (!AnyVote || Min != Max)
+  if (AnyDir && MinDir != MaxDir)
     continue;
-  for (unsigned K = 0; K < Min; ++K) {
+  // Extension target: unanimous direct prefix, extended by a unanimous
+  // tail prefix. A disagreeing tail prefix abstains instead of vetoing.
+  unsigned Target = 0;
+  bool HaveTarget = false;
+  if (AnyDir) {
+    Target = MaxDir;
+    if (AnyTail && MinTail == MaxTail)
+      Target = std::max(Target, MaxTail);
+    HaveTarget = true;
+  } else if (AnyTail && MinTail == MaxTail) {
+    Target = MaxTail;
+    HaveTarget = true;
+  }
+  if (!HaveTarget)
+    continue;
+  for (unsigned K = 0; K < Target; ++K) {
     bool Have = false;
     for (const Param &Q : Sig.Params)
       if (Q.Loc.Tag == ParamLoc::Kind::Reg && Q.Loc.Reg == GRP[K])
