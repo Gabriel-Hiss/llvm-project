@@ -102,7 +102,8 @@ c::CompoundStmt *GotoStmtBuilder::buildBody(llvm::Function &F,
       }
       if (NeedUnsigned) {
         c::QualType U = AST.getCorrespondingUnsignedType(
-            Printed->isSignedIntegerType() ? Printed : CT);
+            (Printed->isSignedIntegerType() || Printed->isUnsignedIntegerType())
+                ? Printed : CT);
         if (!U.isNull()) {
           c::TypeSourceInfo *TSI = AST.getTrivialTypeSourceInfo(U);
           Cond = c::CStyleCastExpr::Create(AST, U, c::VK_PRValue,
