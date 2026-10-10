@@ -476,28 +476,32 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
     if (MinGWRuntimeHooks.count(At) ||
         !Result.UserReachable.insert(At).second)
       continue;
-    // GCC .text.unlikely cold parts are reached by jumps from the hot body.
-    // The library matcher can match them (same code as a library function),
-    // but they are user code. Remove from library starts so the classification
-    // is correct.
-    Result.LibraryStarts.erase(At);
     auto FOrErr = materialize(At);
     if (!FOrErr) {
       consumeError(FOrErr.takeError());
       continue;
     }
     for (const Instr &I : FOrErr->Instrs) {
-      if (I.HasTarget && Prog.Functions.count(I.Target) &&
-          (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
+      // Calls into libdb-matched functions stay library: user code calling
+      // the CRT must not pull the whole static CRT into the user set.
+      // Branch targets are still followed: GCC .text.unlikely cold parts
+      // are reached by jumps from the hot body, and the matcher can match
+      // them (same code as a library function), but they are user code.
+      if (I.HasTarget && Prog.Functions.count(I.Target)) {
+        if (I.Flow == FlowKind::Call && Result.LibraryStarts.count(I.Target))
+          continue;
         UserPending.push(I.Target);
-      if (I.HasMemTarget && Prog.Functions.count(I.MemTarget))
+      }
+      if (I.HasMemTarget && Prog.Functions.count(I.MemTarget) &&
+          !Result.LibraryStarts.count(I.MemTarget))
         UserPending.push(I.MemTarget);
       for (unsigned OpIdx = 0; OpIdx < I.Inst.getNumOperands(); ++OpIdx) {
         const MCOperand &Operand = I.Inst.getOperand(OpIdx);
         if (!Operand.isImm() || Operand.getImm() < 0)
           continue;
         Va Target(static_cast<uint64_t>(Operand.getImm()));
-        if (Prog.Functions.count(Target))
+        if (Prog.Functions.count(Target) &&
+            !Result.LibraryStarts.count(Target))
           UserPending.push(Target);
       }
     }

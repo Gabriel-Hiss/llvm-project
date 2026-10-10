@@ -44,6 +44,7 @@ public:
   struct FieldCell {
     uint64_t SizeBits = 0;
     const llvm::DILocation *Loc = nullptr;
+    const llvm::Value *Access = nullptr;
   };
   struct FieldAccess {
     const llvm::Value *Base = nullptr;

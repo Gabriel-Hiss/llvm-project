@@ -1,6 +1,9 @@
-; Negative: `lshr <2 x i64> %x, 1` moves lane 1 into lane 0, so an
-; extract of it must keep reading the full-width shift. Ports
-; lane0_right_shift_stays_full_width.
+; Per-lane `lshr <2 x i64> %x, <1, 1>` shifts each lane in place (LLVM vector
+; shifts never move bits across lanes), so extracting lane 0 after the shift
+; is just lane 0 shifted: the straight-line phase explodes it into scalar
+; loads + a scalar shift. (The old "stays full width" premise came from the
+; plain-Rust reference where an lshr on a 128-bit pseudo-vector does shift
+; across the whole width; that premise did not survive the LLVM port.)
 ; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 define i64 @lane0_shift(ptr %p0) {
@@ -11,6 +14,6 @@ entry:
   ret i64 %e
 }
 
-; CHECK: load <2 x i64>, ptr %p0
-; CHECK: lshr <2 x i64> %x,
-; CHECK: extractelement <2 x i64> %y, i32 0
+; CHECK-NOT: <2 x i64>
+; CHECK: lshr i64
+; CHECK: ret i64

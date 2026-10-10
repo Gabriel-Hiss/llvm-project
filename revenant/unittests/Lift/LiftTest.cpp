@@ -358,4 +358,39 @@ TEST(LiftFunction, CalleeClobberPreservesLoopIv) {
             << "branch on undef in " << BB.getName().str();
 }
 
+TEST(LiftFunction, WhileLoopKeepsDistinctSuccessors) {
+  // c-o2 fn 0x1400015a0: the bb_1400015e0 while-loop block once ended in a
+  // `br i1` with identical successors (the loop's `cmp ecx, 5 / jg` exit
+  // condition was dropped). The loop must keep a real exit comparison to
+  // two different blocks.
+  auto Fx = open(REVENANT_TEST_C_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Va Start(0x1400015a0);
+  auto It = P.Functions.find(Start);
+  ASSERT_NE(It, P.Functions.end()) << "fn 0x1400015a0 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("while_loop_exit", C);
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, nullptr,
+                                   nullptr, /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::BasicBlock *Loop = nullptr;
+  for (const llvm::BasicBlock &BB : *Lifted->Fn)
+    if (BB.getName() == "bb_1400015e0")
+      Loop = &BB;
+  ASSERT_NE(Loop, nullptr) << "loop block bb_1400015e0 missing";
+  const auto *BI = llvm::dyn_cast<llvm::BranchInst>(Loop->getTerminator());
+  ASSERT_NE(BI, nullptr);
+  ASSERT_TRUE(BI->isConditional())
+      << "loop block lost its exit condition";
+  EXPECT_NE(BI->getSuccessor(0), BI->getSuccessor(1))
+      << "loop block branches to the same block twice";
+  ASSERT_FALSE(llvm::isa<llvm::UndefValue>(BI->getCondition()))
+      << "loop exit condition is undef";
+}
+
 } // end anonymous namespace

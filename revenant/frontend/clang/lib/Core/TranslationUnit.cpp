@@ -11,10 +11,12 @@
 #include "revenant/Clang/FrontendContext.h"
 #include "revenant/Clang/StmtBuilder.h"
 #include "revenant/Clang/TypeBuilder.h"
+#include "revenant/Clang/WideIntModel.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Stmt.h"
+#include "clang/AST/Type.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/FileSystemOptions.h"
@@ -111,13 +113,12 @@ paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
   if (!SP)
     return Out;
   for (auto &BB : F)
-    for (auto &I : BB) {
-      const llvm::DILocalVariable *V = nullptr;
-      if (auto *DDI = llvm::dyn_cast<llvm::DbgDeclareInst>(&I))
-        V = DDI->getVariable();
-      if (V && V->getArg())
-        Out[V->getArg()] = V;
-    }
+    for (auto &I : BB)
+      if (auto *DVI = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
+        const llvm::DILocalVariable *V = DVI->getVariable();
+        if (V && V->isParameter() && V->getArg())
+          Out[V->getArg()] = V;
+      }
   return Out;
 }
 
@@ -186,8 +187,13 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
     PV = paramVars(SP, F);
   SmallVector<c::ParmVarDecl *, 8> Params;
   unsigned Idx = 1;
+  const c::FunctionProtoType *Prototype =
+      FD->getType()->getAs<c::FunctionProtoType>();
   for (llvm::Argument &A : F.args()) {
-    c::QualType PT = Types.typeOf(A.getType(), nullptr);
+    c::QualType PT =
+        Prototype && Idx <= Prototype->getNumParams()
+            ? Prototype->getParamType(Idx - 1)
+            : Types.typeOf(A.getType(), nullptr);
     c::IdentifierInfo *II = nullptr;
     if (auto *V = PV.lookup(Idx))
       II = FCtx.ident(V->getName());
@@ -292,54 +298,7 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
-  llvm::StringRef Triple = TU->getASTContext().getTargetInfo().getTriple().str();
-  if (Triple.contains("msvc")) {
-    OS << "#include <intrin.h>\n\n";
-    OS << "struct rv_u128 { unsigned __int64 lo, hi; };\n";
-    OS << "static struct rv_u128 rv_add128(struct rv_u128 a, struct rv_u128 b) {\n";
-    OS << "  struct rv_u128 r; unsigned __int64 carry = 0;\n";
-    OS << "  r.lo = a.lo + b.lo; carry = (r.lo < a.lo) ? 1 : 0;\n";
-    OS << "  r.hi = a.hi + b.hi + carry; return r;\n";
-    OS << "}\n";
-    OS << "static struct rv_u128 rv_sub128(struct rv_u128 a, struct rv_u128 b) {\n";
-    OS << "  struct rv_u128 r; unsigned __int64 borrow = 0;\n";
-    OS << "  r.lo = a.lo - b.lo; borrow = (a.lo < b.lo) ? 1 : 0;\n";
-    OS << "  r.hi = a.hi - b.hi - borrow; return r;\n";
-    OS << "}\n";
-    OS << "static struct rv_u128 rv_mul128(struct rv_u128 a, struct rv_u128 b) {\n";
-    OS << "  struct rv_u128 r; unsigned __int64 lo = _umul128(a.lo, b.lo, &r.hi);\n";
-    OS << "  r.hi += a.hi * b.lo + a.lo * b.hi; r.lo = lo; return r;\n";
-    OS << "}\n";
-    OS << "static struct rv_u128 rv_shl128(struct rv_u128 a, unsigned c) {\n";
-    OS << "  struct rv_u128 r; c &= 127;\n";
-    OS << "  if (c == 0) return a;\n";
-    OS << "  if (c < 64) { r.lo = a.lo << c; r.hi = (a.hi << c) | (a.lo >> (64 - c)); }\n";
-    OS << "  else { r.lo = 0; r.hi = a.lo << (c - 64); } return r;\n";
-    OS << "}\n";
-    OS << "static struct rv_u128 rv_lshr128(struct rv_u128 a, unsigned c) {\n";
-    OS << "  struct rv_u128 r; c &= 127;\n";
-    OS << "  if (c == 0) return a;\n";
-    OS << "  if (c < 64) { r.hi = a.hi >> c; r.lo = (a.lo >> c) | (a.hi << (64 - c)); }\n";
-    OS << "  else { r.hi = 0; r.lo = a.hi >> (c - 64); } return r;\n";
-    OS << "}\n";
-    OS << "static struct rv_u128 rv_ashr128(struct rv_u128 a, unsigned c) {\n";
-    OS << "  struct rv_u128 r; c &= 127;\n";
-    OS << "  if (c == 0) return a;\n";
-    OS << "  if (c < 64) { r.hi = (long long)a.hi >> c; r.lo = (a.lo >> c) | (a.hi << (64 - c)); }\n";
-    OS << "  else { r.hi = (long long)a.hi >> 63; r.lo = (long long)a.hi >> (c - 64); } return r;\n";
-    OS << "}\n";
-    OS << "static int rv_cmp128(struct rv_u128 a, struct rv_u128 b) {\n";
-    OS << "  if (a.hi < b.hi) return -1; if (a.hi > b.hi) return 1;\n";
-    OS << "  if (a.lo < b.lo) return -1; if (a.lo > b.lo) return 1; return 0;\n";
-    OS << "}\n";
-    OS << "static unsigned __int64 rv_trunc128(struct rv_u128 a) { return a.lo; }\n";
-    OS << "static struct rv_u128 rv_zext128(unsigned __int64 v) {\n";
-    OS << "  struct rv_u128 r; r.lo = v; r.hi = 0; return r;\n";
-    OS << "}\n";
-    OS << "static struct rv_u128 rv_sext128(__int64 v) {\n";
-    OS << "  struct rv_u128 r; r.lo = (unsigned __int64)v; r.hi = (v < 0) ? ~0ULL : 0; return r;\n";
-    OS << "}\n\n";
-  }
+  emitWideIntPreamble(OS, TU->getASTContext());
   std::unordered_set<std::string> PrintedRecords;
   for (unsigned Pass = 0; Pass != 3; ++Pass) {
     for (c::Decl *D : TU->decls()) {

@@ -116,8 +116,13 @@ struct Absolute {
 
   /// The image-backed object covering V, or nullptr.
   Constant *forAddress(uint64_t V) const {
-    if (auto It = Functions.find(V); It != Functions.end())
-      return It->second;
+    // `DenseMapInfo<uint64_t>` reserves ~0 (empty) and ~1 (tombstone) for
+    // key comparison, so a lookup of either address is undefined and can
+    // return an unrelated function (lifted `mov r, -1` sentinels land here).
+    if (V != ~0ULL && V != ~1ULL) {
+      if (auto It = Functions.find(V); It != Functions.end())
+        return It->second;
+    }
     auto It = std::upper_bound(
         Globals.begin(), Globals.end(), V,
         [](uint64_t V, const std::pair<uint64_t, GlobalVariable *> &G) {
@@ -142,14 +147,33 @@ struct Absolute {
 };
 
 /// `C` with every inttoptr-of-image-VA replaced by its global object.
+/// Always returns C itself or a Constant of the same type owned by C's
+/// context, so callers can install the result into a Use unconditionally.
 Constant *resolveConstant(Constant *C, const Absolute &Abs) {
   auto *CE = dyn_cast<ConstantExpr>(C);
   if (!CE)
     return C;
   if (CE->getOpcode() == Instruction::IntToPtr)
     if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+      // Only an image-backed address in the same address space resolves.
+      // A sentinel such as -1 names no object; leave the inttoptr alone.
       if (Constant *R = Abs.forAddress(CI->getZExtValue()))
-        return R;
+        return R->getType() == C->getType() ? R : C;
+  // getWithOperands only supports casts, select/binop/vector ops and GEP;
+  // anything else keeps its operands as they are.
+  switch (CE->getOpcode()) {
+  case Instruction::InsertElement:
+  case Instruction::ExtractElement:
+  case Instruction::ShuffleVector:
+  case Instruction::GetElementPtr:
+    break;
+  default:
+    if (!CE->isCast() &&
+        !(Instruction::isBinaryOp(CE->getOpcode()) &&
+          CE->getNumOperands() == 2))
+      return C;
+    break;
+  }
   SmallVector<Constant *, 8> Ops;
   bool Any = false;
   for (unsigned K = 0; K < CE->getNumOperands(); ++K) {
@@ -160,7 +184,12 @@ Constant *resolveConstant(Constant *C, const Absolute &Abs) {
   }
   if (!Any)
     return C;
-  return CE->getWithOperands(Ops, C->getType(), true);
+  // OnlyIfReduced may decline to rebuild; and never take a result whose
+  // type drifted from C's (e.g. an addrspace-mismatched replacement).
+  Constant *R = CE->getWithOperands(Ops, C->getType(), true);
+  if (!R || R->getType() != C->getType())
+    return C;
+  return R;
 }
 
 /// Point `CB` at F, rebuilding the call when the site's function type no
@@ -206,6 +235,10 @@ void copyOrigin(Instruction *To, const Instruction &From) {
 Value *toPointer(Value *V, IRBuilder<> &B) {
   if (auto *P = dyn_cast<PtrToIntInst>(V))
     return P->getPointerOperand();
+  if (V->getType()->isPointerTy())
+    return V;
+  if (!V->getType()->isIntegerTy(64))
+    return nullptr;
   return B.CreateIntToPtr(V, B.getPtrTy(), "abi.ptr");
 }
 struct Signature {
@@ -260,8 +293,12 @@ void rewriteSignature(Function &F, Signature &S) {
   if (S.PointerReturn)
     for (BasicBlock &BB : *N)
       if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        if (!R->getReturnValue())
+          continue;
         IRBuilder<> B(R);
         Value *V = toPointer(R->getReturnValue(), B);
+        if (!V)
+          continue;
         if (auto *I = dyn_cast<Instruction>(V))
           if (I != R->getReturnValue())
             copyOrigin(I, *R);
@@ -279,9 +316,14 @@ void rewriteSignature(Function &F, Signature &S) {
         ResultBlock = SplitEdge(II->getParent(), II->getNormalDest());
     IRBuilder<> B(C);
     auto *New = cast<CallBase>(C->clone());
-    for (unsigned J = 0; J < Params.size(); ++J)
+    // A call site recovered with fewer operands than the new signature keeps
+    // its own shape: rewriting it would read past the operand list.
+    unsigned Convertible = std::min<unsigned>(Params.size(), C->arg_size());
+    for (unsigned J = 0; J < Convertible; ++J)
       if (S.Pointers[J]) {
         Value *Arg = toPointer(C->getArgOperand(J), B);
+        if (!Arg)
+          continue;
         if (auto *I = dyn_cast<Instruction>(Arg))
           if (I != C->getArgOperand(J))
             copyOrigin(I, *C);
@@ -328,8 +370,11 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
   llvm::sort(Abs.Globals,
              [](const auto &A, const auto &B) { return A.first < B.first; });
   for (Function &F : M)
-    if (auto VA = ir::getFunctionVA(F))
-      Abs.Functions.try_emplace(*VA, &F);
+    if (auto VA = ir::getFunctionVA(F)) {
+      // ~0 / ~1 are DenseMapInfo's reserved keys for uint64_t.
+      if (*VA != ~0ULL && *VA != ~1ULL)
+        Abs.Functions.try_emplace(*VA, &F);
+    }
   for (GlobalVariable &G : M.globals())
     if (G.hasInitializer()) {
       Constant *R = resolveConstant(G.getInitializer(), Abs);
@@ -400,12 +445,17 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
   }
   // Propagate address evidence along real direct-call parameters and returns.
   // A monotone finite set reaches a fixed point even for recursive functions.
+  // Walk the module's function order, not the map's: pointer-keyed iteration
+  // order changes per process, and a rewrite cloning a caller's arguments
+  // would land in a different instruction order run to run.
   bool Progress;
   do {
     Progress = false;
-    for (auto &KV : Signatures) {
-      Function &F = *KV.first;
-      Signature &S = KV.second;
+    for (Function &F : M) {
+      auto It = Signatures.find(&F);
+      if (It == Signatures.end())
+        continue;
+      Signature &S = It->second;
       for (Argument &A : F.args())
         if (A.getType()->isIntegerTy(64) && Addresses.count(&A) && !S.Pointers[A.getArgNo()]) {
           S.Pointers[A.getArgNo()] = true;
@@ -419,7 +469,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
             S.PointerReturn = true;
             Progress = true;
           }
-          for (unsigned J = 0; J < S.Pointers.size(); ++J)
+          for (unsigned J = 0; J < S.Pointers.size() && J < C->arg_size(); ++J)
             if (S.Pointers[J] && C->getArgOperand(J)->getType()->isIntegerTy(64))
               Progress |= Addresses.insert(C->getArgOperand(J)).second;
         }
@@ -430,12 +480,21 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
               Progress |= Addresses.insert(R->getReturnValue()).second;
     }
   } while (Progress);
-  for (auto &KV : Signatures) {
-    Signature &S = KV.second;
-    if (S.PointerReturn || llvm::is_contained(S.Pointers, true)) {
-      rewriteSignature(*KV.first, S);
-      Changed = true;
-    }
+  // Rewriting a signature replaces the function object, so collect the
+  // targets in module order first.
+  SmallVector<Function *, 32> ToRewrite;
+  for (Function &F : M) {
+    auto It = Signatures.find(&F);
+    if (It == Signatures.end())
+      continue;
+    Signature &S = It->second;
+    if (S.PointerReturn || llvm::is_contained(S.Pointers, true))
+      ToRewrite.push_back(&F);
+  }
+  for (Function *F : ToRewrite) {
+    Signature &S = Signatures[F];
+    rewriteSignature(*F, S);
+    Changed = true;
   }
   // Memory is untyped on this target. A pointer-sized integer load consumed
   // as an address can load ptr directly, preserving integer-only uses through
