@@ -843,6 +843,8 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
   Value *Base = nullptr;
   APInt Min(32, 0);
   uint64_t Size = 0;
+  if (Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    return false;
   bool Negated = false;
   if (!matchRangeCheck(Cmp, Base, Min, Size, Negated))
     return false;
