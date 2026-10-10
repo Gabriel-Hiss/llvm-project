@@ -164,6 +164,10 @@ std::optional<unsigned> xmmSlotOf(MCRegister R) {
 
 } // namespace
 
+std::optional<unsigned> LiftState::xmmSlot(MCRegister R) {
+  return xmmSlotOf(R);
+}
+
 bool lift::isTrackedGpr(MCRegister R) {
   auto It = gprInfo().find(R);
   return It != gprInfo().end() && It->second.Tracked;
@@ -1144,6 +1148,100 @@ void LiftState::clobberVolatile() {
     B.CreateStore(UndefValue::get(i64()), Gpr[R]);
   for (unsigned K = 0; K < 6; ++K)
     B.CreateStore(UndefValue::get(iN(128)), Xmm[K]);
+  clobberFlags();
+}
+
+void LiftState::clobberCallee(llvm::Function *Callee, std::optional<Va> Target) {
+  // Only a local function we can decode has a bounded clobber set; everything
+  // else (imports, indirect calls, the CFG dispatch stubs) keeps the
+  // conservative Win64 volatile set.
+  const FuncRecord *Rec = nullptr;
+  if (Target)
+    if (auto It = P.Functions.find(*Target); It != P.Functions.end())
+      Rec = &It->second;
+  if (!Rec) {
+    clobberVolatile();
+    return;
+  }
+  // Walk the callee's decoded instructions collecting every register it
+  // defines (explicit outs + implicit defs), mapped to a tracked root.
+  bool Writes[16] = {}; // rax rcx rdx rbx rsi rdi rbp rsp r8..r15
+  auto Mark = [&](MCRegister R) {
+    MCRegister Root = rootRegOf(R, *MC.MRI);
+    switch (Root) {
+    case X86::RAX: Writes[0] = true; break;
+    case X86::RCX: Writes[1] = true; break;
+    case X86::RDX: Writes[2] = true; break;
+    case X86::RBX: Writes[3] = true; break;
+    case X86::RSI: Writes[4] = true; break;
+    case X86::RDI: Writes[5] = true; break;
+    case X86::RBP: Writes[6] = true; break;
+    case X86::RSP: Writes[7] = true; break;
+    case X86::R8: Writes[8] = true; break;
+    case X86::R9: Writes[9] = true; break;
+    case X86::R10: Writes[10] = true; break;
+    case X86::R11: Writes[11] = true; break;
+    case X86::R12: Writes[12] = true; break;
+    case X86::R13: Writes[13] = true; break;
+    case X86::R14: Writes[14] = true; break;
+    case X86::R15: Writes[15] = true; break;
+    default: break;
+    }
+  };
+  bool WritesXmm[6] = {};
+  bool Unknown = false;
+  for (Rva R : Rec->InstrRvas) {
+    auto DI = D.decodeOne(P.Img->vaOfRva(R));
+    if (!DI) {
+      Unknown = true;
+      break;
+    }
+    const MCInstrDesc &Desc = MC.MII->get(DI->Inst.getOpcode());
+    // A nested call, an indirect jump, a trap, or a direct jump whose target
+    // is another function (a tail call) can transfer to code outside this
+    // record, whose register effects are unknown: stay conservative.
+    if (Desc.isCall() || DI->Flow == FlowKind::IndirectBranch ||
+        DI->Flow == FlowKind::Trap ||
+        (DI->HasTarget && DI->Target != Rec->Start &&
+         !Rec->instrIndex(*P.Img, DI->Target))) {
+      Unknown = true;
+      break;
+    }
+    auto Ops = logicalOps(DI->Inst, Desc);
+    for (unsigned K = 0; K < Desc.getNumDefs() && K < Ops.size(); ++K)
+      if (Ops[K].Kind == LogOpKind::Reg)
+        Mark(DI->Inst.getOperand(Ops[K].MI).getReg());
+    for (MCPhysReg Def : Desc.implicit_defs())
+      Mark(Def);
+    // Any vector def that lands in xmm0-5 also clobbers the tracked slot.
+    for (unsigned K = 0; K < Desc.getNumDefs() && K < Ops.size(); ++K)
+      if (Ops[K].Kind == LogOpKind::Reg)
+        if (auto S = xmmSlot(DI->Inst.getOperand(Ops[K].MI).getReg()))
+          if (*S < 6)
+            WritesXmm[*S] = true;
+    for (MCPhysReg Def : Desc.implicit_defs())
+      if (auto S = xmmSlot(Def))
+        if (*S < 6)
+          WritesXmm[*S] = true;
+  }
+  if (Unknown) {
+    clobberVolatile();
+    return;
+  }
+  // The callee may also be reached through the CFG dispatch stub or a tail
+  // call; those are outside Rec and would be missed, so also treat a call
+  // target that is not the record start conservatively.
+  (void)Callee;
+  static const MCRegister Vol[7] = {X86::RAX, X86::RCX, X86::RDX, X86::R8,
+                                    X86::R9, X86::R10, X86::R11};
+  static const unsigned VolIdx[7] = {0, 1, 2, 8, 9, 10, 11};
+  for (unsigned K = 0; K < 7; ++K)
+    if (Writes[VolIdx[K]])
+      B.CreateStore(UndefValue::get(i64()), Gpr[Vol[K]]);
+  for (unsigned K = 0; K < 6; ++K)
+    if (WritesXmm[K])
+      B.CreateStore(UndefValue::get(iN(128)), Xmm[K]);
+  // Flags are always dead across a call in the modeled semantics.
   clobberFlags();
 }
 
