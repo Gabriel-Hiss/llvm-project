@@ -109,11 +109,25 @@ bool globalAddressCompared(const GlobalVariable &GV) {
       if (const auto *CB = dyn_cast<CallBase>(U)) {
         if (CB->getCalledOperand() == V)
           return true;
+        // Marker intrinsics never observe an address.
+        if (const auto *II = dyn_cast<IntrinsicInst>(CB)) {
+          switch (II->getIntrinsicID()) {
+          case Intrinsic::lifetime_start:
+          case Intrinsic::lifetime_end:
+          case Intrinsic::dbg_declare:
+          case Intrinsic::dbg_value:
+          case Intrinsic::dbg_assign:
+          case Intrinsic::dbg_label:
+          case Intrinsic::assume:
+            continue;
+          default:
+            return true;
+          }
+        }
         // A same-module defined callee can be checked: when its parameter
         // flow exposes the address (integer conversion or comparison, as in
         // an observer that funnels the pointer to ptrtoint), the object
         // identity is observable and the globals are not interchangeable.
-        // Declaration callees stay skipped: their bodies are unavailable.
         const Function *CF = CB->getCalledFunction();
         if (CF && !CF->isDeclaration()) {
           bool Exposed = false;
@@ -130,8 +144,10 @@ bool globalAddressCompared(const GlobalVariable &GV) {
           if (Found)
             continue;
         }
-        // Scalar diagnostic-call arguments do not expose the pointer value.
-        continue;
+        // Declaration and indirect callees are opaque: a linked definition
+        // may record or compare the pointer, so passing the object there
+        // exposes its identity and the globals are not interchangeable.
+        return true;
       }
       if (isa<LoadInst>(U))
         continue;
