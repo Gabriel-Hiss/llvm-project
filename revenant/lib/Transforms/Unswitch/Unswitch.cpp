@@ -980,7 +980,10 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
   Value *Base = nullptr;
   APInt Min(32, 0);
   uint64_t Size = 0;
-  if (!matchRangeCheck(Cmp, Base, Min, Size))
+  bool Reversed = false;
+  if (Cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    return false; // `ugt`/`ule`/`uge` bounds stay plain interval checks
+  if (!matchRangeCheck(Cmp, Base, Min, Size, Reversed))
     return false;
   if (!Base->getType()->isIntegerTy())
     return false;
@@ -1004,6 +1007,7 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
       break; // only inspect the first instruction
     }
   }
+  // ULT: the true successor is the in-range edge, the false one the default.
   BasicBlock *Dest = BI->getSuccessor(0);
   BasicBlock *Other = BI->getSuccessor(1);
   // Small ranges are indistinguishable from source-level interval checks.
