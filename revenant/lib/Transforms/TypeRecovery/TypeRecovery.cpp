@@ -81,6 +81,26 @@ DIType *diTypeForInteger(DIBuilder &DIB, TypeInference &TI,
   return intDIType(DIB, Bits, TI.isUnsigned(V));
 }
 
+DIType *diTypeForAccess(DIBuilder &DIB, TypeInference &TI,
+                        const TypeInference::FieldCell &Cell) {
+  const Value *Access = Cell.Access;
+  if (!Access)
+    return intDIType(DIB, 8, /*Unsigned=*/true);
+  Type *Ty = Access->getType();
+  if (Ty->isIntegerTy())
+    return diTypeForInteger(DIB, TI, Access, Ty->getIntegerBitWidth());
+  if (Ty->isFloatTy())
+    return floatDIType(DIB, Ty->getPrimitiveSizeInBits());
+  if (Ty->isPointerTy())
+    return ir::createPointerType(
+        DIB, intDIType(DIB, 8, /*Unsigned=*/true));
+  unsigned Bits = Cell.SizeBits <= 8    ? 8
+                  : Cell.SizeBits <= 16 ? 16
+                  : Cell.SizeBits <= 32 ? 32
+                                        : 64;
+  return intDIType(DIB, Bits, TI.isUnsigned(Access));
+}
+
 // Build the pointee for a pointer base: a struct when two or more distinct
 // field offsets were observed, else the scalar access type (or an opaque
 // byte when nothing was observed).
@@ -90,103 +110,38 @@ DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
   // Module normalization shares one layout across direct callers. Keep its
   // named LLVM struct and DI schema together instead of creating a second,
   // function-local layout from the subset of fields observed here.
-  for (const User *U : Base->users())
-    if (const auto *G = dyn_cast<GetElementPtrInst>(U))
-      if (MDNode *MD = G->getMetadata("revenant.pointee"))
-        if (MD->getNumOperands() == 1)
-          if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
-            return Ty;
+  if (Base->hasUseList()) {
+    for (const User *U : Base->users())
+      if (const auto *G = dyn_cast<GetElementPtrInst>(U))
+        if (MDNode *MD = G->getMetadata("revenant.pointee"))
+          if (MD->getNumOperands() == 1)
+            if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
+              return Ty;
+  }
   if (!FA || FA->Fields.empty()) {
     // No field evidence: opaque byte pointee (reference Unknown(8)).
     DIType *Byte = intDIType(DIB, 8, /*Unsigned=*/true);
     return Byte;
   }
   if (FA->Fields.size() == 1) {
-    // Single scalar access: pointee is the access type directly.
-    auto It = FA->Fields.begin();
-    uint64_t SizeBits = It->second.SizeBits;
-    // Signedness comes from the loaded/stored value, which may sit behind
-    // a GEP: check loads/stores on the base itself and on GEPs rooted at
-    // it, plus float-typed loads for the float case.
-    bool Unsigned = false;
-    bool Float = false;
-    unsigned FloatBits = 32;
-    SmallVector<const Value *, 4> Ptrs{Base};
-    for (const User *U : Base->users()) {
-      if (const auto *GEP = dyn_cast<GetElementPtrInst>(U))
-        Ptrs.push_back(GEP);
-    }
-    bool Done = false;
-    for (const Value *P : Ptrs) {
-      for (const User *U : P->users()) {
-        if (const auto *LI = dyn_cast<LoadInst>(U)) {
-          Unsigned = TI.isUnsigned(LI);
-          if (LI->getType()->isFloatTy()) {
-            Float = true;
-            FloatBits = LI->getType()->getPrimitiveSizeInBits();
-          }
-          Done = true;
-          break;
-        }
-        if (const auto *SI = dyn_cast<StoreInst>(U)) {
-          if (SI->getPointerOperand() == P) {
-            Unsigned = TI.isUnsigned(SI->getValueOperand());
-            Done = true;
-            break;
-          }
-        }
-      }
-      if (Done)
-        break;
-    }
-    if (Float)
-      return floatDIType(DIB, FloatBits);
-    if (SizeBits == 32 || SizeBits == 64) {
-      unsigned Bits = SizeBits <= 32 ? 32 : 64;
-      return intDIType(DIB, Bits, Unsigned);
-    }
-    if (SizeBits == 8 || SizeBits == 16)
-      return intDIType(DIB, (unsigned)SizeBits, Unsigned);
-    return intDIType(DIB, 8, true);
+    // A single field stays a scalar pointee, retaining the access type.
+    return diTypeForAccess(DIB, TI, FA->Fields.begin()->second);
   }
 
-  // Multi-offset: one DICompositeType with a member per offset. Each
-  // member's signedness comes from the values accessed through a GEP
-  // rooted at this base (loads/stores behind a constant GEP vote on
-  // their own value web at collection time).
+  // Multi-offset: one DICompositeType with a member per offset. The widest
+  // access at each offset supplies that member's recovered type.
   SmallVector<DIDerivedType *, 8> Members;
   for (const auto &KV : FA->Fields) {
     uint64_t OffBits = KV.first;
-    uint64_t SizeBits = KV.second.SizeBits;
-    unsigned Bits = SizeBits <= 8    ? 8
-                    : SizeBits <= 16 ? 16
-                    : SizeBits <= 32 ? 32
-                                     : 64;
-    bool Unsigned = false;
-    for (const User *U : Base->users()) {
-      const auto *GEP = dyn_cast<GetElementPtrInst>(U);
-      if (!GEP)
-        continue;
-      for (const User *GU : GEP->users()) {
-        if (const auto *LI = dyn_cast<LoadInst>(GU)) {
-          Unsigned = TI.isUnsigned(LI);
-          break;
-        }
-        if (const auto *SI = dyn_cast<StoreInst>(GU)) {
-          if (SI->getPointerOperand() == GEP) {
-            Unsigned = TI.isUnsigned(SI->getValueOperand());
-            break;
-          }
-        }
-      }
-      break;
-    }
-    DIType *FieldTy = intDIType(DIB, Bits, Unsigned);
+    const TypeInference::FieldCell &Cell = KV.second;
+    DIType *FieldTy = diTypeForAccess(DIB, TI, Cell);
     std::string Name = "field_" + utostr(OffBits / 8);
     DIDerivedType *M = DIB.createMemberType(
-        Scope, Name, File, 1, Bits, Bits, OffBits, DINode::FlagZero, FieldTy);
+        Scope, Name, File, 1, Cell.SizeBits, Cell.SizeBits, OffBits,
+        DINode::FlagZero, FieldTy);
     Members.push_back(M);
   }
+
   std::string StructName;
   {
     raw_string_ostream OS(StructName);
@@ -235,6 +190,52 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   DIScope *Scope = SP;
 
   bool Changed = false;
+
+  // Keep the subprogram signature aligned with the recovered IR types. The
+  // return type occupies slot zero in DWARF's subroutine type array.
+  auto signatureType = [&](Type *Ty, const Value *V) -> DIType * {
+    if (Ty->isIntegerTy()) {
+      if (V)
+        return diTypeForInteger(DIB, TI, V, Ty->getIntegerBitWidth());
+      return intDIType(DIB, Ty->getIntegerBitWidth(), /*Unsigned=*/false);
+    }
+    if (Ty->isFloatTy())
+      return floatDIType(DIB, Ty->getPrimitiveSizeInBits());
+    if (Ty->isPointerTy()) {
+      const TypeInference::FieldAccess *FA = V ? TI.fieldsFor(V) : nullptr;
+      DIType *Pointee =
+          V ? pointeeForBase(DIB, Scope, File, F, TI, V, FA)
+            : intDIType(DIB, 8, /*Unsigned=*/true);
+      return ir::createPointerType(DIB, Pointee);
+    }
+    return intDIType(DIB, 8, /*Unsigned=*/true);
+  };
+  SmallVector<Metadata *, 8> SignatureTypes;
+  Type *ReturnTy = F.getReturnType();
+  if (ReturnTy->isVoidTy()) {
+    SignatureTypes.push_back(nullptr);
+  } else {
+    const Value *ReturnValue = nullptr;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (const auto *RI = dyn_cast<ReturnInst>(&I))
+          if (RI->getReturnValue()) {
+            ReturnValue = RI->getReturnValue();
+            break;
+          }
+      }
+      if (ReturnValue)
+        break;
+    }
+    SignatureTypes.push_back(signatureType(ReturnTy, ReturnValue));
+  }
+  for (Argument &A : F.args())
+    SignatureTypes.push_back(signatureType(A.getType(), &A));
+  DISubroutineType *Signature = ir::createSubroutineType(DIB, SignatureTypes);
+  if (SP->getType() != Signature) {
+    SP->replaceType(Signature);
+    Changed = true;
+  }
 
   // Arguments: recovered names + inferred types as parameter variables.
   unsigned ArgNo = 1;
@@ -327,9 +328,6 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
         DIType *Pointee = pointeeForBase(DIB, Scope, File, F, TI, AI, FA);
         Ty = ir::createPointerType(DIB, Pointee);
       } else if (AllocTy->isArrayTy()) {
-        // Fixed-size buffer: describe element type, keep the count in the
-        // name comment via the variable (DI has no direct alloca array
-        // spelling through the thin wrappers; element pointer suffices).
         Type *ET = AllocTy->getArrayElementType();
         DIType *Elem = nullptr;
         if (ET->isIntegerTy())
@@ -341,7 +339,13 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
           Elem = ir::createPointerType(DIB, intDIType(DIB, 8, true));
         else
           Elem = intDIType(DIB, 8, true);
-        Ty = ir::createPointerType(DIB, Elem);
+        const DataLayout &DL = M->getDataLayout();
+        Metadata *Subscript = DIB.getOrCreateSubrange(
+            0, static_cast<int64_t>(cast<ArrayType>(AllocTy)->getNumElements()));
+        DINodeArray Subscripts = DIB.getOrCreateArray({Subscript});
+        uint64_t SizeBits = DL.getTypeAllocSizeInBits(AllocTy).getFixedValue();
+        uint32_t AlignBits = DL.getABITypeAlign(AllocTy).value() * 8;
+        Ty = DIB.createArrayType(SizeBits, AlignBits, Elem, Subscripts);
       } else if (AllocTy->isStructTy()) {
         // Source-level struct alloca (rare in lifted code): describe each
         // element access through field inference when present, else keep

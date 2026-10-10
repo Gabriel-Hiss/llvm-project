@@ -16,6 +16,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Stmt.h"
+#include "clang/AST/Type.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/FileSystemOptions.h"
@@ -112,13 +113,12 @@ paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
   if (!SP)
     return Out;
   for (auto &BB : F)
-    for (auto &I : BB) {
-      const llvm::DILocalVariable *V = nullptr;
-      if (auto *DDI = llvm::dyn_cast<llvm::DbgDeclareInst>(&I))
-        V = DDI->getVariable();
-      if (V && V->getArg())
-        Out[V->getArg()] = V;
-    }
+    for (auto &I : BB)
+      if (auto *DVI = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
+        const llvm::DILocalVariable *V = DVI->getVariable();
+        if (V && V->isParameter() && V->getArg())
+          Out[V->getArg()] = V;
+      }
   return Out;
 }
 
@@ -187,8 +187,13 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
     PV = paramVars(SP, F);
   SmallVector<c::ParmVarDecl *, 8> Params;
   unsigned Idx = 1;
+  const c::FunctionProtoType *Prototype =
+      FD->getType()->getAs<c::FunctionProtoType>();
   for (llvm::Argument &A : F.args()) {
-    c::QualType PT = Types.typeOf(A.getType(), nullptr);
+    c::QualType PT =
+        Prototype && Idx <= Prototype->getNumParams()
+            ? Prototype->getParamType(Idx - 1)
+            : Types.typeOf(A.getType(), nullptr);
     c::IdentifierInfo *II = nullptr;
     if (auto *V = PV.lookup(Idx))
       II = FCtx.ident(V->getName());
