@@ -350,6 +350,26 @@ bool matchLoop(Function &F, LoopShape &S, bool &Mutated) {
     }
     if (!Pure)
       continue;
+    // The header body must not contain side effects (stores, calls,
+    // volatile/atomic ops) that are not re-emitted in the latch. The
+    // rewrite moves only pure value ops to L; anything else in H is lost.
+    for (Instruction &I : *H) {
+      if (I.isTerminator() || isa<DbgInfoIntrinsic>(&I) || isa<PHINode>(&I))
+        continue;
+      if (isa<StoreInst>(&I) || isa<CallInst>(&I) || isa<LoadInst>(&I) ||
+          isa<FenceInst>(&I) || isa<AtomicRMWInst>(&I) ||
+          isa<AtomicCmpXchgInst>(&I)) {
+        Pure = false;
+        break;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(&I))
+        if (LI->isVolatile() || LI->getOrdering() != AtomicOrdering::NotAtomic)
+          Pure = false;
+      if (!Pure)
+        break;
+    }
+    if (!Pure)
+      continue;
 
     S.Entry = &E;
     S.Header = H;
