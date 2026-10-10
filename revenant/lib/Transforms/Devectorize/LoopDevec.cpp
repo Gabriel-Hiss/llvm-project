@@ -734,30 +734,36 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         AddR = BO->getOperand(1);
       }
     }
-    auto AccIndexOf = [&](Value *V) -> int {
-      for (unsigned a = 0; a < Accs.size(); ++a)
-        if (V == Accs[a].Phi || V == Accs[a].Back)
-          return (int)a;
-      return -1;
+    // Scalar image of an acc-rooted value: the backedge (post-update) maps
+    // to the scalar chain end; the PHI (pre-update value on the exit edge)
+    // maps to the scalar accumulator PHI itself, which holds the
+    // start-of-iteration value. Conflating them includes the last body
+    // update in a PHI-rooted reduce (devectorize-preupdate-reduce.ll:
+    // one iteration over four ones returned 4 instead of 0).
+    auto ImageOf = [&](Value *V) -> Value * {
+      for (unsigned a = 0; a < Accs.size(); ++a) {
+        if (V == Accs[a].Back)
+          return Chains[a];
+        if (V == Accs[a].Phi)
+          return SS[a];
+      }
+      return nullptr;
     };
     Value *Repl = nullptr;
     if (!AddL) {
-      int Idx = AccIndexOf(Root);
-      if (Idx < 0)
+      Repl = ImageOf(Root);
+      if (!Repl)
         return 0; // precheck promised acc-rooted; defensive
-      Repl = Chains[(unsigned)Idx];
     } else {
       // reduce distributes over the lane-wise combine (same opcode, checked
-      // in the precheck): reduce(a+b) = reduce(a) OP reduce(b). With both
-      // sides on one accumulator (devectorize-mixed-reduce-roots.ll) that is
-      // Chain OP Chain, NOT Chain: reduce(x+x) doubles the sum.
-      int L = AccIndexOf(AddL), RR = AccIndexOf(AddR);
-      if (L < 0 || RR < 0)
+      // in the precheck): reduce(a+b) = reduce(a) OP reduce(b). Each side
+      // maps through its own scalar image (PHI->phi, Back->chain end), so a
+      // combine of pre-update values stays pre-update.
+      Value *IL = ImageOf(AddL), *IR = ImageOf(AddR);
+      if (!IL || !IR)
         return 0;
-      auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
-                                       Chains[(unsigned)L],
-                                       Chains[(unsigned)RR], "s.unopt.m",
-                                       R->getIterator());
+      auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode, IL, IR,
+                                       "s.unopt.m", R->getIterator());
       inheritMeta(R, N);
       Repl = N;
     }
