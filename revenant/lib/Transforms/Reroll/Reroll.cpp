@@ -39,8 +39,12 @@
 
 #include "revenant/Transforms/Reroll/Reroll.h"
 #include "revenant/Evidence/Evidence.h"
+
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -52,6 +56,8 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -151,20 +157,24 @@ std::optional<int64_t> constantDifference(const ConstantInt *A,
   return D.getSExtValue();
 }
 
-// Match `Phi = phi [Init, Pre] [Next, Self]` where Next = Phi +/- Step
+// Match `Phi = phi [Init, Pre...] [Next, Self]` where Next = Phi +/- Step
 // with |Step| in [MinStep, MaxStep]. Returns the step magnitude and the
-// increment instruction.
+// increment instruction. The self-latch contributes exactly one incoming
+// value; the other incomings are loop entries, and a peeled loop keeps
+// several of them (one per path into the header), which the fold carries
+// through untouched.
 bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
                    Instruction *&StepInstOut) {
-  if (Phi->getNumIncomingValues() != 2)
-    return false;
   if (!Phi->getType()->isIntegerTy())
     return false;
   Value *Back = nullptr;
-  for (unsigned i = 0; i < 2; ++i)
-    if (Phi->getIncomingBlock(i) == Header)
+  unsigned NBack = 0;
+  for (unsigned i = 0, e = Phi->getNumIncomingValues(); i != e; ++i)
+    if (Phi->getIncomingBlock(i) == Header) {
       Back = Phi->getIncomingValue(i);
-  if (!Back)
+      ++NBack;
+    }
+  if (NBack != 1 || !Back)
     return false;
   auto *BO = dyn_cast<BinaryOperator>(Back);
   if (!BO || (BO->getOpcode() != Instruction::Add &&
@@ -216,6 +226,8 @@ std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
                                     unsigned Depth = 0);
 std::optional<Affine> affineOfInsn(const Instruction &I, Value *IV,
                                     const DefLookup &DL, unsigned Depth = 0);
+std::optional<Affine> affineOfGEP(const GetElementPtrInst &G, Value *IV,
+                                  const DefLookup &DL, unsigned Depth = 0);
 
 std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
                                     unsigned Depth) {
@@ -230,50 +242,21 @@ std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
     return Affine{0, *Signed};
   }
   if (Instruction *Def = DL.find(V)) {
-    if (auto *GDef = dyn_cast<GetElementPtrInst>(Def)) {
-      // Unfolding a GEP *def*: indices scale by the element size (the
-      // reference folds `mul(idx, elemsize)` into the gep expr).
-      int64_t Scale =
-          (int64_t)GDef->getResultElementType()->getScalarSizeInBits() / 8;
-      if (Scale <= 0)
-        Scale = 1;
-      auto Base = affineOfValue(GDef->getPointerOperand(), IV, DL, Depth + 1);
-      if (!Base)
-        return std::nullopt;
-      Affine Acc = *Base;
-      for (Value *Ix : GDef->indices()) {
-        auto O = affineOfValue(Ix, IV, DL, Depth + 1);
-        if (!O)
-          return std::nullopt;
-        Acc.first += O->first * Scale;
-        Acc.second += O->second * Scale;
-      }
-      return Acc;
-    }
+    if (auto *GDef = dyn_cast<GetElementPtrInst>(Def))
+      return affineOfGEP(*GDef, IV, DL, Depth + 1);
+    // Only the arith the reference models as affine unfolds; a call or
+    // an intrinsic is an opaque leaf (0, 0), not a failed match.
     switch (Def->getOpcode()) {
     case Instruction::Add:
     case Instruction::Sub:
     case Instruction::Mul:
-    case Instruction::UDiv:
-    case Instruction::SDiv:
-    case Instruction::URem:
-    case Instruction::SRem:
     case Instruction::Shl:
-    case Instruction::LShr:
-    case Instruction::AShr:
-    case Instruction::And:
-    case Instruction::Or:
-    case Instruction::Xor:
     case Instruction::ZExt:
     case Instruction::SExt:
     case Instruction::Trunc:
     case Instruction::BitCast:
     case Instruction::PtrToInt:
     case Instruction::IntToPtr:
-    case Instruction::GetElementPtr:
-    case Instruction::ICmp:
-    case Instruction::FCmp:
-    case Instruction::Select:
       return affineOfInsn(*Def, IV, DL, Depth + 1);
     default:
       return Affine{0, 0}; // Load/Phi/Call/... are opaque leaves.
@@ -282,29 +265,119 @@ std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
   return Affine{0, 0}; // Params, globals: opaque leaves.
 }
 
-// Combined affine of an instruction's operands (the reference
-// `Expr::Op("add", insn_exprs)`): a plain unscaled sum. Compares have
-// no affine.
+// Combined affine of an instruction (the reference `affine_of` over the
+// instruction's own arithmetic). A compare has no affine; a div/rem/and/
+// or/xor/shr has none either (the reference `affine_of` returns None for
+// them), and the caller then sees a failed match rather than a bogus one.
+// GEPs go through affineOfGEP, reached before this.
 std::optional<Affine> affineOfInsn(const Instruction &I, Value *IV,
                                     const DefLookup &DL, unsigned Depth) {
   if (isa<CmpInst>(&I))
     return std::nullopt;
-  int64_t Coef = 0, Off = 0;
-  for (const Use &U : I.operands()) {
-    auto A = affineOfValue(U.get(), IV, DL, Depth);
-    if (!A)
+  if (auto *G = dyn_cast<GetElementPtrInst>(&I))
+    return affineOfGEP(*G, IV, DL, Depth);
+  auto Operand = [&](unsigned K) {
+    return affineOfValue(I.getOperand(K), IV, DL, Depth);
+  };
+  switch (I.getOpcode()) {
+  case Instruction::Add: {
+    // The reference sums the operand exprs; LLVM only allows extra
+    // operands on a call, so a two-operand add is the whole story.
+    if (I.getNumOperands() != 2)
       return std::nullopt;
-    Coef += A->first;
-    Off += A->second;
+    auto A = Operand(0), B = Operand(1);
+    if (!A || !B)
+      return std::nullopt;
+    return Affine{A->first + B->first, A->second + B->second};
   }
-  return Affine{Coef, Off};
+  case Instruction::Sub: {
+    if (I.getNumOperands() != 2)
+      return std::nullopt;
+    auto A = Operand(0), B = Operand(1);
+    if (!A || !B)
+      return std::nullopt;
+    return Affine{A->first - B->first, A->second - B->second};
+  }
+  case Instruction::Mul:
+  case Instruction::Shl: {
+    // One side must be a constant: it scales (or shifts) the other.
+    if (I.getNumOperands() != 2)
+      return std::nullopt;
+    for (unsigned K = 0; K < 2; ++K) {
+      auto *C = dyn_cast<ConstantInt>(I.getOperand(K));
+      if (!C)
+        continue;
+      if (I.getOpcode() == Instruction::Shl) {
+        if (!C->getValue().isIntN(32))
+          return std::nullopt;
+      }
+      auto Other = affineOfValue(I.getOperand(1 - K), IV, DL, Depth);
+      if (!Other)
+        return std::nullopt;
+      auto Signed = signedConstant(C);
+      if (!Signed)
+        return std::nullopt;
+      int64_t Factor = I.getOpcode() == Instruction::Shl
+                           ? (int64_t(1) << C->getZExtValue())
+                           : *Signed;
+      return Affine{Other->first * Factor, Other->second * Factor};
+    }
+    return std::nullopt;
+  }
+  case Instruction::ZExt:
+  case Instruction::SExt:
+  case Instruction::Trunc:
+  case Instruction::BitCast:
+  case Instruction::PtrToInt:
+  case Instruction::IntToPtr: {
+    // Pass-through: the reference `affine_of` strips these.
+    if (I.getNumOperands() != 1)
+      return std::nullopt;
+    return Operand(0);
+  }
+  default:
+    return std::nullopt;
+  }
+}
+
+// Affine of a GEP def: base + Σ index_k * sizeof(result element), matching
+// the reference `Expr::Op("gep", [base, mul(idx, sz)])` unfolded through
+// `affine_of`.
+std::optional<Affine> affineOfGEP(const GetElementPtrInst &G, Value *IV,
+                                  const DefLookup &DL, unsigned Depth) {
+  int64_t Scale =
+      (int64_t)G.getResultElementType()->getScalarSizeInBits() / 8;
+  if (Scale <= 0)
+    Scale = 1;
+  auto Base =
+      affineOfValue(const_cast<Value *>(G.getPointerOperand()), IV, DL, Depth + 1);
+  if (!Base)
+    return std::nullopt;
+  Affine Acc = *Base;
+  for (Value *Ix : G.indices()) {
+    auto O = affineOfValue(const_cast<Value *>(Ix), IV, DL, Depth + 1);
+    if (!O)
+      return std::nullopt;
+    Acc.first += O->first * Scale;
+    Acc.second += O->second * Scale;
+  }
+  return Acc;
 }
 
 // Element slot of a value through a memory-deriving (Load/Gep/Cast/Bin)
 // def, mirroring the reference `var_index`: the combined affine of the
 // def's own operands. None when not IV-derived, poison (INT64_MAX) when
 // off a clean boundary.
-std::optional<int64_t> varIndex(Value *V, Value *IV, const DefLookup &DL) {
+//
+// The reference stops at the affine (a mul of two loads is affine (0, 0),
+// so it carries no index). Recovering a rolled accumulator chain needs
+// the index of `mul(load(i), load(i))` too, so when the affine is
+// degenerate the operands' own indices are consulted: they must all
+// agree, and that common index is the def's index.
+std::optional<int64_t> varIndex(Value *V, Value *IV, const DefLookup &DL,
+                                unsigned Depth = 0) {
+  if (Depth > MaxUnfoldDepth)
+    return std::nullopt;
   Instruction *Def = DL.find(V);
   if (!Def)
     return std::nullopt;
@@ -326,11 +399,28 @@ std::optional<int64_t> varIndex(Value *V, Value *IV, const DefLookup &DL) {
     return std::nullopt;
   }
   auto A = affineOfInsn(*Def, IV, DL, 0);
-  if (!A || A->first == 0)
-    return std::nullopt;
-  if (A->second % A->first != 0)
-    return INT64_MAX;
-  return A->second / A->first;
+  if (A && A->first != 0) {
+    if (A->second % A->first != 0)
+      return INT64_MAX;
+    return A->second / A->first;
+  }
+  // Degenerate affine: consult the operands. `nullopt` here means "no
+  // index in any operand", which is the reference answer too.
+  std::optional<int64_t> Common;
+  for (const Use &U : Def->operands()) {
+    if (isa<Constant>(U.get()))
+      continue;
+    auto D = varIndex(U.get(), IV, DL, Depth + 1);
+    if (!D)
+      return std::nullopt;
+    if (*D == INT64_MAX)
+      return INT64_MAX;
+    if (!Common)
+      Common = D;
+    else if (*Common != *D)
+      return INT64_MAX;
+  }
+  return Common;
 }
 
 
@@ -431,7 +521,10 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
                   unsigned Pos, unsigned Op,
                   DenseMap<std::pair<unsigned, unsigned>, int64_t> &Deltas,
                   DenseMap<std::pair<unsigned, unsigned>,
-                           std::pair<Value *, int64_t>> &VarPairs) {
+                           std::pair<Value *, int64_t>> &VarPairs,
+                  const SmallPtrSetImpl<Value *> &Accs,
+                  DenseMap<std::pair<unsigned, unsigned>,
+                           SmallPtrSet<Value *, 2>> &AccPairs) {
   if (A == C)
     return true;
   auto *CA = dyn_cast<ConstantInt>(A);
@@ -458,6 +551,42 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
   }
   if (isa<Constant>(A) || isa<Constant>(C))
     return false;
+  // Multi-accumulator unroll: window 0's acc add reads its own acc phi
+  // and window w's reads a *different* one (`acc0 += a[i]`,
+  // `acc1 += a[i+1]`, merged after the loop). The phis must be pairwise
+  // distinct per window so the pairing identifies a genuine per-window
+  // accumulator set rather than two unrelated ones. The window offset is
+  // sometimes folded into the acc value instead
+  // (`acc1' = acc1 + 1`), which also pairs.
+  if (isa<PHINode>(A) && Accs.count(A)) {
+    Value *AccC = C;
+    int64_t Offset = 0;
+    if (auto *BO = dyn_cast<BinaryOperator>(C))
+      if (BO->getOpcode() == Instruction::Add && BO->getParent() &&
+          BO->getParent() == dyn_cast<Instruction>(A)->getParent()) {
+        for (unsigned K = 0; K < 2; ++K) {
+          if (isa<PHINode>(BO->getOperand(K)) &&
+              Accs.count(BO->getOperand(K)) && BO->getOperand(K) != A) {
+            AccC = BO->getOperand(K);
+            auto *CO = dyn_cast<ConstantInt>(BO->getOperand(1 - K));
+            if (!CO)
+              return false;
+            Offset = CO->getSExtValue();
+          }
+        }
+      }
+    if (!isa<PHINode>(AccC) || !Accs.count(AccC))
+      return false;
+    if (Offset != 0 && Offset != W)
+      return false;
+    auto Key = std::make_pair(Pos, Op);
+    auto &Seen = AccPairs[Key];
+    if (Seen.empty())
+      Seen.insert(A);
+    if (!Seen.insert(AccC).second)
+      return false; // the same acc phi twice: not a per-window set
+    return true;
+  }
   // Same-position def pair (l0 vs l_j): both defined at the same window
   // position in their own window.
   auto IA = W0Pos.find(A);
@@ -477,8 +606,9 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
         return false;
       auto IA2 = GA->idx_begin(), IC2 = GC->idx_begin();
       for (; IA2 != GA->idx_end(); ++IA2, ++IC2)
-        if (!operandsPair(IA2->get(), IC2->get(), W, IV, DL, W0Pos, WSets,
-                          Pos, Op, Deltas, VarPairs))
+        if (!operandsPair(const_cast<Value *>(IA2->get()),
+                          const_cast<Value *>(IC2->get()), W, IV, DL, W0Pos,
+                          WSets, Pos, Op, Deltas, VarPairs, Accs, AccPairs))
           return false;
       return true;
     }
@@ -502,6 +632,280 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Exit legality for a fold.
+//
+// Folding divides the IV step from S to S/D and keeps the latch condition
+// untouched, so the folded index walks the same exit with D times as many
+// steps. Two facts make that legal, and both have to be proved from how the
+// values are built:
+//
+//   1. dense coverage, Step == D * G (checked at the call site): every
+//      element the unrolled body touched, the folded body still touches.
+//   2. the exit operand sits on the induction lattice modulo the ORIGINAL
+//      step S, for every loop entry. The unrolled loop exits at
+//      `entry + k*S`; the folded one at `entry + k*(S/D)`, which is the
+//      same value only when the exit was a multiple of S away from the
+//      entry to begin with.
+//
+// Nothing here looks at values a runtime argument may take. A load, a
+// parameter and an unknown call are never a proved multiple, so loops whose
+// legality is only true for some inputs bail and stay unrolled.
+// ---------------------------------------------------------------------------
+
+constexpr unsigned MaxMultipleDepth = 8;
+
+// True when V is provably a multiple of S (S >= 2) by construction, in
+// the integer domain V actually lives in. This is where the lattice
+// matters: an i8 unsigned bound of 253 is not divisible by 3, but reading
+// it as a signed i64 turns it into -3, which is, so every multiple test
+// below works on the raw bits of V's own type and only then compares.
+//
+// Recognized constructions: a constant multiple, a multiply or left shift
+// by a multiple of S, a mask whose low log2(S) bits are zero (S a power of
+// two), a sum of multiples, or a widening of a multiple. Bit-preserving
+// casts pass through because they leave the low bits alone.
+bool provedMultiple(Value *V, int64_t S, unsigned Depth = 0) {
+  if (S <= 1)
+    return true;
+  if (Depth > MaxMultipleDepth)
+    return false;
+  // The raw bits, interpreted in V's own width.
+  auto Multiple = [&](const APInt &Bits) {
+    if (Bits.getBitWidth() > 64)
+      return false;
+    // S is a positive i64 that fits in Bits' width (the caller only ever
+    // passes values the loop can produce in that width).
+    if (S < 0 || !Bits.getBitWidth() ||
+        (uint64_t)S > (uint64_t{1} << (Bits.getBitWidth() - 1)))
+      return false;
+    APInt Div = APInt(Bits.getBitWidth(), (uint64_t)S);
+    APInt Rem(Bits.getBitWidth(), 0);
+    APInt::udivrem(Bits, Div, Rem, Rem);
+    return Rem.isZero();
+  };
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return Multiple(C->getValue());
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return false;
+  switch (I->getOpcode()) {
+  case Instruction::Mul: {
+    // (a * b) % S == 0 when either factor is a multiple, or when a constant
+    // factor is itself a multiple of S.
+    for (unsigned K = 0; K < 2; ++K) {
+      auto *C = dyn_cast<ConstantInt>(I->getOperand(K));
+      if (C && Multiple(C->getValue()))
+        return true;
+    }
+    return provedMultiple(I->getOperand(0), S, Depth + 1) ||
+           provedMultiple(I->getOperand(1), S, Depth + 1);
+  }
+  case Instruction::Shl: {
+    auto *C = dyn_cast<ConstantInt>(I->getOperand(1));
+    if (!C)
+      return false;
+    if (!C->getValue().isIntN(32) || C->getValue().isNegative())
+      return false;
+    // Only a power-of-two modulus has a shift proving it: 2^Sh is a
+    // multiple of S iff S divides 2^Sh.
+    if (S < 0 || (S & (S - 1)) != 0)
+      return false;
+    uint64_t Sh = C->getZExtValue();
+    if (Sh > 62)
+      return false;
+    uint64_t Factor = uint64_t(1) << Sh;
+    if ((uint64_t)S > Factor || Factor % (uint64_t)S != 0)
+      return false;
+    return true; // any value shifted left by >= log2(S)
+  }
+  case Instruction::And: {
+    // `and X, m` clears the low log2(S) bits exactly when m does, and a
+    // power-of-two modulus is decided by those bits alone.
+    if (S < 0 || (S & (S - 1)) != 0)
+      return false;
+    for (unsigned K = 0; K < 2; ++K) {
+      auto *C = dyn_cast<ConstantInt>(I->getOperand(K));
+      if (!C)
+        continue;
+      APInt M = C->getValue();
+      if (M.getBitWidth() >= 64 || S < 0)
+        return false;
+      APInt Low = APInt(M.getBitWidth(), (uint64_t)(S - 1));
+      if ((M & Low).isZero())
+        return true;
+    }
+    return false;
+  }
+  case Instruction::Add:
+    return provedMultiple(I->getOperand(0), S, Depth + 1) &&
+           provedMultiple(I->getOperand(1), S, Depth + 1);
+  case Instruction::Sub:
+    return provedMultiple(I->getOperand(0), S, Depth + 1) &&
+           provedMultiple(I->getOperand(1), S, Depth + 1);
+  case Instruction::ZExt:
+  case Instruction::SExt:
+  case Instruction::BitCast:
+  case Instruction::PtrToInt:
+  case Instruction::IntToPtr: {
+    // Preserve (or widen) the low bits, so a multiple stays a multiple,
+    // provided S still fits in the narrow type.
+    Value *Op = I->getOperand(0);
+    unsigned Bits = Op->getType()->getIntegerBitWidth();
+    if (Bits == 0 || Bits >= 64)
+      return false;
+    if ((uint64_t)S >= (uint64_t{1} << (Bits - 1)))
+      return false;
+    return provedMultiple(Op, S, Depth + 1);
+  }
+  case Instruction::Trunc: {
+    // Only safe when the low log2(S) bits survive the truncation.
+    if (S < 0 || (S & (S - 1)) != 0)
+      return false;
+    Value *Op = I->getOperand(0);
+    unsigned Bits = I->getType()->getIntegerBitWidth();
+    if (Bits == 0 || Bits >= 64)
+      return false;
+    if ((uint64_t)S >= (uint64_t{1} << (Bits - 1)))
+      return false;
+    return provedMultiple(Op, S, Depth + 1);
+  }
+  case Instruction::PHI: {
+    auto *PN = cast<PHINode>(I);
+    for (unsigned K = 0, E = PN->getNumIncomingValues(); K != E; ++K)
+      if (!provedMultiple(PN->getIncomingValue(K), S, Depth + 1))
+        return false;
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+// True when Bound - Entry is provably a multiple of S: both ends are, or
+// Bound is built as Entry plus a proved multiple (the pointer-loop form
+// `end = start + n * stride`).
+bool provedMultipleDiff(Value *Bound, Value *Entry, int64_t S) {
+  if (Bound == Entry)
+    return true;
+  if (provedMultiple(Bound, S) && provedMultiple(Entry, S))
+    return true;
+  auto *I = dyn_cast<Instruction>(Bound);
+  if (!I)
+    return false;
+  if (I->getOpcode() == Instruction::Add) {
+    for (unsigned K = 0; K < 2; ++K)
+      if (I->getOperand(K) == Entry &&
+          provedMultiple(I->getOperand(1 - K), S))
+        return true;
+  } else if (I->getOpcode() == Instruction::Sub) {
+    if (I->getOperand(0) == Entry && provedMultiple(I->getOperand(1), S))
+      return true;
+  }
+  return false;
+}
+
+// Which operand of the exit compare walks the induction, and how.
+struct ExitSide {
+  bool Valid = false;
+  bool TestsStep = false; // the compare reads the step value, not the index
+  int64_t Offset = 0;     // constant offset on top of the index
+  bool HasOffset = false; // the operand is `index + offset`, not the index
+};
+
+// Proven legality of one folding candidate. `H` is the self-latch header,
+// `IV`/`StepInst` its induction and step, `Step` the ORIGINAL step
+// magnitude and `D` the window count. Returns false when the fold would
+// change the set of iterations the loop performs.
+bool exitTripCompatible(BasicBlock *H, PHINode *IV, Instruction *StepInst,
+                        int64_t Step, int64_t D, const DefLookup &DL,
+                        Instruction *Term) {
+  auto *Br = dyn_cast<BranchInst>(Term);
+  if (!Br || !Br->isConditional())
+    return false;
+  auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+  if (!Cmp || Cmp->getParent() != H)
+    return false; // a value flow we do not model: leave the loop alone
+
+  Value *A = Cmp->getOperand(0), *B = Cmp->getOperand(1);
+  ExitSide Side;
+  auto classify = [&](Value *V) -> bool {
+    Side = ExitSide();
+    if (V == IV) {
+      Side.Valid = true;
+      return true;
+    }
+    if (V == StepInst) {
+      Side.Valid = true;
+      Side.TestsStep = true;
+      return true;
+    }
+    // `index + C` where C is a constant: the exit lands C away from the
+    // index, so C has to sit on the lattice too.
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      if (isa<ICmpInst>(I) || isa<PHINode>(I))
+        return false;
+      auto Aff = affineOfInsn(*I, IV, DL, 0);
+      if (!Aff || (Aff->first != 1 && Aff->first != -1))
+        return false;
+      if (Aff->second % Step != 0)
+        return false;
+      Side.Valid = true;
+      Side.Offset = Aff->second;
+      Side.HasOffset = true;
+      Side.TestsStep = false;
+      return true;
+    }
+    return false;
+  };
+  if (!classify(A)) {
+    if (!classify(B))
+      return false;
+    std::swap(A, B);
+  } else if (classify(B)) {
+    return false; // both operands walk the induction: not a trip count
+  }
+  // Once classified, A is the induction side and B the bound.
+  Value *Bound = B;
+
+  SmallVector<Value *, 4> Entries;
+  for (unsigned K = 0, E = IV->getNumIncomingValues(); K != E; ++K)
+    if (IV->getIncomingBlock(K) != H)
+      Entries.push_back(IV->getIncomingValue(K));
+  if (Entries.empty())
+    return false;
+
+  switch (Cmp->getPredicate()) {
+  case ICmpInst::ICMP_EQ:
+  case ICmpInst::ICMP_NE: {
+    // `index (+ offset) == bound`: the original exits when the induction
+    // has advanced to `bound`, so `bound` has to be a multiple of S away
+    // from every entry. The folded induction then reaches the very same
+    // value in exactly D times as many steps.
+    for (Value *E : Entries)
+      if (!provedMultipleDiff(Bound, E, Step))
+        return false;
+    return true;
+  }
+  case ICmpInst::ICMP_ULT:
+  case ICmpInst::ICMP_ULE:
+  case ICmpInst::ICMP_SLT:
+  case ICmpInst::ICMP_SLE: {
+    // A range exit counts induction values in [entry, bound). That set
+    // scales by D only when both ends sit on the lattice; an exit that
+    // tests the step value counts a shifted range and never scales.
+    if (Side.TestsStep || Side.HasOffset)
+      return false;
+    for (Value *E : Entries)
+      if (!provedMultiple(E, Step))
+        return false;
+    return provedMultiple(Bound, Step);
+  }
+  default:
+    return false;
+  }
+}
+
 // Try to fold one single-block self-latch loop: find a stride IV,
 // partition the body into element slots 0..D-1, verify shape, drop windows
 // 1... On success rewrites the step and returns the fold factor D.
@@ -516,8 +920,9 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
   for (BasicBlock *S : successors(H))
     if (S == H)
       SelfLatch = true;
-  if (!SelfLatch)
+  if (!SelfLatch) {
     return 0;
+  }
 
   // Collect stride IV candidates.
   struct IVCand {
@@ -529,8 +934,6 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
   for (Instruction &I : *H) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi || !Phi->getType()->isIntegerTy())
-      continue;
-    if (Phi->getNumIncomingValues() != 2)
       continue;
     int64_t Step = 0;
     Instruction *StepInst = nullptr;
@@ -701,6 +1104,17 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     int64_t NewStep = IV.Step / D;
     if (NewStep < 1)
       continue;
+    // Dense coverage: the windows must tile the whole step. Sparse windows
+    // (Step > D * G) leave elements between them untouched, and the folded
+    // body — one window per iteration — would skip exactly those.
+    if (NewStep != G)
+      continue;
+    // The fold divides the step and leaves the latch condition alone, so
+    // the exit has to be proved reachable on the same lattice; see
+    // exitTripCompatible. An unproved trip count means the folded loop
+    // would run a different number of times, so the loop stays unrolled.
+    if (!exitTripCompatible(H, IV.Phi, IV.StepInst, IV.Step, D, DL, Term))
+      continue;
 
     auto W0 = Effective(0);
     std::vector<std::vector<Instruction *>> WSets;
@@ -720,6 +1134,9 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     DenseMap<std::pair<unsigned, unsigned>, int64_t> DeltaMap;
     DenseMap<std::pair<unsigned, unsigned>, std::pair<Value *, int64_t>>
         VarPairs;
+    // Per (window position, operand): the acc phis already paired there,
+    // so a multi-accumulator unroll's phis stay pairwise distinct.
+    DenseMap<std::pair<unsigned, unsigned>, SmallPtrSet<Value *, 2>> AccPairs;
     DenseMap<Value *, unsigned> W0Pos;
     for (unsigned p = 0; p < W0.size(); ++p)
       if (!W0[p]->getType()->isVoidTy())
@@ -759,7 +1176,8 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
           }
           if (!Paired)
             Paired = operandsPair(VA, VC, w, IV.Phi, DL, W0Pos, WSets,
-                                  (unsigned)pos, o, DeltaMap, VarPairs);
+                                  (unsigned)pos, o, DeltaMap, VarPairs, Accs,
+                                  AccPairs);
           if (!Paired) {
             ShapeOK = false;
             break;
@@ -770,8 +1188,10 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     if (!ShapeOK)
       continue;
 
-    // Only the last window's values survive the fold; an earlier
-    // window's value read outside the windows blocks the fold.
+    // Only the last window's values survive the fold (as their slot-0
+    // counterparts); a value of a *dropped* window read outside the
+    // windows blocks the fold. Window 0 is kept, so its values may be
+    // read outside freely — that is the ordinary accumulator case.
     DenseMap<Instruction *, int64_t> Body;
     for (auto &KV : Slots)
       for (Instruction *I : KV.second)
@@ -790,7 +1210,7 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       return false;
     };
     bool LiveBlock = false;
-    for (int64_t w = 0; w < D - 1 && !LiveBlock; ++w) {
+    for (int64_t w = 1; w < D - 1 && !LiveBlock; ++w) {
       auto It = Slots.find(w * G);
       if (It == Slots.end())
         continue;
@@ -825,6 +1245,56 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       for (Instruction *I : It->second)
         Drop.insert(I);
     }
+    // Collapse the unroll's accumulator merge. A multi-accumulator unroll
+    // sums its per-window accumulator values after the loop; rolled, they
+    // are one accumulator, so the merge outside the header must drop its
+    // dropped-window terms. The guard is tight: an add outside the header
+    // whose operands are all the kept accumulator update (New) and the
+    // dropped ones (Old, being replaced by New) of the same window
+    // position, where the kept update itself reads a loop phi.
+    bool Collapsed = true;
+    while (Collapsed) {
+      Collapsed = false;
+      for (auto &KV : Remap) {
+        Value *Old = KV.first, *New = KV.second;
+        if (Old->use_empty())
+          continue;
+        auto *NewI = dyn_cast<Instruction>(New);
+        if (!NewI || Drop.count(NewI))
+          continue;
+        bool KeptReadsPhi = false;
+        for (const Use &U : NewI->operands())
+          if (isa<PHINode>(U.get())) {
+            KeptReadsPhi = true;
+            break;
+          }
+        if (!KeptReadsPhi)
+          continue;
+        for (User *U : Old->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI || Drop.count(UI) || UI == IV.StepInst ||
+              UI->getParent() == H || UI->getType()->isVoidTy())
+            continue;
+          if (UI->getOpcode() != Instruction::Add &&
+              UI->getOpcode() != Instruction::FAdd)
+            continue;
+          bool AllSame = true;
+          for (const Use &O : UI->operands())
+            if (O.get() != New && O.get() != Old) {
+              AllSame = false;
+              break;
+            }
+          if (!AllSame)
+            continue;
+          UI->replaceAllUsesWith(New);
+          UI->eraseFromParent();
+          Collapsed = true;
+          break;
+        }
+        if (Collapsed)
+          break;
+      }
+    }
     // Rewrite the step: keep the sign (add/sub), divide magnitude.
     if (auto *BO = dyn_cast<BinaryOperator>(IV.StepInst)) {
       int64_t Old = cast<ConstantInt>(BO->getOperand(1))->getSExtValue();
@@ -850,6 +1320,13 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
         Dead.push_back(&*It);
     for (Instruction *I : Dead)
       I->eraseFromParent();
+    // A dropped window's accumulator phi has no users left once its window
+    // is gone; erase it so the header keeps only the rolled accumulator.
+    for (Instruction &I : make_early_inc_range(*H)) {
+      auto *Phi = dyn_cast<PHINode>(&I);
+      if (Phi && Phi->use_empty())
+        Phi->eraseFromParent();
+    }
 
     // The rewritten IV (phi +/- NewStep) is a simple recurrence by
     // construction; no SCEV query needed.
@@ -857,6 +1334,232 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     return (unsigned)D;
   }
   return 0;
+}
+
+// Fold a single-block self-latch loop whose induction is a `ptr` PHI stepped
+// by a constant-stride byte GEP (the lifted LSR form): D identical memory
+// windows at constant element offsets from the pointer reduce to one window
+// and the stride divides by D. An integer mirror PHI stepping by the same
+// byte count is divided too, so the end-address exit keeps its meaning.
+//
+// Shape (c-gcc-o2 `fill_vec`, c-clang-o2 byte loops):
+//   %ptr = phi ptr [%base, Pre], [%step, H], [%peeled, Peel]
+//   %step = getelementptr i8, %ptr, K          ; K = D * sizeof(elem)
+//   <mem> T %v, %ptr                           ; window 0
+//   <mem> T %v, getelementptr T, %ptr, 1       ; window 1
+//   ...
+//   %mirror = phi i64 [%base.bits, Pre], [%mstep, H], ...
+//   %mstep = add i64 %mirror, K
+//   %done = icmp eq i64 %mstep, %end
+//   br i1 %done, label %Exit, label %H
+unsigned tryFoldPtrLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
+  bool SelfLatch = false;
+  for (BasicBlock *S : successors(H))
+    if (S == H)
+      SelfLatch = true;
+  if (!SelfLatch)
+    return 0;
+
+  // The pointer induction: exactly one ptr PHI, one header edge, and the
+  // back value is a constant byte GEP on it.
+  PHINode *Ptr = nullptr;
+  for (Instruction &I : *H) {
+    auto *P = dyn_cast<PHINode>(&I);
+    if (!P)
+      continue;
+    if (!P->getType()->isPointerTy())
+      continue;
+    if (Ptr)
+      return 0; // two pointer inductions: leave it to another pass
+    Ptr = P;
+  }
+  if (!Ptr) {
+    return 0;
+  }
+  Value *Back = nullptr;
+  unsigned NBack = 0;
+  for (unsigned i = 0, e = Ptr->getNumIncomingValues(); i != e; ++i)
+    if (Ptr->getIncomingBlock(i) == H) {
+      Back = Ptr->getIncomingValue(i);
+      ++NBack;
+    }
+  if (NBack != 1 || !Back) {
+    return 0;
+  }
+  auto *StepGEP = dyn_cast<GetElementPtrInst>(Back);
+  if (!StepGEP || StepGEP->getParent() != H) {
+    return 0;
+  }
+  if (StepGEP->getPointerOperand() != Ptr || StepGEP->getNumIndices() != 1) {
+    return 0;
+  }
+  auto *KConst = dyn_cast<ConstantInt>(StepGEP->getOperand(1));
+  if (!KConst) {
+    return 0;
+  }
+  int64_t K = KConst->getSExtValue();
+  if (K < 2) {
+    return 0;
+  }
+
+  // Collect the memory windows: loads/stores on the pointer, directly or
+  // through a single constant-index GEP whose element type decides the
+  // element size. Anything else touching the pointer bails.
+  Type *ElemTy = nullptr;
+  int64_t ElemSize = 0;
+  struct Win {
+    Instruction *Mem;  // load or store
+    int64_t Off;       // element offset from the pointer
+  };
+  SmallVector<Win, 8> Wins;
+  for (User *U : Ptr->users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I) {
+      return 0;
+    }
+    if (I == StepGEP)
+      continue;
+    GetElementPtrInst *IdxGEP = nullptr;
+    if (isa<LoadInst>(I) || isa<StoreInst>(I)) {
+      // direct touch
+    } else if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+      if (G->getParent() != H || G->getNumIndices() != 1 ||
+          G->getPointerOperand() != Ptr)
+        return 0;
+      auto *C = dyn_cast<ConstantInt>(G->getOperand(1));
+      if (!C)
+        return 0;
+      IdxGEP = G;
+      // the GEP's users must be the memory ops of this window
+      for (User *GU : G->users()) {
+        auto *GM = dyn_cast<Instruction>(GU);
+        if (!GM || !(isa<LoadInst>(GM) || isa<StoreInst>(GM)))
+          return 0;
+        if (GM->getParent() != H)
+          return 0;
+        Type *T = isa<LoadInst>(GM) ? cast<LoadInst>(GM)->getType()
+                                    : cast<StoreInst>(GM)->getValueOperand()->getType();
+        if (!T->isSized())
+          return 0;
+        int64_t Sz = (int64_t)T->getPrimitiveSizeInBits() / 8;
+        if (!ElemTy) {
+          ElemTy = T;
+          ElemSize = Sz;
+        } else if (T != ElemTy) {
+          return 0;
+        }
+        Wins.push_back({GM, C->getSExtValue()});
+      }
+      continue;
+    } else {
+      return 0; // some other use of the pointer induction
+    }
+    if (I->getParent() != H)
+      return 0;
+    Type *T = isa<LoadInst>(I) ? cast<LoadInst>(I)->getType()
+                                : cast<StoreInst>(I)->getValueOperand()->getType();
+    if (!T->isSized())
+      return 0;
+    int64_t Sz = (int64_t)T->getPrimitiveSizeInBits() / 8;
+    if (!ElemTy) {
+      ElemTy = T;
+      ElemSize = Sz;
+    } else if (T != ElemTy) {
+      return 0;
+    }
+    Wins.push_back({I, 0});
+  }
+  if (Wins.empty() || !ElemTy || ElemSize <= 0) {
+    return 0;
+  }
+  if (K % ElemSize != 0) {
+    return 0;
+  }
+  int64_t D = K / ElemSize;
+  if (D < 2 || D > 64) {
+    return 0;
+  }
+  // The window offsets must be exactly 0..D-1, one memory op each, and the
+  // memory ops must be stores: a load's result feeds the loop body (the
+  // reduction and copy chains), which only the slot-based fold may rewrite,
+  // so pointer-induction load windows stay for tryFoldLoop.
+  llvm::sort(Wins, [](const Win &A, const Win &B) { return A.Off < B.Off; });
+  for (auto &W : Wins)
+    if (isa<LoadInst>(W.Mem))
+      return 0;
+  for (int64_t J = 0; J < D; ++J) {
+    if ((int64_t)Wins.size() <= J || Wins[J].Off != J)
+      return 0;
+  }
+  if ((int64_t)Wins.size() != D) {
+    return 0;
+  }
+  // Pair the windows: same opcode, same types, same non-address operands.
+  auto *W0 = Wins[0].Mem;
+  for (int64_t J = 1; J < D; ++J) {
+    auto *WJ = Wins[J].Mem;
+    if (WJ->getOpcode() != W0->getOpcode() ||
+        WJ->getNumOperands() != W0->getNumOperands()) {
+      return 0;
+    }
+    for (unsigned O = 0; O < W0->getNumOperands(); ++O) {
+      Value *A = W0->getOperand(O), *C = WJ->getOperand(O);
+      if (A == C)
+        continue;
+      // The pointer operand differs by design; everything else must match.
+      bool APtr = A == Ptr || (isa<GetElementPtrInst>(A) &&
+                               cast<GetElementPtrInst>(A)->getPointerOperand() == Ptr);
+      bool CPtr = C == Ptr || (isa<GetElementPtrInst>(C) &&
+                               cast<GetElementPtrInst>(C)->getPointerOperand() == Ptr);
+      if (APtr && CPtr)
+        continue;
+      return 0;
+    }
+  }
+
+  // Fold: point every window's memory op at window 0's address, erase the
+  // dropped windows (address GEP first, memory op after), and divide the
+  // pointer stride (and the mirror stride, when present) by D.
+  Value *W0Addr = W0->getOperand(isa<LoadInst>(W0) ? 0 : 1);
+  for (int64_t J = 1; J < D; ++J) {
+    auto *WJ = Wins[J].Mem;
+    Value *Addr = WJ->getOperand(isa<LoadInst>(WJ) ? 0 : 1);
+    if (isa<LoadInst>(WJ))
+      cast<LoadInst>(WJ)->setOperand(0, W0Addr);
+    else
+      cast<StoreInst>(WJ)->setOperand(1, W0Addr);
+    // Drop the offset GEP now that its memory op moved.
+    if (auto *G = dyn_cast<GetElementPtrInst>(Addr))
+      if (G != StepGEP && G->use_empty())
+        G->eraseFromParent();
+    WJ->eraseFromParent();
+  }
+  StepGEP->setOperand(1, ConstantInt::get(KConst->getType(), K / D));
+
+  // The integer mirror, when the exit tests it: same division.
+  for (Instruction &I : *H) {
+    auto *P = dyn_cast<PHINode>(&I);
+    if (!P || P == Ptr || !P->getType()->isIntegerTy())
+      continue;
+    Value *MBack = nullptr;
+    for (unsigned i = 0, e = P->getNumIncomingValues(); i != e; ++i)
+      if (P->getIncomingBlock(i) == H)
+        MBack = P->getIncomingValue(i);
+    auto *Add = dyn_cast<BinaryOperator>(MBack);
+    if (!Add || Add->getOpcode() != Instruction::Add || Add->getParent() != H)
+      continue;
+    auto *MC = dyn_cast<ConstantInt>(
+        Add->getOperand(0) == P ? Add->getOperand(1)
+                                : Add->getOperand(1) == P ? Add->getOperand(0)
+                                                          : nullptr);
+    if (!MC || MC->getSExtValue() != K)
+      continue;
+    Add->setOperand(Add->getOperand(0) == P ? 1 : 0,
+                    ConstantInt::get(MC->getType(), K / D));
+  }
+
+  Notes.push_back(H->getName());
+  return (unsigned)D;
 }
 
 // Straight-line synthesis: find the longest run of K >= 4 identical-shape
@@ -966,14 +1669,14 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
                 int64_t D = *Difference;
                 if (D != 0) {
                   SawOff = true;
-                  // Exactness: the window-K offset must be exactly K
-                  // times the per-step delta. Truncated division here
-                  // rewrites lane indices (0,3,7 -> 0,3,6): wrong code.
-                  if (D % (int64_t)K != 0) {
-                    ScanOK = false;
-                    break;
-                  }
+                  // The per-window stride has to be exact: window K's
+                  // offset is K * Delta from window 0's, so any
+                  // truncation here means the lanes are not evenly
+                  // spaced and the synthesized counted loop would visit
+                  // element offsets the original never touches.
                   int64_t Per = D / (int64_t)K;
+                  if (D % (int64_t)K != 0)
+                    ScanOK = false;
                   if (!WinDelta)
                     WinDelta = Per;
                   else if (*WinDelta != Per) {
@@ -1009,6 +1712,48 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
           break;
         }
         if (!WinDelta)
+          break;
+        // Re-derive every lane's stride against the window's own delta:
+        // window w must sit exactly w strides past window 0. `WSets` holds
+        // windows 0..K-1 here and `WJ` is the candidate at index K, so the
+        // bounds are 1..K inclusive.
+        for (size_t w = 1; w <= K && ScanOK; ++w) {
+          auto &WW = (w == K) ? WJ : WSets[w];
+          auto &W0 = WSets[0];
+          for (size_t p = 0; p < M && ScanOK; ++p) {
+            Instruction *A = W0[p], *C = WW[p];
+            if (A->getNumOperands() != C->getNumOperands()) {
+              ScanOK = false;
+              break;
+            }
+            for (unsigned o = 0; o < A->getNumOperands(); ++o) {
+              Value *VA = A->getOperand(o), *VC = C->getOperand(o);
+              if (VA == VC)
+                continue;
+              auto *IA = dyn_cast<ConstantInt>(VA);
+              auto *IC = dyn_cast<ConstantInt>(VC);
+              if (!IA || !IC)
+                continue;
+              auto Difference = constantDifference(IA, IC);
+              if (!Difference) {
+                ScanOK = false;
+                break;
+              }
+              int64_t D = *Difference;
+              if (D == 0)
+                continue;
+              // A lane that is not exactly w strides out (a truncated
+              // offset such as 7 with a stride of 3) would make the
+              // synthesized loop visit elements the original never
+              // touched.
+              if (D != (int64_t)w * *WinDelta) {
+                ScanOK = false;
+                break;
+              }
+            }
+          }
+        }
+        if (!ScanOK)
           break;
         if (!Delta)
           Delta = WinDelta;
@@ -1303,6 +2048,11 @@ PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
     }
     for (BasicBlock *H : Headers)
       if (tryFoldLoop(H, Notes))
+        RoundChanged = true;
+    // Pointer-induction unrolls (lifted LSR `ptr` PHI stepped by a byte GEP)
+    // are folded separately: the slot machinery is integer-index based.
+    for (BasicBlock *H : Headers)
+      if (tryFoldPtrLoop(H, Notes))
         RoundChanged = true;
     Changed |= RoundChanged;
     if (!RoundChanged)
