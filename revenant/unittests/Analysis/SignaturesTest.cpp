@@ -325,6 +325,44 @@ TEST(SignaturesTest, TailJumpThunkForwardsReturn) {
   EXPECT_EQ(WrapSig->Ret.Bits, 32u);
 }
 
+TEST(SignaturesTest, ExportWithoutCallerStillReturns) {
+  constexpr uint64_t Base = 0x140012000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x20;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  Text.Data[0x00] = 0x8B;
+  Text.Data[0x01] = 0xC1;
+  Text.Data[0x02] = 0xE8;
+  Text.Data[0x03] = 0x09;
+  Text.Data[0x04] = 0x00;
+  Text.Data[0x05] = 0x00;
+  Text.Data[0x06] = 0x00;
+  Text.Data[0x07] = 0xC3;
+  Text.Data[0x10] = 0x8B;
+  Text.Data[0x11] = 0xC1;
+  Text.Data[0x12] = 0xC3;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va BodyVa(Base), AllocVa(Base + 0x10);
+  P.Functions.emplace(BodyVa, record(BodyVa, 0, 8, {0, 2, 7}));
+  P.Functions.emplace(AllocVa, record(AllocVa, 0x10, 3, {0x10, 0x12}));
+  P.Exports.insert(BodyVa);
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(BodyVa);
+  ASSERT_NE(Sig, nullptr);
+  EXPECT_TRUE(Sig->HasRet);
+  EXPECT_EQ(Sig->Ret.Bits, 64u);
+}
+
 
 TEST(SignaturesTest, LibraryMatchIgnoresTrailingArchiveAlignmentPadding) {
   constexpr uint64_t Base = 0x140009000;

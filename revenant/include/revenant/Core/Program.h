@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -440,6 +441,9 @@ struct Program {
   std::optional<Va> GuardCFDispatchPtr;
   /// The shared resolver for disasm formatting.
   std::shared_ptr<const NameProvider> Resolver;
+  /// Executable export VAs (non-forwarders): external callers read their
+  /// return values outside the image.
+  std::set<Va> Exports;
 };
 
 } // end namespace revenant

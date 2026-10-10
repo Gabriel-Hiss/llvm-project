@@ -246,6 +246,9 @@ static bool isSignExtendFamily(StringRef Name) {
 struct RegUse {
   unsigned Reg;
   bool Read, Write;
+  // Width of the operand register before write-widening (EAX stays 32
+  // even though the write is recorded on RAX for grouping).
+  unsigned Bits = 0;
 };
 
 struct MemOp {
@@ -324,8 +327,8 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
     MemStart = MemNo + (int)X86II::getOperandBias(D);
 
   SmallVector<RegUse, 8> &R = Info.Regs;
-  auto Emit = [&](unsigned Reg, bool Read, bool Write) {
-    R.push_back({Reg, Read, Write});
+  auto Emit = [&](unsigned Reg, bool Read, bool Write, unsigned Bits) {
+    R.push_back({Reg, Read, Write, Bits});
   };
 
   for (unsigned i = 0; i < I.getNumOperands(); ++i) {
@@ -335,7 +338,7 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
     if (InMem && Op.isReg() && Op.getReg() != 0) {
       // Address computation registers are reads; the memory value's
       // access is tracked separately.
-      Emit(Op.getReg(), true, false);
+      Emit(Op.getReg(), true, false, regBits(Op.getReg()));
       continue;
     }
     if (Op.isReg() && Op.getReg() != 0) {
@@ -343,15 +346,15 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
       if (isDeadReadIdiom(Name, I, T)) {
         // Constant-result idiom: only the destination write counts.
         if (i == 0)
-          Emit(widenWrite(Reg), false, true);
+          Emit(widenWrite(Reg), false, true, regBits(Reg));
       } else if (i < NumDefs) {
 
         // Def side: the write (widened, iced `add_register`).
-        Emit(widenWrite(Reg), false, true);
+        Emit(widenWrite(Reg), false, true, regBits(Reg));
       } else {
         // Use side: read at operand width. A tied use is the read half
         // of a read-write; the write was already emitted by the def.
-        Emit(Reg, true, false);
+        Emit(Reg, true, false, regBits(Reg));
       }
     }
   }
@@ -413,22 +416,22 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
   SmallSet<unsigned, 8> ImpUses;
   for (MCPhysReg U : D.implicit_uses()) {
     ImpUses.insert(U);
-    Emit(U, true, false);
+    Emit(U, true, false, regBits(U));
   }
   bool SignExt = isSignExtendFamily(Name);
   for (MCPhysReg Def : D.implicit_defs()) {
     // cbw/cwd/cdq/cqo: iced keeps the accumulator as a pure read.
     if (SignExt && ImpUses.count(Def))
       continue;
-    Emit(widenWrite(Def), false, true);
+    Emit(widenWrite(Def), false, true, regBits(Def));
   }
   // LLVM models `enter` without implicit regs; iced reports the frame
   // setup (rsp/rbp read-write). Rare in compiler output; keep parity.
   if (Name == "ENTER") {
-    Emit(X86::RSP, true, false);
-    Emit(X86::RBP, true, false);
-    Emit(X86::RSP, false, true);
-    Emit(X86::RBP, false, true);
+    Emit(X86::RSP, true, false, regBits(X86::RSP));
+    Emit(X86::RBP, true, false, regBits(X86::RBP));
+    Emit(X86::RSP, false, true, regBits(X86::RSP));
+    Emit(X86::RBP, false, true, regBits(X86::RBP));
   }
   return Info;
 }
@@ -920,7 +923,7 @@ static unsigned widestWrite(const Function &F, const McTables &T,
           // scanning past it (defensive: iced reports none).
           if (Ins.Flow == FlowKind::Call)
             continue;
-          Bits = std::max(Bits, regBits(U.Reg));
+          Bits = std::max(Bits, U.Bits ? U.Bits : regBits(U.Reg));
           Wrote = true;
         }
       }
@@ -933,7 +936,7 @@ static unsigned widestWrite(const Function &F, const McTables &T,
       InsnInfo II = insnInfo(Ins.Inst, T);
       for (const RegUse &U : II.Regs)
         if (grp(U.Reg) == grp(Reg) && U.Write)
-          Bits = std::max(Bits, regBits(U.Reg));
+          Bits = std::max(Bits, U.Bits ? U.Bits : regBits(U.Reg));
     }
   }
   return std::max(Bits, 8u);
@@ -1148,8 +1151,6 @@ static bool mustDefine(const Function &F, const McTables &T,
   return !MustIn[entryBlock(F)];
 }
 
-/// Direct call sites by callee: (caller start, index of the call in its
-/// instrs).
 using CallSites = std::map<Va, SmallVector<std::pair<Va, uint32_t>, 2>>;
 
 static CallSites callSites(const Program &P, FnCache &Fns) {
@@ -1334,8 +1335,17 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
       Sig.Params.push_back(P_);
     }
 
+    // DLL exports have external callers: must-define alone suffices.
+    // The same holds for any function with no in-module callers at all
+    // (library API reached from outside the image, e.g. qoi_encode /
+    // qoi_decode): an extra return is harmless (nothing reads it),
+    // while a missing one is wrong code. A void function leaves rax
+    // unwritten on some path to ret, so must-define still gates.
+    bool Exported = P.Exports.count(F.Start) != 0;
+    auto NoCallers = Sites.find(F.Start) == Sites.end();
     bool RaxRet = mustDefine(F, T, X86::RAX) &&
-                  callerReads(Sites, Fns, T, F.Start, X86::RAX);
+                  (Exported || NoCallers ||
+                   callerReads(Sites, Fns, T, F.Start, X86::RAX));
     bool XmmRet = mustDefine(F, T, X86::XMM0) &&
                   callerReads(Sites, Fns, T, F.Start, X86::XMM0);
     // Return width: what callers actually read post-call when narrower
@@ -1345,6 +1355,11 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
       unsigned W = widestWrite(F, T, X86::RAX);
       unsigned C = callerReadWidth(Sites, Fns, T, F.Start, X86::RAX);
       RaxRetBits = (C > 0 && C < W) ? C : W;
+      // With no observed caller width (export or callerless API), keep
+      // the full 64-bit register: the safe direction for pointers and
+      // longs, and harmless for i32 values (low bits identical).
+      if ((Exported || NoCallers) && C == 0)
+        RaxRetBits = 64;
     }
     if (XmmRet) {
       Sig.HasRet = true;
@@ -1474,6 +1489,11 @@ do {
       continue;
     Sig.HasRet = Target->second.HasRet;
     Sig.Ret = Target->second.Ret;
+    if (!Sig.Ret.Float && Sig.HasRet) {
+      unsigned TC = callerReadWidth(Sites, Fns, T, Start, X86::RAX);
+      if (TC > 0 && TC < Sig.Ret.Bits)
+        Sig.Ret.Bits = std::clamp(TC, 8u, 64u);
+    }
     Sig.Noreturn = Target->second.Noreturn;
     Sig.VarArgs = Target->second.VarArgs;
     std::stable_sort(Sig.Params.begin(), Sig.Params.end(),
