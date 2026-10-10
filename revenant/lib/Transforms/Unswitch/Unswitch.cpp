@@ -56,6 +56,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
@@ -1619,6 +1620,195 @@ bool tryMergeDefault(Function &F, BasicBlock &Head) {
   return true;
 }
 
+//===----------------------------------------------------------------------===//
+// 8. Compare trees across arms -> one switch
+//    (FoldValueComparisonIntoPredecessors + switchToSelect inverse)
+//===----------------------------------------------------------------------===//
+
+// A switch whose arms SimplifyCFG turned into compare trees:
+//
+//   head: %c = icmp <pred> %v, K; br %c, label %t, label %f
+//   f:    %sel = <select chain over %v>; br join
+//   t:    %sel = <select chain over %v>; br join
+//   join: %phi = phi [ %sel_f, f ], [ %sel_t, t ]
+//
+// becomes one switch on %v at the head with every case row from both
+// chains, the shared chain default as the switch default, and the arms
+// deleted. The head's condition partitions the value space, so merging
+// is only sound when every case constant lives on the arm that can
+// reach it: each case is proven against `ConstantRange` of that arm's
+// edge, and both arms must agree on the default constant.
+bool trySelectTree(Function &F, BasicBlock &Head) {
+  auto *BI = dyn_cast<BranchInst>(Head.getTerminator());
+  if (!BI || !BI->isConditional() || hasOpaque(&Head))
+    return false;
+  auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+  if (!Cmp || Cmp->getParent() != &Head)
+    return false;
+  CmpInst::Predicate Pred = Cmp->getPredicate();
+  Value *V = nullptr;
+  ConstantInt *K = nullptr;
+  if (auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
+    V = Cmp->getOperand(0);
+    K = C;
+  } else if (auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(0))) {
+    // Commuted compare: restate it as `pred V, K` so the range proof
+    // reads one direction.
+    V = Cmp->getOperand(1);
+    K = C;
+    Pred = Cmp->getSwappedPredicate();
+  }
+  if (!V || !K)
+    return false;
+  auto *VTy = dyn_cast<IntegerType>(V->getType());
+  if (!VTy)
+    return false;
+  unsigned CW = VTy->getBitWidth();
+  if (CW > 64 || CW == 0)
+    return false;
+
+  BasicBlock *TrueArm = BI->getSuccessor(0);
+  BasicBlock *FalseArm = BI->getSuccessor(1);
+  if (TrueArm == FalseArm || TrueArm == &Head || FalseArm == &Head)
+    return false;
+  BasicBlock *Join = nullptr;
+  for (unsigned Side = 0; Side < 2; ++Side) {
+    BasicBlock *Arm = Side ? FalseArm : TrueArm;
+    if (Arm->getSinglePredecessor() != &Head)
+      return false;
+    if (hasOpaque(Arm))
+      return false;
+    if (isa<PHINode>(Arm->front()))
+      return false;
+    auto *Br = dyn_cast<BranchInst>(Arm->getTerminator());
+    if (!Br || Br->isConditional())
+      return false;
+    if (!Join)
+      Join = Br->getSuccessor(0);
+    else if (Join != Br->getSuccessor(0))
+      return false;
+  }
+  if (!Join || Join == &Head || Join == TrueArm || Join == FalseArm)
+    return false;
+  if (hasOpaque(Join))
+    return false;
+  if (!Join->hasNPredecessors(2))
+    return false;
+
+  // Exactly one phi, fed by both arms.
+  auto PHIs = Join->phis();
+  if (PHIs.begin() == PHIs.end() || std::next(PHIs.begin()) != PHIs.end())
+    return false;
+  PHINode *Phi = &*PHIs.begin();
+  Value *RootT = Phi->getIncomingValueForBlock(TrueArm);
+  Value *RootF = Phi->getIncomingValueForBlock(FalseArm);
+  if (!RootT || !RootF)
+    return false;
+  auto *SelT = dyn_cast<SelectInst>(RootT);
+  auto *SelF = dyn_cast<SelectInst>(RootF);
+  if (!SelT || !SelF || SelT->getParent() != TrueArm ||
+      SelF->getParent() != FalseArm)
+    return false;
+
+  // Every other value computed in an arm must stay inside the arm,
+  // otherwise deleting the arm would drop live code.
+  for (unsigned Side = 0; Side < 2; ++Side) {
+    BasicBlock *Arm = Side ? FalseArm : TrueArm;
+    Value *Root = Side ? RootF : RootT;
+    for (Instruction &I : *Arm) {
+      if (I.isTerminator())
+        continue;
+      for (User *U : I.users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI)
+          return false; // a constant never uses an instruction
+        if (UI->getParent() == Arm)
+          continue;
+        if (U == Phi && (Value *)&I == Root)
+          continue; // the chain root feeds the phi
+        return false;
+      }
+    }
+  }
+
+  std::vector<SelectCase> RowsT;
+  std::vector<SelectCase> RowsF;
+  Constant *DefT = nullptr;
+  Constant *DefF = nullptr;
+  // Mask rows cannot be expressed as flat case rows without enumerating
+  // their sets; those stay with the per-block chain rewrite.
+  Value *CondT = matchSelectChain(SelT, RowsT, DefT, V);
+  Value *CondF = matchSelectChain(SelF, RowsF, DefF, V);
+  if (!CondT || !CondF || !DefT || !DefF)
+    return false;
+  if (CondT != V || CondF != V)
+    return false;
+  if (RowsT.empty() || RowsF.empty())
+    return false;
+  for (auto &R : RowsT)
+    if (R.IsMask || !R.CaseVal)
+      return false;
+  for (auto &R : RowsF)
+    if (R.IsMask || !R.CaseVal)
+      return false;
+  if (DefT != DefF)
+    return false;
+
+  // Range proof: a case on the true arm must satisfy `pred v, K`, one on
+  // the false arm must not.
+  ConstantRange TrueRange = ConstantRange::makeExactICmpRegion(
+      Pred, K->getValue().zextOrTrunc(CW));
+  ConstantRange FalseRange = TrueRange.inverse();
+  auto inRange = [&](ConstantRange Range, const APInt &Val) {
+    if (Val.getBitWidth() != CW)
+      return false;
+    return Range.contains(Val);
+  };
+  for (auto &R : RowsT)
+    if (!inRange(TrueRange, R.CaseVal->getValue()))
+      return false;
+  for (auto &R : RowsF)
+    if (!inRange(FalseRange, R.CaseVal->getValue()))
+      return false;
+  // No case value twice across the arms: a switch has one row per value.
+  SmallPtrSet<ConstantInt *, 8> Seen;
+  for (unsigned Side = 0; Side < 2; ++Side)
+    for (auto &R : Side ? RowsF : RowsT)
+      if (!Seen.insert(R.CaseVal).second)
+        return false;
+
+  LLVMContext &Ctx = F.getContext();
+  IRBuilder<> B(BI);
+  unsigned NumCases = (unsigned)(RowsT.size() + RowsF.size());
+  auto *SI = B.CreateSwitch(V, Join, NumCases);
+  copyProvenance(SI, Cmp);
+  Constant *Def = DefT;
+  // The head's switch default edge now carries the shared default.
+  Phi->addIncoming(Def, &Head);
+  for (unsigned Side = 0; Side < 2; ++Side) {
+    for (auto &R : Side ? RowsF : RowsT) {
+      BasicBlock *CB = BasicBlock::Create(Ctx, "sw.case", &F, Join);
+      IRBuilder<> CBb(CB);
+      Instruction *Br = CBb.CreateBr(Join);
+      copyProvenance(Br, R.Cmp);
+      SI->addCase(R.CaseVal, CB);
+      Phi->addIncoming(R.Result, CB);
+    }
+  }
+  Phi->removeIncomingValue(TrueArm);
+  Phi->removeIncomingValue(FalseArm);
+
+  BI->eraseFromParent();
+  if (Cmp->use_empty())
+    Cmp->eraseFromParent();
+  for (unsigned Side = 0; Side < 2; ++Side) {
+    BasicBlock *Arm = Side ? FalseArm : TrueArm;
+    Arm->dropAllReferences();
+    Arm->eraseFromParent();
+  }
+  return true;
+}
+
 } // namespace
 
 PreservedAnalyses revenant::UnswitchPass::run(Function &F,
@@ -1671,11 +1861,13 @@ PreservedAnalyses revenant::UnswitchPass::run(Function &F,
       break;
   }
 
-  // Pass D: select chains.
+  // Pass D: select chains. The compare-tree merge comes first: it folds
+  // both arms into one switch, so the per-block chain rewrite never sees
+  // a tree it would split in two.
   for (int Iter = 0; Iter < 16; ++Iter) {
     bool More = false;
     for (BasicBlock &BB : llvm::make_early_inc_range(F)) {
-      if (trySelectToSwitch(F, BB)) {
+      if (trySelectTree(F, BB) || trySelectToSwitch(F, BB)) {
         More = true;
         Changed = true;
         break;
