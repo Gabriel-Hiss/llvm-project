@@ -141,6 +141,11 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
 
 
   QualType ResTy = exprTypeOf(&I);
+  // A wide record has no operator spelling in C; the model spells the
+  // operator as a call to one of its wrappers.
+  if (clang::Expr *Wide = wideIntArithmetic(*AST, ResTy, Op, 0, L, R))
+    return ensureTemp(llvm::cast<llvm::Instruction>(&I), Scope, Wide);
+
   bool SignedOp = Op == llvm::Instruction::SDiv ||
                   Op == llvm::Instruction::SRem ||
                   Op == llvm::Instruction::AShr;
@@ -149,9 +154,11 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
                     Op == llvm::Instruction::LShr;
   if ((SignedOp || UnsignedOp) && L->getType()->isIntegerType()) {
     QualType OperandTy = L->getType();
-    if (SignedOp && !OperandTy->isSignedIntegerType())
+    if (SignedOp && !OperandTy->isSignedIntegerType() &&
+        (OperandTy->isSignedIntegerType() || OperandTy->isUnsignedIntegerType()))
       OperandTy = AST->getCorrespondingSignedType(OperandTy);
-    else if (UnsignedOp && !OperandTy->isUnsignedIntegerType())
+    else if (UnsignedOp && !OperandTy->isUnsignedIntegerType() &&
+        (OperandTy->isSignedIntegerType() || OperandTy->isUnsignedIntegerType()))
       OperandTy = AST->getCorrespondingUnsignedType(OperandTy);
     if (!OperandTy.isNull()) {
       if (L->getType() != OperandTy)
@@ -220,9 +227,11 @@ Expr *ExprBuilderImpl::buildCmp(llvm::CmpInst &I, ExprScope &Scope) {
                        BOp == BO_LE;
     if (IsRelational && L->getType()->isIntegerType()) {
       QualType OperandTy = L->getType();
-      if (Signed && !OperandTy->isSignedIntegerType())
+      if (Signed && !OperandTy->isSignedIntegerType() &&
+          (OperandTy->isSignedIntegerType() || OperandTy->isUnsignedIntegerType()))
         OperandTy = AST->getCorrespondingSignedType(OperandTy);
-      else if (!Signed && !OperandTy->isUnsignedIntegerType())
+      else if (!Signed && !OperandTy->isUnsignedIntegerType() &&
+          (OperandTy->isSignedIntegerType() || OperandTy->isUnsignedIntegerType()))
         OperandTy = AST->getCorrespondingUnsignedType(OperandTy);
       if (!OperandTy.isNull()) {
         if (L->getType() != OperandTy)
@@ -276,6 +285,11 @@ Expr *ExprBuilderImpl::buildCmp(llvm::CmpInst &I, ExprScope &Scope) {
   Expr *Rp = parenIfNeeded(R, P, NonAssocRight);
   QualType BoolTy =
       Ctx.isCPlusPlus() ? AST->BoolTy : AST->UnsignedCharTy;
+  // A wide record has no comparison spelling in C.
+  if (clang::Expr *Wide = wideIntArithmetic(
+          *AST, L->getType(), llvm::Instruction::ICmp,
+          (unsigned)llvm::cast<llvm::CmpInst>(&I)->getPredicate(), L, R))
+    return ensureTemp(&I, Scope, Wide);
   clang::BinaryOperator *B =
       BinaryOperator::Create(*AST, Lp, Rp, BOp, BoolTy, VK_PRValue,
                              OK_Ordinary, SourceLocation(),
@@ -305,10 +319,12 @@ Expr *ExprBuilderImpl::buildCast(llvm::CastInst &I, ExprScope &Scope) {
     // compiler sign-extends: (long long)(int)a1, not (unsigned long long)a1.
     if (SrcTy->isIntegerTy() && DstTy->isIntegerTy() &&
         SrcTy->getIntegerBitWidth() < DstTy->getIntegerBitWidth()) {
-      QualType SignedNarrow = AST->getCorrespondingSignedType(
-          Types.typeOf(SrcTy, nullptr));
-      if (!SignedNarrow.isNull() && SignedNarrow != Op->getType())
-        Op = makeCStyleCast(SignedNarrow, CK_IntegralCast, Op);
+      QualType Narrow = Types.typeOf(SrcTy, nullptr);
+      if (Narrow->isSignedIntegerType() || Narrow->isUnsignedIntegerType()) {
+        QualType SignedNarrow = AST->getCorrespondingSignedType(Narrow);
+        if (!SignedNarrow.isNull() && SignedNarrow != Op->getType())
+          Op = makeCStyleCast(SignedNarrow, CK_IntegralCast, Op);
+      }
     }
     break;
   case llvm::Instruction::FPTrunc:
@@ -348,6 +364,10 @@ Expr *ExprBuilderImpl::buildCast(llvm::CastInst &I, ExprScope &Scope) {
     K = CK_NoOp;
     break;
   }
+  // A wide record has no C cast spelling; the model builds the compound
+  // literal or reads `.lo` instead of a C-style cast.
+  if (clang::Expr *Wide = wideIntConvert(*AST, Dst, Op, K))
+    return Wide;
   // Collapse same-width sign-flip llvm::cast chains ((u64)((i64)x) -> (u64)x),
   // mirroring emit-c's Cast rule.
   if (auto *Inner = llvm::dyn_cast<clang::CStyleCastExpr>(Op)) {
