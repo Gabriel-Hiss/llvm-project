@@ -12,10 +12,12 @@
 #ifndef REVENANT_TRANSFORMS_UNLOOPVEC_COMMON_H
 #define REVENANT_TRANSFORMS_UNLOOPVEC_COMMON_H
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
-
 namespace revenant {
 namespace unloopvec {
 
@@ -186,6 +188,128 @@ inline Value *stripCountDerivation(Value *V, const Function &F,
   }
   return V;
 }
+
+// Structural phi congruence for tier routing, shared verbatim with
+// UnloopVec.cpp (TailCmp): compares the non-phi instruction sequence
+// by opcode/type across a vector-side block A and a scalar block B,
+// and projects vector defs to scalar lanes (laneEq) through the
+// vectorizer's own idioms (loads, splats, lane-wise ALU).
+struct TailCmp {
+  const BasicBlock *A = nullptr; // vector-side tier block
+  const BasicBlock *B = nullptr; // scalar tail block
+  DenseMap<const Value *, const Value *> MapAB;
+  DenseSet<std::pair<const Value *, const Value *>> InProgress;
+  static constexpr unsigned MaxDepth = 16;
+
+  const Instruction *nthNonPhi(const BasicBlock *BB, unsigned N) const {
+    unsigned I = 0;
+    for (const Instruction &J : *BB) {
+      if (isa<PHINode>(&J))
+        continue;
+      if (I == N)
+        return &J;
+      ++I;
+    }
+    return nullptr;
+  }
+
+  bool valEq(const Value *X, const Value *Y, unsigned Depth) {
+    if (X == Y)
+      return true;
+    if (Depth == 0)
+      return false;
+    if (isa<Constant>(X) && isa<Constant>(Y))
+      return X == Y;
+    if (isa<Argument>(X) && X == Y)
+      return true;
+    auto It = MapAB.find(X);
+    if (It != MapAB.end())
+      return It->second == Y;
+    // Defs outside both blocks must be identical values.
+    const auto *IX = dyn_cast<Instruction>(X);
+    const auto *IY = dyn_cast<Instruction>(Y);
+    if (!IX || !IY)
+      return false;
+    if (IX->getParent() != A || IY->getParent() != B)
+      return false;
+    if (IX->getOpcode() != IY->getOpcode())
+      return false;
+    if (IX->getType() != IY->getType())
+      return false;
+    if (!InProgress.insert({X, Y}).second)
+      return true; // coinductive: already comparing, assume equal
+    bool OK = IX->getNumOperands() == IY->getNumOperands();
+    for (unsigned I = 0; OK && I < IX->getNumOperands(); ++I)
+      OK = valEq(IX->getOperand(I), IY->getOperand(I), Depth - 1);
+    if (!OK)
+      InProgress.erase({X, Y});
+    return OK;
+  }
+
+  // Lane projection: X is a vector-typed def in A whose every lane
+  // must equal scalar value Y. Handles the vectorizer's own idioms:
+  // the loaded lanes (X maps to Y directly), a splat of a scalar S
+  // (lanes equal S, so require S == Y), and a lane-wise ALU op over
+  // lane-equal operands (recurse per side). Anything else fails.
+  bool laneEq(const Value *X, const Value *Y, unsigned Depth) {
+    if (Depth == 0)
+      return false;
+    if (X == Y)
+      return true;
+    auto It = MapAB.find(X);
+    if (It != MapAB.end())
+      return It->second == Y;
+    if (const auto *CX = dyn_cast<Constant>(X)) {
+      if (const auto *CY = dyn_cast<Constant>(Y))
+        return CX == CY;
+      return false;
+    }
+    // Splat of a scalar: every lane equals the splatted value.
+    if (auto *Splat = laneSplat(X))
+      return valEq(Splat, Y, Depth - 1);
+    const auto *IX = dyn_cast<Instruction>(X);
+    const auto *IY = dyn_cast<Instruction>(Y);
+    if (!IX || !IY || IX->getParent() != A || IY->getParent() != B)
+      return false;
+    // Lane-wise ALU over lane-equal operands.
+    if (IX->getOpcode() != IY->getOpcode())
+      return false;
+    if (IX->getNumOperands() != IY->getNumOperands())
+      return false;
+    if (!IX->getType()->isVectorTy())
+      return false;
+    if (auto *VT = dyn_cast<FixedVectorType>(IX->getType()))
+      if (VT->getElementType() != IY->getType())
+        return false;
+    if (!InProgress.insert({X, Y}).second)
+      return true;
+    bool OK = true;
+    for (unsigned I = 0; OK && I < IX->getNumOperands(); ++I)
+      OK = laneEq(IX->getOperand(I), IY->getOperand(I), Depth - 1);
+    if (!OK)
+      InProgress.erase({X, Y});
+    return OK;
+  }
+
+  // The splatted scalar behind insertelement+shufflevector, else null.
+  const Value *laneSplat(const Value *X) const {
+    auto *Shuffle = dyn_cast<ShuffleVectorInst>(X);
+    if (!Shuffle)
+      return nullptr;
+    auto *Insert =
+        dyn_cast<InsertElementInst>(Shuffle->getOperand(0));
+    if (!Insert)
+      return nullptr;
+    auto *Index = dyn_cast<ConstantInt>(Insert->getOperand(2));
+    if (!Index || !Index->isZero())
+      return nullptr;
+    for (int I = 0, E = static_cast<int>(Shuffle->getShuffleMask().size());
+         I != E; ++I)
+      if (Shuffle->getMaskValue(I) != 0)
+        return nullptr;
+    return Insert->getOperand(1);
+  }
+};
 
 } // namespace unloopvec
 } // namespace revenant
