@@ -571,6 +571,32 @@ Expr *ExprBuilderImpl::cond(llvm::Value *Cond, ExprScope &Scope) {
       }
     }
   }
+  if (auto *Cmp = llvm::dyn_cast<llvm::ICmpInst>(Cond)) {
+    auto Pred = Cmp->getPredicate();
+    if (Pred == llvm::CmpInst::ICMP_EQ || Pred == llvm::CmpInst::ICMP_NE) {
+      llvm::Value *Tested = nullptr;
+      for (llvm::Value *Op : Cmp->operands()) {
+        auto *Zero = llvm::dyn_cast<llvm::Constant>(Op);
+        llvm::Value *Other = Op == Cmp->getOperand(0)
+                                 ? Cmp->getOperand(1)
+                                 : Cmp->getOperand(0);
+        if (Zero && Zero->isNullValue() &&
+            (Other->getType()->isIntegerTy() || Other->getType()->isPointerTy())) {
+          Tested = Other;
+          break;
+        }
+      }
+      if (Tested) {
+        Expr *Test = truthTest(value(Tested, Scope));
+        if (Pred == llvm::CmpInst::ICMP_NE)
+          return Test;
+        return UnaryOperator::Create(
+            *AST, parenIfNeeded(Test, Prec::Unary), UO_LNot, AST->BoolTy,
+            VK_PRValue, OK_Ordinary, SourceLocation(), false,
+            FPOptionsOverride());
+      }
+    }
+  }
   Expr *C = value(Cond, Scope);
   // `!(a < b)` flips to `a >= b` (emit-c Unary rule).
   if (auto *UO = llvm::dyn_cast<clang::UnaryOperator>(C)) {

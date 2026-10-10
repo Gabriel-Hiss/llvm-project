@@ -1090,10 +1090,22 @@ Stmt *StructuredStmtBuilder::tryForPieces(Region &R, Expr *&Step) {
   Stmt *Init = clang::BinaryOperator::Create(*AST, IVe, InitE, BO_Assign, T,
                                       VK_PRValue, OK_Ordinary,
                                       SourceLocation(), FPOptionsOverride());
-  Expr *NewV = Exprs->value(StepStore->getValueOperand(), *Scope);
-  Step = clang::BinaryOperator::Create(*AST, Exprs->value(IV, *Scope), NewV,
-                                BO_Assign, T, VK_PRValue, OK_Ordinary,
-                                SourceLocation(), FPOptionsOverride());
+  if (auto *StepAmount = dyn_cast<ConstantInt>(Upd->getOperand(1));
+      StepAmount && StepAmount->isOne() &&
+      (Upd->getOpcode() == Instruction::Add ||
+       Upd->getOpcode() == Instruction::Sub)) {
+    Step = clang::UnaryOperator::Create(
+        *AST, IVe, Upd->getOpcode() == Instruction::Add ? UO_PreInc
+                                                        : UO_PreDec,
+        T, VK_PRValue, OK_Ordinary, SourceLocation(), false,
+        FPOptionsOverride());
+  } else {
+    Expr *Amount = Exprs->value(Upd->getOperand(1), *Scope);
+    Step = clang::CompoundAssignOperator::Create(
+        *AST, IVe, Amount,
+        Upd->getOpcode() == Instruction::Add ? BO_AddAssign : BO_SubAssign, T,
+        VK_PRValue, OK_Ordinary, SourceLocation(), FPOptionsOverride(), T, T);
+  }
   return Init;
 }
 

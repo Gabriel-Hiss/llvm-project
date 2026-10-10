@@ -315,16 +315,17 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
   // the type width first, preserving the value under the type's own
   // signedness. Non-integer types fall back to `uintptr_t`.
   QualType T = Ty->isIntegerType() ? Ty : uintptrTy();
-  // Promote small integer types to int for literals to avoid Ui8/Ui16 suffixes
-  // that gcc doesn't understand.
-  if (T->isIntegerType() && AST->getTypeSize(T) < 32)
-    T = AST->IntTy;
+
   // Bool context: 0/1 become `false`/`true` in C++ mode. IntegerLiteral
   // cannot carry a bool type, so C prints a plain `0`/`1`.
   if (T->isBooleanType()) {
     if (Ctx.isCPlusPlus())
       return CXXBoolLiteralExpr::Create(*AST, !V.isZero(), T,
                                         SourceLocation());
+    T = AST->IntTy;
+  } else if (T->isIntegerType() && AST->getTypeSize(T) < 32) {
+    // Promote small integer types to int for literals to avoid Ui8/Ui16
+    // suffixes that gcc doesn't understand.
     T = AST->IntTy;
   }
   unsigned W = (unsigned)AST->getIntWidth(T);

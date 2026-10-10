@@ -213,7 +213,43 @@ TEST(StructuredStmtBuilderTest, ForShape) {
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("for"), std::string::npos);
   EXPECT_NE(S.find("continue"), std::string::npos);
+  EXPECT_NE(S.find("++"), std::string::npos);
 }
+
+TEST(StructuredStmtBuilderTest, ForCompoundAssignmentStep) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_for_compound", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_for_compound", M);
+  llvm::Argument *N = F->getArg(0);
+  llvm::BasicBlock *Pre = BasicBlock::Create(C, "bb_5100", F);
+  llvm::BasicBlock *Head = BasicBlock::Create(C, "bb_5110", F);
+  llvm::BasicBlock *Body = BasicBlock::Create(C, "bb_5120", F);
+  llvm::BasicBlock *Latch = BasicBlock::Create(C, "bb_5130", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_5140", F);
+  llvm::IRBuilder<> B(Pre);
+  llvm::AllocaInst *I = B.CreateAlloca(I32, nullptr, "i");
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), I);
+  B.CreateBr(Head);
+  B.SetInsertPoint(Head);
+  B.CreateCondBr(B.CreateICmpSLT(B.CreateLoad(I32, I), N), Body, Exit);
+  B.SetInsertPoint(Body);
+  B.CreateCondBr(B.CreateICmpEQ(N, llvm::ConstantInt::get(I32, 0)), Head,
+                 Latch);
+  B.SetInsertPoint(Latch);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, I), llvm::ConstantInt::get(I32, 2)),
+                I);
+  B.CreateBr(Head);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(B.CreateLoad(I32, I));
+  tagRegion(Head->getTerminator(), "for",
+            {indexOf(*F, Head), indexOf(*F, Latch), indexOf(*F, Exit)});
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("+="), std::string::npos);
+}
+
 
 TEST(StructuredStmtBuilderTest, Switch) {
   LLVMContext &C = ctx();

@@ -335,6 +335,20 @@ TEST_F(ExprTest, SignedArithmeticCastsUnsignedOperands) {
             std::string::npos);
 }
 
+TEST_F(ExprTest, ConditionUsesDirectTruthTestForZeroCompare) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *IsNonzero =
+      B.CreateICmpNE(H.A, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0));
+  EXPECT_EQ(print(Exprs->cond(IsNonzero, Scope)), "a");
+
+  llvm::Value *IsZero =
+      B.CreateICmpEQ(H.A, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0));
+  EXPECT_EQ(print(Exprs->cond(IsZero, Scope)), "!a");
+}
+
 TEST_F(ExprTest, TruncIsCast) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
@@ -477,6 +491,20 @@ TEST_F(ExprTest, StringGlobalBecomesLiteral) {
   Exprs->beginFunction(*H.F, H.FD, Scope);
   clang::Expr *E = Exprs->value(GV, Scope);
   EXPECT_EQ(print(E), "\"hi\"");
+}
+
+TEST_F(ExprTest, CppBooleanConstantsPrintAsKeywords) {
+  LangOpts.CPlusPlus = 1;
+  FCtx = std::make_unique<revenant::clangx::FrontendContext>(
+      *ACtx, *M, revenant::clangx::SourceLang::CPlusPlus);
+  Types = std::make_unique<TestTypes>(FCtx.get());
+  Exprs = std::make_unique<ExprBuilderImpl>(*FCtx, *Types);
+
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  EXPECT_EQ(print(Exprs->value(ConstantInt::getTrue(LLCtx), Scope)), "true");
+  EXPECT_EQ(print(Exprs->value(ConstantInt::getFalse(LLCtx), Scope)), "false");
 }
 
 TEST_F(ExprTest, VirtualCallThroughVfptrSlot) {
