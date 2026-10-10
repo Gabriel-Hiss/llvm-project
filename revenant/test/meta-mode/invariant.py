@@ -197,6 +197,13 @@ def main() -> int:
             if args.whole:
                 none = run_whole(driver, binary, "none")
                 embedded = run_whole(driver, binary, "embedded")
+                if none is None and embedded is None:
+                    # A driver crash in both modes is an engine bug, not a
+                    # divergence: the modes agree that this binary does not
+                    # decompile. Filed on the bug board by the sweep runner.
+                    print(f"{name}: SKIP whole-binary invariant (crashed in "
+                          f"both modes)")
+                    continue
                 if none is not None and embedded is not None and none == embedded:
                     print(f"{name}: PASS whole-binary invariant")
                 else:

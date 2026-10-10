@@ -99,7 +99,10 @@ between the modes; control flow, statements and call argument counts may
 not. A function that crashes in both modes is counted separately and
 excluded; a one-mode crash or differing IR fails the check.
 For a full-binary run without retaining intermediate `.ll` dumps, add
-`--whole`; this also passes `--no-artifacts` to the driver.
+`--whole`; this also passes `--no-artifacts` to the driver. A binary that
+crashes the driver in both modes prints `SKIP` there and is excluded the
+same way, because the two modes agree and the crash itself is an engine
+bug to file on the bug board.
 `test/meta-mode/recovery-report.py` compares sampled real names with oracle
 PDB or map symbols. Both scripts accept `--all-release`.
 
