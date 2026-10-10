@@ -66,11 +66,13 @@
 using namespace llvm;
 
 namespace revenant {
-
 using unloopvec::loopBound;
 using unloopvec::matchScalarLoop;
 using unloopvec::ScalarLoopInfo;
 using unloopvec::stripCountDerivation;
+namespace unvecmaps {
+bool runUnvecMaps(llvm::Function &F);
+} // namespace unvecmaps
 
 namespace {
 
@@ -2085,7 +2087,9 @@ bool runOnFunction(Function &F) {
 PreservedAnalyses UnloopVecPass::run(Function &F, FunctionAnalysisManager &) {
   if (F.isDeclaration() || F.hasOptNone())
     return PreservedAnalyses::all();
-  if (!runOnFunction(F))
+  bool Changed = runOnFunction(F);
+  Changed |= unvecmaps::runUnvecMaps(F);
+  if (!Changed)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
 }

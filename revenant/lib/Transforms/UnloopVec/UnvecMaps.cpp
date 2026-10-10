@@ -49,6 +49,23 @@ using unloopvec::matchScalarLoop;
 using unloopvec::ScalarLoopInfo;
 using unloopvec::stripCountDerivation;
 
+// Pass-local candidate: the inner dispatch D, its scalar entry S,
+// the countdown drain L plus the counted tail T, the middle vector
+// tier Mid with its preheader, and the region R to erase (middle
+// preheader-through-exit plus the outer dispatch blocks that only
+// route into it).
+struct InnerCascade {
+  BasicBlock *D = nullptr;
+  BasicBlock *S = nullptr;
+  BasicBlock *Mid = nullptr;
+  BasicBlock *MidPre = nullptr;
+  ScalarLoopInfo MidLoop;
+  BasicBlock *L = nullptr; // countdown drain
+  ScalarLoopInfo DrainLoop;
+  BasicBlock *T = nullptr; // counted tail
+  ScalarLoopInfo TailLoop;
+  DenseSet<BasicBlock *> R;
+};
 // True when V is a cast chain rooted at one of the resume phis: the
 // value restarts at 0 on the folded path exactly like the phi.
 static bool isResumeDerived(Value *V,
@@ -221,6 +238,15 @@ static bool isMapBody(BasicBlock *B) {
       VL = LI;
       continue;
     }
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (isa<FixedVectorType>(BO->getType())) {
+        // Lane-wise vector arithmetic: only add is a map.
+        if (BO->getOpcode() != Instruction::Add)
+          return false;
+      }
+      // Scalar ALU (address math, IV steps, bounds) is fine.
+      continue;
+    }
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
       if (!isa<FixedVectorType>(SI->getValueOperand()->getType()) ||
           SI->isVolatile() || !SI->isSimple())
@@ -228,13 +254,6 @@ static bool isMapBody(BasicBlock *B) {
       if (VS)
         return false;
       VS = SI;
-      continue;
-    }
-    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-      if (BO->getOpcode() != Instruction::Add)
-        return false;
-      if (!isa<FixedVectorType>(BO->getType()))
-        return false;
       continue;
     }
     if (isa<InsertElementInst>(&I) || isa<ShuffleVectorInst>(&I))
@@ -246,10 +265,264 @@ static bool isMapBody(BasicBlock *B) {
   return VL->getType() == VS->getValueOperand()->getType();
 }
 
+// Match the inner cascade around dispatch D with scalar entry S:
+// S routes to a countdown drain L and a counted tail T; the other
+// arm reaches a middle vector tier Mid (single-block self-loop with
+// a preheader) whose bound the countdown check accepts against the
+// drain. Region R covers the middle preheader, tier, and exit plus
+// any dispatch blocks between D and the preheader. Returns true with
+// C filled on a full structural match; no mutation.
+static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
+                              InnerCascade &C) {
+  // S must route to exactly the drain and the tail entries.
+  auto *SBr = dyn_cast<BranchInst>(S->getTerminator());
+  if (!SBr || !SBr->isConditional())
+    return false;
+  BasicBlock *S0 = SBr->getSuccessor(0);
+  BasicBlock *S1 = SBr->getSuccessor(1);
+  // One successor is the countdown drain (single-block self-loop
+  // whose latch compares against 0); the other reaches the counted
+  // tail. Try both orders.
+  for (int Pick = 0; Pick < 2; ++Pick) {
+    BasicBlock *MaybeDrain = Pick == 0 ? S0 : S1;
+    BasicBlock *MaybeTailEntry = Pick == 0 ? S1 : S0;
+    ScalarLoopInfo Drain;
+    if (!matchScalarLoop(MaybeDrain, Drain))
+      continue;
+    // Drain latch must compare against constant 0 (countdown form).
+    Value *DrainBound = loopBound(Drain);
+    auto *Zero = dyn_cast_or_null<ConstantInt>(DrainBound);
+    if (!Zero || !Zero->isZero())
+      continue;
+    // The tail entry is either the counted tail itself or a block
+    // leading to it; find the single-block counted self-loop below.
+    ScalarLoopInfo Tail;
+    BasicBlock *TailBB = nullptr;
+    if (matchScalarLoop(MaybeTailEntry, Tail)) {
+      TailBB = MaybeTailEntry;
+    } else {
+      SmallVector<BasicBlock *, 4> Work{MaybeTailEntry};
+      DenseSet<BasicBlock *> Seen{MaybeTailEntry};
+      while (!Work.empty() && !TailBB) {
+        BasicBlock *BB = Work.pop_back_val();
+        if (BB != MaybeTailEntry && matchScalarLoop(BB, Tail)) {
+          TailBB = BB;
+          break;
+        }
+        for (BasicBlock *Su : successors(BB))
+          if (Seen.insert(Su).second)
+            Work.push_back(Su);
+        if (Seen.size() > 32)
+          break;
+      }
+    }
+    if (!TailBB)
+      continue;
+    // The middle tier: the non-S arm of D reaches a preheader that
+    // feeds a single-block vector self-loop.
+    auto *DBr = dyn_cast<BranchInst>(D->getTerminator());
+    if (!DBr || !DBr->isConditional())
+      continue;
+    BasicBlock *V = DBr->getSuccessor(0) == S ? DBr->getSuccessor(1)
+                                              : DBr->getSuccessor(0);
+    // Walk from V to the middle preheader: a block whose single
+    // successor is a vector self-loop.
+    BasicBlock *MidPre = V;
+    BasicBlock *Mid = nullptr;
+    ScalarLoopInfo MidLoop;
+    for (unsigned Walk = 0; Walk < 8 && MidPre && !Mid; ++Walk) {
+      for (BasicBlock *Su : successors(MidPre)) {
+        if (Su == S || Su == MaybeDrain || Su == TailBB)
+          continue;
+        ScalarLoopInfo Loop;
+        if (matchScalarLoop(Su, Loop) && isMapBody(Su)) {
+          Mid = Su;
+          MidLoop = Loop;
+          break;
+        }
+      }
+      if (Mid)
+        break;
+      // Step through unconditional single-successor blocks.
+      auto *WBr = dyn_cast<BranchInst>(MidPre->getTerminator());
+      if (!WBr || WBr->isConditional())
+        break;
+      MidPre = WBr->getSuccessor(0);
+      if (MidPre == S || MidPre == MaybeDrain || MidPre == TailBB)
+        break;
+    }
+    if (!Mid)
+      continue;
+    uint64_t Step = MidLoop.Step->getZExtValue();
+    if (Step < 2)
+      continue;
+    if (!countdownSecondaryOK(Mid, MidLoop, Drain, F, Step))
+      continue;
+    C.D = D;
+    C.S = S;
+    C.Mid = Mid;
+    C.MidPre = MidPre;
+    C.MidLoop = MidLoop;
+    C.L = MaybeDrain;
+    C.DrainLoop = Drain;
+    C.T = TailBB;
+    C.TailLoop = Tail;
+    return true;
+  }
+  return false;
+}
+
+// Fold an inner cascade: point D directly at S, drop the middle
+// region blocks, and let the drain plus counted tail cover the full
+// range from the zero restart. The middle tier's element range is
+// exactly what the drain remainder plus tail re-cover: the countdown
+// check proved middle bound N&~(K-1) with drain remainder N&(K-1).
+// Only branch targets change; kept instructions are untouched.
+static bool foldInnerCascade(Function &F, const InnerCascade &C) {
+  // Collect the erase region: from D's vector arm forward to the
+  // middle preheader, tier, and exit, stopping at S/L/T/returns.
+  DenseSet<BasicBlock *> Stop{C.S, C.L, C.T};
+  for (BasicBlock &BB : F)
+    if (isa<ReturnInst>(BB.getTerminator()))
+      Stop.insert(&BB);
+  for (BasicBlock *ES : successors(C.L))
+    if (ES != C.L)
+      Stop.insert(ES);
+  for (BasicBlock *ES : successors(C.T))
+    if (ES != C.T)
+      Stop.insert(ES);
+  auto *DBr = cast<BranchInst>(C.D->getTerminator());
+  BasicBlock *V = DBr->getSuccessor(0) == C.S ? DBr->getSuccessor(1)
+                                              : DBr->getSuccessor(0);
+  DenseSet<BasicBlock *> R;
+  SmallVector<BasicBlock *, 16> Work{V};
+  while (!Work.empty()) {
+    BasicBlock *BB = Work.pop_back_val();
+    if (Stop.count(BB) || R.count(BB))
+      continue;
+    if (isa<ReturnInst>(BB->getTerminator()) ||
+        isa<UnreachableInst>(BB->getTerminator()))
+      continue;
+    R.insert(BB);
+    for (BasicBlock *Su : successors(BB))
+      Work.push_back(Su);
+  }
+  if (!R.count(C.Mid) || !R.count(C.MidPre))
+    return false;
+  // Single entry: every R pred is in R or D.
+  for (BasicBlock *BB : R)
+    for (BasicBlock *P : predecessors(BB))
+      if (!R.count(P) && P != C.D)
+        return false;
+  // Escape: no R def may feed kept code except S phis through
+  // R edges (dropped below) and dead-in-R users.
+  for (BasicBlock *BB : R)
+    for (Instruction &I : *BB) {
+      if (I.getType()->isVoidTy())
+        continue;
+      for (Use &U : I.uses()) {
+        auto *UI = cast<Instruction>(U.getUser());
+        BasicBlock *UB = UI->getParent();
+        if (R.count(UB))
+          continue;
+        if (auto *P = dyn_cast<PHINode>(UI)) {
+          if (P->getParent() == C.S)
+            continue;
+          bool AllR = true;
+          for (unsigned K = 0; K < P->getNumIncomingValues(); ++K)
+            if (P->getIncomingValue(K) == &I &&
+                !R.count(P->getIncomingBlock(K)))
+              AllR = false;
+          if (AllR)
+            continue;
+        }
+        return false;
+      }
+    }
+  // Rewrite: D jumps to S; S drops R incomings.
+  BranchInst *NewBr = BranchInst::Create(C.S, DBr);
+  if (MDNode *MD = DBr->getMetadata("revenant.va"))
+    NewBr->setMetadata("revenant.va", MD);
+  NewBr->setDebugLoc(DBr->getDebugLoc());
+  DBr->eraseFromParent();
+  for (PHINode &Phi : C.S->phis()) {
+    SmallVector<BasicBlock *, 4> Kill;
+    for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+      if (R.count(Phi.getIncomingBlock(I)))
+        Kill.push_back(Phi.getIncomingBlock(I));
+    if (Kill.size() == Phi.getNumIncomingValues())
+      return false;
+    for (BasicBlock *KB : Kill)
+      Phi.removeIncomingValue(KB);
+  }
+  for (BasicBlock *BB : R)
+    BB->getTerminator()->setMetadata(LLVMContext::MD_loop, nullptr);
+  SmallVector<BasicBlock *, 16> Dead(R.begin(), R.end());
+  DenseSet<BasicBlock *> DeadSet(Dead.begin(), Dead.end());
+  for (BasicBlock *BB : Dead) {
+    Instruction *OldT = BB->getTerminator();
+    auto *Unr = new UnreachableInst(BB->getContext());
+    Unr->insertInto(BB, BB->end());
+    OldT->eraseFromParent();
+  }
+  for (BasicBlock &BB : F) {
+    if (DeadSet.count(&BB))
+      continue;
+    for (PHINode &Phi : BB.phis()) {
+      SmallVector<BasicBlock *, 4> Kill;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+        if (DeadSet.count(Phi.getIncomingBlock(I)))
+          Kill.push_back(Phi.getIncomingBlock(I));
+      if (Kill.size() == Phi.getNumIncomingValues())
+        continue;
+      for (BasicBlock *KB : Kill)
+        Phi.removeIncomingValue(KB);
+    }
+  }
+  for (BasicBlock *BB : Dead)
+    BB->dropAllReferences();
+  for (BasicBlock *BB : Dead)
+    BB->eraseFromParent();
+  return true;
+}
 // Runs after UnloopVec in the same library: folds inner-cascade map
-// dispatches UnloopVec leaves behind. Declared here; registered as
-// `revenant-unvecmaps` in Pipeline/Register.cpp.
-bool runUnvecMaps(llvm::Function &F);
+// dispatches UnloopVec leaves behind.
+bool runUnvecMaps(llvm::Function &F) {
+  bool Changed = false;
+  // Collect-then-rewrite: matching never mutates.
+  SmallVector<InnerCascade, 4> Cands;
+  for (BasicBlock &BB : F) {
+    auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Br || !Br->isConditional())
+      continue;
+    for (unsigned SIdx = 0; SIdx < 2; ++SIdx) {
+      InnerCascade C;
+      if (matchInnerCascade(&BB, Br->getSuccessor(SIdx), F, C))
+        Cands.push_back(std::move(C));
+    }
+  }
+  DenseSet<BasicBlock *> Taken;
+  for (InnerCascade &C : Cands) {
+    if (Taken.count(C.D) || Taken.count(C.S) || Taken.count(C.Mid) ||
+        Taken.count(C.L) || Taken.count(C.T))
+      continue;
+    bool Overlap = false;
+    for (BasicBlock *BB : C.R)
+      Overlap = Overlap || Taken.count(BB);
+    if (Overlap)
+      continue;
+    Taken.insert(C.D);
+    Taken.insert(C.S);
+    Taken.insert(C.Mid);
+    Taken.insert(C.MidPre);
+    Taken.insert(C.L);
+    Taken.insert(C.T);
+    for (BasicBlock *BB : C.R)
+      Taken.insert(BB);
+    Changed |= foldInnerCascade(F, C);
+  }
+  return Changed;
+}
 
 } // namespace unvecmaps
 } // namespace revenant
