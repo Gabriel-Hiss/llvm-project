@@ -172,11 +172,11 @@ std::optional<uint64_t> globalVA(const GlobalObject &GV) {
 bool globalEquivalent(const GlobalValue *A, const GlobalValue *B) {
   if (A == B)
     return true;
-  // Distinct function declarations are never equivalent: a declaration
-  // carries no body, so nothing proves two of them behave the same (even
-  // same-typed `sub_0x` trap stubs: linked definitions may return
-  // different values). Trap-tail folding goes through deadTrapCalls,
-  // which proves both differing calls unobservable at their sites.
+  // Distinct functions are never equivalent: a declaration carries no
+  // body, so nothing proves two of them behave the same (not same type,
+  // noreturn, unused results, or unreachable successors; linked
+  // definitions may exit with distinct codes). Folds need identical
+  // callee identity.
   if (isa<Function>(A) || isa<Function>(B))
     return false;
   const auto *VA = dyn_cast<GlobalVariable>(A);
@@ -194,8 +194,8 @@ bool globalEquivalent(const GlobalValue *A, const GlobalValue *B) {
 
 
 // Within an operand pair that is already constantsEquivalent: did the
-// equality rely on dedup'd constant data (a GlobalVariable pair), rather
-// than identical sub-trees or trap-stub decls?
+// equality rely on dedup'd constant data (a GlobalVariable pair) rather
+// than identical sub-trees?
 bool differsOnlyByDataGlobal(const Constant *A, const Constant *B) {
   if (A == B)
     return false;
@@ -203,7 +203,7 @@ bool differsOnlyByDataGlobal(const Constant *A, const Constant *B) {
     return isa<GlobalVariable>(B) &&
            globalEquivalent(GA, cast<GlobalVariable>(B));
   if (isa<GlobalValue>(A))
-    return false; // trap stubs and other globals are not data
+    return false; // functions and other globals are not data
   const auto *EA = dyn_cast<ConstantExpr>(A);
   const auto *EB = dyn_cast<ConstantExpr>(B);
   if (!EA || !EB || EA->getNumOperands() != EB->getNumOperands())
@@ -214,60 +214,6 @@ bool differsOnlyByDataGlobal(const Constant *A, const Constant *B) {
   return false;
 }
 
-// A `sub_0x` declaration is only a trap marker when the differing calls
-// are dead ends in both bodies: no caller observes a result, and control
-// never continues past the call (noreturn or immediately unreachable).
-// Anything else (a returned or stored result, a following live return)
-// makes the stub's behavior observable: linked definitions may return
-// different values, so distinct declarations are never interchangeable
-// there. I/J are the instructions carrying A/B as operands.
-bool deadTrapCalls(const Constant *A, const Constant *B, const Instruction &I,
-                   const Instruction &J) {
-  const auto *FA = dyn_cast<Function>(A);
-  const auto *FB = dyn_cast<Function>(B);
-  if (!FA || !FB || !FA->isDeclaration() || !FB->isDeclaration())
-    return false;
-  if (FA->getFunctionType() != FB->getFunctionType())
-    return false;
-  if (!FA->getName().starts_with("sub_0x") ||
-      !FB->getName().starts_with("sub_0x"))
-    return false;
-  const auto *CI = dyn_cast<CallInst>(&I);
-  const auto *CJ = dyn_cast<CallInst>(&J);
-  if (!CI || !CJ || CI->getCalledOperand() != FA ||
-      CJ->getCalledOperand() != FB)
-    return false;
-  for (const CallInst *C : {CI, CJ}) {
-    if (!C->use_empty())
-      return false;
-    if (C->doesNotReturn())
-      continue;
-    if (isa<UnreachableInst>(C->getNextNode()))
-      continue;
-    return false;
-  }
-  return true;
-}
-
-bool differsOnlyByTrapStub(const Constant *A, const Constant *B) {
-  if (A == B)
-    return false;
-  const auto *FA = dyn_cast<Function>(A);
-  const auto *FB = dyn_cast<Function>(B);
-  if (FA || FB)
-    return FA && FB && FA->isDeclaration() && FB->isDeclaration() &&
-           FA->getFunctionType() == FB->getFunctionType() &&
-           FA->getName().starts_with("sub_0x") &&
-           FB->getName().starts_with("sub_0x");
-  const auto *EA = dyn_cast<ConstantExpr>(A);
-  const auto *EB = dyn_cast<ConstantExpr>(B);
-  if (!EA || !EB || EA->getNumOperands() != EB->getNumOperands())
-    return false;
-  for (unsigned I = 0; I < EA->getNumOperands(); ++I)
-    if (differsOnlyByTrapStub(EA->getOperand(I), EB->getOperand(I)))
-      return true;
-  return false;
-}
 
 // `sub_<hexva>` lifted names carry the entry address; used to prefer the
 // lowest-VA equivalent as the fold survivor (GCC keeps the general body
@@ -363,11 +309,13 @@ hash_code bodyHash(Function &F) {
 
 // `SawDataGlobal` (optional) records that at least one operand pair was
 // equal only through GlobalVariable equivalence (dedup'd constant data),
-// so the bodies are not literally identical. Trap-stub-decl equivalence
-// alone does not set it: identical throw/trap tails are far more common
-// than clones and are not IPO evidence by themselves.
-bool equalBodies(Function &A, Function &B, bool *SawDataGlobal = nullptr,
-                 bool *SawTrapStub = nullptr) {
+// so the bodies are not literally identical. Calls to different
+// declarations are always different, whatever their attributes: a
+// declaration carries no body, so nothing proves two of them behave the
+// same (noreturn, unused results and unreachable successors do not prove
+// side-effect equivalence; linked definitions may exit with distinct
+// codes). Only identical callee identity folds.
+bool equalBodies(Function &A, Function &B, bool *SawDataGlobal = nullptr) {
   if (A.size() != B.size() || A.arg_size() != B.arg_size())
     return false;
   DenseMap<const Value *, const Value *> Map;
@@ -412,15 +360,10 @@ bool equalBodies(Function &A, Function &B, bool *SawDataGlobal = nullptr,
           auto *CW = dyn_cast<Constant>(W);
           if (!CV || !CW)
             return false;
-          // Trap-stub declarations prove nothing on their own: accept the
-          // pair only with a dead-trap proof at both call sites (results
-          // unused, control never continues). Anything observable rejects.
-          if (differsOnlyByTrapStub(CV, CW)) {
-            if (!SawTrapStub || !deadTrapCalls(CV, CW, I, J))
-              return false;
-            *SawTrapStub = true;
-            continue;
-          }
+          // Distinct callees reject here: constantsEquivalent never
+          // equates two different Functions (globalEquivalent is
+          // identity-only for declarations), so calls to different
+          // declarations always differ.
           if (!revenant::constantsEquivalent(CV, CW))
             return false;
           if (SawDataGlobal && differsOnlyByDataGlobal(CV, CW))
@@ -497,10 +440,10 @@ bool foldStructuralIPO(Module &M) {
         std::optional<uint64_t> BV = functionVA(B);
         bool Earlier = AV && BV ? *AV < *BV : AI < BI;
         bool DataGlobal = false;
-        bool TrapStub = false;
-        bool BodiesEqual =
-            Earlier && equalBodies(A, B, &DataGlobal, &TrapStub);
-        if (BodiesEqual && DataGlobal && TrapStub) {
+        bool BodiesEqual = Earlier && equalBodies(A, B, &DataGlobal);
+        // Identical bodies are not proof of shared source identity; only
+        // a dedup'd-data difference with identical call targets folds.
+        if (BodiesEqual && DataGlobal) {
           redirect(A, B);
           Functions.erase(Functions.begin() + BI);
           Folded = Changed = true;
