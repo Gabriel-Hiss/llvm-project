@@ -39,6 +39,7 @@
 
 #include "revenant/Transforms/Reroll/Reroll.h"
 #include "revenant/Evidence/Evidence.h"
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -1668,13 +1669,11 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
                 int64_t D = *Difference;
                 if (D != 0) {
                   SawOff = true;
-                  // Exactness: the window-K offset must be exactly K
-                  // times the per-step delta. Truncated division here
-                  // rewrites lane indices (0,3,7 -> 0,3,6): wrong code.
-                  if (D % (int64_t)K != 0) {
-                    ScanOK = false;
-                    break;
-                  }
+                  // The per-window stride has to be exact: window K's
+                  // offset is K * Delta from window 0's, so any
+                  // truncation here means the lanes are not evenly
+                  // spaced and the synthesized counted loop would visit
+                  // element offsets the original never touches.
                   int64_t Per = D / (int64_t)K;
                   if (D % (int64_t)K != 0)
                     ScanOK = false;
