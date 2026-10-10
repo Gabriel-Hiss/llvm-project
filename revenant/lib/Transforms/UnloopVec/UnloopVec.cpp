@@ -1200,9 +1200,13 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       if (!Cand.R.count(P))
         continue;
       auto *PB = dyn_cast<BranchInst>(P->getTerminator());
-      bool Guard = PB && PB->isConditional() &&
-                   (PB->getSuccessor(0) == S || PB->getSuccessor(1) == S);
-      HasRegionPredecessor |= !Guard;
+      bool CondGuard = PB && PB->isConditional() &&
+                       (PB->getSuccessor(0) == S || PB->getSuccessor(1) == S);
+      // Any R block flowing into S that is not a conditional guard
+      // edge is a region resume entry: an unconditional R jump into
+      // S (or a multi-successor branch to S) means the scalar tail
+      // resumes mid-range, so this is not a versioned candidate.
+      HasRegionPredecessor |= !CondGuard;
     }
     Cand.Versioned = !HasRegionPredecessor;
     // Compute the dispatch chain BEFORE the strict tail check so
@@ -1498,6 +1502,14 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       // from D or the chain.
       for (BasicBlock *BB : Cand.R) {
         Candidate Probe = Cand;
+        // The versioned path runs the same lane-equivalence gate
+        // (bug board 25): a versioned candidate accepts a body that
+        // passes EITHER the versioned lane proof OR the ordinary
+        // tier-bound match, but the lane check inside
+        // matchVersionedBody must still run before any fold. A body
+        // whose arithmetic disagrees with the scalar fallback fails
+        // the lane check and can only be accepted through the
+        // ordinary match, which never fires for it either.
         bool VM = Cand.Versioned && matchVersionedBody(BB, Probe, F);
         if (matchVectorBody(BB, Probe, F, false) || VM) {
           if (Cand.Versioned)
@@ -1518,9 +1530,13 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
             Self = true;
         if (!Self)
           continue;
+        // The versioned body already passed the lane-equivalence
+        // proof in matchVersionedBody; every other self-loop keeps
+        // the ordinary tier match.
+        if (Cand.Versioned && BB == Cand.VersionedBody)
+          continue;
         Candidate Probe = Cand;
-        if ((Cand.Versioned && BB == Cand.VersionedBody) ||
-            matchVectorBody(BB, Probe, F, false) ||
+        if (matchVectorBody(BB, Probe, F, false) ||
             matchVectorBody(BB, Probe, F, true))
           continue;
         ULV_BAIL();
@@ -1653,7 +1669,9 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
   // the vector ALU must be the lane-wise image of the scalar ALU.
   // Require the other vector operand to be a splat of the scalar's
   // operand, then confirm structurally with laneEq. A body that adds
-  // a different constant (+100 vs +1) fails here and bails.
+  // a different constant (+100 vs +1) fails here and bails. This
+  // runs before the alias/epilogue checks so a mismatched body can
+  // never be masked by them.
   if (broadcastScalar(VectorOther) != ScalarOther)
     return false;
   {
@@ -2949,17 +2967,40 @@ bool lowerUniformStoreUnroll(Function &F) {
     if (!LanesMatch)
       continue;
     // Trip-count divisibility (bug board 23): narrowing the step from
-    // ByteStep to ByteStep/Stores.size() drops stores unless the
-    // loop's trip count is a multiple of the old step. The latch
-    // compares IV.next against the bound with the IV starting at 0,
-    // so require the bound to be a constant multiple of the old
-    // step. Anything else keeps the loop untouched.
+    // ByteStep to ByteStep/Stores.size() is only sound for the exact
+    // shape proven here: the IV starts at constant 0, the latch exit
+    // compares IV.next (the stepped value, not the raw IV) against a
+    // constant bound, and the bound is a multiple of the old step
+    // under the compare's unsigned interpretation. Anything else
+    // (nonzero start, IV tested instead of IV.next, symbolic bound)
+    // keeps the loop untouched.
     {
       Value *Bound = loopBound(Loop);
-      bool Divisible = false;
-      if (auto *CBound = dyn_cast<ConstantInt>(Bound))
-        Divisible = CBound->getZExtValue() % ByteStep == 0;
-      if (!Divisible)
+      auto *CBound = dyn_cast<ConstantInt>(Bound);
+      if (!CBound)
+        continue;
+      // Every entry value must be constant 0.
+      bool ZeroStart = true;
+      for (unsigned I = 0; I < Loop.IV->getNumIncomingValues(); ++I) {
+        if (Loop.IV->getIncomingBlock(I) == &BB)
+          continue;
+        auto *CStart =
+            dyn_cast<ConstantInt>(Loop.IV->getIncomingValue(I));
+        if (!CStart || !CStart->isZero())
+          ZeroStart = false;
+      }
+      if (!ZeroStart)
+        continue;
+      // The latch must compare IV.next, the backedge-fed step value.
+      Value *BackVal = Loop.IV->getIncomingValueForBlock(&BB);
+      auto *Cmp = dyn_cast<ICmpInst>(
+          cast<BranchInst>(BB.getTerminator())->getCondition());
+      bool TestsNext = Cmp && (Cmp->getOperand(0) == BackVal ||
+                               Cmp->getOperand(1) == BackVal);
+      if (!TestsNext)
+        continue;
+      // Divisibility under the compare's unsigned interpretation.
+      if (CBound->getZExtValue() % ByteStep != 0)
         continue;
     }
     auto *StepUpdate =

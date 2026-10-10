@@ -41,7 +41,9 @@ exit:
 }
 
 ; CHECK-LABEL: define{{.*}}void @add_choice
+; CHECK: entry:
 ; CHECK: br label %scalar.pre
+; CHECK-NOT: vector.loop
 ; CHECK: scalar.loop:
 ; CHECK: add i32 %x, 1
 ; CHECK: ret void
