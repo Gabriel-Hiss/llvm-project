@@ -131,14 +131,29 @@ bool tryStore(Function &F, StoreInst *SI, unsigned &Changed) {
   if (SI->getPointerAddressSpace() != 0)
     return false;
   Value *V = SI->getValueOperand();
-  if (auto *C = dyn_cast<ConstantInt>(V))
-    if (C->isZero())
-      return false; // zero stores already emit cleanly
   DenseSet<Value *> Web;
   DenseSet<Value *> EnRoute;
   if (!collectWeb(V, Web, EnRoute))
     return false;
   if (!privateUses(Web, SI))
+    return false;
+  // Split only webs containing a constant the C emitter cannot materialize
+  // (needs more than 64 bits: the u64-literal path fails, e.g. folded
+  // pointer pairs). Load-only webs and small constants emit cleanly as one
+  // struct assignment, which reads better and stays recognizable for loop
+  // folding; splitting them only lengthens the source.
+  bool Huge = false;
+  auto HugeConst = [&](Value *X) {
+    if (auto *C = dyn_cast<ConstantInt>(X))
+      if (C->getValue().getActiveBits() > 64)
+        Huge = true;
+  };
+  HugeConst(V);
+  for (Value *D : Web)
+    if (auto *P = dyn_cast<PHINode>(D))
+      for (Value *Arm : P->incoming_values())
+        HugeConst(Arm);
+  if (!Huge)
     return false;
 
   LLVMContext &Ctx = F.getContext();
