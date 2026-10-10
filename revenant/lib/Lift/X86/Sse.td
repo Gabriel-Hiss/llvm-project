@@ -50,6 +50,10 @@ def rv_movmskpd     : RVOp; // (rv_movmskpd x): i128 -> i32
 def rv_ptest        : RVOp; // (rv_ptest a, b): flags-only
 def rv_vbroadcastb  : RVOp; // (rv_vbroadcastb val): low byte splat -> i128
 def rv_vcvtdq2pd    : RVOp; // (rv_vcvtdq2pd x): low 2xi32 -> 2xf64 as i128
+def rv_vcvtps2pd    : RVOp; // (rv_vcvtps2pd x): low 2xf32 -> 2xf64 as i128
+def rv_vcvtpd2ps    : RVOp; // (rv_vcvtpd2ps x): low 2xf64 -> 2xf32 as i128
+def rv_xroundsd     : RVOp; // (rv_xroundsd x, imm): round lane 0 double
+def rv_xroundss     : RVOp; // (rv_xroundss x, imm): round lane 0 float
 def rv_pcmpextest   : RVOp; // (rv_pcmpextest kind, x, m, imm): pcmpestr flags-only
 def rv_pcmpistest   : RVOp; // (rv_pcmpistest kind, x, m, imm): pcmpistr flags-only
 
@@ -489,6 +493,76 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "CVTSS2SI64rm_Int";
   dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
+}
+
+// ---- SSE4.1 packed conversions and scalar rounding ------------------------------
+// CVTPS2PD/CVTPD2PS: packed convert on the low 64 bits. Legacy forms keep
+// upper lanes; VEX forms zero them.
+def : RVMatch {
+  string Glob = "CVTPS2PDrr";
+  dag Body = (rv_set $dst, (rv_vcvtps2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPS2PDrm";
+  dag Body = (rv_set $dst, (rv_vcvtps2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPS2PDrr";
+  dag Body = (rv_setz $dst, (rv_vcvtps2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPS2PDrm";
+  dag Body = (rv_setz $dst, (rv_vcvtps2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPD2PSrr";
+  dag Body = (rv_set $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPD2PSrm";
+  dag Body = (rv_set $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPD2PSrr";
+  dag Body = (rv_setz $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPD2PSrm";
+  dag Body = (rv_setz $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+// ROUNDSD/ROUNDSS: scalar round with imm8 rounding mode. Legacy forms keep
+// upper lanes; VEX forms zero them.
+def : RVMatch {
+  string Glob = "ROUNDSDri";
+  dag Body = (rv_set $dst, (rv_xroundsd (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "ROUNDSDmi";
+  dag Body = (rv_set $dst, (rv_xroundsd (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSDri";
+  dag Body = (rv_setz $dst, (rv_xroundsd (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSDmi";
+  dag Body = (rv_setz $dst, (rv_xroundsd (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "ROUNDSSri";
+  dag Body = (rv_set $dst, (rv_xroundss (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "ROUNDSSmi";
+  dag Body = (rv_set $dst, (rv_xroundss (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSSri";
+  dag Body = (rv_setz $dst, (rv_xroundss (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSSmi";
+  dag Body = (rv_setz $dst, (rv_xroundss (rv_op 0), (rv_op 1)));
 }
 
 // ---- scalar float compares (flags only) --------------------------------------

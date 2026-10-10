@@ -379,7 +379,8 @@ class RevenantLiftEmitter {
           Name == "rv_xnewlane0f32" || Name == "rv_xnewlane0f64" ||
           Name == "rv_pmovmskb" || Name == "rv_movmskps" ||
           Name == "rv_movmskpd" || Name == "rv_vbroadcastb" ||
-          Name == "rv_vcvtdq2pd" || Name == "rv_fsqrt" ||
+          Name == "rv_vcvtdq2pd" || Name == "rv_vcvtps2pd" ||
+          Name == "rv_vcvtpd2ps" || Name == "rv_fsqrt" ||
           Name == "rv_sitofpf32" || Name == "rv_sitofpf64" ||
           Name == "rv_fpext" || Name == "rv_fptrunc") {
         if (D->getNumArgs() != 1)
@@ -406,6 +407,21 @@ class RevenantLiftEmitter {
                              .str()
                        : (Twine("LC.vop(\"") + Vop + "\", " + A + ")")
                              .str();
+      }
+      if (Name == "rv_xroundsd" || Name == "rv_xroundss") {
+        if (D->getNumArgs() != 2)
+          return {};
+        unsigned W = Name == "rv_xroundsd" ? 64 : 32;
+        std::string A = expression(D->getArg(0), Inst, 128,
+                                   D->getArgNameStr(0));
+        if (A.empty())
+          return {};
+        std::string Imm = immediateExpr(D->getArg(1), Inst);
+        if (Imm.empty())
+          return {};
+        return (Twine("LC.vop(\"") + Name.drop_front(3) + "\", " + A +
+                ", nullptr, " + Imm + ")")
+                   .str();
       }
       if ((Name == "rv_xsetlane0f32" || Name == "rv_xsetlane0f64") &&
           D->getNumArgs() == 2) {

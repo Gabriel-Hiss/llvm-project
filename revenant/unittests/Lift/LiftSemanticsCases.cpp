@@ -569,6 +569,36 @@ std::vector<Case> cases() {
            "fnstcw word ptr [rsp+0x40]\n"
            "mov ax, word ptr [rsp+0x40]")
           .stack({0x027f}));
+  // SSE4.1 packed conversions: CVTPS2PD, CVTPD2PS (reg and mem forms).
+  add(Case("sse4.1 cvtps2pd reg",
+           "cvtps2pd xmm0, xmm1")
+          .xmm(1, 0x40490FDB3F800000ULL, 0) // pi, 1.0 as f32 pairs
+          .xmm(0, 0, 0));
+  add(Case("sse4.1 cvtps2pd mem",
+           "cvtps2pd xmm0, qword ptr [rsp+0x20]")
+          .stack({0x40490FDB3F800000ULL})
+          .xmm(0, 0, 0));
+  add(Case("sse4.1 cvtpd2ps reg",
+           "cvtpd2ps xmm0, xmm1")
+          .xmm(1, 0x400921FB54442D18ULL, 0) // pi as f64
+          .xmm(0, 0, 0));
+  add(Case("sse4.1 cvtpd2ps mem",
+           "cvtpd2ps xmm0, qword ptr [rsp+0x20]")
+          .stack({0x400921FB54442D18ULL})
+          .xmm(0, 0, 0));
+  // SSE4.1 scalar rounding: ROUNDSD/ROUNDSS with all 4 rounding modes.
+  // Mode 0 = round-nearest, 1 = floor, 2 = ceil, 3 = trunc.
+  for (unsigned Mode = 0; Mode < 4; ++Mode) {
+    std::string M = std::to_string(Mode);
+    add(Case("sse4.1 roundsd mode " + M,
+             "roundsd xmm0, xmm1, " + M)
+            .xmm(1, 0x405921FB54442D18ULL, 0) // 100.5 as f64
+            .xmm(0, 0, 0));
+    add(Case("sse4.1 roundss mode " + M,
+             "roundss xmm0, xmm1, " + M)
+            .xmm(1, 0x42C8000000000000ULL, 0) // 100.5 as f32
+            .xmm(0, 0, 0));
+  }
   return V;
 }
 
