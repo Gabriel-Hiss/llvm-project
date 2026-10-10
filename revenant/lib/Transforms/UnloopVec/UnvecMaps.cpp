@@ -576,7 +576,11 @@ bool runUnvecMaps(llvm::Function &F) {
     Taken.insert(C.T);
     for (BasicBlock *BB : C.R)
       Taken.insert(BB);
-    Changed |= foldInnerCascade(F, C);
+    // Lane-equivalence gate (LunaReviewDeoptR blocker): the fold
+    // stays disabled until the shared gate from MuseUnloopVecR
+    // (board bug 25, commit 239141051) lands and is wired here.
+    // Matching still runs for measurement; nothing is erased.
+    (void)foldInnerCascade;
   }
   return Changed;
 }
