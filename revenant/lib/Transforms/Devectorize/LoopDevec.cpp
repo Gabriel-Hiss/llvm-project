@@ -395,6 +395,83 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         return 0;
     }
   }
+  // Pre-mutation explodability check (multi-acc-dependency.ll): Ex below
+  // has no PHI case, so any stream whose lane tree touches an accumulator
+  // PHI/back would fail AFTER scalar PHIs exist and old edges are severed
+  // (verifier abort on half-built s.unopt PHIs). Prove everything
+  // explodable here, before creating any IR.
+  std::function<bool(Value *, unsigned)> CanExplode =
+      [&](Value *V, unsigned Depth) -> bool {
+    if (Depth > 32)
+      return false;
+    if (AccVals.contains(V))
+      return false;
+    if (auto *C = dyn_cast<Constant>(V)) {
+      for (unsigned j = 0; j < Lanes; ++j)
+        if (!laneConst(C, Elem, j))
+          return false;
+      return true;
+    }
+    if (isa<UndefValue>(V))
+      return true;
+    if (auto *LI = dyn_cast<LoadInst>(V))
+      return LI->getParent() == H;
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getParent() != H || !isLaneBinop(BO->getOpcode()))
+        return false;
+      return CanExplode(BO->getOperand(0), Depth + 1) &&
+             CanExplode(BO->getOperand(1), Depth + 1);
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(V)) {
+      if (BI->getDestTy() != BI->getSrcTy())
+        return false;
+      return CanExplode(BI->getOperand(0), Depth + 1);
+    }
+    return false;
+  };
+  for (auto &A : Accs)
+    if (!CanExplode(A.Stream, 0))
+      return 0;
+  for (Instruction &I : *H) {
+    if (AccBacks.contains(&I) || isa<PHINode>(&I))
+      continue;
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (isa<FixedVectorType>(LI->getType()) && !CanExplode(LI, 0))
+        return 0;
+      continue;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (isa<FixedVectorType>(BO->getType()) && !CanExplode(BO, 0))
+        return 0;
+      continue;
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(&I)) {
+      if (isa<FixedVectorType>(BI->getDestTy()) &&
+          !CanExplode(BI->getOperand(0), 0))
+        return 0;
+      continue;
+    }
+  }
+  // Reduce-root shape check before mutation: each reduce aliases to one
+  // acc chain end, or to one lane-wise exit-block add of two acc chain
+  // ends. AccTree above already proved this shape; re-check the exact emit
+  // cases so the defensive bail below never fires post-mutation.
+  for (Instruction *R : Reduces) {
+    Value *Root = cast<IntrinsicInst>(R)->getOperand(0);
+    auto IsAcc = [&](Value *V) {
+      for (auto &A : Accs)
+        if (V == A.Phi || V == A.Back)
+          return true;
+      return false;
+    };
+    if (IsAcc(Root))
+      continue;
+    auto *BO = dyn_cast<BinaryOperator>(Root);
+    if (!BO || BO->getOpcode() != Instruction::Add ||
+        !isa<FixedVectorType>(BO->getType()) || BO->getParent() == H ||
+        !IsAcc(BO->getOperand(0)) || !IsAcc(BO->getOperand(1)))
+      return 0;
+  }
 
   // Emit: one scalar acc phi per vector acc phi (init edge only; backedges
   // close below). Each vector reduction keeps its own accumulator: sharing
@@ -404,15 +481,18 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   Type *I8 = Type::getInt8Ty(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx);
   unsigned Esz = Elem->getScalarSizeInBits() / 8;
-  SmallVector<PHINode *, 4> SS;
+  SmallVector<Value *, 4> Inits;
   for (auto &A : Accs) {
-    PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
     Value *L0 = splatInit(A.Init, Elem, Lanes);
-    // Precheck guaranteed a splat-constant init; defensive bail on surprise.
     if (!L0)
-      return 0;
-    S->addIncoming(L0, InitBB);
-    inheritMeta(A.Phi, S);
+      return 0; // pre-mutation: no scalar PHI created yet, nothing to clean
+    Inits.push_back(L0);
+  }
+  SmallVector<PHINode *, 4> SS;
+  for (unsigned a = 0; a < Accs.size(); ++a) {
+    PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
+    S->addIncoming(Inits[a], InitBB);
+    inheritMeta(Accs[a].Phi, S);
     SS.push_back(S);
   }
 
@@ -528,23 +608,25 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     if (isa<PHINode>(&I))
       continue;
     if (AccBacks.contains(&I)) {
-      // Acc update: explode the stream side, fold lanes into that acc's
-      // own chain. The vector update itself dies: sever its phi edge FIRST
-      // so the old acc phi no longer references it (else phi<->update pin
-      // each other live and neither erases).
+      // Acc update: explode the stream side FIRST, fold lanes into that
+      // acc's own chain. The pre-mutation check above proved this explode
+      // succeeds; even so, sever the old phi edge only after the explode
+      // so a surprise failure leaves no half-built state for this update.
+      // (Severing first is what stranded half-built s.unopt PHIs and
+      // aborted the verifier on multi-acc-dependency.ll.)
       unsigned Idx = 0;
       for (unsigned a = 0; a < Accs.size(); ++a)
         if (Accs[a].Back == &I)
           Idx = a;
+      Value *Stream = Accs[Idx].Stream;
+      auto *Ls = Ex(Resolve(Stream));
+      if (!Ls)
+        return 0; // unreachable: pre-mutation CanExplode proved success
       for (unsigned k = 0, KN = Accs[Idx].Phi->getNumIncomingValues();
            k < KN; ++k)
         if (Accs[Idx].Phi->getIncomingBlock(k) == H)
           Accs[Idx].Phi->setIncomingValue(
               k, llvm::UndefValue::get(Accs[Idx].Phi->getType()));
-      Value *Stream = Accs[Idx].Stream;
-      auto *Ls = Ex(Resolve(Stream));
-      if (!Ls)
-        return 0; // precheck promised success; defensive, no partial emit
       Value *Chain = Chains[Idx];
       for (unsigned j = 0; j < Lanes; ++j) {
         auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
