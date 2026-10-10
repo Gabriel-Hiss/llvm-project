@@ -19,7 +19,7 @@ bb_14000117a:
   %c100 = icmp eq i32 %4, 0
   br i1 %c100, label %bb_14000117a.bb_140001160_crit_edge, label %bb_140001187154, !revenant.va !2
 bb_140001187154:
-  %5 = load i32, ptr %v_r8.0.i32
+  %5 = load i32, ptr %v_r8.0.i32, !revenant.va !5
   %c116 = icmp ugt i32 %5, 20
   br i1 %c116, label %bb_140001187154.bb_140001187_crit_edge, label %bb_140001182, !revenant.va !3
 bb_140001182:
@@ -31,25 +31,25 @@ bb_140001182:
   store i64 %z134, ptr %v_rax.2
   br label %bb_140001160, !revenant.va !4
 bb_140001187:
-  %9 = load i64, ptr %v_rax.2
+  %9 = load i64, ptr %v_rax.2, !revenant.va !5
   %e136 = trunc i64 %9 to i32
   ret i32 %e136, !revenant.va !5
 bb_140001154.bb_140001187_crit_edge:
   store i64 0, ptr %v_rax.2
-  br label %bb_140001187, !revenant.va !6
+  br label %bb_140001187
 bb_140001154.bb_14000117a_crit_edge:
   store i32 0, ptr %v_r8.0.i32
   store i64 0, ptr %v_rax.2
-  br label %bb_14000117a, !revenant.va !7
+  br label %bb_14000117a
 bb_140001160.bb_140001187_crit_edge:
-  br label %bb_140001187, !revenant.va !8
+  br label %bb_140001187
 bb_140001160.bb_14000117a_crit_edge:
   store i32 %2, ptr %v_r8.0.i32
-  br label %bb_14000117a, !revenant.va !9
+  br label %bb_14000117a
 bb_14000117a.bb_140001160_crit_edge:
-  br label %bb_140001160, !revenant.va !10
+  br label %bb_140001160
 bb_140001187154.bb_140001187_crit_edge:
-  br label %bb_140001187, !revenant.va !11
+  br label %bb_140001187
 }
 !0 = !{i64 5368713556}
 !1 = !{i64 5368713568}
@@ -57,11 +57,5 @@ bb_140001187154.bb_140001187_crit_edge:
 !3 = !{i64 5368713600}
 !4 = !{i64 5368713602}
 !5 = !{i64 5368713607}
-!6 = !{i64 5368713557}
-!7 = !{i64 5368713558}
-!8 = !{i64 5368713574}
-!9 = !{i64 5368713575}
-!10 = !{i64 5368713595}
-!11 = !{i64 5368713601}
 ; CHECK-LABEL: @break_continue(
 ; CHECK: br i1 %{{.*}}, label %{{.*}}, label %{{.*}}, !revenant.region
