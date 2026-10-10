@@ -195,6 +195,7 @@ private:
   /// Instructions consumed by a for-init or for-step; skipped during leaf
   /// emission.
   DenseSet<Instruction *> ForClaimed;
+  SmallVector<Region *, 4> ActiveLoops;
   DenseMap<StoreInst *, BasicBlock *> ReturnStoreFollows;
   /// Invoke blocks already emitted inside a try statement.
   SmallPtrSet<BasicBlock *, 8> EHClaimed;
@@ -660,6 +661,35 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
                               nullptr);
   if (isa<UnreachableInst>(T))
     return nullptr;
+  auto loopTransfer = [&](BasicBlock *Target) -> Stmt * {
+    if (ActiveLoops.empty())
+      return nullptr;
+    Region *Loop = ActiveLoops.back();
+    if (Target == Loop->Follow)
+      return new (*AST) BreakStmt(SourceLocation());
+    if (Target != Loop->Header && Target != Loop->Latch)
+      return nullptr;
+    for (Instruction &I : *Target)
+      if (!I.isTerminator() && !isa<PHINode>(I) &&
+          !isa<DbgInfoIntrinsic>(I))
+        return nullptr;
+    return new (*AST) ContinueStmt(SourceLocation());
+  };
+  auto loopTrampolineTransfer = [&](BasicBlock *Target) -> Stmt * {
+    if (ActiveLoops.empty() || pred_size(Target) != 1)
+      return nullptr;
+    for (Instruction &I : *Target)
+      if (!I.isTerminator() && !isa<PHINode>(I) &&
+          !isa<DbgInfoIntrinsic>(I))
+        return nullptr;
+    auto *Edge = dyn_cast<BranchInst>(Target->getTerminator());
+    if (!Edge || !Edge->isUnconditional())
+      return nullptr;
+    Stmt *Transfer = loopTransfer(Edge->getSuccessor(0));
+    if (Transfer)
+      Emitted.insert(Target);
+    return Transfer;
+  };
 
   if (auto *BI = dyn_cast<BranchInst>(T)) {
     if (BI->isUnconditional()) {
@@ -686,6 +716,10 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
         if (flowsIntoNext(S, BB, Rgn))
           return nullptr;
       }
+      if (Stmt *Transfer = loopTransfer(S))
+        return Transfer;
+      if (Stmt *Transfer = loopTrampolineTransfer(S))
+        return Transfer;
       return gotoTo(S);
     }
     // Conditional leaf: express each arm as a control statement or let it
@@ -710,6 +744,10 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
         if (flowsIntoNext(S, BB, Rgn))
           return nullptr;
       }
+      if (Stmt *Transfer = loopTransfer(S))
+        return Transfer;
+      if (Stmt *Transfer = loopTrampolineTransfer(S))
+        return Transfer;
       return gotoTo(S);
     };
     Stmt *TA = arm(TS), *FA = arm(FS);
@@ -872,6 +910,22 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
 
   auto emitArm = [&](BasicBlock *Arm,
                      const SmallPtrSetImpl<BasicBlock *> &Mem) -> Stmt * {
+    if (!ActiveLoops.empty() && Arm != R.Follow && pred_size(Arm) == 1) {
+      bool Empty = true;
+      for (Instruction &I : *Arm)
+        if (!I.isTerminator() && !isa<PHINode>(I) &&
+            !isa<DbgInfoIntrinsic>(I)) {
+          Empty = false;
+          break;
+        }
+      auto *Edge = dyn_cast<BranchInst>(Arm->getTerminator());
+      Region *Loop = ActiveLoops.back();
+      if (Empty && Edge && Edge->isUnconditional() &&
+          Edge->getSuccessor(0) == Loop->Follow) {
+        Emitted.insert(Arm);
+        return new (*AST) BreakStmt(SourceLocation());
+      }
+    }
     if (Arm == R.Follow || Mem.empty())
       return nullptr;
     SmallVector<Stmt *, 8> SS;
@@ -1002,6 +1056,7 @@ bool StructuredStmtBuilder::endsTerminal(ArrayRef<Stmt *> SS) {
 }
 
 Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
+  ActiveLoops.push_back(&R);
   Expr *Cond = nullptr;
   Expr *Step = nullptr;
   Stmt *Init = nullptr;
@@ -1069,8 +1124,10 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
     }
     Stmt *B = CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                    SourceLocation(), SourceLocation());
-    return new (*AST) DoStmt(B, Cond, SourceLocation(), SourceLocation(),
-                             SourceLocation());
+    Stmt *Loop = new (*AST) DoStmt(B, Cond, SourceLocation(), SourceLocation(),
+                                   SourceLocation());
+    ActiveLoops.pop_back();
+    return Loop;
   }
 
   // Generic loops run until an explicit break; other loop kinds test at the header.
@@ -1165,12 +1222,16 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   }
   Stmt *B = CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                  SourceLocation(), SourceLocation());
+  Stmt *Loop = nullptr;
   if (R.Kind == RegionKind::For)
-    return new (*AST)
+    Loop = new (*AST)
         ForStmt(*AST, Init, Cond, nullptr, Step, B, SourceLocation(),
                 SourceLocation(), SourceLocation());
-  return WhileStmt::Create(*AST, nullptr, Cond, B, SourceLocation(),
-                           SourceLocation(), SourceLocation());
+  else
+    Loop = WhileStmt::Create(*AST, nullptr, Cond, B, SourceLocation(),
+                             SourceLocation(), SourceLocation());
+  ActiveLoops.pop_back();
+  return Loop;
 }
 
 Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
@@ -1623,6 +1684,7 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
   ForClaimed.clear();
   EHClaimed.clear();
   Emitted.clear();
+  ActiveLoops.clear();
   for (BasicBlock &BB : F)
     Blocks.push_back(&BB);
 
