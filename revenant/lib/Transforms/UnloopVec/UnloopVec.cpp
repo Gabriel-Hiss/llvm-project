@@ -1134,6 +1134,7 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F);
 
 bool isZeroStartValue(Value *V, BasicBlock *S,
                       const DenseSet<BasicBlock *> &Starts,
+                      const DenseSet<BasicBlock *> &R,
                       DenseSet<Value *> &Seen) {
   if (!Seen.insert(V).second)
     return true;
@@ -1143,21 +1144,25 @@ bool isZeroStartValue(Value *V, BasicBlock *S,
     if (P->getParent() != S)
       return false;
     bool Found = false;
-    for (unsigned I = 0; I < P->getNumIncomingValues(); ++I)
-      if (Starts.count(P->getIncomingBlock(I))) {
+    for (unsigned I = 0; I < P->getNumIncomingValues(); ++I) {
+      BasicBlock *IB = P->getIncomingBlock(I);
+      if (R.count(IB))
+        continue; // R incomings are dropped by the fold
+      if (Starts.count(IB)) {
         Found = true;
         auto *C = dyn_cast<ConstantInt>(P->getIncomingValue(I));
         if (!C || !C->isZero())
           return false;
       }
+    }
     return Found;
   }
   if (auto *Cast = dyn_cast<CastInst>(V))
-    return isZeroStartValue(Cast->getOperand(0), S, Starts, Seen);
+    return isZeroStartValue(Cast->getOperand(0), S, Starts, R, Seen);
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
     if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1)))
       return C->isZero() &&
-             isZeroStartValue(BO->getOperand(0), S, Starts, Seen);
+             isZeroStartValue(BO->getOperand(0), S, Starts, R, Seen);
   }
   return false;
 }
@@ -1461,7 +1466,7 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
             IVOK = true;
         } else {
           DenseSet<Value *> Seen;
-          IVOK = isZeroStartValue(Inc, S, Cand.Starts, Seen);
+          IVOK = isZeroStartValue(Inc, S, Cand.Starts, Cand.R, Seen);
         }
       }
       if (!IVOK) {
