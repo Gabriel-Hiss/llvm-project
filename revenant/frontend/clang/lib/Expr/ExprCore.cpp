@@ -303,16 +303,22 @@ bool ExprBuilderImpl::isStoredVar(llvm::Value *PtrOp, const clang::Expr *Ptr) {
 // ---- literals -------------------------------------------------------------
 
 Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
+  // A wide record has no C spelling for a decimal literal, and Clang's
+  // IntegerLiteral cannot carry a record type. The model spells the value
+  // as a compound literal instead. This check MUST run before the
+  // narrow-type normalization below so the record survives.
+  if (clang::Expr *Wide = wideIntLiteral(*AST, Ty, V))
+    return Wide;
   // The QualType comes from TypeBuilder, which may map an IR width to a
   // different C width (e.g. i64 -> `long`, 32 bits on Windows). Clang's
   // IntegerLiteral asserts exact width match, so normalize the APInt to
   // the type width first, preserving the value under the type's own
   // signedness. Non-integer types fall back to `uintptr_t`.
-    QualType T = Ty->isIntegerType() ? Ty : uintptrTy();
-    // Promote small integer types to int for literals to avoid Ui8/Ui16 suffixes
-    // that gcc doesn't understand.
-    if (T->isIntegerType() && AST->getTypeSize(T) < 32)
-      T = AST->IntTy;
+  QualType T = Ty->isIntegerType() ? Ty : uintptrTy();
+  // Promote small integer types to int for literals to avoid Ui8/Ui16 suffixes
+  // that gcc doesn't understand.
+  if (T->isIntegerType() && AST->getTypeSize(T) < 32)
+    T = AST->IntTy;
   // Bool context: 0/1 become `false`/`true` in C++ mode. IntegerLiteral
   // cannot carry a bool type, so C prints a plain `0`/`1`.
   if (T->isBooleanType()) {
@@ -321,11 +327,6 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
                                         SourceLocation());
     T = AST->IntTy;
   }
-  // A wide record has no C spelling for a decimal literal, and Clang's
-  // IntegerLiteral cannot carry a record type. The model spells the value
-  // as a compound literal instead.
-  if (clang::Expr *Wide = wideIntLiteral(*AST, T, V))
-    return Wide;
   unsigned W = (unsigned)AST->getIntWidth(T);
   // No C/C++ spelling exists for a >64-bit decimal literal: Clang's
   // printer emits the raw digits and clang-cl rejects them ("integer
@@ -354,9 +355,15 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
       return Or;
     return makeCStyleCast(T, CK_IntegralCast, Or);
   }
-  llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative())
-                        ? V.sextOrTrunc(W)
-                        : V.zextOrTrunc(W);
+  llvm::APInt Val;
+  if (T->isSignedIntegerType() && V.isNegative())
+    Val = V.sextOrTrunc(W);
+  else
+    Val = V.zextOrTrunc(W);
+  // IntegerLiteral asserts hasSignedIntegerRepresentation when the APInt
+  // is negative; for unsigned types, the value must be zero-extended.
+  if (!T->isSignedIntegerType())
+    Val = Val.zextOrTrunc(W);
   // Single characters in a char-typed slot print as 'x'.
   if ((T->isSpecificBuiltinType(BuiltinType::Char_S) ||
        T->isSpecificBuiltinType(BuiltinType::Char_U) ||

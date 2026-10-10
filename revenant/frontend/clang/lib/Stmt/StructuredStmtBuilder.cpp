@@ -472,14 +472,16 @@ Expr *StructuredStmtBuilder::widenSwitchCond(Expr *Cond, QualType &CT,
     return Cond;
   for (auto &Case : SI->cases())
     if (Case.getCaseValue()->getValue().isNegative()) {
-      QualType U = AST->getCorrespondingUnsignedType(Printed);
-      if (U.isNull())
-        return Cond;
-      TypeSourceInfo *TSI = AST->getTrivialTypeSourceInfo(U);
-      CT = U;
-      return CStyleCastExpr::Create(*AST, U, VK_PRValue, CK_IntegralCast,
-                                    Cond, nullptr, FPOptionsOverride(), TSI,
-                                    SourceLocation(), SourceLocation());
+      if (Printed->isSignedIntegerType() || Printed->isUnsignedIntegerType()) {
+        QualType U = AST->getCorrespondingUnsignedType(Printed);
+        if (U.isNull())
+          return Cond;
+        TypeSourceInfo *TSI = AST->getTrivialTypeSourceInfo(U);
+        CT = U;
+        return CStyleCastExpr::Create(*AST, U, VK_PRValue, CK_IntegralCast,
+                                      Cond, nullptr, FPOptionsOverride(), TSI,
+                                      SourceLocation(), SourceLocation());
+      }
     }
   return Cond;
 }
