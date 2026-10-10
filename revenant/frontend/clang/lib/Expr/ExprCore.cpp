@@ -247,6 +247,10 @@ static CastKind boolDestKind(QualType T, CastKind K, const Expr *Op) {
 }
 
 Expr *ExprBuilderImpl::makeCStyleCast(QualType T, CastKind K, Expr *Op) {
+  // A wide record on either side is outside Clang's C-style-cast rules;
+  // the model spells the conversion as a compound literal or a `.lo`.
+  if (Expr *Wide = wideIntConvert(*AST, T, Op, K))
+    return Wide;
   // `(T)a + b` casts only `a`: a binary operand needs its own parentheses.
   Op = parenIfNeeded(Op, Prec::Unary);
   K = boolDestKind(T, K, Op);
@@ -299,6 +303,12 @@ bool ExprBuilderImpl::isStoredVar(llvm::Value *PtrOp, const clang::Expr *Ptr) {
 // ---- literals -------------------------------------------------------------
 
 Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
+  // A wide record has no C spelling for a decimal literal, and Clang's
+  // IntegerLiteral cannot carry a record type. The model spells the value
+  // as a compound literal instead. Check before the integer-only
+  // normalization below, which would discard the record for uintptr_t.
+  if (clang::Expr *Wide = wideIntLiteral(*AST, Ty, V))
+    return Wide;
   // The QualType comes from TypeBuilder, which may map an IR width to a
   // different C width (e.g. i64 -> `long`, 32 bits on Windows). Clang's
   // IntegerLiteral asserts exact width match, so normalize the APInt to
@@ -733,6 +743,10 @@ Expr *ExprBuilderImpl::retVal(llvm::Value *V, ExprScope &Scope) {
   // Convert to the declared return type so `return v;` type-checks.
   QualType Want = CurFD ? CurFD->getReturnType() : QualType();
   if (!Want.isNull() && !Want->isVoidType() && E->getType() != Want) {
+    // A wide return has no cast rule of its own; the model builds the
+    // compound literal (or reads `.lo`) so `return v;` type-checks.
+    if (isWideIntRecord(Want) || isWideIntRecord(E->getType()))
+      return wideIntConvert(*AST, Want, E, clang::CK_IntegralCast);
     if (E->getType()->isIntegerType() && Want->isIntegerType())
       E = makeCStyleCast(Want, CK_IntegralCast, E);
     else if (E->getType()->isPointerType() && Want->isPointerType())

@@ -23,6 +23,7 @@
 #include "revenant/Clang/TypeBuilder.h"
 #include "RealTypeBuilder.h"
 #include "revenant/Clang/FrontendContext.h"
+#include "revenant/Clang/WideIntModel.h"
 
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
@@ -398,42 +399,13 @@ private:
     case 64:
       return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
     case 128: {
-      // MSVC does not support __int128. Use target-conditional:
-      // gcc/clang targets get unsigned __int128; MSVC gets struct rv_u128
-      // with per-TU helpers (see TranslationUnit.cpp).
+      // MSVC's cl has no `__int128`; the corpus recompiles with the
+      // producer's compiler, so the width comes from the wide-integer
+      // model (a record MSVC accepts) instead of an array or the builtin.
       clang::ASTContext &A = Ctx.ast();
-      llvm::StringRef Triple = Ctx.module().getTargetTriple().str();
-      bool IsMSVC = Triple.contains("msvc");
-      if (!IsMSVC) {
-        return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
-      }
-      // MSVC: struct rv_u128 { unsigned __int64 lo, hi; }
-      clang::IdentifierInfo &II = A.Idents.get("rv_u128");
-      clang::TagDecl *TD = nullptr;
-      for (clang::NamedDecl *D : A.getTranslationUnitDecl()->lookup(&II))
-        if (auto *T = llvm::dyn_cast<clang::TagDecl>(D))
-          TD = T;
-      if (!TD) {
-        TD = clang::RecordDecl::Create(A, clang::TagTypeKind::Struct,
-                                       A.getTranslationUnitDecl(),
-                                       clang::SourceLocation(),
-                                       clang::SourceLocation(), &II);
-        TD->setImplicit(false);
-        A.getTranslationUnitDecl()->addDecl(TD);
-        clang::QualType U64Ty = A.UnsignedLongLongTy;
-        clang::IdentifierInfo &LoII = A.Idents.get("lo");
-        clang::FieldDecl *LoFD = clang::FieldDecl::Create(A, TD,
-            clang::SourceLocation(), clang::SourceLocation(), &LoII,
-            U64Ty, nullptr, nullptr, false, clang::ICIS_NoInit);
-        TD->addDecl(LoFD);
-        clang::IdentifierInfo &HiII = A.Idents.get("hi");
-        clang::FieldDecl *HiFD = clang::FieldDecl::Create(A, TD,
-            clang::SourceLocation(), clang::SourceLocation(), &HiII,
-            U64Ty, nullptr, nullptr, false, clang::ICIS_NoInit);
-        TD->addDecl(HiFD);
-        llvm::cast<clang::RecordDecl>(TD)->completeDefinition();
-      }
-      return A.getCanonicalTagType(TD);
+      if (clang::QualType Wide = wideIntType(A, Bits, Signed); !Wide.isNull())
+        return Wide;
+      return Signed ? A.Int128Ty : A.UnsignedInt128Ty;
     }
     default:
       return uintptrT();
