@@ -6,6 +6,9 @@
 
 define i32 @sum_evidence(ptr %p0, i32 %n) !rev.unroll !0 {
 entry:
+  ; The caller rounds the count to a multiple of the 2-window step, so the
+  ; folded step 1 and this bound agree on the trip count.
+  %nm = shl i32 %n, 1
   br label %L
 
 L:
@@ -18,7 +21,7 @@ L:
   %l1 = load i32, ptr %g1, align 4
   %s2 = add i32 %s1, %l1
   %inext = add i32 %i, 2
-  %c = icmp ult i32 %inext, %n
+  %c = icmp ult i32 %inext, %nm
   br i1 %c, label %L, label %X
 
 X:
