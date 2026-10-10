@@ -7,6 +7,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include <cstdint>
@@ -22,6 +23,79 @@ namespace {
 // re-emitted under a dotted suffix. Two globals are equivalent when they
 // describe the same bytes: identical !revenant.va, or same-typed internal
 // constants with identical initializers.
+// Does the callee expose its ArgNo-th parameter's address? Loads, stores
+// through the pointer and address arithmetic feeding only such accesses
+// keep the address hidden; anything else (integer conversion, comparison,
+// returning or storing the pointer itself, passing it to an unknown or
+// address-exposing callee) observes it. Declarations are opaque: their
+// parameter flow cannot be proved hidden, so they expose. Depth-capped:
+// exhaustion means unknown, which is exposure.
+bool paramAddressExposed(const Function &F, unsigned ArgNo, unsigned Depth) {
+  if (Depth == 0 || ArgNo >= F.arg_size())
+    return true;
+  const Argument &P = *F.getArg(ArgNo);
+  SmallVector<const Value *, 8> Worklist{&P};
+  SmallPtrSet<const Value *, 16> Seen;
+  while (!Worklist.empty()) {
+    const Value *V = Worklist.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    for (const User *U : V->users()) {
+      if (isa<LoadInst>(U))
+        continue;
+      if (const auto *S = dyn_cast<StoreInst>(U)) {
+        if (S->getPointerOperand() == V)
+          continue;
+        return true;
+      }
+      if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
+        Worklist.push_back(cast<Value>(U));
+        continue;
+      }
+      if (const auto *II = dyn_cast<IntrinsicInst>(U)) {
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::lifetime_start:
+        case Intrinsic::lifetime_end:
+        case Intrinsic::dbg_declare:
+        case Intrinsic::dbg_value:
+        case Intrinsic::dbg_assign:
+        case Intrinsic::dbg_label:
+        case Intrinsic::assume:
+          continue;
+        default:
+          return true;
+        }
+      }
+      if (const auto *CB = dyn_cast<CallBase>(U)) {
+        if (CB->getCalledOperand() == V)
+          return true;
+        const Function *CF = CB->getCalledFunction();
+        if (!CF || CF->isDeclaration())
+          return true;
+        bool Hidden = true;
+        bool Found = false;
+        for (unsigned K = 0; K < CB->arg_size(); ++K) {
+          const Value *A = CB->getArgOperand(K)->stripPointerCasts();
+          if (A == V) {
+            Found = true;
+            if (paramAddressExposed(*CF, K, Depth - 1))
+              return true;
+          }
+        }
+        if (Found)
+          continue;
+        return true;
+      }
+      if (isa<Constant>(U)) {
+        Worklist.push_back(cast<Value>(U));
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 bool globalAddressCompared(const GlobalVariable &GV) {
   SmallVector<const Value *, 8> Worklist{&GV};
   SmallPtrSet<const Value *, 16> Seen;
@@ -35,6 +109,27 @@ bool globalAddressCompared(const GlobalVariable &GV) {
       if (const auto *CB = dyn_cast<CallBase>(U)) {
         if (CB->getCalledOperand() == V)
           return true;
+        // A same-module defined callee can be checked: when its parameter
+        // flow exposes the address (integer conversion or comparison, as in
+        // an observer that funnels the pointer to ptrtoint), the object
+        // identity is observable and the globals are not interchangeable.
+        // Declaration callees stay skipped: their bodies are unavailable.
+        const Function *CF = CB->getCalledFunction();
+        if (CF && !CF->isDeclaration()) {
+          bool Exposed = false;
+          bool Found = false;
+          for (unsigned K = 0; K < CB->arg_size(); ++K) {
+            const Value *A = CB->getArgOperand(K)->stripPointerCasts();
+            if (A == V) {
+              Found = true;
+              Exposed |= paramAddressExposed(*CF, K, 4);
+            }
+          }
+          if (Exposed)
+            return true;
+          if (Found)
+            continue;
+        }
         // Scalar diagnostic-call arguments do not expose the pointer value.
         continue;
       }
@@ -61,19 +156,13 @@ std::optional<uint64_t> globalVA(const GlobalObject &GV) {
 bool globalEquivalent(const GlobalValue *A, const GlobalValue *B) {
   if (A == B)
     return true;
-  if (const auto *FA = dyn_cast<Function>(A)) {
-    // Tail-call/trap stubs: the lifter emits a no-body `sub_0x<va>`
-    // declaration for the trap bytes reached after a noreturn call.
-    // Same-type stubs are the same unreachable marker; their distinct
-    // VAs live only in the removed !revenant.va metadata.
-    const auto *FB = dyn_cast<Function>(B);
-    if (!FB || !FA->isDeclaration() || !FB->isDeclaration())
-      return false;
-    if (FA->getFunctionType() != FB->getFunctionType())
-      return false;
-    return FA->getName().starts_with("sub_0x") &&
-           FB->getName().starts_with("sub_0x");
-  }
+  // Distinct function declarations are never equivalent: a declaration
+  // carries no body, so nothing proves two of them behave the same (even
+  // same-typed `sub_0x` trap stubs: linked definitions may return
+  // different values). Trap-tail folding goes through deadTrapCalls,
+  // which proves both differing calls unobservable at their sites.
+  if (isa<Function>(A) || isa<Function>(B))
+    return false;
   const auto *VA = dyn_cast<GlobalVariable>(A);
   const auto *VB = dyn_cast<GlobalVariable>(B);
   if (!VA || !VB || VA->getValueType() != VB->getValueType())
@@ -109,13 +198,49 @@ bool differsOnlyByDataGlobal(const Constant *A, const Constant *B) {
   return false;
 }
 
+// A `sub_0x` declaration is only a trap marker when the differing calls
+// are dead ends in both bodies: no caller observes a result, and control
+// never continues past the call (noreturn or immediately unreachable).
+// Anything else (a returned or stored result, a following live return)
+// makes the stub's behavior observable: linked definitions may return
+// different values, so distinct declarations are never interchangeable
+// there. I/J are the instructions carrying A/B as operands.
+bool deadTrapCalls(const Constant *A, const Constant *B, const Instruction &I,
+                   const Instruction &J) {
+  const auto *FA = dyn_cast<Function>(A);
+  const auto *FB = dyn_cast<Function>(B);
+  if (!FA || !FB || !FA->isDeclaration() || !FB->isDeclaration())
+    return false;
+  if (FA->getFunctionType() != FB->getFunctionType())
+    return false;
+  if (!FA->getName().starts_with("sub_0x") ||
+      !FB->getName().starts_with("sub_0x"))
+    return false;
+  const auto *CI = dyn_cast<CallInst>(&I);
+  const auto *CJ = dyn_cast<CallInst>(&J);
+  if (!CI || !CJ || CI->getCalledOperand() != FA ||
+      CJ->getCalledOperand() != FB)
+    return false;
+  for (const CallInst *C : {CI, CJ}) {
+    if (!C->use_empty())
+      return false;
+    if (C->doesNotReturn())
+      continue;
+    if (isa<UnreachableInst>(C->getNextNode()))
+      continue;
+    return false;
+  }
+  return true;
+}
+
 bool differsOnlyByTrapStub(const Constant *A, const Constant *B) {
   if (A == B)
     return false;
   const auto *FA = dyn_cast<Function>(A);
   const auto *FB = dyn_cast<Function>(B);
   if (FA || FB)
-    return FA && FB && globalEquivalent(FA, FB) &&
+    return FA && FB && FA->isDeclaration() && FB->isDeclaration() &&
+           FA->getFunctionType() == FB->getFunctionType() &&
            FA->getName().starts_with("sub_0x") &&
            FB->getName().starts_with("sub_0x");
   const auto *EA = dyn_cast<ConstantExpr>(A);
@@ -269,12 +394,21 @@ bool equalBodies(Function &A, Function &B, bool *SawDataGlobal = nullptr,
         } else if (V != W) {
           auto *CV = dyn_cast<Constant>(V);
           auto *CW = dyn_cast<Constant>(W);
-          if (!CV || !CW || !revenant::constantsEquivalent(CV, CW))
+          if (!CV || !CW)
+            return false;
+          // Trap-stub declarations prove nothing on their own: accept the
+          // pair only with a dead-trap proof at both call sites (results
+          // unused, control never continues). Anything observable rejects.
+          if (differsOnlyByTrapStub(CV, CW)) {
+            if (!SawTrapStub || !deadTrapCalls(CV, CW, I, J))
+              return false;
+            *SawTrapStub = true;
+            continue;
+          }
+          if (!revenant::constantsEquivalent(CV, CW))
             return false;
           if (SawDataGlobal && differsOnlyByDataGlobal(CV, CW))
             *SawDataGlobal = true;
-          if (SawTrapStub && differsOnlyByTrapStub(CV, CW))
-            *SawTrapStub = true;
         }
       }
     }

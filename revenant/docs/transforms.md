@@ -163,7 +163,7 @@ runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
-**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies, and requires matching operands except for equivalent constant data and trap-only stubs. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
+**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies, and requires matching operands except for equivalent constant data and dead-end trap stubs (distinct `sub_0x` declarations count only when both differing calls are result-unused and noreturn or immediately unreachable; a returned or live stub result rejects the fold). A global passed to a same-module defined callee that exposes its address (integer conversion, comparison, return) is address-compared, never dedup'd. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
 **revenant-locals-to-slots (owner: LunaLocalsToSlots).** Expects structured,
 type-recovered SSA. Restores the `-O0` storage shape: every parameter gets an
@@ -249,9 +249,11 @@ The pool constprop clones regain their folded pool-object formal by rebinding
 the equivalent internal constant global. Their remaining arguments stay
 site-specific, so callers retain distinct allocation sizes rather than
 requiring a unanimous constant. The `_S_construct.isra` pair folds only when
-the body match proves equivalent initialized string data and equivalent
-trap-only `sub_0x` callees; pooled data is treated as equal only when constant
-initializers match and its address is not compared. Four named entries remain:
+the body match proves equivalent initialized string data and dead-end
+`sub_0x` trap tails (both differing stub calls result-unused and followed
+by `unreachable`); pooled data is treated as equal only when constant
+initializers match and its address is not compared, including comparison
+through a same-module callee that exposes it. Four named entries remain:
 `_M_construct.isra` at VA `0x14001bca0` (O2) / `0x14001bf40` (O3), whose body
 CFG/opcode shapes differ from unspecialized `_M_construct` at `0x14001bbf0` /
 `0x14001be90`; `d_demangle_callback.constprop` at `0x14000aa20` / `0x14000ac30`
