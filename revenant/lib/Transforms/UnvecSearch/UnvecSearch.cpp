@@ -46,8 +46,11 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Module.h"
 
 using namespace llvm;
 
@@ -1016,6 +1019,34 @@ bool matchScanLoop(BasicBlock *H, Function &F, ScanInfo &S) {
 // (resume) or 0; after the fold the resume edge is dropped and the
 // zero-start edge stands.
 bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
+  // The header terminator must encode the same search decision as the
+  // chunk scan. Find form: the element compare TRUE means hit, so the
+  // true edge must leave the tail loop (found) and the false edge must
+  // continue it. Dual-buffer form: TRUE means lanes still equal, so the
+  // true edge continues and the false edge leaves (first difference).
+  // Inverted (xor i1) conditions swap the edges. Anything else
+  // (a differently-poled loop, e.g. looping while equal) bails: the
+  // tail would compute a different function than the chunk scan.
+  auto *HTerm = dyn_cast<BranchInst>(Hdr->getTerminator());
+  if (!HTerm || !HTerm->isConditional())
+    return false;
+  Value *HCond = HTerm->getCondition();
+  bool CondInverted = false;
+  if (auto *Xor = dyn_cast<BinaryOperator>(HCond)) {
+    if (Xor->getOpcode() != Instruction::Xor)
+      return false;
+    auto *C0 = dyn_cast<ConstantInt>(Xor->getOperand(0));
+    auto *C1 = dyn_cast<ConstantInt>(Xor->getOperand(1));
+    Value *Inner = nullptr;
+    if (C1 && C1->isOne())
+      Inner = Xor->getOperand(0);
+    else if (C0 && C0->isOne())
+      Inner = Xor->getOperand(1);
+    else
+      return false;
+    HCond = Inner;
+    CondInverted = true;
+  }
   // Scalar loads + one icmp eq in the header: one load (find form,
   // against the needle element) or two loads (dual-buffer compare).
   SmallVector<LoadInst *, 2> EltLoads;
@@ -1035,6 +1066,29 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
   }
   if (EltLoads.empty() || EltLoads.size() > 2 || !EltCmp)
     return false;
+  // The branch must decide on exactly this compare.
+  if (HCond != EltCmp)
+    return false;
+  BasicBlock *TrueSucc = HTerm->getSuccessor(0);
+  BasicBlock *FalseSucc = HTerm->getSuccessor(1);
+  auto Continues = [&](BasicBlock *BB) {
+    return BB == Hdr || BB == Latch;
+  };
+  if (S.SecondLoad) {
+    // Dual form: equal keeps scanning (true continues), mismatch is
+    // the answer (false leaves). Inverted form swaps the edges.
+    bool TrueCont = Continues(TrueSucc) && !Continues(FalseSucc);
+    bool FalseCont = Continues(FalseSucc) && !Continues(TrueSucc);
+    if (CondInverted ? !FalseCont : !TrueCont)
+      return false;
+  } else {
+    // Find form: hit is the answer (true leaves), miss keeps scanning
+    // (false continues). Inverted form swaps the edges.
+    bool TrueLeaves = !Continues(TrueSucc) && Continues(FalseSucc);
+    bool FalseLeaves = !Continues(FalseSucc) && Continues(TrueSucc);
+    if (CondInverted ? !FalseLeaves : !TrueLeaves)
+      return false;
+  }
   // No vector types anywhere in the tail pair.
   for (BasicBlock *BB : {Hdr, Latch}) {
     if (BB == Hdr)
@@ -1059,20 +1113,56 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
     if (EltBits != S.LaneBytes * 8)
       return false;
   }
-  // Base pointers of the tail loads must match the chunk loads' bases
-  // (same buffers), proving the tail walks the same arrays. Phis
-  // resolve through their non-chunk-region incomings (the base).
+  // Address identity must hold with exact constant offsets, not just
+  // equal roots: the chunk stream (base + c0 + k*stride) and the tail
+  // stream (base + c1 + i*elt) are the same array walk only when
+  // c0 == c1. A chunk pointer starting at base+1 with a tail at base
+  // would otherwise fold a hit at chunk index 0 into tail index 1.
+  // Phis resolve through their single non-chunk-region incoming (the
+  // base); anything ambiguous bails.
   DenseSet<BasicBlock *> ChunkBlocks{S.H, S.ScanExit};
   if (S.Latch)
     ChunkBlocks.insert(S.Latch);
-  auto BaseOf = [&](Value *Ptr) -> Value * {
+  const DataLayout &DL = Hdr->getModule()->getDataLayout();
+  struct AddrInfo {
+    Value *Root = nullptr;
+    int64_t Off = 0;
+    bool OK = false;
+  };
+  auto Decomp = [&](Value *Ptr) -> AddrInfo {
+    int64_t Off = 0;
     SmallVector<Value *, 4> WL{Ptr};
     DenseSet<Value *> Seen;
+    Value *Root = nullptr;
     while (!WL.empty()) {
       Value *V = WL.pop_back_val();
       if (!Seen.insert(V).second)
         continue;
       if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+        // Fold constant indices into the offset; a non-constant index
+        // ends offset folding for this chain (the symbolic stride is
+        // proven separately by the IV/step checks).
+        bool AllConst = true;
+        int64_t Step = 0;
+        for (unsigned K = 1; K < GEP->getNumOperands(); ++K) {
+          auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(K));
+          if (!CI) {
+            AllConst = false;
+            break;
+          }
+        }
+        if (AllConst) {
+          APInt Total(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+          if (!GEP->accumulateConstantOffset(DL, Total))
+            return AddrInfo{};
+          if (Total.getActiveBits() > 63)
+            return AddrInfo{};
+          Step = Total.getSExtValue();
+          if ((Off > 0 && Step > INT64_MAX - Off) ||
+              (Off < 0 && Step < INT64_MIN - Off))
+            return AddrInfo{};
+          Off += Step;
+        }
         WL.push_back(GEP->getPointerOperand());
         continue;
       }
@@ -1081,14 +1171,34 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
         continue;
       }
       if (auto *Phi = dyn_cast<PHINode>(V)) {
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I)
-          if (!ChunkBlocks.count(Phi->getIncomingBlock(I)))
-            WL.push_back(Phi->getIncomingValue(I));
+        Value *Outside = nullptr;
+        bool Ambiguous = false;
+        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+          if (ChunkBlocks.count(Phi->getIncomingBlock(I)))
+            continue;
+          if (Outside) {
+            Ambiguous = true;
+            break;
+          }
+          Outside = Phi->getIncomingValue(I);
+        }
+        if (Ambiguous || !Outside)
+          return AddrInfo{};
+        WL.push_back(Outside);
         continue;
       }
-      return V;
+      if (Root && Root != V)
+        return AddrInfo{};
+      Root = V;
     }
-    return Ptr;
+    if (!Root)
+      return AddrInfo{};
+    return AddrInfo{Root, Off, true};
+  };
+  auto SameAddr = [&](Value *A, Value *B) -> bool {
+    AddrInfo X = Decomp(A);
+    AddrInfo Y = Decomp(B);
+    return X.OK && Y.OK && X.Root == Y.Root && X.Off == Y.Off;
   };
   if (S.SecondLoad) {
     // Dual-buffer: two tail loads from the two chunk bases, in either
@@ -1096,11 +1206,12 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
     // side one of the loads).
     if (EltLoads.size() != 2)
       return false;
-    Value *B0 = BaseOf(S.ChunkLoad->getPointerOperand());
-    Value *B1 = BaseOf(S.SecondLoad->getPointerOperand());
-    Value *T0 = BaseOf(EltLoads[0]->getPointerOperand());
-    Value *T1 = BaseOf(EltLoads[1]->getPointerOperand());
-    bool Same = (T0 == B0 && T1 == B1) || (T0 == B1 && T1 == B0);
+    Value *CP0 = S.ChunkLoad->getPointerOperand();
+    Value *CP1 = S.SecondLoad->getPointerOperand();
+    Value *TP0 = EltLoads[0]->getPointerOperand();
+    Value *TP1 = EltLoads[1]->getPointerOperand();
+    bool Same = (SameAddr(TP0, CP0) && SameAddr(TP1, CP1)) ||
+                (SameAddr(TP0, CP1) && SameAddr(TP1, CP0));
     if (!Same)
       return false;
     Value *C0 = EltCmp->getOperand(0);
@@ -1115,9 +1226,8 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
     // compare must use the same needle value (through casts).
     if (EltLoads.size() != 1)
       return false;
-    Value *B0 = BaseOf(S.ChunkLoad->getPointerOperand());
-    Value *T0 = BaseOf(EltLoads[0]->getPointerOperand());
-    if (T0 != B0)
+    if (!SameAddr(EltLoads[0]->getPointerOperand(),
+                  S.ChunkLoad->getPointerOperand()))
       return false;
     bool NeedleUse = false;
     for (unsigned K = 0; K < 2; ++K) {
