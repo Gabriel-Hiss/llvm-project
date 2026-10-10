@@ -298,7 +298,14 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       return 0;
     }
   }
-  // Vector-typed exit PHIs fed from H also block.
+  // At least one reduce intrinsic must consume the accumulators: with only
+  // an exit-block combine (manual i128 horizontal fold, no reduce) the emit
+  // stage would scalarize the body yet leave the fold feeding severed vector
+  // phis (undef backedges) while the scalar chains feed nothing (WRONG CODE;
+  // MSVC c-o2 sum_vec fires this shape). The manual-fold family is staged
+  // UnvecReductions work, not v1 scope.
+  if (Reduces.empty())
+    return 0;
   for (BasicBlock *S : Br->successors()) {
     if (S == H)
       continue;
