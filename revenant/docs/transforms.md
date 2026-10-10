@@ -38,7 +38,7 @@ so `ir-final` carries the compiler's pre-optimization shape.
 |---|---|---|
 | cleanup | `sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg<no-switch-to-lookup;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks>,gvn,dse,dce,sroa,instcombine<no-verify-fixpoint>` | `crates/lift/src/pipeline.rs` `CLEANUP_PASSES` |
 | idioms (IR) | `revenant-idioms` | `crates/idioms` `ir_passes()` |
-| unopt | `revenant-devectorize,revenant-reroll,revenant-unrotate,revenant-untailrec` | `crates/unopt` `passes()` |
+| unopt | `revenant-devectorize,revenant-reroll,revenant-unrotate,revenant-untailrec,revenant-unswitch` | `crates/unopt` `passes()` + `revenant/lib/Transforms/Unswitch` |
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
@@ -129,6 +129,23 @@ back into the loop it came from (toward IR 1:1 with the compiler's ir-pre).
 Self-loop headers get a dedicated latch split out first, then the same
 rewrite. Guarantees vetoes on any existing self-call, impure latch, or
 non-covering phis; anything vetoed stays as-is.
+
+**revenant-unswitch (owner: StepUnswitchTables).** Expects unopt output.
+Undoes the switch lowerings the frontends and SimplifyCFG leave behind, so
+`revenant-structure` sees a `switch` and the emitter writes the source-level
+construct. Eight families, all LLVM-IR only, all semantics-preserving:
+lookup tables (both `@switch.table.*` arrays and the lifter's merged `.rdata`
+blobs, where the bound check may read `cmp; ja` with the in-range edge on the
+false successor), linear maps (the map may scale the range-checked offset or
+the case value itself), bitmaps, range-to-icmp (only on `icmp ult` — `ugt`,
+`ule` and `uge` bounds stay plain interval checks), switch-to-select chains,
+switch-of-select, default-block icmp/select merges, and compare trees spread
+across both arms of one range check. The tree merge keeps one switch only when
+both arms share the same default and every case constant is proven inside its
+own arm's value range (`ConstantRange`). Guarantees `!revenant.va` copied onto
+new instructions, a veto on any `revenant.opaque` in the matched region, and
+no rewrite when the table or map values cannot be read back exactly. Runs
+last inside unopt, before `revenant-unhotcold`.
 
 **revenant-patterns (owner: MuseTxPatterns, opt-in).** Expects unopt
 output. Matches oracle-generated library-idiom patterns (anchor-seeded
