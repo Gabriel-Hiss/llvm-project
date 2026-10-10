@@ -142,10 +142,12 @@ irreducible edges get `!revenant.region !{!"goto", target}`. Guarantees a
 frontend ignoring annotations still emits correct code via labels + `goto`.
 
 **revenant-types (owner: MuseTypeRecovery, post-structure).** Expects
-structured IR with region annotations. Recovers locals/parameters and
-struct/class/vtable/enum shapes, expressed as DI (`DILocalVariable`,
-`DIBasicType`, `DIDerivedType`, `DICompositeType`) via RevenantIR helpers.
-Guarantees region annotations and provenance survive; types only refine.
+structured IR with region annotations. Recovers locals, fixed-size array
+extents, parameter and return types, plus struct/class/vtable/enum shapes,
+expressed as DI (`DILocalVariable`, `DISubroutineType`, `DIBasicType`,
+`DIDerivedType`, `DICompositeType`) via RevenantIR helpers. Field types come
+from the widest access at each constant offset. Guarantees region annotations
+and provenance survive; types only refine.
 
 **revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
 structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the

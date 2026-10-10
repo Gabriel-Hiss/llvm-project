@@ -445,13 +445,16 @@ void TypeInference::recordFieldAccess(const Value *Ptr, uint64_t BaseOffset,
 
   // Access width from the memory operation; the byte offset is the GEP
   // offset plus the caller's base offset.
-  uint64_t SizeBits = 0;
   uint64_t OffBits = (GepOff + BaseOffset) * 8;
+  uint64_t SizeBits = 0;
+  const Value *Access = nullptr;
   const DataLayout &DL = F.getParent()->getDataLayout();
   if (const auto *LI = dyn_cast<LoadInst>(I)) {
     SizeBits = DL.getTypeStoreSizeInBits(LI->getType());
+    Access = LI;
   } else if (const auto *SI = dyn_cast<StoreInst>(I)) {
-    SizeBits = DL.getTypeStoreSizeInBits(SI->getValueOperand()->getType());
+    Access = SI->getValueOperand();
+    SizeBits = DL.getTypeStoreSizeInBits(Access->getType());
   } else {
     return; // GEP alone is not an access; wait for its load/store users.
   }
@@ -464,7 +467,8 @@ void TypeInference::recordFieldAccess(const Value *Ptr, uint64_t BaseOffset,
   FA.Base = Base;
   auto It = FA.Fields.find(OffBits);
   if (It == FA.Fields.end() || It->second.SizeBits < SizeBits) {
-    FA.Fields[OffBits] = FieldCell{SizeBits, I->getDebugLoc().get()};
+    FA.Fields[OffBits] =
+        FieldCell{SizeBits, I->getDebugLoc().get(), Access};
   }
   FA.MaxEndBits = std::max(FA.MaxEndBits, OffBits + SizeBits);
 }
