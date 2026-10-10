@@ -64,6 +64,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "revenant/Evidence/Evidence.h"
 #include "revenant/Transforms/Uninline/Uninline.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -167,6 +168,9 @@ struct CalleeBody {
   SmallVector<const Instruction *, 16> Insts;
   const Value *RetVal = nullptr; // null for `ret void`
   bool Valid = false;
+  // Tiny exact-match body held only by lift-recorded evidence: a rewrite
+  // additionally requires regionMatchesEvidence on the candidate region.
+  bool EvidenceOnly = false;
 };
 
 CalleeBody analyzeCallee(Function &F) {
@@ -219,8 +223,17 @@ CalleeBody analyzeCallee(Function &F) {
   for (const Instruction *I : B.Insts)
     if (isa<CallBase>(I))
       HasCall = true;
-  if (B.Insts.size() < 3 && !HasCall)
-    return B;
+  if (B.Insts.size() < 3 && !HasCall) {
+    // Tiny bodies stay eligible only with lift-recorded evidence; each
+    // candidate region must then confirm regionMatchesEvidence.
+    // Evidence-empty modules keep the reject, so --meta=none behavior is
+    // unchanged. (revenant.lib survives none mode, so Library evidence
+    // can still confirm there; the structural match stays exact, so the
+    // output stays correct.)
+    if (revenant::evidence::uninlineEvidence(F).empty())
+      return B;
+    B.EvidenceOnly = true;
+  }
   // Wrapper disambiguation: a body that only forwards its arguments to
   // one inner call (`mz_free(p)` = `free(p)`) is indistinguishable from
   // hand-written calls to the inner function (measured: all 16 `free`
@@ -567,6 +580,11 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
       }
     }
   }
+  // Evidence is read once per callee, not per region: it is function-level
+  // metadata and cannot change during this caller's rewrite.
+  revenant::evidence::InlineEvidence Ev;
+  if (CB.EvidenceOnly)
+    Ev = revenant::evidence::uninlineEvidence(*Callee);
   bool Changed = false;
   // Snapshot blocks: the rewrite erases instructions but never adds or
   // removes blocks, so iterating blocks directly is safe.
@@ -594,6 +612,13 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
         SmallVector<Instruction *, 16> RegionInsts;
         for (unsigned i = 0; i != CB.Insts.size(); ++i)
           RegionInsts.push_back(Body[S + i]);
+        // Evidence-only bodies rewrite solely when the region references
+        // the same distinctive strings or library body as the callee.
+        // The structural match above already passed fully; evidence only
+        // confirms tiny exact matches (the assert-string family).
+        if (CB.EvidenceOnly &&
+            !revenant::evidence::regionMatchesEvidence(Ev, RegionInsts))
+          continue;
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
           // region end.

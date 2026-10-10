@@ -5,6 +5,20 @@ its callee definition and the caller contains an equivalent instruction region.
 The pass does not reconstruct deleted definitions or undo arbitrary instruction
 combining. No failed match changes the module.
 
+## Evidence-confirmed tiny bodies
+
+Single-block callees below the 3-instruction structural minimum stay
+eligible only with lift-recorded evidence (`revenant/Evidence/Evidence.h`):
+the callee must carry non-empty `uninlineEvidence` (source Location,
+crash-metadata strings, libdb name) and each candidate region must pass
+`regionMatchesEvidence` against it (same string global referenced, or
+same library body called). The structural match still runs fully first;
+evidence only confirms tiny exact matches such as assert-string readers.
+The single-call wrapper veto stays absolute: evidence never lifts it.
+Evidence-empty modules keep the old reject, so `--meta=none` output is
+unchanged apart from `revenant.lib` confirmations, which stay correct
+because the match itself remains exact.
+
 ## Corpus measurement
 
 The scripts under `test/Transforms/Uninline` consume the read-only parity
