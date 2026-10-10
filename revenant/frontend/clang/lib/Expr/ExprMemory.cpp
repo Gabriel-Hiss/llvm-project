@@ -119,9 +119,14 @@ ExprBuilderImpl::compositeBehindPointer(const llvm::DIType *DI) {
 }
 
 FieldDecl *ExprBuilderImpl::fieldAtOffset(RecordDecl *Rec, uint64_t BitOff) {
-  if (!Rec || !Rec->getDefinitionOrSelf())
+  if (!Rec)
     return nullptr;
   Rec = Rec->getDefinitionOrSelf();
+  // Records under construction (no definition yet, e.g. while Core is
+  // still declaring fields) have no layout; getASTRecordLayout asserts
+  // on them, so bail out and let the caller use the byte-offset path.
+  if (!Rec || !Rec->getDefinitionOrSelf() || !Rec->isCompleteDefinition())
+    return nullptr;
   const ASTRecordLayout &Layout = AST->getASTRecordLayout(Rec);
   for (FieldDecl *FD : Rec->fields()) {
     if (Layout.getFieldOffset(FD->getFieldIndex()) == BitOff)
