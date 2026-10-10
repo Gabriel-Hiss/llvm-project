@@ -462,6 +462,113 @@ std::vector<Case> cases() {
           .stack({0x4010000000000000ull, 0}));
   add(Case("rdrand non-destination state", "rdrand eax").skip("rax"));
   add(Case("rdseed non-destination state", "rdseed ecx").skip("rcx"));
+
+  // ---- AVX-512 masked moves and ops (k registers) ---------------------------
+  // Hosts without AVX-512 skip these (the native half would fault). Merge
+  // masking keeps the destination lanes; {z} zeroes the masked-off lanes.
+  {
+    const uint64_t Q0 = 0x1111111111111111ull, Q1 = 0x2222222222222222ull;
+    const uint64_t Q2 = 0x3333333333333333ull, Q3 = 0x4444444444444444ull;
+    // k1 = 0x5 (lanes 0 and 2 of a 4-lane qword vector).
+    add(Case("avx512 masked vpsubq merge",
+             "kmovq k1, rax\n"
+             "vpsubq ymm2 {k1}, ymm0, ymm1")
+            .r("rax", 0x5).needs("avx512f")
+            .zmm(0, Q0, Q1, Q2, Q3, 0, 0, 0, 0)
+            .zmm(1, 1, 1, 1, 1, 0, 0, 0, 0)
+            .zmm(2, 9, 9, 9, 9, 0, 0, 0, 0));
+    add(Case("avx512 masked vpsubq zero",
+             "kmovq k1, rax\n"
+             "vpsubq ymm2 {k1}{z}, ymm0, ymm1")
+            .r("rax", 0xA).needs("avx512f")
+            .zmm(0, Q0, Q1, Q2, Q3, 0, 0, 0, 0)
+            .zmm(1, 1, 1, 1, 1, 0, 0, 0, 0)
+            .zmm(2, 9, 9, 9, 9, 0, 0, 0, 0));
+    add(Case("avx512 kmovq k2,k1 roundtrip",
+             "kmovq k1, rax\n"
+             "kmovq k2, k1\n"
+             "kmovq rbx, k2")
+            .r("rax", 0xA5A5).r("rbx", 0).needs("avx512f"));
+    add(Case("avx512 vpcmpuq into k",
+             "kmovq k1, rax\n"
+             "vpcmpuq k1, ymm0, ymm1, 0\n"
+             "kmovq rbx, k1")
+            .r("rax", 0).r("rbx", 0x99).needs("avx512f")
+            .zmm(0, 1, 2, 3, 4, 0, 0, 0, 0)
+            .zmm(1, 1, 5, 3, 9, 0, 0, 0, 0));
+    add(Case("avx512 masked vmovdqu8 store",
+             "kmovq k1, rax\n"
+             "vmovdqu8 ymmword ptr [rsp+0x20] {k1}, ymm0")
+            .r("rax", 0xFF).needs("avx512f")
+            .stack({0, 0, 0, 0})
+            .zmm(0, Q0, Q1, Q2, Q3, 0, 0, 0, 0));
+  }
+
+  // ---- AVX-512 FMA: default rounding and embedded rounding ------------------
+  {
+    // fma(2.0, 4.0, 3.0) = 11.0 in lane 0 of each form.
+    add(Case("avx512 vfmadd213ps default",
+             "vfmadd213ps zmm0, zmm1, zmm2")
+            .needs("avx512f")
+            .zmm(0, 0x4000000040000000ull, 0, 0, 0, 0, 0, 0, 0)
+            .zmm(1, 0x4080000040800000ull, 0, 0, 0, 0, 0, 0, 0)
+            .zmm(2, 0x4040000040400000ull, 0, 0, 0, 0, 0, 0, 0));
+    add(Case("avx512 vfmadd213ps masked merge",
+             "kmovq k1, rax\n"
+             "vfmadd213ps zmm0 {k1}, zmm1, zmm2")
+            .r("rax", 0x1).needs("avx512f")
+            .zmm(0, 0x4000000040000000ull, 0x1111111111111111ull, 0, 0, 0, 0, 0, 0)
+            .zmm(1, 0x4080000040800000ull, 0x2222222222222222ull, 0, 0, 0, 0, 0, 0)
+            .zmm(2, 0x4040000040400000ull, 0x3333333333333333ull, 0, 0, 0, 0, 0, 0));
+  }
+
+  // ---- x87 environment, save/restore and BCD --------------------------------
+  // The 28-byte environment holds the control word at offset 0 and the status
+  // word at offset 4; both round-trip through the modeled state. The images
+  // are placed past the eight compared stack qwords (rsp+0x20..0x5f) and the
+  // result is read back into a register, so the comparison covers the modeled
+  // words only.
+  add(Case("x87 fnstenv control word",
+           "xor eax, eax\n"
+           "fldcw word ptr [rsp+0x20]\n"
+           "fnstenv [rsp+0x28]\n"
+           "mov ax, word ptr [rsp+0x28]")
+          .stack({0x027f}));
+  add(Case("x87 fldenv control word",
+           "fninit\n"
+           "mov word ptr [rsp+0x28], 0x037f\n"
+           "fldenv [rsp+0x28]\n"
+           "xor eax, eax\n"
+           "fnstcw word ptr [rsp+0x40]\n"
+           "mov ax, word ptr [rsp+0x40]")
+          .stack({0, 0x037f}));
+  add(Case("x87 fsave/frstor stack round trip",
+           "fldpi\n"
+           "fld1\n"
+           "fsave [rsp+0x80]\n"
+           "frstor [rsp+0x80]\n"
+           "fstp qword ptr [rsp+0x40]\n"
+           "fstp qword ptr [rsp+0x48]")
+          .stack({0, 0, 0, 0, 0, 0}));
+  add(Case("x87 fbld packed bcd",
+           "fbld [rsp+0x20]\n"
+           "fstp qword ptr [rsp+0x40]")
+          // 1234: digits 4,3,2,1 in nibbles, sign byte 0.
+          .stack({0x0000000000004321ull, 0, 0, 0}));
+  add(Case("x87 fbstp packed bcd",
+           "fld qword ptr [rsp+0x20]\n"
+           "fbstp [rsp+0x60]\n"
+           "mov rax, qword ptr [rsp+0x60]")
+          .stack({0x4059000000000000ull}));
+  add(Case("x87 fxsave/fxrstor control word",
+           "fninit\n"
+           "fldcw word ptr [rsp+0x20]\n"
+           "fxsave [rsp+0x80]\n"
+           "fxrstor [rsp+0x80]\n"
+           "xor eax, eax\n"
+           "fnstcw word ptr [rsp+0x40]\n"
+           "mov ax, word ptr [rsp+0x40]")
+          .stack({0x027f}));
   return V;
 }
 

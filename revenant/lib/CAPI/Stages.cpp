@@ -389,10 +389,10 @@ std::string cleanPipeline(bool EnableStructDI) {
       .str();
 }
 
-/// ir-final: deoptimization, structuring, type recovery, SSA-out.
+/// ir-final: deoptimization, type recovery, SSA-out, then control-flow shape.
 std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
-  return formatv("function({0}{1}{2},revenant-unhotcold,revenant-structure,"
-                 "revenant-types,revenant-ssaout)",
+  return formatv("function({0}{1}{2},revenant-unhotcold,revenant-types,"
+                 "revenant-ssaout,revenant-structure)",
                  IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
                  Patterns ? ",revenant-patterns" : "")
       .str();
@@ -810,13 +810,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-pre-like --------------------------------------------------------
-    // Run the deopt pipeline with locals-to-slots as the terminal pass
-    // instead of ssaout. This gives a baseline that matches the compiler's
-    // pre-optimization IR shape (SSA form with allocas, no registers).
+    // Run the deopt pipeline with locals-to-slots instead of ssaout, then
+    // annotate the final CFG after critical-edge blocks have been added.
     if (Opts.Emit == EmitKind::IrPreLike) {
       std::string PreLikePipeline =
-          formatv("function({0},revenant-unloopvec,revenant-structure,"
-                  "revenant-types,revenant-locals-to-slots)",
+          formatv("function({0},revenant-unloopvec,revenant-types,"
+                  "revenant-locals-to-slots,revenant-structure)",
                   UnoptPipeline)
               .str();
       if (auto E = runPipelineText("ir-pre-like", M, PreLikePipeline,
@@ -824,7 +823,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                    &UserFunctions))
         return std::move(E);
       record(R.Stages, "ir-pre-like", "ok",
-             "deopt + structure + types + locals-to-slots");
+             "deopt + types + locals-to-slots + structure");
       R.Text = moduleText(*M);
       break;
     }

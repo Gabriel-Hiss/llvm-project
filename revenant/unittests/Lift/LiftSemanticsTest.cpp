@@ -61,28 +61,33 @@ static std::string snippet(const Case &C, bool FlagVariantB) {
   auto L = [&](const std::string &Line) { S += Line + "\n"; };
   for (const char *R : {"rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"})
     L(std::string("push ") + R);
-  L("sub rsp, 0x208"); // 16-byte aligned: entry rsp is 8 mod 16, eight pushes
+  L("sub rsp, 0x408"); // 16-byte aligned; holds eight 64-byte vectors
   L("mov r15, rcx");
   // xmm6/xmm7 are callee-saved in the Windows x64 ABI.
-  L("movdqu xmmword ptr [rsp+0x1a0], xmm6");
-  L("movdqu xmmword ptr [rsp+0x1b0], xmm7");
+  L("movdqu xmmword ptr [rsp+0x300], xmm6");
+  L("movdqu xmmword ptr [rsp+0x310], xmm7");
+  // A defined x87 state per case: the native side runs many snippets in one
+  // process and the FPU stack is not otherwise reset between them.
+  L("fninit");
   for (size_t K = 0; K < C.Stack.size(); ++K) {
     L("mov rax, " + hexQ(C.Stack[K]));
     L("mov qword ptr [rsp+" + hexQ(0x20 + 8 * K) + "], rax");
   }
   if (C.VecUsed) {
-    unsigned Bytes = C.Ymm ? 32 : 16;
-    const char *Width = C.Ymm ? "ymmword" : "xmmword";
+    unsigned Bytes = C.Zmm ? 64 : C.Ymm ? 32 : 16;
+    const char *Width = C.Zmm ? "zmmword" : C.Ymm ? "ymmword" : "xmmword";
     for (size_t N = 0; N < VecRegs; ++N) {
       for (unsigned Q = 0; Q < Bytes / 8; ++Q) {
         uint64_t V = N < C.Vec.size() && C.Given[N]
-                         ? C.Vec[N][Q]
+                         ? (Q < 4 ? C.Vec[N][Q] : C.VecHi[N][Q - 4])
                          : 0x0101010101010101ull * (N * 4 + Q + 1);
         L("mov rax, " + hexQ(V));
         L("mov qword ptr [rsp+" + hexQ(0x80 + Bytes * N + 8 * Q) + "], rax");
       }
-      L(std::string(C.Ymm ? "vmovdqu ymm" : "movdqu xmm") + std::to_string(N) +
-        ", " + Width + " ptr [rsp+" + hexQ(0x80 + Bytes * N) + "]");
+      L(std::string(C.Zmm ? "vmovdqu64 zmm" : C.Ymm ? "vmovdqu ymm"
+                                                     : "movdqu xmm") +
+        std::to_string(N) + ", " + Width + " ptr [rsp+" +
+        hexQ(0x80 + Bytes * N) + "]");
     }
   }
   uint64_t Nonce = 0x1111111111111111ull;
@@ -111,16 +116,23 @@ static std::string snippet(const Case &C, bool FlagVariantB) {
   }
   for (unsigned N = 0; C.VecUsed && N < VecRegs; ++N) {
     unsigned Off = 8 * (SlotVec + N * VecQwords);
-    if (C.Ymm)
+    if (C.Zmm) {
+      // A zmm needs 64 bytes; spill it to the frame and copy out.
+      L("vmovdqu64 zmmword ptr [rsp+0x340], zmm" + std::to_string(N));
+      for (unsigned Q = 0; Q < 4; ++Q) {
+        L("mov rax, qword ptr [rsp+" + hexQ(0x340 + 8 * Q) + "]");
+        L("mov qword ptr [r15+" + std::to_string(Off + 8 * Q) + "], rax");
+      }
+    } else if (C.Ymm)
       L("vmovdqu ymmword ptr [r15+" + std::to_string(Off) + "], ymm" +
         std::to_string(N));
     else
       L("movdqu xmmword ptr [r15+" + std::to_string(Off) + "], xmm" +
         std::to_string(N));
   }
-  L("movdqu xmm6, xmmword ptr [rsp+0x1a0]");
-  L("movdqu xmm7, xmmword ptr [rsp+0x1b0]");
-  L("add rsp, 0x208");
+  L("movdqu xmm6, xmmword ptr [rsp+0x300]");
+  L("movdqu xmm7, xmmword ptr [rsp+0x310]");
+  L("add rsp, 0x408");
   for (const char *R : {"r15", "r14", "r13", "r12", "rdi", "rsi", "rbp", "rbx"})
     L(std::string("pop ") + R);
   L("ret");
@@ -195,7 +207,7 @@ static std::vector<uint64_t> runNative(llvm::ArrayRef<uint8_t> Code) {
 }
 
 static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
-                      std::string &Err) {
+                      std::string &Err, bool Execute = true) {
   auto Img = std::make_shared<Image>();
   Img->Base = Va(0x140000000);
   Section Sec;
@@ -235,6 +247,8 @@ static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
     return false;
   }
   std::string Name = Lifted->Fn->getName().str();
+  if (!Execute)
+    return true;
   // COFF constant-pool symbols (__ymm@...) do not link in the JIT, so compile
   // the lifted module as ELF for the host CPU. One JIT serves every case,
   // each in its own dylib, because a JIT per case exhausts the host.
@@ -289,11 +303,41 @@ static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
 TEST(LiftSemantics, MatchesNativeExecution) {
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
+  // The host may lack the ISA a case exercises (this machine has no AVX-512),
+  // so a case with `Requires` runs only when the host reports the feature;
+  // otherwise the native half would fault.
+  llvm::StringMap<bool> HostFeatures = llvm::sys::getHostCPUFeatures();
   std::vector<Case> Cases = cases();
   unsigned Failures = 0;
+  unsigned Skipped = 0;
   const char *Only = std::getenv("REVENANT_SEM_FILTER");
   const bool Verbose = std::getenv("REVENANT_SEM_VERBOSE") != nullptr;
   for (const Case &C : Cases) {
+    // A case the host CPU cannot run still has to lift: assemble it and run
+    // the lifter so a wrong lowering fails to lift. Only the execution and
+    // the native-vs-lifted comparison are skipped.
+    bool RunNative = !C.Requires || HostFeatures.lookup(C.Requires);
+    if (!RunNative) {
+      ++Skipped;
+      if (Verbose)
+        llvm::errs() << "lift-only " << C.Name << " (needs " << C.Requires
+                     << ")\n";
+      if (Only && C.Name.find(Only) == std::string::npos)
+        continue;
+      std::string Err;
+      std::vector<uint8_t> Code;
+      if (!assemble(snippet(C, false), Code, Err)) {
+        ADD_FAILURE() << C.Name << ": assemble: " << Err;
+        ++Failures;
+        continue;
+      }
+      std::vector<uint64_t> Got;
+      if (!runLifted(Code, Got, Err, /*Execute=*/false)) {
+        ADD_FAILURE() << C.Name << ": lift: " << Err;
+        ++Failures;
+      }
+      continue;
+    }
     if (Only && C.Name.find(Only) == std::string::npos)
       continue;
     if (Verbose)
@@ -335,13 +379,14 @@ TEST(LiftSemantics, MatchesNativeExecution) {
       for (unsigned N = 0; N < VecRegs; ++N) {
         if (!C.VecUsed)
           continue;
-        for (unsigned Q = 0; Q < (C.Ymm ? 4u : 2u); ++Q) {
+        unsigned NQ = C.Zmm ? 8u : C.Ymm ? 4u : 2u;
+        for (unsigned Q = 0; Q < NQ; ++Q) {
           uint64_t W = Want[SlotVec + N * VecQwords + Q];
           uint64_t G = Got[SlotVec + N * VecQwords + Q];
           if (W != G)
-            Diff += (C.Ymm ? " ymm" : " xmm") + std::to_string(N) + "." +
-                    std::to_string(Q) + " want " + hexQ(W) + " got " + hexQ(G) +
-                    ";";
+            Diff += (C.Zmm ? " zmm" : C.Ymm ? " ymm" : " xmm") +
+                    std::to_string(N) + "." + std::to_string(Q) + " want " +
+                    hexQ(W) + " got " + hexQ(G) + ";";
         }
       }
       if (!Diff.empty()) {
@@ -352,7 +397,8 @@ TEST(LiftSemantics, MatchesNativeExecution) {
       }
     }
   }
-  llvm::errs() << Cases.size() << " cases, " << Failures << " failed\n";
+  llvm::errs() << Cases.size() << " cases, " << Failures << " failed, "
+               << Skipped << " skipped\n";
   EXPECT_EQ(Failures, 0u);
 }
 

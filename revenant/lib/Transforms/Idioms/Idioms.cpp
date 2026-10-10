@@ -68,6 +68,28 @@ void copyProvenance(Instruction *New, Instruction *Old) {
 
 bool hasOpaque(Instruction *I) { return I->hasMetadata("revenant.opaque"); }
 
+// Argument count the phase-2 intrinsic rewrites read for `ID`. An intrinsic
+// outside this set takes no rewrite at all; one with fewer operands than its
+// rewrite needs is left alone. Lifted code meets zero-argument intrinsics
+// such as `llvm.x86.rdrand.32()`.
+unsigned idiomArity(Intrinsic::ID ID) {
+  switch (ID) {
+  case Intrinsic::scmp:
+  case Intrinsic::ucmp:
+  case Intrinsic::smin:
+  case Intrinsic::smax:
+  case Intrinsic::umin:
+  case Intrinsic::umax:
+  case Intrinsic::usub_sat:
+  case Intrinsic::uadd_sat:
+    return 2;
+  case Intrinsic::abs:
+    return 1;
+  default:
+    return ~0u;
+  }
+}
+
 // ---- magic division: concrete DAG evaluator ------------------------------
 // Interprets an instruction DAG as q(x) with wrap-around semantics.
 // Values are carried as 128-bit APInts holding a W-bit value.
@@ -96,7 +118,7 @@ bool DagEval::evalOperand(Value *V, unsigned W, APInt &Out128) {
     Out128 = XVal.zextOrTrunc(W).zext(128);
     return true;
   }
-  if (Input && !isa<ConstantInt>(V) && !isa<Instruction>(V))
+  if (Input && !isa<ConstantInt>(V) && !isa<Instruction>(V) && V != Input)
     return false;
   if (auto *C = dyn_cast<ConstantInt>(V)) {
     Out128 = C->getValue().zextOrTrunc(W).zext(128);
@@ -277,9 +299,29 @@ bool DagEval::evalInst(Instruction *I, APInt &Out128, unsigned &OutW) {
     return true;
   }
   if (auto *IC = dyn_cast<ICmpInst>(I)) {
+    // A comparison of a function argument against a constant is
+    // source-level control flow (`x == 42`), never compiler fixup: no
+    // witness set can prove it equivalent to a divide. Both
+    // witness-hole fixtures key on it (one via select, one via
+    // zext+add). End the proof before evaluating either side.
+    Value *LHS = IC->getOperand(0), *RHS = IC->getOperand(1);
+    auto isArgCompare = [&](Value *V) {
+      if (isa<ConstantInt>(V))
+        return false;
+      if (auto *A = dyn_cast<Argument>(V))
+        return true;
+      if (V == Dividend || V == Input)
+        return true;
+      return false;
+    };
+    if ((isa<ConstantInt>(RHS) && isArgCompare(LHS)) ||
+        (isa<ConstantInt>(LHS) && isArgCompare(RHS))) {
+      Dividend = nullptr;
+      return false;
+    }
+    APInt A128(128, 0), B128(128, 0);
     unsigned W =
         IC->getOperand(0)->getType()->getScalarType()->getIntegerBitWidth();
-    APInt A128(128, 0), B128(128, 0);
     if (!evalOperand(IC->getOperand(0), W, A128))
       return false;
     if (!evalOperand(IC->getOperand(1), W, B128))
@@ -448,6 +490,103 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
   if (Div->getType() && Div->getType()->isIntegerTy() &&
       Div->getType()->getIntegerBitWidth() != W)
     return std::nullopt;
+  // The dividend must be the function's input (or the pinned W->2W
+  // source): any other leaf is not a quotient of the input.
+  if (DivInput) {
+    if (Div != DivInput)
+      return std::nullopt;
+  } else if (!isa<Argument>(Div)) {
+    return std::nullopt;
+  }
+  // Soundness over witnesses: the rewrite replaces the root with a pure
+  // divide of the dividend, so the DAG must be a pure function of that
+  // leaf. Any icmp in the function comparing a dividend-derived value
+  // against a constant is a data-dependent branch (both witness-hole
+  // fixtures key on `x == 42`); witnesses cannot prove it away. Walk
+  // every icmp in the function, not just the evaluated DAG: the
+  // arithmetic fixture's compare never enters the trunc's DAG, it
+  // observes the leaf from outside it.
+  for (BasicBlock &BB : *Root->getParent()->getParent()) {
+    for (Instruction &I : BB) {
+      auto *IC = dyn_cast<ICmpInst>(&I);
+      if (!IC)
+        continue;
+      Value *LHS = IC->getOperand(0), *RHS = IC->getOperand(1);
+      if (!isa<ConstantInt>(LHS) && !isa<ConstantInt>(RHS))
+        continue;
+      Value *Side = isa<ConstantInt>(LHS) ? RHS : LHS;
+      SmallPtrSet<const Value *, 16> Seen;
+      SmallVector<const Value *, 16> Work{Side};
+      bool OnDividend = false;
+      while (!Work.empty()) {
+        const Value *V = Work.pop_back_val();
+        if (!Seen.insert(V).second)
+          continue;
+        if (V == Div || V == DivInput) {
+          OnDividend = true;
+          break;
+        }
+        if (auto *LI = dyn_cast<Instruction>(V)) {
+          if (auto *A = dyn_cast<Argument>(LI)) {
+            if (A == Div)
+              OnDividend = true;
+            break;
+          }
+          for (Value *Operand : LI->operands())
+            Work.push_back(Operand);
+        }
+      }
+      if (OnDividend)
+        return std::nullopt;
+    }
+  }
+  // The rewrite replaces the root value, so an outside observer is only
+  // dangerous when it branches on the raw dividend around the DAG: the
+  // witness-hole select takes the trunc as one arm and `q + 1` as the
+  // other under `x == 42`. No witness set can prove that branch away.
+  // Bail when a live select in the same function takes a member of this
+  // DAG as an arm while its condition reads the dividend. Pure
+  // arithmetic reuses (the urem7 quotient feeding `q * -7`) stay legal:
+  // they compute from the quotient, not around it.
+  {
+    Value *D3 = nullptr;
+    bool W3 = false, C3 = false;
+    SmallVector<Value *, 8> Reachable;
+    evalRoot(Root, Zero, W, D3, W3, C3, &Reachable, DivInput);
+    SmallPtrSet<const Value *, 32> InDag;
+    InDag.insert(Root);
+    for (Value *M : Reachable)
+      InDag.insert(M);
+    InDag.insert(Div);
+    for (BasicBlock &BB : *Root->getParent()->getParent()) {
+      for (Instruction &I : BB) {
+        auto *SI = dyn_cast<SelectInst>(&I);
+        if (!SI)
+          continue;
+        bool ArmInDag = InDag.count(SI->getTrueValue()) ||
+                        InDag.count(SI->getFalseValue());
+        if (!ArmInDag)
+          continue;
+        SmallPtrSet<const Value *, 16> SeenC;
+        SmallVector<const Value *, 16> WorkC{SI->getCondition()};
+        bool CondOnDiv = false;
+        while (!WorkC.empty()) {
+          const Value *C = WorkC.pop_back_val();
+          if (!SeenC.insert(C).second)
+            continue;
+          if (C == Div) {
+            CondOnDiv = true;
+            break;
+          }
+          if (auto *CI = dyn_cast<Instruction>(C))
+            for (Value *Operand : CI->operands())
+              WorkC.push_back(Operand);
+        }
+        if (CondOnDiv)
+          return std::nullopt;
+      }
+    }
+  }
 
   // |d| = smallest positive x with q(x) != 0. Exponential probe then
   // binary search (quotient-like functions are 0 up to |d|).
@@ -775,14 +914,17 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
       if (hasOpaque(&I))
         continue;
       if (auto *Call = dyn_cast<CallInst>(&I)) {
-          B.SetInsertPoint(Call);
+        B.SetInsertPoint(Call);
         Function *Callee = Call->getCalledFunction();
-        if (Callee && Callee->isIntrinsic()) {
+        if (Callee && Callee->isIntrinsic() &&
+            Call->arg_size() >= idiomArity(Callee->getIntrinsicID())) {
           Intrinsic::ID ID = Callee->getIntrinsicID();
-          Value *A = Call->getArgOperand(0);
           Value *R = nullptr;
           Value *Cond = nullptr;
           if (ID == Intrinsic::scmp || ID == Intrinsic::ucmp) {
+            if (Call->arg_size() < 2)
+              continue;
+            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             bool Signed = ID == Intrinsic::scmp;
             Value *Less = B.CreateICmp(
@@ -796,6 +938,9 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                                B.CreateSelect(Greater, One, Zero));
           } else if (ID == Intrinsic::smin || ID == Intrinsic::smax ||
                      ID == Intrinsic::umin || ID == Intrinsic::umax) {
+            if (Call->arg_size() < 2)
+              continue;
+            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             bool Signed = ID == Intrinsic::smin || ID == Intrinsic::smax;
             bool Min = ID == Intrinsic::smin || ID == Intrinsic::umin;
@@ -805,18 +950,25 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                 A, Bv);
             R = B.CreateSelect(Cond, A, Bv);
           } else if (ID == Intrinsic::abs) {
+            Value *A = Call->getArgOperand(0);
             Cond = B.CreateICmpSLT(
                 A, ConstantInt::getNullValue(A->getType()));
             Value *Neg = B.CreateSub(ConstantInt::getNullValue(A->getType()),
                                      A);
             R = B.CreateSelect(Cond, Neg, A);
           } else if (ID == Intrinsic::usub_sat) {
+            if (Call->arg_size() < 2)
+              continue;
+            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             Cond = B.CreateICmpULT(A, Bv);
             Value *Difference = B.CreateSub(A, Bv);
             R = B.CreateSelect(Cond, ConstantInt::getNullValue(A->getType()),
                                Difference);
           } else if (ID == Intrinsic::uadd_sat) {
+            if (Call->arg_size() < 2)
+              continue;
+            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             Value *Sum = B.CreateAdd(A, Bv);
             Cond = B.CreateICmpULT(Sum, A);

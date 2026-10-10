@@ -113,6 +113,23 @@ class RevenantLiftEmitter {
     const auto *Op = operandAt(I, MIOpNo);
     return Op && Op->Rec->isSubClassOf("RegisterClass");
   }
+  /// Bit width of a k-register operand's class (VK8 -> 8, VK16 -> 16, ...).
+  static unsigned kregWidth(const CGIOperandList::OperandInfo *Op) {
+    if (!Op)
+      return 0;
+    StringRef C = Op->Rec->getName();
+    if (C.starts_with("VK8"))
+      return 8;
+    if (C.starts_with("VK16"))
+      return 16;
+    if (C.starts_with("VK32"))
+      return 32;
+    if (C.starts_with("VK64"))
+      return 64;
+    if (C.starts_with("VK1") || C.starts_with("VK2") || C.starts_with("VK4"))
+      return 8;
+    return 0;
+  }
 
   /// MI operand index of logical operand `L`: the operands in order with
   /// tied inputs merged into their defs, the iced-like view the DSL's
@@ -247,8 +264,18 @@ class RevenantLiftEmitter {
              : std::string();
   }
 
+  /// Immediate expression: a literal, (rv_op N) at an input position, or a
+  /// named operand whose value is the MI immediate.
   static std::string immediateExpr(const Init *I,
-                                   const CodeGenInstruction &Inst) {
+                                   const CodeGenInstruction &Inst,
+                                   StringRef Named = {}) {
+    if (!Named.empty()) {
+      auto No = operandNo(Inst, Named);
+      return No ? (Twine("MI.getOperand(") + Twine(*No) + ").getImm()").str()
+                : std::string();
+    }
+    if (const auto *V = dyn_cast<VarInit>(I))
+      return immediateExpr(I, Inst, V->getName());
     if (const auto *N = dyn_cast<IntInit>(I))
       return Twine(N->getValue()).str();
     const auto *D = dyn_cast<DagInit>(I);
@@ -774,6 +801,66 @@ class RevenantLiftEmitter {
                 B + ")")
             .str();
       }
+    // AVX-512 k-register and masked DSL expressions. Widths are explicit
+      // because the mask ops work on W-bit vectors whose lane width differs.
+      if (Name == "rv_kselect" && D->getNumArgs() == 5) {
+        std::string K = expression(D->getArg(0), Inst, 64,
+                                   D->getArgNameStr(0));
+        std::string T = expression(D->getArg(1), Inst, Width,
+                                   D->getArgNameStr(1));
+        std::string F = expression(D->getArg(2), Inst, Width,
+                                   D->getArgNameStr(2));
+        const auto *EB = dyn_cast<IntInit>(D->getArg(3));
+        const auto *BW = dyn_cast<IntInit>(D->getArg(4));
+        if (K.empty() || T.empty() || F.empty() || !EB || !BW)
+          return {};
+        return (Twine("LC.avx512Select(") + K + ", " + T + ", " + F + ", " +
+                Twine(BW->getValue()) + ", " + Twine(EB->getValue()) + ")")
+            .str();
+      }
+      if (Name == "rv_kmasked" && D->getNumArgs() == 3) {
+        std::string K = expression(D->getArg(0), Inst, 64,
+                                   D->getArgNameStr(0));
+        std::string S = expression(D->getArg(1), Inst, Width,
+                                   D->getArgNameStr(1));
+        std::string M = expression(D->getArg(2), Inst, Width,
+                                   D->getArgNameStr(2));
+        if (K.empty() || S.empty())
+          return {};
+        return (Twine("LC.avx512Select(") + K + ", " + S + ", " +
+                (M.empty() ? std::string("nullptr") : M) + ", " +
+                Twine(Width) + ", " + Twine(Width) + ")")
+            .str();
+      }
+      if (Name == "rv_kfma" && D->getNumArgs() >= 8) {
+        const auto *Kind = dyn_cast<StringInit>(D->getArg(0));
+        if (!Kind)
+          return {};
+        std::string K = expression(D->getArg(1), Inst, 64,
+                                   D->getArgNameStr(1));
+        std::string A = expression(D->getArg(2), Inst, Width,
+                                   D->getArgNameStr(2));
+        std::string B = expression(D->getArg(3), Inst, Width,
+                                   D->getArgNameStr(3));
+        std::string C = expression(D->getArg(4), Inst, Width,
+                                   D->getArgNameStr(4));
+        std::string M = expression(D->getArg(5), Inst, Width,
+                                   D->getArgNameStr(5));
+        const auto *EB = dyn_cast<IntInit>(D->getArg(6));
+        if (K.empty() || A.empty() || B.empty() || C.empty() || !EB)
+          return {};
+        std::string Rc = "-1";
+        if (D->getNumArgs() >= 8)
+          Rc = immediateExpr(D->getArg(7), Inst);
+        if (Rc.empty())
+          Rc = "-1";
+        return (Twine("LC.avx512Select(") + K + ", LC.avx512FmaVec(\"" +
+                Kind->getValue() + "\", " + A + ", " + B + ", " + C + ", " +
+                Twine(Width) + ", " + Twine(EB->getValue()) + ", " + Rc +
+                "), " + (M.empty() ? std::string("nullptr") : M) + ", " +
+                Twine(Width) + ", " + Twine(EB->getValue()) + ")")
+            .str();
+      }
       if (Name == "rv_zext" || Name == "rv_sext" || Name == "rv_trunc") {
         unsigned W = Width;
         if (D->getNumArgs() == 2) {
@@ -1270,6 +1357,23 @@ class RevenantLiftEmitter {
       return {};
     }
     MVT VT = N.getSimpleType(0);
+    // A k-register mask operand: `<N x i1>` has no lifted vector type, so it
+    // reads as the i64 k register instead. It is a leaf naming a VK operand.
+    if (VT.isVector() && VT.getVectorElementType() == MVT::i1) {
+      if (!N.isLeaf() || !N.hasName()) {
+        C.Failed = true;
+        return {};
+      }
+      auto No = patOperandNo(C, N.getName());
+      const auto *Op = No ? operandAt(C.Inst, *No) : nullptr;
+      if (!No || !Op || !Op->Rec->getName().starts_with("VK")) {
+        C.Failed = true;
+        return {};
+      }
+      return (Twine("LC.kregRead(MI.getOperand(") + Twine(*No) +
+              ").getReg())")
+          .str();
+    }
     std::string Ty = typeExpr(VT);
     if (Ty.empty()) {
       C.Failed = true;
@@ -1302,6 +1406,16 @@ class RevenantLiftEmitter {
             return (Twine("LC.vcast(LC.constI(") + Twine(I->getValue()) + ", " +
                     Twine(Bits) + "), " + Ty + ")")
                 .str();
+      if (N.isLeaf())
+        if (const auto *DI = dyn_cast<DefInit>(N.getLeafValue())) {
+          // immAllZerosV/immAllOnesV: the all-zeros (the {z} masking) and
+          // all-ones constants the masked patterns use.
+          StringRef Leaf = DI->getDef()->getName();
+          if (Leaf == "immAllZerosV")
+            return (Twine("LC.constI(0, ") + Twine(Bits) + ")").str();
+          if (Leaf == "immAllOnesV")
+            return (Twine("LC.constI(-1, ") + Twine(Bits) + ")").str();
+        }
       C.Failed = true;
       return {};
     }
@@ -1322,6 +1436,68 @@ class RevenantLiftEmitter {
     if (Op == "bitconvert" && NC == 1) {
       std::string A = Child(0);
       return A.empty() ? A : (Twine("LC.vcast(") + A + ", " + Ty + ")").str();
+    }
+    // Masked forms: vselect/vselect_mask (mask, true, false) with a k-register
+    // mask, and masked_load/masked_store with the same mask argument. The
+    // false arm's zero constant is the {z} form.
+    if ((Op == "vselect" || Op == "vselect_mask") && NC == 3) {
+      std::string K = Child(0), T = Child(1), F = Child(2);
+      if (K.empty() || T.empty())
+        return {};
+      // The false arm is the tied merge vector or the all-zeros constant
+      // (the {z} form). vecExpr renders the latter as constI(0, W).
+      std::string Zero = (Twine("LC.constI(0, ") + Twine(Bits) + ")").str();
+      bool ZeroFalse = F == Zero;
+      if (F.empty() && !ZeroFalse) {
+        C.Failed = true;
+        return {};
+      }
+      return (Twine("LC.avx512Select(") + K + ", " + T + ", " +
+              (ZeroFalse ? std::string("nullptr") : F) + ", " + Twine(Bits) +
+              ", " + Twine(VT.getVectorElementType().getSizeInBits()) + ")")
+          .str();
+    }
+    // FMA SDNodes: X86Fmadd/Fmsub/Fnmadd/Fnmsub and their _RND (embedded
+    // rounding) twins, plus the alternating add/sub forms. The result keeps
+    // the vector type, so the inverter emits typed IR.
+    {
+      static const std::pair<StringRef, StringRef> FmaNodes[] = {
+          {"fma", "madd"},        {"X86Fmadd", "madd"},
+          {"X86Fmsub", "msub"},   {"X86Fnmadd", "nmadd"},
+          {"X86Fnmsub", "nmsub"}, {"X86Fmaddsub", "maddsub"},
+          {"X86Fmsubadd", "msubadd"},
+          {"X86FmaddRnd", "madd"}, {"X86FmsubRnd", "msub"},
+          {"X86FnmaddRnd", "nmadd"}, {"X86FnmsubRnd", "nmsub"},
+          {"X86FmaddsubRnd", "maddsub"}, {"X86FmsubaddRnd", "msubadd"}};
+      for (const auto &[Node, Kind] : FmaNodes)
+        if (Op == Node && NC == 3) {
+          std::string VA = Child(0), VB = Child(1), VC = Child(2);
+          if (VA.empty() || VB.empty() || VC.empty())
+            return {};
+          // The _RND forms carry a trailing rounding immediate operand.
+          int64_t Rc = -1;
+          std::string RcExpr;
+          if (Op.ends_with("Rnd")) {
+            const TreePatternNode &RN = N.getChild(NC - 1);
+            if (!RN.isLeaf() || !RN.hasName()) {
+              C.Failed = true;
+              return {};
+            }
+            auto No = patOperandNo(C, RN.getName());
+            if (!No) {
+              C.Failed = true;
+              return {};
+            }
+            RcExpr = (Twine("MI.getOperand(") + Twine(*No) + ").getImm()").str();
+          }
+          unsigned EB = VT.getVectorElementType().getSizeInBits();
+          std::string RcArg =
+              RcExpr.empty() ? Twine(Rc).str() : RcExpr;
+          return (Twine("LC.avx512FmaVec(\"") + Kind + "\", " + VA + ", " + VB +
+                  ", " + VC + ", " + Twine(Bits) + ", " + Twine(EB) + ", " +
+                  RcArg + ")")
+              .str();
+        }
     }
     // Plain IRBuilder spellings.
     static const std::pair<StringRef, StringRef> Bin[] = {
@@ -1478,10 +1654,7 @@ class RevenantLiftEmitter {
     if (!hasType(Val) || !anyVectorType(Val))
       return {};
     IsVector = true;
-    // Mask registers and implicit state belong to the DSL.
-    for (unsigned K = 0, E = Inst.Operands.size(); K != E; ++K)
-      if (Inst.Operands[K].Rec->getName().starts_with("VK"))
-        return {};
+    // Mask registers are read by vecExpr as i64 k registers.
     VecPat C{Inst, Dst};
     std::string V = vecExpr(C, Val);
     if (C.Failed || V.empty())
@@ -1496,10 +1669,14 @@ class RevenantLiftEmitter {
     if (Inst.Operands.NumDefs != 1)
       return {};
     MVT RootVT = Val.getSimpleType(0);
-    bool Vex = Inst.TheDef->getName().starts_with("V");
-    // VEX.128 writes clear the upper ymm lane; a scalar result (movmsk,
-    // extract) goes to a general register.
-    bool Zero = Vex && RootVT.isVector() && RootVT.getSizeInBits() <= 128;
+    StringRef Name = Inst.TheDef->getName();
+    bool Vex = Name.starts_with("V");
+    // A 128-bit VEX or any EVEX write clears the bits above the written
+    // width in the root register (VEX.128 zeroes the ymm upper half; EVEX
+    // zeroes the zmm upper half). Scalar results (movmsk, extract) write a
+    // general register and use the plain merge.
+    bool Zero = RootVT.isVector() &&
+                (Name.contains('Z') || (Vex && RootVT.getSizeInBits() <= 128));
     return (Twine("    LC.") + (Zero ? "writeOpZ" : "writeOp") +
             "(MI, 0, " + V + ");\n")
         .str();
@@ -1698,6 +1875,108 @@ class RevenantLiftEmitter {
     }
     if (Name == "rv_fclex")
       return true;
+    // x87 environment/save/restore and BCD: (rv_fxenv "st|ld", $m) and
+    // (rv_fbcd "ld|st", $m) address the memory operand.
+    if ((Name == "rv_fxenv" || Name == "rv_fbcd") && Body.getNumArgs() == 2) {
+      const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
+      auto Mem = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Kind || !Mem)
+        return false;
+      StringRef K = Kind->getValue();
+      if (Name == "rv_fbcd")
+        OS << "    LC." << (K == "ld" ? "x87BcdLoad" : "x87BcdStore")
+           << "(LC.memAddr(MI, " << *Mem << "));\n";
+      else
+        OS << "    LC." << (K == "ld" ? "fxrstorOp" : "fxsaveOp")
+           << "(LC.memAddr(MI, " << *Mem << "));\n";
+      return true;
+    }
+    // 28-byte environment (FNSTENV/FSTENV/FLDENV) and 108-byte FPU image
+    // (FSAVE/FNSAVE/FRSTOR).
+    if ((Name == "rv_x87env" || Name == "rv_x87save") &&
+        Body.getNumArgs() == 2) {
+      const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
+      auto Mem = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Kind || !Mem)
+        return false;
+      StringRef K = Kind->getValue();
+      if (Name == "rv_x87env")
+        OS << "    LC.x87Env(\"" << K << "\", LC.memAddr(MI, " << *Mem
+           << "));\n";
+      else
+        OS << "    LC.x87SaveRestore(\"" << K << "\", LC.memAddr(MI, " << *Mem
+           << "));\n";
+      return true;
+    }
+    // AVX-512 k-register statements. KMOV's destination width comes from the
+    // k register class (VK8/16/32/64); the source is read at that width and
+    // merge-written into the k register.
+    if ((Name == "rv_kmov" || Name == "rv_kst") && Body.getNumArgs() == 2) {
+      auto Dst = operandNo(Inst, Body.getArgNameStr(0));
+      auto Src = operandNo(Inst, Body.getArgNameStr(1));
+      if (!Dst || !Src)
+        return false;
+      // The k width: the destination (kmov) or source (kst) k-register class.
+      const CGIOperandList::OperandInfo *KOp =
+          operandAt(Inst, Name == "rv_kmov" ? *Dst : *Src);
+      unsigned KB = kregWidth(KOp);
+      if (!KB)
+        return false;
+      if (Name == "rv_kmov")
+        OS << "    LC.kregMerge(MI.getOperand(" << *Dst
+           << ").getReg(), LC.readOp(MI, " << *Src << ", LC.iN(" << KB
+           << ")));\n";
+      else
+        OS << "    LC.memWrite(MI, " << *Dst << ", LC.kregRead(MI.getOperand("
+           << *Src << ").getReg()));\n";
+      return true;
+    }
+    // (rv_kvstore $m, $v, $k): masked vector store. The lane width comes from
+    // the opcode (DQU8 -> 8, DQU64/DQA64 -> 64, PS/PD -> 32/64, ...).
+    if (Name == "rv_kvstore" && Body.getNumArgs() == 3) {
+      auto Mem = operandNo(Inst, Body.getArgNameStr(0));
+      std::string V = expression(Body.getArg(1), Inst, Width,
+                                 Body.getArgNameStr(1));
+      auto K = operandNo(Inst, Body.getArgNameStr(2));
+      if (!Mem || V.empty() || !K)
+        return false;
+      StringRef OpName = Inst.TheDef->getName();
+      unsigned EB = OpName.contains("DQU8") ? 8
+                    : OpName.contains("DQU16") ? 16
+                    : OpName.contains("DQU32") || OpName.contains("DQA32") ||
+                              OpName.contains("PS")
+                        ? 32
+                        : 64;
+      OS << "    LC.avx512MaskedStore(LC.kregRead(MI.getOperand(" << *K
+         << ").getReg()), " << V << ", LC.memAddr(MI, " << *Mem << "), "
+         << Width << ", " << EB << ");\n";
+      return true;
+    }
+    if (Name == "rv_kcmp" && Body.getNumArgs() == 5) {
+      // (rv_kcmp "u|s", $dst, $src1, $src2, $cc)
+      const auto *Sign = dyn_cast<StringInit>(Body.getArg(0));
+      auto Dst = operandNo(Inst, Body.getArgNameStr(1));
+      std::string A = expression(Body.getArg(2), Inst, Width,
+                                 Body.getArgNameStr(2));
+      std::string B = expression(Body.getArg(3), Inst, Width,
+                                 Body.getArgNameStr(3));
+      std::string Pred = immediateExpr(Body.getArg(4), Inst,
+                                       Body.getArgNameStr(4));
+      if (!Sign || !Dst || Pred.empty() || A.empty() || B.empty())
+        return false;
+      // The element width comes from the letter after VPCMP[U].
+      StringRef OpName = Inst.TheDef->getName();
+      size_t P = OpName.find("VPCMP");
+      unsigned EB = 64;
+      if (P != StringRef::npos) {
+        char C = OpName[P + 5] == 'U' ? OpName[P + 6] : OpName[P + 5];
+        EB = C == 'B' ? 8 : C == 'W' ? 16 : C == 'D' ? 32 : 64;
+      }
+      OS << "    LC.kregCompare(MI.getOperand(" << *Dst << ").getReg(), "
+         << Pred << ", " << (Sign->getValue() == "u" ? "true" : "false")
+         << ", " << A << ", " << B << ", " << Width << ", " << EB << ");\n";
+      return true;
+    }
     if (Name == "rv_fst" && Body.getNumArgs() == 3) {
       const auto *Kind = dyn_cast<StringInit>(Body.getArg(0));
       auto Mem = operandNo(Inst, Body.getArgNameStr(1));
@@ -2197,10 +2476,13 @@ public:
     for (const CodeGenInstruction *I : Target.getTargetInstructions())
       Instructions[I->TheDef] = I;
     std::map<const Record *, const DagInit *> Semantics;
+    std::set<const Record *> Exact;
     for (const Record *R : Records.getAllDerivedDefinitions("RVLift")) {
       const Record *Insn = R->getValueAsDef("Insn");
-      if (Instructions.count(Insn))
+      if (Instructions.count(Insn)) {
         Semantics[Insn] = bodyOf(*R);
+        Exact.insert(Insn);
+      }
     }
     // An exact name beats a wildcard, so `MOV*rm` (the general-register
     // moves) cannot capture MOVSDrm and friends.
@@ -2259,6 +2541,18 @@ public:
       unsigned VW = vectorWidthOf(Inst);
       bool Emits = emitBody(BodyOS, *Body, Inst, VW ? VW : widthFor(*R));
       BodyOS.flush();
+      // A wildcard glob written for the unmasked form also matches the EVEX
+      // masked twin (VFMADD213* matches VFMADD213PSZrk) and would drop the
+      // mask. When the instruction carries a k-register operand and the
+      // pattern inverter understood it, the inverted pattern wins.
+      if (Emits && !Exact.count(R)) {
+        bool HasMask = false;
+        for (unsigned K = 0, E = Inst.Operands.size(); K != E; ++K)
+          if (Inst.Operands[K].Rec->getName().starts_with("VK"))
+            HasMask = true;
+        if (HasMask && PatternBodies.count(R))
+          Emits = false;
+      }
       if (Emits && !operandRefsValid(Buffer, Inst)) {
         Rejected.push_back(R->getName().str());
         Emits = false;

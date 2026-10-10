@@ -110,6 +110,37 @@ exit:
 ; CHECK:   br i1 %{{.*}}, label %bb_x2, label %bb_x5, !revenant.region ![[RO:[0-9]+]]
 ; CHECK: bb_x2:
 ; CHECK:   br i1 %{{.*}}, label %bb_x3, label %bb_x4, !revenant.region ![[RI:[0-9]+]]
+
+; Break and continue paths inside a natural loop must not erase its region.
+define i32 @loop_break_continue(i32 %n) {
+entry:
+  br label %head
+head:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %latch ]
+  %sum = phi i32 [ 0, %entry ], [ %sum.next, %latch ]
+  %in.range = icmp slt i32 %i, %n
+  br i1 %in.range, label %check.continue, label %exit
+check.continue:
+  %rem = urem i32 %i, 3
+  %skip = icmp eq i32 %rem, 0
+  br i1 %skip, label %latch, label %check.break
+check.break:
+  %past.limit = icmp sgt i32 %i, 20
+  br i1 %past.limit, label %exit, label %body
+body:
+  %sum.body = add i32 %sum, %i
+  br label %latch
+latch:
+  %sum.next = phi i32 [ %sum, %check.continue ], [ %sum.body, %body ]
+  %i.next = add i32 %i, 1
+  br label %head
+exit:
+  ret i32 %sum
+}
+; header=1, latch=5, exit=6
+; CHECK-LABEL: @loop_break_continue(
+; CHECK: bb_x1:
+; CHECK: br i1 %{{.*}}, label %bb_x2, label %bb_x6, !revenant.region ![[RBC:[0-9]+]]
 ; CHECK: ![[RF]] = !{!"for", i32 1, i32 3, i32 4}
 ; CHECK: ![[RW]] = !{!"while", i32 1, i32 2, i32 3}
 ; CHECK: ![[RD]] = !{!"dowhile", i32 1, i32 2, i32 3}
@@ -117,3 +148,4 @@ exit:
 ; CHECK: ![[RLLOOP]] = !{!"loop", i32 1, i32 3, i32 5}
 ; CHECK: ![[RO]] = !{!"for", i32 1, i32 4, i32 5}
 ; CHECK: ![[RI]] = !{!"for", i32 2, i32 3, i32 4}
+; CHECK: ![[RBC]] = !{!"for", i32 1, i32 5, i32 6}

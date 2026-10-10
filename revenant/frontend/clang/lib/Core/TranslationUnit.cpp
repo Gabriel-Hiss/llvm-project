@@ -11,10 +11,12 @@
 #include "revenant/Clang/FrontendContext.h"
 #include "revenant/Clang/StmtBuilder.h"
 #include "revenant/Clang/TypeBuilder.h"
+#include "revenant/Clang/WideIntModel.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Stmt.h"
+#include "clang/AST/Type.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/FileSystemOptions.h"
@@ -111,13 +113,12 @@ paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
   if (!SP)
     return Out;
   for (auto &BB : F)
-    for (auto &I : BB) {
-      const llvm::DILocalVariable *V = nullptr;
-      if (auto *DDI = llvm::dyn_cast<llvm::DbgDeclareInst>(&I))
-        V = DDI->getVariable();
-      if (V && V->getArg())
-        Out[V->getArg()] = V;
-    }
+    for (auto &I : BB)
+      if (auto *DVI = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
+        const llvm::DILocalVariable *V = DVI->getVariable();
+        if (V && V->isParameter() && V->getArg())
+          Out[V->getArg()] = V;
+      }
   return Out;
 }
 
@@ -186,8 +187,13 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
     PV = paramVars(SP, F);
   SmallVector<c::ParmVarDecl *, 8> Params;
   unsigned Idx = 1;
+  const c::FunctionProtoType *Prototype =
+      FD->getType()->getAs<c::FunctionProtoType>();
   for (llvm::Argument &A : F.args()) {
-    c::QualType PT = Types.typeOf(A.getType(), nullptr);
+    c::QualType PT =
+        Prototype && Idx <= Prototype->getNumParams()
+            ? Prototype->getParamType(Idx - 1)
+            : Types.typeOf(A.getType(), nullptr);
     c::IdentifierInfo *II = nullptr;
     if (auto *V = PV.lookup(Idx))
       II = FCtx.ident(V->getName());
@@ -292,6 +298,7 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
     OS << "#include <" << Inc << ">\n";
   if (!Includes.empty())
     OS << "\n";
+  emitWideIntPreamble(OS, TU->getASTContext());
   std::unordered_set<std::string> PrintedRecords;
   for (unsigned Pass = 0; Pass != 3; ++Pass) {
     for (c::Decl *D : TU->decls()) {
@@ -312,6 +319,8 @@ void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
         std::string Key =
             (Record->isUnion() ? "union " : "struct ") +
             Record->getNameAsString();
+        if (Key == "struct rv_u128")
+          continue; // defined in the MSVC helper block above
         if (!PrintedRecords.insert(std::move(Key)).second)
           continue;
       }

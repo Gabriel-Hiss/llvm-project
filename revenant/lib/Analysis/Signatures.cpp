@@ -100,10 +100,14 @@ private:
     T.MRI.reset(Tgt->createMCRegInfo(*T.TT));
     T.MII.reset(Tgt->createMCInstrInfo());
     assert(T.MRI && T.MII);
-
     // Group leader map: every sub-register of a GR64 member -> the GR64
     // member; every sub-register of a VR512 member -> the zmm.
-    auto &MRI = *T.MRI;
+    // The XMM registers are also sub-registers of the zmm in LLVM's
+    // tables but VR512 iteration only covers registers LLVM lists in
+    // that class, so map them explicitly: without this, xmm writes
+    // (recorded on the zmm) and xmm reads land in different groups and
+    // return recovery misses float/double results (c-clang-o2 sum_vec_d).
+    const MCRegisterInfo &MRI = *T.MRI;
     auto MapFamily = [&](const MCRegisterClass &RC) {
       for (MCPhysReg Root : RC) {
         T.Full[Root] = Root;
@@ -111,6 +115,23 @@ private:
           T.Full[*S] = Root;
       }
     };
+    {
+      const unsigned Xmm[16] = {X86::XMM0,  X86::XMM1,  X86::XMM2,
+                                X86::XMM3,  X86::XMM4,  X86::XMM5,
+                                X86::XMM6,  X86::XMM7,  X86::XMM8,
+                                X86::XMM9,  X86::XMM10, X86::XMM11,
+                                X86::XMM12, X86::XMM13, X86::XMM14,
+                                X86::XMM15};
+      const MCRegisterClass &ZmmRC = MRI.getRegClass(X86::VR512RegClassID);
+      for (unsigned X : Xmm) {
+        unsigned Z = MRI.getMatchingSuperReg(X, X86::sub_xmm, &ZmmRC);
+        if (!Z)
+          continue;
+        T.Full[X] = Z;
+        for (MCSubRegIterator S(X, &MRI); S.isValid(); ++S)
+          T.Full[*S] = Z;
+      }
+    }
     MapFamily(MRI.getRegClass(X86::GR64RegClassID));
     MapFamily(MRI.getRegClass(X86::VR512RegClassID));
 
@@ -246,6 +267,9 @@ static bool isSignExtendFamily(StringRef Name) {
 struct RegUse {
   unsigned Reg;
   bool Read, Write;
+  // Width of the operand register before write-widening (EAX stays 32
+  // even though the write is recorded on RAX for grouping).
+  unsigned Bits = 0;
 };
 
 struct MemOp {
@@ -324,8 +348,8 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
     MemStart = MemNo + (int)X86II::getOperandBias(D);
 
   SmallVector<RegUse, 8> &R = Info.Regs;
-  auto Emit = [&](unsigned Reg, bool Read, bool Write) {
-    R.push_back({Reg, Read, Write});
+  auto Emit = [&](unsigned Reg, bool Read, bool Write, unsigned Bits) {
+    R.push_back({Reg, Read, Write, Bits});
   };
 
   for (unsigned i = 0; i < I.getNumOperands(); ++i) {
@@ -335,7 +359,7 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
     if (InMem && Op.isReg() && Op.getReg() != 0) {
       // Address computation registers are reads; the memory value's
       // access is tracked separately.
-      Emit(Op.getReg(), true, false);
+      Emit(Op.getReg(), true, false, regBits(Op.getReg()));
       continue;
     }
     if (Op.isReg() && Op.getReg() != 0) {
@@ -343,15 +367,15 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
       if (isDeadReadIdiom(Name, I, T)) {
         // Constant-result idiom: only the destination write counts.
         if (i == 0)
-          Emit(widenWrite(Reg), false, true);
+          Emit(widenWrite(Reg), false, true, regBits(Reg));
       } else if (i < NumDefs) {
 
         // Def side: the write (widened, iced `add_register`).
-        Emit(widenWrite(Reg), false, true);
+        Emit(widenWrite(Reg), false, true, regBits(Reg));
       } else {
         // Use side: read at operand width. A tied use is the read half
         // of a read-write; the write was already emitted by the def.
-        Emit(Reg, true, false);
+        Emit(Reg, true, false, regBits(Reg));
       }
     }
   }
@@ -413,29 +437,32 @@ static InsnInfo insnInfo(const MCInst &I, const McTables &T) {
   SmallSet<unsigned, 8> ImpUses;
   for (MCPhysReg U : D.implicit_uses()) {
     ImpUses.insert(U);
-    Emit(U, true, false);
+    Emit(U, true, false, regBits(U));
   }
   bool SignExt = isSignExtendFamily(Name);
   for (MCPhysReg Def : D.implicit_defs()) {
     // cbw/cwd/cdq/cqo: iced keeps the accumulator as a pure read.
     if (SignExt && ImpUses.count(Def))
       continue;
-    Emit(widenWrite(Def), false, true);
+    Emit(widenWrite(Def), false, true, regBits(Def));
   }
   // LLVM models `enter` without implicit regs; iced reports the frame
   // setup (rsp/rbp read-write). Rare in compiler output; keep parity.
   if (Name == "ENTER") {
-    Emit(X86::RSP, true, false);
-    Emit(X86::RBP, true, false);
-    Emit(X86::RSP, false, true);
-    Emit(X86::RBP, false, true);
+    Emit(X86::RSP, true, false, regBits(X86::RSP));
+    Emit(X86::RBP, true, false, regBits(X86::RBP));
+    Emit(X86::RSP, false, true, regBits(X86::RSP));
+    Emit(X86::RBP, false, true, regBits(X86::RBP));
   }
   return Info;
 }
 
 static bool anyWrite(const InsnInfo &II, unsigned Reg) {
+  // Compare group leaders: vector writes canonicalize to zmm while the
+  // query may name xmm (and vice versa for reads of ymm lanes).
+  unsigned Want = grp(Reg);
   for (const RegUse &U : II.Regs)
-    if (grp(U.Reg) == Reg && U.Write)
+    if (grp(U.Reg) == Want && U.Write)
       return true;
   return false;
 }
@@ -912,12 +939,12 @@ static unsigned widestWrite(const Function &F, const McTables &T,
       InsnInfo II = insnInfo(Ins.Inst, T);
       bool Wrote = false;
       for (const RegUse &U : II.Regs) {
-        if (grp(U.Reg) == Reg && U.Write) {
+        if (grp(U.Reg) == grp(Reg) && U.Write) {
           // A call's implicit rax write isn't the return write; keep
           // scanning past it (defensive: iced reports none).
           if (Ins.Flow == FlowKind::Call)
             continue;
-          Bits = std::max(Bits, regBits(U.Reg));
+          Bits = std::max(Bits, U.Bits ? U.Bits : regBits(U.Reg));
           Wrote = true;
         }
       }
@@ -929,8 +956,8 @@ static unsigned widestWrite(const Function &F, const McTables &T,
     for (const Instr &Ins : F.Instrs) {
       InsnInfo II = insnInfo(Ins.Inst, T);
       for (const RegUse &U : II.Regs)
-        if (grp(U.Reg) == Reg && U.Write)
-          Bits = std::max(Bits, regBits(U.Reg));
+        if (grp(U.Reg) == grp(Reg) && U.Write)
+          Bits = std::max(Bits, U.Bits ? U.Bits : regBits(U.Reg));
     }
   }
   return std::max(Bits, 8u);
@@ -1145,8 +1172,6 @@ static bool mustDefine(const Function &F, const McTables &T,
   return !MustIn[entryBlock(F)];
 }
 
-/// Direct call sites by callee: (caller start, index of the call in its
-/// instrs).
 using CallSites = std::map<Va, SmallVector<std::pair<Va, uint32_t>, 2>>;
 
 static CallSites callSites(const Program &P, FnCache &Fns) {
@@ -1182,11 +1207,15 @@ static bool callerReads(const CallSites &Sites, FnCache &Fns,
       const Instr &Nx = G->Instrs[J];
       InsnInfo II = insnInfo(Nx.Inst, T);
       for (const RegUse &U : II.Regs)
-        if (grp(U.Reg) == Reg && U.Read)
+        if (grp(U.Reg) == grp(Reg) && U.Read)
           return true;
-      // Stop scanning at the next call: it clobbers rax.
-      if (Nx.Flow == FlowKind::Call)
+      // A later call clobbers the integer return (rax) but not the
+      // vector return (xmm0): gcc -O2 `main` calls `sum_vec_d` then
+      // `cmp_vec` before `cvttsd2si r10d, xmm0` consumes the double.
+      if (Nx.Flow == FlowKind::Call && grp(Reg) != grp(X86::XMM0))
         break;
+      if (Nx.Flow == FlowKind::Call)
+        continue;
     }
   }
   return false;
@@ -1214,15 +1243,18 @@ static unsigned callerReadWidth(const CallSites &Sites, FnCache &Fns,
       const Instr &Nx = G->Instrs[J];
       InsnInfo II = insnInfo(Nx.Inst, T);
       for (const RegUse &U : II.Regs) {
-        if (grp(U.Reg) == Reg && U.Read) {
+        if (grp(U.Reg) == grp(Reg) && U.Read) {
           Bits = std::max(Bits, regBits(U.Reg));
           Stop = true;
         }
-        if (grp(U.Reg) == Reg && U.Write)
+        if (grp(U.Reg) == grp(Reg) && U.Write)
           Stop = true;
       }
-      if (Nx.Flow == FlowKind::Call)
+      // Same as callerReads: calls clobber rax, not xmm0.
+      if (Nx.Flow == FlowKind::Call && grp(Reg) != grp(X86::XMM0))
         break;
+      if (Nx.Flow == FlowKind::Call)
+        continue;
     }
   }
   return Bits;
@@ -1324,8 +1356,17 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
       Sig.Params.push_back(P_);
     }
 
+    // DLL exports have external callers: must-define alone suffices.
+    // The same holds for any function with no in-module callers at all
+    // (library API reached from outside the image, e.g. qoi_encode /
+    // qoi_decode): an extra return is harmless (nothing reads it),
+    // while a missing one is wrong code. A void function leaves rax
+    // unwritten on some path to ret, so must-define still gates.
+    bool Exported = P.Exports.count(F.Start) != 0;
+    auto NoCallers = Sites.find(F.Start) == Sites.end();
     bool RaxRet = mustDefine(F, T, X86::RAX) &&
-                  callerReads(Sites, Fns, T, F.Start, X86::RAX);
+                  (Exported || NoCallers ||
+                   callerReads(Sites, Fns, T, F.Start, X86::RAX));
     bool XmmRet = mustDefine(F, T, X86::XMM0) &&
                   callerReads(Sites, Fns, T, F.Start, X86::XMM0);
     // Return width: what callers actually read post-call when narrower
@@ -1335,6 +1376,11 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
       unsigned W = widestWrite(F, T, X86::RAX);
       unsigned C = callerReadWidth(Sites, Fns, T, F.Start, X86::RAX);
       RaxRetBits = (C > 0 && C < W) ? C : W;
+      // With no observed caller width (export or callerless API), keep
+      // the full 64-bit register: the safe direction for pointers and
+      // longs, and harmless for i32 values (low bits identical).
+      if ((Exported || NoCallers) && C == 0)
+        RaxRetBits = 64;
     }
     if (XmmRet) {
       Sig.HasRet = true;
@@ -1343,6 +1389,16 @@ Signatures analyzeSignatures(const Program &P, const Disasm &Dis) {
     } else if (RaxRet) {
       Sig.HasRet = true;
       Sig.Ret.Bits = std::clamp(RaxRetBits, 8u, 64u);
+    } else if (!F.IsNoreturn && mustDefine(F, T, X86::RAX) &&
+               widestWrite(F, T, X86::RAX) >= 32) {
+      // No caller reads the result (the only callers ignore it), but the
+      // function computes a full 32/64-bit value into the return register
+      // on every path to ret (cpp-clang-o2 `sum_vec`: vector reduction
+      // plus scalar tail into eax). Returning it is semantics-preserving
+      // (nothing reads it today) while `ret void` drops a real result
+      // for differential calls, so keep the return.
+      Sig.HasRet = true;
+      Sig.Ret.Bits = std::clamp(widestWrite(F, T, X86::RAX), 32u, 64u);
     }
     // A function that never returns has no ret.
     if (F.IsNoreturn)
@@ -1361,20 +1417,68 @@ do {
     const Function *F = Fns.get(Start);
     if (!F || F->Instrs.empty())
       continue;
-    const Instr &Jump = F->Instrs.back();
-    if (Jump.Flow != FlowKind::Branch || !Jump.HasTarget)
-      continue;
-    bool Simple = true;
-    for (size_t I = 0; I + 1 < F->Instrs.size(); ++I)
-      if (F->Instrs[I].Flow != FlowKind::None) {
-        Simple = false;
-        break;
+    const Instr *TailJump = nullptr;
+    const Instr *WrapCall = nullptr;
+    // Tail jump: straight-line body ending in an unconditional branch.
+    // Wrapper call: straight-line body (calls allowed) whose last call
+    // leaves rax/xmm0 untouched until the end, so the function returns
+    // the call's value exactly like a tail jump (cpp-clang-o2 `sum_vec`
+    // calls its vector body and returns eax while its only caller
+    // ignores the result).
+    {
+      const Instr &Last = F->Instrs.back();
+      bool Straight = true;
+      for (size_t I = 0; I + 1 < F->Instrs.size(); ++I) {
+        FlowKind Fl = F->Instrs[I].Flow;
+        if (Fl != FlowKind::None && Fl != FlowKind::Call) {
+          Straight = false;
+          break;
+        }
       }
-    if (!Simple)
+      if (!Straight)
+        continue;
+      if (Last.Flow == FlowKind::Branch && Last.HasTarget &&
+          Last.Target != Start) {
+        TailJump = &Last;
+      } else {
+        const Instr *LastCall = nullptr;
+        for (const Instr &Ins : F->Instrs)
+          if (Ins.Flow == FlowKind::Call && Ins.HasTarget &&
+              Ins.Target != Start)
+            LastCall = &Ins;
+        if (LastCall &&
+            Out.Funcs.find(LastCall->Target) != Out.Funcs.end()) {
+          bool Clobbered = false;
+          bool PastCall = false;
+          for (const Instr &Ins : F->Instrs) {
+            if (Ins.Addr == LastCall->Addr) {
+              PastCall = true;
+              continue;
+            }
+            if (!PastCall)
+              continue;
+            InsnInfo II = insnInfo(Ins.Inst, T);
+            for (const RegUse &U : II.Regs)
+              if (U.Write &&
+                  (grp(U.Reg) == grp(X86::RAX) ||
+                   grp(U.Reg) == grp(X86::XMM0)))
+                Clobbered = true;
+          }
+          if (!Clobbered)
+            WrapCall = LastCall;
+        }
+      }
+    }
+    if (!TailJump && !WrapCall)
       continue;
-    auto Target = Out.Funcs.find(Jump.Target);
-    if (Target == Out.Funcs.end() || Target->second.Params.empty())
+    Va TargetVa = TailJump ? TailJump->Target : WrapCall->Target;
+    auto Target = Out.Funcs.find(TargetVa);
+    if (Target == Out.Funcs.end())
       continue;
+    // The return below forwards even when the target takes no ABI
+    // registers; only the parameter loop needs a non-empty list.
+    const Function *Body = Fns.get(TargetVa);
+    const Instr &Jump = TailJump ? *TailJump : *WrapCall;
     bool Added = false;
     for (const Param &P_ : Target->second.Params) {
       if (P_.Loc.Tag != ParamLoc::Kind::Reg)
@@ -1424,10 +1528,67 @@ do {
         Added = true;
       }
     }
+    // A tail jump forwards the target's return even when no parameter
+    // needed forwarding (zlib `crc32_z` wrapper only narrows r8d). The
+    // jump transfers control with the return register intact, so the
+    // wrapper returns exactly what the target returns: copy it
+    // unconditionally. When the target has no proven return yet, the
+    // wrapper's own callers are evidence: if they read rax/xmm0 and the
+    // target must-defines it, both functions return (cpp-clang-o2
+    // `sum_vec`, whose only caller ignores eax but whose target
+    // must-defines it on every path to ret).
+    if (!Sig.HasRet) {
+      bool BodyRax = mustDefine(*F, T, X86::RAX) &&
+                     callerReads(Sites, Fns, T, Start, X86::RAX);
+      bool TargetRax = Body && mustDefine(*Body, T, X86::RAX) &&
+                       callerReads(Sites, Fns, T, Start, X86::RAX);
+      bool TargetXmm = Body && mustDefine(*Body, T, X86::XMM0) &&
+                       callerReads(Sites, Fns, T, Start, X86::XMM0);
+      if (Target->second.HasRet) {
+        Sig.HasRet = true;
+        Sig.Ret = Target->second.Ret;
+        Sig.Noreturn = Target->second.Noreturn;
+        ThunkChanged = true;
+      } else if (TargetRax || TargetXmm || BodyRax) {
+        Sig.HasRet = true;
+        Target->second.HasRet = true;
+        if (TargetXmm && !TargetRax) {
+          Sig.Ret.Float = true;
+          Sig.Ret.Bits =
+              std::clamp(widestWrite(*Body, T, X86::XMM0), 32u, 128u);
+          Target->second.Ret = Sig.Ret;
+        } else {
+          unsigned W = Body ? widestWrite(*Body, T, X86::RAX) : 64;
+          unsigned C = callerReadWidth(Sites, Fns, T, Start, X86::RAX);
+          Sig.Ret.Bits = std::clamp((C > 0 && C < W) ? C : W, 8u, 64u);
+          Target->second.Ret = Sig.Ret;
+        }
+        Target->second.Noreturn = Sig.Noreturn = false;
+        ThunkChanged = true;
+      } else if (Body && mustDefine(*Body, T, X86::RAX) &&
+                 widestWrite(*Body, T, X86::RAX) >= 32) {
+        // No caller evidence at all, but the target computes a full
+        // 32/64-bit value into the return register on every path to
+        // ret: returning it is semantics-preserving (nothing reads it
+        // today) and dropping it is wrong code for differential calls.
+        Sig.HasRet = true;
+        Target->second.HasRet = true;
+        unsigned W = widestWrite(*Body, T, X86::RAX);
+        Sig.Ret.Bits = std::clamp(W, 32u, 64u);
+        Target->second.Ret = Sig.Ret;
+        Target->second.Noreturn = Sig.Noreturn = false;
+        ThunkChanged = true;
+      }
+    }
     if (!Added)
       continue;
     Sig.HasRet = Target->second.HasRet;
     Sig.Ret = Target->second.Ret;
+    if (!Sig.Ret.Float && Sig.HasRet) {
+      unsigned TC = callerReadWidth(Sites, Fns, T, Start, X86::RAX);
+      if (TC > 0 && TC < Sig.Ret.Bits)
+        Sig.Ret.Bits = std::clamp(TC, 8u, 64u);
+    }
     Sig.Noreturn = Target->second.Noreturn;
     Sig.VarArgs = Target->second.VarArgs;
     std::stable_sort(Sig.Params.begin(), Sig.Params.end(),

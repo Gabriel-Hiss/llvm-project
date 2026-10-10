@@ -295,12 +295,74 @@ public:
   /// One-operand stack math: sqrt/sin/cos/patan/atan/prem/scale/abs/chs/
   /// rnd/extract/decstp/incstp/free/tst/exam implemented on TOP or pairs.
   Value *x87Math(StringRef Name, Value *A, Value *B = nullptr);
-  /// FLDENV/FNSTENV 28-byte image at Addr.
-  void x87Env(StringRef Dir, Value *Addr);
   /// Stack index (0-7) of an RSTi operand register, for DSL rv_x87idx.
   unsigned x87IndexOf(MCRegister Reg) const;
   /// FXCH: swap ST(0) with ST(i).
   void x87Xchg(unsigned I);
+
+  // ---- AVX-512 mask registers (K0-K7) --------------------------------------
+  /// AVX-512 mask register K0-K7 as an i64 bit pattern (one bit per lane).
+  /// K0 reads as all-ones (the hardwired "no masking" register).
+  Value *kregRead(MCRegister Reg);
+  void kregWrite(MCRegister Reg, Value *V);
+  /// kregWrite preserving the bits above the written width (merge semantics
+  /// of the 8/16/32-bit KMOV forms into the 64-bit register).
+  void kregMerge(MCRegister Reg, Value *V);
+  /// An i64 k-register value as the `<N x i1>` vector the mask ops consume.
+  Value *kregToMask(Value *K, unsigned N);
+  /// An `<N x i1>` vector as the i64 k-register value.
+  Value *maskToKreg(Value *Mask);
+  /// VPCMPx: per-lane compare of two W-bit vectors into the k register Dst.
+  /// Pred is the 3-bit Intel predicate (0 eq, 1 lt, 2 le, 3 false, 4 ne,
+  /// 5 nlt, 6 nle, 7 true); Unsigned picks the signedness of lt/le/gt/ge.
+  void kregCompare(MCRegister Dst, unsigned Pred, bool Unsigned, Value *A,
+                   Value *B, unsigned W, unsigned EltBits);
+
+  // ---- AVX-512 masked operations -------------------------------------------
+  /// Per-lane select driven by a k register: result[i] = K[i] ? T[i] : F[i],
+  /// over W-bit vectors of EltBits lanes. Null F means zeroing masking.
+  Value *avx512Select(Value *K, Value *T, Value *F, unsigned W,
+                      unsigned EltBits);
+  /// Masked move (VMOVDQU8/16/32/64 etc): the same select without an op.
+  Value *avx512MaskedMove(Value *K, Value *Src, Value *Merge, unsigned W,
+                          unsigned EltBits);
+  /// Masked load: masked.load with the k register as the lane mask; Merge
+  /// (null = zero) fills the masked-off lanes.
+  Value *avx512MaskedLoad(Value *K, Value *AddrI64, unsigned W,
+                          unsigned EltBits, Value *Merge);
+  void avx512MaskedStore(Value *K, Value *V, Value *AddrI64, unsigned W,
+                         unsigned EltBits);
+  /// AVX-512 FMA with default rounding: select(k, llvm.fma(a, b, c), merge).
+  Value *avx512FmaMasked(StringRef Op, Value *K, Value *A, Value *B,
+                         Value *C, Value *Merge, unsigned W,
+                         unsigned EltBits);
+  /// AVX-512 FMA with embedded rounding: llvm.x86.avx512.vfmadd.* with the
+  /// rounding-control immediate, then the k-register select.
+  Value *avx512FmaEmbedded(StringRef Op, Value *K, Value *A, Value *B,
+                           Value *C, Value *Merge, unsigned W,
+                           unsigned EltBits, uint64_t Rounding);
+  /// Typed-vector FMA for the pattern inverter: Kind is madd|msub|nmadd|
+  /// nmsub|maddsub|msubadd; Rc >= 0 selects the embedded-rounding intrinsic
+  /// (llvm.x86.avx512.vfmadd.*), otherwise llvm.fma. Returns `<N x Elt>`.
+  Value *avx512FmaVec(StringRef Kind, Value *A, Value *B, Value *C, unsigned W,
+                      unsigned EltBits, int64_t Rc);
+
+  // ---- x87 environment / save / restore / BCD -------------------------------
+  /// FNSTENV/FSTENV ("st") or FLDENV ("ld"): the 28-byte environment image.
+  /// The control and status words are the modeled fields; the tag/ip/opcode
+  /// fields stay as the caller's memory (28 bytes are reserved on store).
+  void x87Env(StringRef Dir, Value *Addr);
+  /// FSAVE/FNSAVE ("st") or FRSTOR ("ld"): the 108-byte image = environment
+  /// followed by the eight 10-byte ST(i) registers.
+  void x87SaveRestore(StringRef Dir, Value *Addr);
+  /// FXSAVE/FXRSTOR through the backend intrinsic (512-byte state image,
+  /// defined read/write memory effects).
+  void fxsaveOp(Value *Addr);
+  void fxrstorOp(Value *Addr);
+  /// FBLD: read 10-byte packed BCD, convert to x86_fp80, push onto the stack.
+  void x87BcdLoad(Value *Addr);
+  /// FBSTP: pop ST(0), convert to 10-byte packed BCD, store at Addr.
+  void x87BcdStore(Value *Addr);
 
 
 protected:
@@ -315,6 +377,7 @@ protected:
   AllocaInst *X87Top = nullptr;     // i8
   AllocaInst *X87CW = nullptr;      // i16
   AllocaInst *X87CFlags[4] = {};    // C0..C3
+  AllocaInst *KRegs[8] = {};    // K0-K7 as i64 (one bit per lane)
   RepKind PendingRep = NoRep;
   bool PendingLock = false;
   MCRegister PendingSeg;

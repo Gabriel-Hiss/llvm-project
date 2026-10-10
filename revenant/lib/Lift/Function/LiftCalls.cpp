@@ -347,7 +347,7 @@ void LiftState::emitCall(const Instr &I) {
         B.CreateCall(Callee, Args,
                      Callee->getReturnType()->isVoidTy() ? "" : "c");
     ir::setInstructionVA(*Call, I.Addr.Value);
-    clobberVolatile();
+    clobberCallee(Callee, I.Target);
     if (Call->getType()->isIntegerTy())
       regWrite(llvm::X86::RAX, extTo(Call, 64));
     else if (Call->getType()->isFloatingPointTy()) {

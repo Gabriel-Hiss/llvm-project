@@ -171,9 +171,11 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     // Split the block after the call: normal edge keeps fallthrough.
     BasicBlock::iterator SplitAt = CI->getIterator();
     ++SplitAt;
-    BasicBlock *Normal = BB->splitBasicBlock(SplitAt, "eh.normal");
+    BasicBlock *Normal = BB->splitBasicBlock(SplitAt);
+    ir::nameBlock(*Normal);
     BasicBlock *Dispatch =
-        BasicBlock::Create(C, "eh.dispatch", &Fn, Normal);
+        BasicBlock::Create(C, "", &Fn, Normal);
+    ir::nameBlock(*Dispatch);
 
     // Build the pad in the dispatch block per model.
     Value *Pad = nullptr;
@@ -226,7 +228,8 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
           ConstantTokenNone::get(C), nullptr, Handlers.size(),
           "eh.catchswitch", Dispatch);
       for (const EHHandler *H : Handlers) {
-        BasicBlock *HandlerBB = BasicBlock::Create(C, "eh.catch", &Fn, Normal);
+        BasicBlock *HandlerBB = BasicBlock::Create(C, "", &Fn, Normal);
+        ir::nameBlock(*HandlerBB);
         SW->addHandler(HandlerBB);
         CatchPadInst *PadI = nullptr;
         Value *NullPtr =

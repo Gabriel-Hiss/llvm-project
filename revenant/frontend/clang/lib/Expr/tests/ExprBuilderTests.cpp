@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "../ExprBuilderImpl.h"
+#include "revenant/Clang/WideIntModel.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
@@ -67,6 +68,10 @@ public:
         return Signed ? A.ShortTy : A.UnsignedShortTy;
       case 32:
         return Signed ? A.IntTy : A.UnsignedIntTy;
+      case 64:
+        return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
+      case 128:
+        return revenant::clangx::wideIntType(A, 128, Signed);
       default:
         return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
       }
@@ -547,6 +552,36 @@ TEST_F(ExprTest, VirtualCallThroughVfptrSlot) {
   std::string S = print(E);
   EXPECT_TRUE(S.find("Method") != std::string::npos);
   EXPECT_TRUE(S.find("->") != std::string::npos);
+}
+
+TEST_F(ExprTest, WideConstantStoreKeepsBothHalves) {
+  // zlib-cl-o2 sub_140050B44: a folded i128 store must keep both halves,
+  // not truncate to the low 64 bits (C2440 x101 before the fix).
+  FuncHost H = makeFunc();
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I128 = llvm::Type::getInt128Ty(LLCtx);
+  llvm::AllocaInst *Slot = B.CreateAlloca(I128, nullptr, "v_tmp");
+  // (5369332880 << 64) | 5369332432.
+  llvm::APInt V(128, "99046709483913839067215266512", 10);
+  llvm::Value *C = llvm::ConstantInt::get(LLCtx, V);
+  llvm::StoreInst *St = B.CreateStore(C, Slot);
+  clang::QualType Wide =
+      revenant::clangx::wideIntType(*ACtx, 128, /*Signed=*/false);
+  ASSERT_FALSE(Wide.isNull());
+  clang::IdentifierInfo *Id = FCtx->ident("v_tmp");
+  clang::VarDecl *VD = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(), Id,
+      Wide, ACtx->getTrivialTypeSourceInfo(Wide), clang::SC_None);
+  FCtx->bindDecl(Slot, VD);
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  clang::Stmt *S = Exprs->instr(*St, Scope);
+  llvm::SmallString<256> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  S->printPretty(OS, nullptr, clang::PrintingPolicy(LangOpts));
+  std::string Text(OS.str());
+  EXPECT_TRUE(Text.find("5369332432ULL") != std::string::npos) << Text;
+  EXPECT_TRUE(Text.find("5369332880ULL") != std::string::npos) << Text;
 }
 
 } // namespace
