@@ -1086,6 +1086,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       // resumes mid-range, so this is not a versioned candidate.
       HasRegionPredecessor |= !CondGuard;
     }
+    // A resume edge that carries a live R-defined value into S is a
+    // real resume, not a versioned fallback (see the strict tail
+    // check below for the full rule).
     Cand.Versioned = !HasRegionPredecessor;
     // Compute the dispatch chain BEFORE the strict tail check so
     // the escape rule can see chain membership: chain blocks are
@@ -1376,22 +1379,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     // self-loops).
     {
       bool Found = false;
-      // The top body is an R block whose IV starts at constant 0
-      // from D or the chain.
       for (BasicBlock *BB : Cand.R) {
         Candidate Probe = Cand;
-        // The versioned path runs the same lane-equivalence gate
-        // (bug board 25): a versioned candidate accepts a body that
-        // passes EITHER the versioned lane proof OR the ordinary
-        // tier-bound match, but the lane check inside
-        // matchVersionedBody must still run before any fold. A body
-        // whose arithmetic disagrees with the scalar fallback fails
-        // the lane check and can only be accepted through the
-        // ordinary match, which never fires for it either.
-        bool VM = Cand.Versioned && matchVersionedBody(BB, Probe, F);
-        if (matchVectorBody(BB, Probe, F, false) || VM) {
-          if (Cand.Versioned)
-            Probe.VersionedBody = BB;
+        if (matchVectorBody(BB, Probe, F, false)) {
           Cand = Probe;
           Found = true;
           break;
@@ -1407,11 +1397,6 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           if (Su == BB)
             Self = true;
         if (!Self)
-          continue;
-        // The versioned body already passed the lane-equivalence
-        // proof in matchVersionedBody; every other self-loop keeps
-        // the ordinary tier match.
-        if (Cand.Versioned && BB == Cand.VersionedBody)
           continue;
         Candidate Probe = Cand;
         if (matchVectorBody(BB, Probe, F, false) ||
@@ -3041,6 +3026,25 @@ bool runOnFunction(Function &F) {
     Work.push_back(std::move(C));
   }
   for (Candidate &C : Work) {
+    // Standalone-tail disable (bug board 25): when the scalar tail
+    // takes no live values from the region (no S phi fed from an R
+    // block), folding would erase the vector arm and replay the
+    // range from scratch. That is only sound with a lane-equivalence
+    // proof between the vector body and the scalar tail, which this
+    // pass does not have (the versioned proof failed review three
+    // times and stays disconnected). Neither the ordinary nor the
+    // versioned match may fire here. Tails that resume live region
+    // values keep the existing resume-phi proof path below.
+    {
+      bool TakesResume = false;
+      for (PHINode &Phi : C.S->phis()) {
+        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+          if (C.R.count(Phi.getIncomingBlock(I)))
+            TakesResume = true;
+      }
+      if (!TakesResume)
+        continue;
+    }
     // Pre-check: every kept outsider phi that uses an R def through
     // an R edge must keep a non-R incoming after the drop (the
     // loop-exit LCSSA merge keeps its L edge). Otherwise skip this

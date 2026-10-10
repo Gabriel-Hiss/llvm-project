@@ -41,10 +41,12 @@ exit:
 }
 
 ; CHECK-LABEL: define{{.*}}void @add_choice
+; The standalone-tail fold stays disabled at the rewrite choke point
+; (bug board 25): the dispatch and both arms survive.
 ; CHECK: entry:
-; CHECK: br label %scalar.pre
-; CHECK-NOT: vector.loop
+; CHECK: br i1 %small, label %scalar.pre, label %dispatch
+; CHECK: vector.loop:
+; CHECK: add <4 x i32> %vx, %splat
 ; CHECK: scalar.loop:
 ; CHECK: add i32 %x, 1
 ; CHECK: ret void
-; CHECK: }
