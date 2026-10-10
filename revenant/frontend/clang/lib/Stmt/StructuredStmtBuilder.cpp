@@ -846,7 +846,7 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
       BasicBlock *FalseSucc = BI->getSuccessor(1);
       if (TrueSucc == R.Header) {
         // True arm continues -> negate
-        Cond = Exprs->inverted(condOf(BI, R.Header), *Scope);
+        Cond = Exprs->inverted(BI->getCondition(), *Scope);
       } else {
         // False arm continues -> use as-is
         Cond = condOf(BI, R.Header);

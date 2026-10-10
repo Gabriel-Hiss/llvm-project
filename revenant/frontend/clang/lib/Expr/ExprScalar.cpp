@@ -303,7 +303,7 @@ Expr *ExprBuilderImpl::buildCast(llvm::CastInst &I, ExprScope &Scope) {
     K = CK_IntegralCast;
     // For sext, cast through the signed narrow type first so the
     // compiler sign-extends: (long long)(int)a1, not (unsigned long long)a1.
-    if (SrcTy->isIntegerType() && DstTy->isIntegerType() &&
+    if (SrcTy->isIntegerTy() && DstTy->isIntegerTy() &&
         SrcTy->getIntegerBitWidth() < DstTy->getIntegerBitWidth()) {
       QualType SignedNarrow = AST->getCorrespondingSignedType(
           Types.typeOf(SrcTy, nullptr));
