@@ -50,9 +50,14 @@ inline constexpr llvm::StringLiteral CleanupPipeline =
 /// produces the canonical one-element-per-iteration form that `reroll`
 /// compacts further; `unrotate`/`untailrec` normalize loop structure.
 
+/// `revenant-unswitch` closes the stage: it turns the lowered switches back
+/// into `switch` instructions, which the structurer reads as the
+/// source-level construct. It runs last so the earlier passes see the
+/// control flow they were tuned on, and before `revenant-unhotcold` so
+/// hot/cold splitting never copies a switch's arms apart.
 inline constexpr llvm::StringLiteral UnoptPipeline =
     "revenant-devectorize,revenant-unloopvec,revenant-reroll,"
-    "revenant-unrotate,revenant-untailrec";
+    "revenant-unrotate,revenant-untailrec,revenant-unswitch";
 
 /// The IR-level idiom stage, ported from `crates/idioms/src/lib.rs`
 /// (`ir_passes()`). Currently just magic-div; AST-level idiom passes
