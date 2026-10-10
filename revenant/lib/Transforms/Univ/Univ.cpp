@@ -29,13 +29,20 @@
 //    PHI stepped by a constant-stride byte GEP plus an `i64` mirror PHI of
 //    the same stride, and exits on `icmp eq %mirror-step, %end` where
 //    `%end = %start + %n * stride` (GCC `sum_vec`/`hash_vec` LSR form).
+// 5. Countdown trip counters: the loop trips on an `i32` (or `i64`) PHI
+//    stepped by -1 and tested with `icmp eq %step, 0`, the loop-reduce form
+//    MSVC keeps for byte copies and for the trip of an unrolled body. The
+//    bound is the countdown's start value; an extra mirror whose step
+//    escapes into the exit block (the returned element count) is
+//    materialized as `%start + %stride * %new_step` on that edge.
 //
 // All four rewrite to the ir-pre shape: a single `i32` index PHI from 0,
 // `add i32 %i, 1` in the latch, `icmp slt i32 %i, %n` in the header, one
 // `getelementptr <elem>, %base, i32 %i` per touched element, and the pointer
 // PHIs/counters replaced by the equivalent address expression. Loops whose
-// IV steps by more than 1, that keep a coupled countdown trip counter, or
-// that were unrolled stay for the unroll/vector passes.
+// IV steps by more than 1, or that were unrolled, stay for the unroll and
+// vector passes; a folded (reroll) body trips on the countdown this pass
+// eliminates, which is why the two compose.
 //
 // Corpus:
 // - `c-clang-o2` `sum_vec` (ir-pre `icmp slt i32` + `sext` + `getelementptr
@@ -57,12 +64,17 @@
 //   eq %mirror-step, %start + %n * 4`), `copy_vec`/`add_vec` (`getelementptr
 //   i8` + `add %iv, 4` + `icmp eq %iv-next, shl (zext %n), 2`), `copy_bytes`
 //   (`getelementptr i8` + `add %iv, 1` + `icmp eq %iv-next, zext %n`).
+// - `c-o2` `copy_bytes` (two `ptr` PHIs + countdown `i32` trip + escaping
+//   `i64` mirror) and, after `revenant-reroll` folds their unrolled bodies,
+//   `dot4` and the `c-gcc-o2` `fill_vec` (see reroll-composition.ll).
 //
 // Safety: single-IV loops only. The IV PHI must step by constant 1 (byte
 // loops: by the touched element size), and every use must be the step, the
 // exit compare, a `trunc` escape into an i32 result, a loop-invariant-valued
 // base expression, an in-loop value use of an already-narrow IV, or one of
-// the recognized addresses. The new exit `icmp slt %i, %n` computes the
+// the recognized addresses. One countdown trip PHI is allowed beside the
+// index; it may only feed its step, the compare, and (mirrors) a PHI on the
+// exit edge. The new exit `icmp slt %i, %n` computes the
 // same trip count (0..n-1) when the bound `%n` dominates and the old bound
 // provably equals its widening (or its stride scaling of it). `!revenant.va`
 // moves to each rebuilt instruction; `!revenant.opaque` is copied over,
