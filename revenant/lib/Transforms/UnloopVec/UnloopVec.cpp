@@ -1501,12 +1501,6 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     // self-loops).
     {
       bool Found = false;
-      // The top body is an R block whose IV starts at constant 0
-      // from D or the chain. The dedicated versioned-body proof
-      // stays disabled (bug board 25, failed review three times):
-      // bodies fold only through the ordinary tier-bound match
-      // used by every other tail. Re-enable the dedicated proof
-      // in a later commit.
       for (BasicBlock *BB : Cand.R) {
         Candidate Probe = Cand;
         if (matchVectorBody(BB, Probe, F, false)) {
@@ -1514,6 +1508,10 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           Found = true;
           break;
         }
+      }
+      if (!Found) {
+        ULV_BAIL();
+        goto next_pick;
       }
       for (BasicBlock *BB : Cand.R) {
         bool Self = false;
@@ -3150,6 +3148,25 @@ bool runOnFunction(Function &F) {
     Work.push_back(std::move(C));
   }
   for (Candidate &C : Work) {
+    // Standalone-tail disable (bug board 25): when the scalar tail
+    // takes no live values from the region (no S phi fed from an R
+    // block), folding would erase the vector arm and replay the
+    // range from scratch. That is only sound with a lane-equivalence
+    // proof between the vector body and the scalar tail, which this
+    // pass does not have (the versioned proof failed review three
+    // times and stays disconnected). Neither the ordinary nor the
+    // versioned match may fire here. Tails that resume live region
+    // values keep the existing resume-phi proof path below.
+    {
+      bool TakesResume = false;
+      for (PHINode &Phi : C.S->phis()) {
+        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+          if (C.R.count(Phi.getIncomingBlock(I)))
+            TakesResume = true;
+      }
+      if (!TakesResume)
+        continue;
+    }
     // Pre-check: every kept outsider phi that uses an R def through
     // an R edge must keep a non-R incoming after the drop (the
     // loop-exit LCSSA merge keeps its L edge). Otherwise skip this
