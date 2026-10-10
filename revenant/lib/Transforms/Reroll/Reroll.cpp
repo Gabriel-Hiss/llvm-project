@@ -966,6 +966,13 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
                 int64_t D = *Difference;
                 if (D != 0) {
                   SawOff = true;
+                  // Exactness: the window-K offset must be exactly K
+                  // times the per-step delta. Truncated division here
+                  // rewrites lane indices (0,3,7 -> 0,3,6): wrong code.
+                  if (D % (int64_t)K != 0) {
+                    ScanOK = false;
+                    break;
+                  }
                   int64_t Per = D / (int64_t)K;
                   if (!WinDelta)
                     WinDelta = Per;
@@ -1025,6 +1032,40 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
         continue; // independent windows: vector work, not a loop
       if (!Delta)
         continue;
+      // Exactness, second layer: re-derive every accepted lane's offset
+      // from window 0 and require D_w == w * Delta for all w. The scan
+      // compares each window against window 0 with division; this check
+      // closes any truncated or periodic-multiple lane that slipped
+      // through, at every K, with or without evidence.
+      {
+        bool Exact = true;
+        auto &W0 = WSets[0];
+        llvm::APInt WDelta(65, (uint64_t)*Delta, true);
+        for (size_t w = 1; w < WSets.size() && Exact; ++w) {
+          auto &WJ = WSets[w];
+          llvm::APInt Want = llvm::APInt(65, (uint64_t)w) * WDelta;
+          for (size_t p = 0; p < W0.size() && Exact; ++p) {
+            Instruction *A = W0[p], *C = WJ[p];
+            for (unsigned o = 0; o < A->getNumOperands() && Exact; ++o) {
+              auto *IA = dyn_cast<ConstantInt>(A->getOperand(o));
+              auto *IC = dyn_cast<ConstantInt>(C->getOperand(o));
+              if (!IA || !IC)
+                continue;
+              auto Diff = constantDifference(IA, IC);
+              if (!Diff)
+                Exact = false;
+              else if (*Diff != 0) {
+                llvm::APInt Got = IC->getValue().sextOrTrunc(65) -
+                                  IA->getValue().sextOrTrunc(65);
+                if (Got != Want)
+                  Exact = false;
+              }
+            }
+          }
+        }
+        if (!Exact)
+          continue;
+      }
       // An earlier window's value read outside the run blocks synthesis
       // (no single loop value exists for it).
       size_t RunEnd = Start + K * M;
