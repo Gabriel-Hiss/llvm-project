@@ -29,13 +29,20 @@
 //    PHI stepped by a constant-stride byte GEP plus an `i64` mirror PHI of
 //    the same stride, and exits on `icmp eq %mirror-step, %end` where
 //    `%end = %start + %n * stride` (GCC `sum_vec`/`hash_vec` LSR form).
+// 5. Countdown trip counters: the loop trips on an `i32` (or `i64`) PHI
+//    stepped by -1 and tested with `icmp eq %step, 0`, the loop-reduce form
+//    MSVC keeps for byte copies and for the trip of an unrolled body. The
+//    bound is the countdown's start value; an extra mirror whose step
+//    escapes into the exit block (the returned element count) is
+//    materialized as `%start + %stride * %new_step` on that edge.
 //
 // All four rewrite to the ir-pre shape: a single `i32` index PHI from 0,
 // `add i32 %i, 1` in the latch, `icmp slt i32 %i, %n` in the header, one
 // `getelementptr <elem>, %base, i32 %i` per touched element, and the pointer
 // PHIs/counters replaced by the equivalent address expression. Loops whose
-// IV steps by more than 1, that keep a coupled countdown trip counter, or
-// that were unrolled stay for the unroll/vector passes.
+// IV steps by more than 1, or that were unrolled, stay for the unroll and
+// vector passes; a folded (reroll) body trips on the countdown this pass
+// eliminates, which is why the two compose.
 //
 // Corpus:
 // - `c-clang-o2` `sum_vec` (ir-pre `icmp slt i32` + `sext` + `getelementptr
@@ -57,12 +64,17 @@
 //   eq %mirror-step, %start + %n * 4`), `copy_vec`/`add_vec` (`getelementptr
 //   i8` + `add %iv, 4` + `icmp eq %iv-next, shl (zext %n), 2`), `copy_bytes`
 //   (`getelementptr i8` + `add %iv, 1` + `icmp eq %iv-next, zext %n`).
+// - `c-o2` `copy_bytes` (two `ptr` PHIs + countdown `i32` trip + escaping
+//   `i64` mirror) and, after `revenant-reroll` folds their unrolled bodies,
+//   `dot4` and the `c-gcc-o2` `fill_vec` (see reroll-composition.ll).
 //
 // Safety: single-IV loops only. The IV PHI must step by constant 1 (byte
 // loops: by the touched element size), and every use must be the step, the
 // exit compare, a `trunc` escape into an i32 result, a loop-invariant-valued
 // base expression, an in-loop value use of an already-narrow IV, or one of
-// the recognized addresses. The new exit `icmp slt %i, %n` computes the
+// the recognized addresses. One countdown trip PHI is allowed beside the
+// index; it may only feed its step, the compare, and (mirrors) a PHI on the
+// exit edge. The new exit `icmp slt %i, %n` computes the
 // same trip count (0..n-1) when the bound `%n` dominates and the old bound
 // provably equals its widening (or its stride scaling of it). `!revenant.va`
 // moves to each rebuilt instruction; `!revenant.opaque` is copied over,
@@ -312,8 +324,22 @@ struct LoopShape {
   // Pointer loop whose trip count is an integer mirror of the pointers with
   // an end-address compare (`%end = %start + %n * stride`).
   bool Mirror = false;
+  // Pointer loop whose trip count is a countdown PHI stepped by -1 and
+  // tested with `icmp eq %step, 0`; the bound is its start value.
+  bool PtrCountdown = false;
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> PtrSteps;
+  // Self-feeding extra integer PHIs (kept mirrors/counters the exit compare
+  // does not test); both they and their steps die with the rewrite. An extra
+  // whose step feeds a PHI on the loop's exit edge (the LSR end value used
+  // to compute the returned element count) is rewritten to
+  // `%start + %stride * %new_step` at that edge instead.
+  SmallVector<PHINode *, 2> ExtraTrips;
+  SmallVector<Instruction *, 2> ExtraSteps;
+  // Exit-edge escapes of the extra mirrors: (user PHI, extra entry value,
+  // extra step constant). %user takes `%extra + %k` on the exit edge and is
+  // rewritten to `%start + %k * %new_step`.
+  SmallVector<std::tuple<PHINode *, Value *, int64_t>, 2> Escapes;
   SmallVector<Touch, 4> Touches;
   Type *ElemTy = nullptr;
   // `trunc i64 %iv to i32` escapes into the loop result (early-exit loops
@@ -322,6 +348,13 @@ struct LoopShape {
   // `zext`/`sext` of the IV that only fed the rebuilt addresses; dead after
   // the rewrite.
   SmallVector<Instruction *, 2> Widenings;
+  // LSR countdown trip counter stepped by -1 (integer half only); its start
+  // value is the bound and both it and its step die with the rewrite.
+  PHINode *Countdown = nullptr;
+  Instruction *CountdownStep = nullptr;
+  // The old exit compare tested a step value (the IV's step or the
+  // countdown's step), so the rebuilt compare tests the new step.
+  bool TripTestsStep = false;
   // The old IV is already `i32`, so in-loop value uses of it keep working
   // through an RAUW instead of being rebuilt away.
   bool IVIsNarrow = false;
@@ -340,6 +373,45 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   Instruction *Step = nullptr;
   int64_t StepC = 0;
   SmallVector<std::pair<Value *, BasicBlock *>, 2> Starts;
+  // A countdown trip PHI (stepped by -1) is not the index: it is the LSR trip
+  // counter and its start value is the bound. Scanned separately from
+  // matchStep because its start is the trip count, not a zero index.
+  PHINode *Countdown = nullptr;
+  Instruction *CountdownStep = nullptr;
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> CountdownStarts;
+  for (Instruction &I : *Header) {
+    auto *PN = dyn_cast<PHINode>(&I);
+    if (!PN)
+      break;
+    if (!PN->getType()->isIntegerTy())
+      continue;
+    Value *Back = nullptr;
+    SmallVector<std::pair<Value *, BasicBlock *>, 2> Entries;
+    for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
+      if (PN->getIncomingBlock(i) == Latch) {
+        if (Back)
+          Back = nullptr;
+        Back = PN->getIncomingValue(i);
+      } else {
+        Entries.emplace_back(PN->getIncomingValue(i), PN->getIncomingBlock(i));
+      }
+    }
+    auto *St = dyn_cast<Instruction>(Back);
+    if (!St || St->getParent() != Latch ||
+        St->getOpcode() != Instruction::Add)
+      continue;
+    Value *Other = St->getOperand(0) == PN   ? St->getOperand(1)
+                   : St->getOperand(1) == PN ? St->getOperand(0)
+                                             : nullptr;
+    auto *C = Other ? dyn_cast<ConstantInt>(Other) : nullptr;
+    if (!C || C->getSExtValue() != -1)
+      continue;
+    if (Countdown)
+      return false; // two countdowns: not a shape we invert
+    Countdown = PN;
+    CountdownStep = St;
+    CountdownStarts = std::move(Entries);
+  }
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
@@ -360,19 +432,6 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (!IV)
     return false;
-  // Other integer PHIs must be accumulators (no step in the latch), not
-  // coupled IVs.
-  for (Instruction &I : *Header) {
-    auto *PN = dyn_cast<PHINode>(&I);
-    if (!PN)
-      break;
-    if (PN != IV && PN->getType()->isIntegerTy()) {
-      SmallVector<std::pair<Value *, BasicBlock *>, 2> Cand;
-      int64_t C = 0;
-      if (matchStep(PN, Header, Latch, C, Cand))
-        return false;
-    }
-  }
   // No pointer PHIs either: those are the pointer half's loops.
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
@@ -382,13 +441,15 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       return false;
   }
 
-  // Exit compare in the header or latch: `ne`/`eq` on the IV or its step.
-  // A single-block loop has Header == Latch; scan once so the exit
-  // compare is not seen twice. Multi-block loops test in the latch (the
-  // header holds only addresses); body-block compares belong to a
-  // different loop shape (early exit) and stay put.
+  // Exit compare in the header or latch: `ne`/`eq` on the IV, its step, or
+  // the countdown trip PHI (whose step the LSR exit tests). A single-block
+  // loop has Header == Latch; scan once so the exit compare is not seen
+  // twice. Multi-block loops test in the latch (the header holds only
+  // addresses); body-block compares belong to a different loop shape
+  // (early exit) and stay put.
   ICmpInst *Cmp = nullptr;
   Value *Wide = nullptr;
+  bool CountdownTrip = false;
   auto inLoop = [&](BasicBlock *BB) {
     return BB == Header || BB == Latch ||
            (reachable(Header, BB) && reachable(BB, Latch));
@@ -405,24 +466,36 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       Value *A = C->getOperand(0), *B = C->getOperand(1);
       bool AIs = A == IV || A == Step;
       bool BIs = B == IV || B == Step;
-      if (AIs == BIs)
+      bool ACount = Countdown && (A == Countdown || A == CountdownStep);
+      bool BCount = Countdown && (B == Countdown || B == CountdownStep);
+      if (AIs == BIs && ACount == BCount)
         continue;
       // The other operand must be loop-invariant: body compares on the IV
       // (the `i % 3 == 0` of `break_continue`) are not trip counts.
-      if (!isLoopInvariant(AIs ? B : A, Header, Latch))
+      if (!isLoopInvariant(AIs || ACount ? B : A, Header, Latch))
         continue;
       if (Cmp)
         return false;
       Cmp = C;
-      Wide = AIs ? B : A;
+      Wide = AIs || ACount ? B : A;
+      CountdownTrip = ACount || BCount;
     }
   }
   if (!Cmp || !Wide || !isLoopInvariant(Wide, Header, Latch))
     return false;
-  // The bound: an already-narrow `i32`, the widening of one, or (byte
-  // loops) its stride scaling.
+  // The bound: an already-narrow `i32`, the widening of one, (byte loops)
+  // its stride scaling, or the countdown's start value.
   Value *Narrow = nullptr;
-  if (Wide->getType()->isIntegerTy(32)) {
+  if (CountdownTrip) {
+    if (CountdownStarts.size() != 1 || !CountdownStarts.front().first)
+      return false;
+    Narrow = CountdownStarts.front().first;
+    if (!Narrow->getType()->isIntegerTy(32)) {
+      Narrow = peelWidening(Narrow);
+      if (!Narrow)
+        return false;
+    }
+  } else if (Wide->getType()->isIntegerTy(32)) {
     Narrow = Wide;
   } else {
     Narrow = peelWidening(Wide);
@@ -600,6 +673,11 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   S.TruncEscapes = std::move(Truncs);
   S.Widenings = std::move(Widenings);
   S.IVIsNarrow = NarrowIV;
+  S.Countdown = Countdown;
+  S.CountdownStep = CountdownStep;
+  S.TripTestsStep = CountdownTrip ||
+                    S.ExitCmp->getOperand(0) == Step ||
+                    S.ExitCmp->getOperand(1) == Step;
   for (auto *GI : GEPs)
     S.Touches.push_back({nullptr, GI, nullptr});
   return true;
@@ -674,13 +752,16 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   if (Ptrs.empty())
     return false;
 
-  // The trip PHI: an `i32` counter from 0 stepping by 1 (classic), or an
-  // integer PHI stepping by the pointer stride (address mirror). Other
-  // integer PHIs must be accumulators.
-  PHINode *Trip = nullptr;
-  Instruction *TripStep = nullptr;
-  bool Mirror = false;
-  SmallVector<std::pair<Value *, BasicBlock *>, 2> MirrorStarts;
+  // Every stepped integer PHI of the header: the trip PHI (whose step or
+  // value the exit compare tests) plus self-feeding mirrors the lifter
+  // kept. Non-stepped integer PHIs are accumulators.
+  struct Stepped {
+    PHINode *Phi;
+    Instruction *Step;
+    int64_t StepC;
+    SmallVector<std::pair<Value *, BasicBlock *>, 2> Starts;
+  };
+  SmallVector<Stepped, 4> Stepped;
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
@@ -692,32 +773,23 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     Instruction *St = matchStep(PN, Header, Latch, C, Cand);
     if (!St)
       continue;
-    if (C == 1 && PN->getType()->isIntegerTy(32)) {
-      if (Trip)
-        return false;
-      Trip = PN;
-      TripStep = St;
-      continue;
-    }
-    if (C == Stride && !Mirror) {
-      if (Trip && Trip != PN)
-        return false;
-      Mirror = true;
-      Trip = PN;
-      TripStep = St;
-      MirrorStarts = std::move(Cand);
-      continue;
-    }
-    return false; // coupled IV
+    Stepped.push_back({PN, St, C, std::move(Cand)});
   }
-  if (!Trip)
+  if (Stepped.empty())
     return false;
 
   // Exit: `icmp eq %trip-step, %bound`, false edge leaves the loop. A
   // single-block loop has Header == Latch; scan once so the exit compare
-  // is not seen twice.
+  // is not seen twice. The tested PHI decides the trip form: a kept `i32`
+  // counter from 0 (bound: the `i32` trip count), an integer mirror of the
+  // pointers (bound: `%start + %n * stride`), or a countdown trip counter
+  // (bound: its start value).
   ICmpInst *Cmp = nullptr;
   Value *Bound = nullptr;
+  unsigned TripIdx = 0;
+  bool Mirror = false;
+  bool Countdown = false;
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> MirrorStarts;
   SmallVector<BasicBlock *, 2> CmpBlocks{Header};
   if (Latch != Header)
     CmpBlocks.push_back(Latch);
@@ -727,17 +799,67 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       if (!C || C->getPredicate() != ICmpInst::ICMP_EQ)
         continue;
       Value *A = C->getOperand(0), *B = C->getOperand(1);
-      bool AIs = A == Trip || A == TripStep;
-      bool BIs = B == Trip || B == TripStep;
-      if (AIs == BIs)
+      unsigned Hit = 0;
+      for (unsigned K = 0; K < Stepped.size(); ++K)
+        if (A == Stepped[K].Phi || A == Stepped[K].Step ||
+            B == Stepped[K].Phi || B == Stepped[K].Step)
+          Hit = K + 1;
+      if (!Hit)
         continue;
-      if (!isLoopInvariant(AIs ? B : A, Header, Latch))
+      const struct Stepped &T = Stepped[Hit - 1];
+      if (!isLoopInvariant(A == T.Phi || A == T.Step ? B : A, Header, Latch))
         continue;
       if (Cmp)
         return false;
       Cmp = C;
-      Bound = AIs ? B : A;
+      TripIdx = Hit - 1;
+      Bound = A == T.Phi || A == T.Step ? B : A;
+      if (T.StepC == 1 && T.Phi->getType()->isIntegerTy(32)) {
+        // Classic kept counter: the bound is the i32 trip count.
+      } else if (T.StepC == Stride) {
+        // Address mirror: the bound is `%start + %n * stride`.
+        Mirror = true;
+        MirrorStarts = T.Starts;
+      } else if (T.StepC == -1) {
+        // Countdown trip counter: the bound is its start value.
+        Countdown = true;
+        MirrorStarts = T.Starts;
+      } else {
+        return false; // coupled IV tested by the exit
+      }
     }
+  }
+  if (!Cmp)
+    return false;
+  SmallVector<std::tuple<PHINode *, Value *, int64_t>, 2> Escapes;
+  // The other stepped PHIs feed only their step, and the step feeds the PHI
+  // plus at most PHIs on the loop's exit edge (the LSR end value the caller
+  // turns into the returned element count); those are rewritten to
+  // `%start + %stride * %new_step` at the exit edge.
+  for (unsigned K = 0; K < Stepped.size(); ++K) {
+    const struct Stepped &S = Stepped[K];
+    if (K == TripIdx)
+      continue;
+    if (S.StepC != Stride || S.Starts.size() != 1 || !S.Starts.front().first)
+      return false; // the extra must mirror the pointers by the same stride
+    Value *EStart = S.Starts.front().first;
+    for (User *U : S.Step->users()) {
+      if (U == S.Phi)
+        continue;
+      auto *P = dyn_cast<PHINode>(U);
+      if (!P || P->getParent() == Header || P->getParent() == Latch)
+        return false;
+      // The PHI must take this value only from the compare's block (the
+      // loop's exit edge).
+      for (unsigned i = 0, e = P->getNumIncomingValues(); i != e; ++i)
+        if (P->getIncomingValue(i) == S.Step &&
+            P->getIncomingBlock(i) != Cmp->getParent())
+          return false;
+      Escapes.emplace_back(P, EStart, S.StepC);
+    }
+    for (User *U : S.Phi->users())
+      if (U != S.Step)
+        return false;
   }
   if (!Cmp || !Bound || !isLoopInvariant(Bound, Header, Latch))
     return false;
@@ -757,6 +879,19 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       Bound = N;
     else
       return false;
+  }
+  if (Countdown) {
+    // The countdown starts at the trip count (one entry only: the peeled
+    // remainder form would need the exit count too).
+    if (MirrorStarts.size() != 1 || !MirrorStarts.front().first)
+      return false;
+    Value *N = MirrorStarts.front().first;
+    if (!N->getType()->isIntegerTy(32)) {
+      N = peelWidening(N);
+      if (!N)
+        return false;
+    }
+    Bound = N;
   }
   if (!Bound->getType()->isIntegerTy(32) ||
       !isLoopInvariant(Bound, Header, Latch))
@@ -800,24 +935,33 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     }
   }
   // The trip PHI feeds only its step and the compare.
-  for (User *U : Trip->users()) {
-    if (U == TripStep || U == Cmp)
+  for (User *U : Stepped[TripIdx].Phi->users()) {
+    if (U == Stepped[TripIdx].Step || U == Cmp)
       continue;
     return false;
   }
   if (Touches.empty())
     return false;
-  if (Mirror && Entries != 1)
-    return false; // mirrored end addresses are only restored for one entry
+  if ((Mirror || Countdown) && Entries != 1)
+    return false; // derived bounds are only restored for one entry
 
   S.Header = Header;
   S.Latch = Latch;
-  S.IV = Trip;
-  S.Step = TripStep;
+  S.IV = Stepped[TripIdx].Phi;
+  S.Step = Stepped[TripIdx].Step;
   S.ExitCmp = Cmp;
+  S.Escapes = std::move(Escapes);
   S.Bound = Bound;
   S.IsPtr = true;
   S.Mirror = Mirror;
+  S.PtrCountdown = Countdown;
+  // Self-feeding extra PHIs (kept mirrors/counters the compare does not
+  // test) die with the rewrite.
+  for (unsigned K = 0; K < Stepped.size(); ++K)
+    if (K != TripIdx) {
+      S.ExtraTrips.push_back(Stepped[K].Phi);
+      S.ExtraSteps.push_back(Stepped[K].Step);
+    }
   S.Ptrs = std::move(Ptrs);
   S.PtrSteps = std::move(Steps);
   S.Touches = std::move(Touches);
@@ -901,10 +1045,8 @@ static bool rewriteIntLoop(LoopShape &S) {
   if (!S.ExitCmp)
     return false;
   // Exit compare on the same operand the old one tested (PHI or step).
-  Value *Tested = S.ExitCmp->getOperand(0) == S.Step ||
-                          S.ExitCmp->getOperand(1) == S.Step
-                      ? NewStep
-                      : static_cast<Value *>(NewIV);
+  Value *Tested = S.TripTestsStep ? static_cast<Value *>(NewStep)
+                                  : static_cast<Value *>(NewIV);
   ICmpInst::Predicate OldPredicate = S.ExitCmp->getPredicate();
   IRBuilder<> CB(S.ExitCmp);
   Value *NewCmp =
@@ -936,6 +1078,13 @@ static bool rewriteIntLoop(LoopShape &S) {
   for (auto *W : S.Widenings)
     if (W->use_empty())
       W->eraseFromParent();
+  // The countdown trip counter dies with its step: nothing references it
+  // after the compare above was replaced.
+  if (S.Countdown) {
+    S.Countdown->dropAllReferences();
+    S.CountdownStep->eraseFromParent();
+    S.Countdown->eraseFromParent();
+  }
   // Drop the old IV machinery. Detach the latch incoming (it references the
   // old step, erased next) before anything else; then rewrite any
   // remaining in-loop value user of an already-narrow IV onto the new
@@ -995,9 +1144,36 @@ static bool rewritePtrLoop(LoopShape &S) {
       CB.CreateICmpSLT(Tested, S.Bound, S.ExitCmp->getName() + ".idx");
   moveVA(S.ExitCmp, cast<Instruction>(NewCmp));
   auto *PBr = cast<BranchInst>(CB.GetInsertBlock()->getTerminator());
+  BasicBlock *CmpBB = S.ExitCmp->getParent();
   PBr->setCondition(cast<Value>(NewCmp));
   PBr->swapSuccessors();
   S.ExitCmp->eraseFromParent();
+
+  // Exit-edge escapes: the LSR end value `%extra + %stride` leaves the loop
+  // through a PHI on the exit edge. At that edge the new index has just
+  // failed the compare, so `%new_step` is the trip count and the same value
+  // is `%extra_start + %stride * %new_step`. Materialize it at the end of the
+  // compare's block (which dominates the exit) and point the escape PHI at
+  // it; the old extra PHI and its step then die below.
+  for (auto &E : S.Escapes) {
+    PHINode *User = std::get<0>(E);
+    Value *EStart = std::get<1>(E);
+    int64_t K = std::get<2>(E);
+    IRBuilder<> EB(CmpBB->getTerminator());
+    Value *Idx = NewStep;
+    Type *ETy = EStart->getType();
+    if (ETy != I32) {
+      Idx = EB.CreateSExt(NewStep, ETy, "escape.idx");
+      moveVA(S.Step, cast<Instruction>(Idx));
+    }
+    if (K != 1) {
+      Idx = EB.CreateMul(Idx, ConstantInt::get(ETy, K), "escape.scaled");
+      moveVA(S.Step, cast<Instruction>(Idx));
+    }
+    Value *Val = EB.CreateAdd(EStart, Idx, "escape.end");
+    moveVA(S.Step, cast<Instruction>(Val));
+    User->setIncomingValueForBlock(CmpBB, Val);
+  }
 
   // Each touch gets `getelementptr <elem>, start, %i`; the pointer PHI and
   // its step die. The index reaching a touch in the latch must be the
@@ -1028,7 +1204,14 @@ static bool rewritePtrLoop(LoopShape &S) {
     Phi->eraseFromParent();
   }
 
-  // The counter PHI and step form a cycle; remove the incoming edge first.
+  // The counter/mirror/countdown PHI and step form a cycle; remove the
+  // incoming edge first. Self-feeding extras die the same way.
+  for (auto *P : S.ExtraTrips)
+    P->dropAllReferences();
+  for (auto *St : S.ExtraSteps)
+    St->eraseFromParent();
+  for (auto *P : S.ExtraTrips)
+    P->eraseFromParent();
   S.IV->dropAllReferences();
   S.Step->eraseFromParent();
   S.IV->eraseFromParent();

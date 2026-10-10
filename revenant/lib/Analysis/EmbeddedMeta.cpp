@@ -89,23 +89,19 @@ void forEachXrefTo(const Xrefs &Refs, Va Target, Fn &&Visit) {
 }
 
 void collectLocation(const Image &Img, Program &P, Va Target, Va From) {
+  // The panic call loads the `Location` static itself (`lea rdx,[rip+loc]`),
+  // so the referenced address is the record. Reading a record out of the
+  // neighbourhood attached neighbouring constants to the wrong function: a
+  // static that sits right before a record made the pass read that record.
   const FuncRecord *F = functionForReference(P, From);
   if (!F)
     return;
-
-  for (int Offset = -24; Offset <= 24; Offset += 8) {
-    if (Offset < 0 && Target.Value < static_cast<uint64_t>(-Offset))
-      continue;
-    Va Candidate = Offset < 0 ? Va(Target.Value - static_cast<uint64_t>(-Offset))
-                              : Target.wrappingAdd(static_cast<uint64_t>(Offset));
-    EmbeddedFunctionMetadata M;
-    if (!readLocation(Img, Candidate, M))
-      continue;
-    auto [It, Inserted] = P.Embedded.emplace(F->Start, M);
-    if (!Inserted && It->second.SourceFile.empty())
-      It->second = std::move(M);
+  EmbeddedFunctionMetadata M;
+  if (!readLocation(Img, Target, M))
     return;
-  }
+  auto [It, Inserted] = P.Embedded.emplace(F->Start, M);
+  if (!Inserted && It->second.SourceFile.empty())
+    It->second = std::move(M);
 }
 
 std::string classNameFromRTTI(StringRef Decorated) {
@@ -130,7 +126,12 @@ std::string classNameFromRTTI(StringRef Decorated) {
 }
 
 void collectRtti(Program &P, const Image &Img) {
+  // One row per class name. MSVC links a template's RTTI once per object that
+  // instantiates it, so the same `.?AV` descriptor can appear several times in
+  // the image; keeping a row per copy would emit the same class (with a
+  // different vtable) many times over.
   std::map<Va, size_t> TypeByDescriptor;
+  std::map<std::string, size_t> TypeByName;
   for (const Section &S : Img.Sections) {
     for (size_t Off = 16; Off + 8 < S.Data.size(); ++Off) {
       StringRef Tail(reinterpret_cast<const char *>(S.Data.data() + Off),
@@ -149,7 +150,14 @@ void collectRtti(Program &P, const Image &Img) {
       auto Spare = Img.readU64(Descriptor.wrappingAdd(8));
       if (!Vftable || !*Vftable || !Spare || *Spare != 0)
         continue;
-      TypeByDescriptor.emplace(Descriptor, P.EmbeddedTypes.size());
+      auto ByName = TypeByName.find(Name);
+      if (ByName != TypeByName.end()) {
+        TypeByDescriptor.emplace(Descriptor, ByName->second);
+        continue;
+      }
+      size_t Index = P.EmbeddedTypes.size();
+      TypeByName.emplace(Name, Index);
+      TypeByDescriptor.emplace(Descriptor, Index);
       P.EmbeddedTypes.push_back(
           {Descriptor, std::move(Name), Decorated.str(), Va(), {}});
     }

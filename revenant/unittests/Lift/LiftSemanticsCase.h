@@ -25,7 +25,7 @@ constexpr unsigned SlotStack = 15;
 constexpr unsigned StackQwords = 8;
 constexpr unsigned SlotVec = 23;
 constexpr unsigned VecRegs = 8;
-constexpr unsigned VecQwords = 4;
+constexpr unsigned VecQwords = 8; // room for a full zmm
 constexpr unsigned BufferQwords = SlotVec + VecRegs * VecQwords;
 
 struct Case {
@@ -33,10 +33,15 @@ struct Case {
   std::string Asm;
   std::vector<std::pair<std::string, uint64_t>> Regs;
   std::vector<uint64_t> Stack; // [rsp+0x20 + 8*i]
-  std::vector<std::array<uint64_t, 4>> Vec; // xmm/ymm 0..N-1
+  std::vector<std::array<uint64_t, 4>> Vec; // xmm/ymm/zmm low 4 qwords
+  std::array<uint64_t, 4> VecHi[8]{};       // zmm qwords 4..7 per register
   std::array<bool, 8> Given{};
   bool VecUsed = false;
   bool Ymm = false;
+  bool Zmm = false;
+  /// Host CPU feature the case needs ("avx512f"); the runner skips it when
+  /// the host lacks the feature (the bytes would fault natively).
+  const char *Requires = nullptr;
   unsigned RegMask = 0x3FF;
   unsigned FlagMask = 0;
 
@@ -64,6 +69,23 @@ struct Case {
     Vec[N] = {A, B, C, D};
     Given[N] = true;
     VecUsed = true;
+    return *this;
+  }
+  /// A 512-bit register: 8 qwords, low four in Vec and high four in VecHi.
+  Case &zmm(unsigned N, uint64_t A, uint64_t B, uint64_t C, uint64_t D,
+            uint64_t E, uint64_t F, uint64_t G, uint64_t H) {
+    Zmm = true;
+    if (Vec.size() <= N)
+      Vec.resize(N + 1);
+    Vec[N] = {A, B, C, D};
+    VecHi[N] = {E, F, G, H};
+    Given[N] = true;
+    VecUsed = true;
+    return *this;
+  }
+  /// Host CPU feature this case needs; skipped when absent.
+  Case &needs(const char *Feature) {
+    Requires = Feature;
     return *this;
   }
   Case &flags(unsigned M) {

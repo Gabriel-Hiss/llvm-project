@@ -276,6 +276,12 @@ public:
   void clobberFlags();
   /// After a call, volatile regs hold arbitrary values.
   void clobberVolatile();
+  /// Clobber only the volatile registers the callee actually writes. A local
+  /// callee is scanned for explicit/implicit register defs; anything else
+  /// (imports, indirect, unknown) falls back to clobberVolatile. GCC's
+  /// interprocedural RA keeps a loop IV in r8/r9 across a call to a leaf
+  /// that only touches eax/ecx, so an unconditional clobber would poison it.
+  void clobberCallee(llvm::Function *Callee, std::optional<Va> Target);
 
   // ---- calls ---------------------------------------------------------------------
   llvm::FunctionType *fnType(const Signature *S);

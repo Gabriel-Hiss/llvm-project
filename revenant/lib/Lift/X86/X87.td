@@ -54,6 +54,8 @@ def rv_fclex    : RVOp; // (rv_fclex): clear exception flags
 def rv_fld      : RVOp; // (rv_fld "f32|f64|f80|i16|i32|i64" $m): load+convert
 def rv_fst      : RVOp; // (rv_fst "f32|f64|i16|i32|i64|ti16|ti32|ti64" $m, v)
                         //   store with convert; ti* truncate (FISTTP)
+def rv_x87env  : RVOp; // (rv_x87env "st|ld", $m): 28-byte environment image
+def rv_x87save : RVOp; // (rv_x87save "st|ld", $m): 108-byte FPU image
 
 // ---- loads ----------------------------------------------------------------
 // LD_F32m/64m/80m: (outs), (ins f32mem/f64mem/f80mem:$src).
@@ -670,13 +672,17 @@ def : RVLift { let Insn = FNCLEX; dag Body = (rv_fclex); }
 def : RVLift { let Insn = FNOP; dag Body = (rv_nop); }
 def : RVLift { let Insn = WAIT; dag Body = (rv_nop); }
 
-// Byte-exact state images with no IR equivalent: BCD loads/stores, the
-// 28-byte environment, 108-byte save/restore, FXSAVE/FXRSTOR.
-def : RVLift { let Insn = FBLDm; dag Body = (rv_opaque); }
-def : RVLift { let Insn = FBSTPm; dag Body = (rv_opaque); }
-def : RVLift { let Insn = FLDENVm; dag Body = (rv_opaque); }
-def : RVLift { let Insn = FSTENVm; dag Body = (rv_opaque); }
-def : RVLift { let Insn = FRSTORm; dag Body = (rv_opaque); }
-def : RVLift { let Insn = FSAVEm; dag Body = (rv_opaque); }
-def : RVMatch { let Glob = "FXSAVE*"; dag Body = (rv_opaque); }
-def : RVMatch { let Glob = "FXRSTOR*"; dag Body = (rv_opaque); }
+// The 28-byte environment (FNSTENV/FSTENV/FLDENV) and the 108-byte FPU
+// image (FSAVE/FNSAVE/FRSTOR) are byte-level views of modeled state: the
+// control word and status word round-trip, and the eight ST(i) registers
+// come from the x87 stack. The tag word is not modeled (see the file note).
+def : RVLift { let Insn = FLDENVm; dag Body = (rv_x87env "ld", $src); }
+def : RVLift { let Insn = FSTENVm; dag Body = (rv_x87env "st", $dst); }
+def : RVLift { let Insn = FRSTORm; dag Body = (rv_x87save "ld", $src); }
+def : RVLift { let Insn = FSAVEm; dag Body = (rv_x87save "st", $dst); }
+// FXSAVE/FXRSTOR are the backend's own intrinsics (full 512-byte state).
+def : RVMatch { let Glob = "FXSAVE*"; dag Body = (rv_fxenv "st", $dst); }
+def : RVMatch { let Glob = "FXRSTOR*"; dag Body = (rv_fxenv "ld", $src); }
+// Packed BCD loads/stores.
+def : RVLift { let Insn = FBLDm; dag Body = (rv_fbcd "ld", $src); }
+def : RVLift { let Insn = FBSTPm; dag Body = (rv_fbcd "st", $dst); }

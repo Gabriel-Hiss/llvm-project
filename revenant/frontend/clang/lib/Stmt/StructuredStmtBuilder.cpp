@@ -835,15 +835,28 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
 
   if (R.Kind == RegionKind::DoWhile) {
     // Body first, test last: condition comes from the latch's conditional
-    // branch (continue edge -> header).
+    // branch (continue edge -> header). For do-while, the latch branches
+    // back to header when the condition is TRUE (continue), so the emitted
+    // do-while condition is the *negation* of the latch's branch condition
+    // when the true arm goes to the header.
     auto *BI = dyn_cast<BranchInst>(R.Latch->getTerminator());
-    if (BI && BI->isConditional())
-      Cond = condOf(BI, R.Header);
-    else
+    if (BI && BI->isConditional()) {
+      // If the true arm goes to header, the condition is negated
+      BasicBlock *TrueSucc = BI->getSuccessor(0);
+      BasicBlock *FalseSucc = BI->getSuccessor(1);
+      if (TrueSucc == R.Header) {
+        // True arm continues -> negate
+        Cond = Exprs->inverted(BI->getCondition(), *Scope);
+      } else {
+        // False arm continues -> use as-is
+        Cond = condOf(BI, R.Header);
+      }
+    } else {
       Cond = IntegerLiteral::Create(*AST, APInt(32, 1), AST->IntTy,
                                     SourceLocation());
+    }
     // Header and latch leaf code belong to the body; latch code sits at
-    // the end.
+    // the end (this includes the increment).
     emitBlockStmts(R.Header, Body);
     for (BasicBlock *BB : Blocks) {
       if (!R.Members.contains(BB) || BB == R.Header || BB == R.Latch)
