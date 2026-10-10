@@ -231,48 +231,12 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       return 0;
   }
 
-  // Merged scalar init: fold lane-0 splat inits with the reduction op.
-  Value *MergedInit = nullptr;
-  {
-    Value *Fold = nullptr;
-    for (auto &A : Accs) {
-      Value *L0 = splatInit(A.Init, Elem, Lanes);
-      if (!L0)
-        return 0;
-      auto *LC = dyn_cast<Constant>(L0);
-      auto *FC = Fold ? dyn_cast<Constant>(Fold) : nullptr;
-      if (Fold && (!LC || !FC))
-        return 0;
-      if (!Fold) {
-        Fold = L0;
-        continue;
-      }
-      auto *LCa = cast<ConstantInt>(LC);
-      auto *FCa = cast<ConstantInt>(FC);
-      APInt R = FCa->getValue();
-      APInt V = LCa->getValue();
-      switch (Opcode) {
-      case Instruction::Add:
-        R = R + V;
-        break;
-      case Instruction::Mul:
-        R = R * V;
-        break;
-      case Instruction::And:
-        R = R & V;
-        break;
-      case Instruction::Or:
-        R = R | V;
-        break;
-      case Instruction::Xor:
-        R = R ^ V;
-        break;
-      default:
-        return 0;
-      }
-      Fold = ConstantInt::get(Elem, R);
-    }
-    MergedInit = Fold;
+  // Per-acc splat init check: every acc init must fold to one Elem lane
+  // value. The emit stage seeds each scalar phi from its own acc's init
+  // (no cross-acc merging: independent reductions keep independent sums).
+  for (auto &A : Accs) {
+    if (!splatInit(A.Init, Elem, Lanes))
+      return 0;
   }
 
   // Outside-use precheck: every outside use of an acc phi, backedge, or
@@ -432,16 +396,25 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     }
   }
 
-  // Emit: scalar acc phi first (init edge only; backedge closes below).
+  // Emit: one scalar acc phi per vector acc phi (init edge only; backedges
+  // close below). Each vector reduction keeps its own accumulator: sharing
+  // one chain across independent reductions would merge their sums and any
+  // outer add of two reduces would double the total (multi-reduce.ll).
   LLVMContext &Ctx = F.getContext();
   Type *I8 = Type::getInt8Ty(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx);
   unsigned Esz = Elem->getScalarSizeInBits() / 8;
-  PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
-  S->addIncoming(MergedInit, InitBB);
-  // Provenance: the merged acc represents every vector acc phi. Copy
-  // from the first acc in classification order (= header phi order).
-  inheritMeta(Accs[0].Phi, S);
+  SmallVector<PHINode *, 4> SS;
+  for (auto &A : Accs) {
+    PHINode *S = PHINode::Create(Elem, 2, "s.unopt", H->begin());
+    Value *L0 = splatInit(A.Init, Elem, Lanes);
+    // Precheck guaranteed a splat-constant init; defensive bail on surprise.
+    if (!L0)
+      return 0;
+    S->addIncoming(L0, InitBB);
+    inheritMeta(A.Phi, S);
+    SS.push_back(S);
+  }
 
   DenseMap<const Value *, Value *> Subs;
   DenseMap<const Value *, SmallVector<Value *, 4>> LaneMemo;
@@ -527,24 +500,26 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   (void)Explode;
   (void)Empty;
 
-  // Subs for acc phis (scalar phi) and valid lane-0 acc extracts.
-  for (auto &A : Accs)
-    Subs[A.Phi] = S;
+  // Subs for acc phis (own scalar phi each) and valid lane-0 acc extracts.
+  for (unsigned a = 0; a < Accs.size(); ++a)
+    Subs[Accs[a].Phi] = SS[a];
   for (Instruction &I : *H) {
     auto *EI = dyn_cast<ExtractElementInst>(&I);
     if (!EI)
       continue;
-    for (auto &A : Accs)
-      if (EI->getVectorOperand() == A.Phi) {
-        Subs[&I] = S;
+    for (unsigned a = 0; a < Accs.size(); ++a)
+      if (EI->getVectorOperand() == Accs[a].Phi) {
+        Subs[&I] = SS[a];
         Kill.push_back(&I);
       }
   }
 
-  // Walk in order: explode streams, extend the scalar chain at acc
-  // updates. Chain operations append before the update instruction so
+  // Walk in order: explode streams, extend each acc's own scalar chain at
+  // its update. Chain operations append before the update instruction so
   // intra-block SSA order holds.
-  Value *Chain = S;
+  SmallVector<Value *, 4> Chains;
+  for (auto *S : SS)
+    Chains.push_back(S);
   SmallVector<Instruction *, 16> Walk;
   for (Instruction &I : *H)
     Walk.push_back(&I);
@@ -553,23 +528,24 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     if (isa<PHINode>(&I))
       continue;
     if (AccBacks.contains(&I)) {
-      // Acc update: explode the stream side, fold lanes into the chain.
-      // The vector update itself dies: sever its phi edge FIRST so the
-      // old acc phi no longer references it (else phi<->update pin each
-      // other live and neither erases).
-      for (auto &A : Accs)
-        if (A.Back == &I)
-          for (unsigned k = 0, KN = A.Phi->getNumIncomingValues(); k < KN; ++k)
-            if (A.Phi->getIncomingBlock(k) == H)
-              A.Phi->setIncomingValue(
-                  k, llvm::UndefValue::get(A.Phi->getType()));
-      Value *Stream = nullptr;
-      for (auto &A : Accs)
-        if (A.Back == &I)
-          Stream = A.Stream;
+      // Acc update: explode the stream side, fold lanes into that acc's
+      // own chain. The vector update itself dies: sever its phi edge FIRST
+      // so the old acc phi no longer references it (else phi<->update pin
+      // each other live and neither erases).
+      unsigned Idx = 0;
+      for (unsigned a = 0; a < Accs.size(); ++a)
+        if (Accs[a].Back == &I)
+          Idx = a;
+      for (unsigned k = 0, KN = Accs[Idx].Phi->getNumIncomingValues();
+           k < KN; ++k)
+        if (Accs[Idx].Phi->getIncomingBlock(k) == H)
+          Accs[Idx].Phi->setIncomingValue(
+              k, llvm::UndefValue::get(Accs[Idx].Phi->getType()));
+      Value *Stream = Accs[Idx].Stream;
       auto *Ls = Ex(Resolve(Stream));
       if (!Ls)
         return 0; // precheck promised success; defensive, no partial emit
+      Value *Chain = Chains[Idx];
       for (unsigned j = 0; j < Lanes; ++j) {
         auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
                                          Chain, (*Ls)[j],
@@ -577,6 +553,7 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         inheritMeta(&I, N);
         Chain = N;
       }
+      Chains[Idx] = Chain;
       Subs[&I] = Chain;
       Kill.push_back(&I);
       continue;
@@ -609,15 +586,59 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     }
   }
 
-  // Close the scalar backedge. The old vector acc phis keep their own
+  // Close each scalar backedge. The old vector acc phis keep their own
   // (vector-typed) backedge slots untouched: they die by erasure below
   // once use-free, never by type-breaking slot rewrite.
-  S->addIncoming(Chain, H);
-  for (auto &A : Accs)
-    Subs[A.Back] = Chain;
+  for (unsigned a = 0; a < Accs.size(); ++a) {
+    SS[a]->addIncoming(Chains[a], H);
+    Subs[Accs[a].Back] = Chains[a];
+  }
+  // Each reduce aliases to its own accumulator's chain end. The precheck's
+  // AccTree proves which acc(s) feed each reduce operand; with one acc per
+  // chain the operand's acc set decides the replacement. A reduce over a
+  // two-acc combine (Combines) keeps the old merged behavior: sum the two
+  // chain ends with the same opcode.
   unsigned NReduce = 0;
   for (Instruction *R : Reduces) {
-    R->replaceAllUsesWith(Chain);
+    auto *II = cast<IntrinsicInst>(R);
+    Value *Root = II->getOperand(0);
+    // Peel one lane-wise add combine of acc backs (the exit-block merge).
+    Value *AddL = nullptr, *AddR = nullptr;
+    if (auto *BO = dyn_cast<BinaryOperator>(Root)) {
+      if (BO->getOpcode() == Instruction::Add &&
+          isa<FixedVectorType>(BO->getType()) && BO->getParent() != H) {
+        AddL = BO->getOperand(0);
+        AddR = BO->getOperand(1);
+      }
+    }
+    auto AccIndexOf = [&](Value *V) -> int {
+      for (unsigned a = 0; a < Accs.size(); ++a)
+        if (V == Accs[a].Phi || V == Accs[a].Back)
+          return (int)a;
+      return -1;
+    };
+    Value *Repl = nullptr;
+    if (!AddL) {
+      int Idx = AccIndexOf(Root);
+      if (Idx < 0)
+        return 0; // precheck promised acc-rooted; defensive
+      Repl = Chains[(unsigned)Idx];
+    } else {
+      int L = AccIndexOf(AddL), RR = AccIndexOf(AddR);
+      if (L < 0 || RR < 0)
+        return 0;
+      if (L == RR) {
+        Repl = Chains[(unsigned)L];
+      } else {
+        auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
+                                         Chains[(unsigned)L],
+                                         Chains[(unsigned)RR], "s.unopt.m",
+                                         R->getIterator());
+        inheritMeta(R, N);
+        Repl = N;
+      }
+    }
+    R->replaceAllUsesWith(Repl);
     if (R->use_empty()) {
       R->eraseFromParent();
       ++NReduce;
