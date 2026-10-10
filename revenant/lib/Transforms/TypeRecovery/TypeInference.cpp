@@ -511,6 +511,26 @@ unsigned TypeInference::intBits(const Value *V, unsigned Default) const {
   if (It == Index.end())
     return Default;
   unsigned W = Nodes[find(It->second)].MaxIntBits;
+
+  // An ABI-width integer parameter used only through explicit truncations
+  // carries narrower source-width evidence. Keep the widest such truncation;
+  // any non-debug use of the untruncated value keeps the IR width instead.
+  if (const auto *A = dyn_cast<Argument>(V)) {
+    unsigned Narrowest = 0;
+    bool HasOtherUse = false;
+    for (const User *U : A->users()) {
+      if (isa<DbgInfoIntrinsic>(U))
+        continue;
+      if (const auto *Trunc = dyn_cast<TruncInst>(U)) {
+        Narrowest =
+            std::max(Narrowest, Trunc->getType()->getIntegerBitWidth());
+      } else {
+        HasOtherUse = true;
+      }
+    }
+    if (Narrowest && !HasOtherUse)
+      return Narrowest;
+  }
   return W ? W : Default;
 }
 

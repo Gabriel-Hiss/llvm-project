@@ -7,9 +7,8 @@
 ; CHECK-DAG: [[RET:![0-9]+]] = !DIBasicType(name: "int32_t", size: 32, encoding: DW_ATE_signed)
 ; CHECK-DAG: [[SIGARRAY:![0-9]+]] = !{[[RET]], !{{[0-9]+}}}
 ; CHECK-DAG: !DISubroutineType(types: [[SIGARRAY]])
-; CHECK-DAG: [[SIGNED:![0-9]+]] = !DIBasicType(name: "int32_t", size: 32, encoding: DW_ATE_signed)
 ; CHECK-DAG: [[UNSIGNED:![0-9]+]] = !DIBasicType(name: "uint32_t", size: 32, encoding: DW_ATE_unsigned)
-; CHECK-DAG: !DIDerivedType(tag: DW_TAG_member, name: "field_0", scope: !{{[0-9]+}}, file: !{{[0-9]+}}, line: 1, baseType: [[SIGNED]], size: 32, align: 32, offset: 0)
+; CHECK-DAG: !DIDerivedType(tag: DW_TAG_member, name: "field_0", scope: !{{[0-9]+}}, file: !{{[0-9]+}}, line: 1, baseType: [[RET]], size: 32, align: 32)
 ; CHECK-DAG: !DIDerivedType(tag: DW_TAG_member, name: "field_8", scope: !{{[0-9]+}}, file: !{{[0-9]+}}, line: 1, baseType: [[UNSIGNED]], size: 32, align: 32, offset: 64)
 define i32 @sub_140004000(ptr %a0) !revenant.va !0 {
 bb_140004000:

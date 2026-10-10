@@ -145,9 +145,12 @@ frontend ignoring annotations still emits correct code via labels + `goto`.
 structured IR with region annotations. Recovers locals, fixed-size array
 extents, parameter and return types, plus struct/class/vtable/enum shapes,
 expressed as DI (`DILocalVariable`, `DISubroutineType`, `DIBasicType`,
-`DIDerivedType`, `DICompositeType`) via RevenantIR helpers. Field types come
-from the widest access at each constant offset. Guarantees region annotations
-and provenance survive; types only refine.
+`DIDerivedType`, `DICompositeType`) via RevenantIR helpers. Integer parameters
+used only through explicit truncations can recover the narrower width. Field
+types come from the widest access at each constant offset. Guarantees region
+annotations and provenance survive; types only refine.
+The Clang emitter uses recovered parameter-variable types and names when a
+lifted `DISubroutineType` still carries placeholder parameter types.
 
 **revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
 structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the

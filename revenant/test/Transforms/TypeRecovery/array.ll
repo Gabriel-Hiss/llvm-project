@@ -5,9 +5,9 @@
 ; CHECK-LABEL: define i32 @array_local(
 ; CHECK-DAG: !DILocalVariable(name: "values", scope: !{{[0-9]+}}, file: !{{[0-9]+}}, line: 1, type: ![[ARRAY:[0-9]+]])
 ; CHECK-DAG: [[INT:![0-9]+]] = !DIBasicType(name: "int32_t", size: 32, encoding: DW_ATE_signed)
-; CHECK-DAG: ![[ARRAY]] = !DICompositeType(tag: DW_TAG_array_type, baseType: [[INT]], size: 128, align: 128, elements: ![[SUBRANGES:[0-9]+]])
+; CHECK-DAG: ![[ARRAY]] = !DICompositeType(tag: DW_TAG_array_type, baseType: [[INT]], size: 128, align: 32, elements: ![[SUBRANGES:[0-9]+]])
 ; CHECK-DAG: ![[SUBRANGES]] = !{![[RANGE:[0-9]+]]}
-; CHECK-DAG: ![[RANGE]] = !DISubrange(count: 4)
+; CHECK-DAG: ![[RANGE]] = !DISubrange(count: 4, lowerBound: 0)
 define i32 @array_local(i32 %n) !revenant.va !0 {
 entry:
   %values = alloca [4 x i32], align 16

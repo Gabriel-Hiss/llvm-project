@@ -94,7 +94,11 @@ DIType *diTypeForAccess(DIBuilder &DIB, TypeInference &TI,
   if (Ty->isPointerTy())
     return ir::createPointerType(
         DIB, intDIType(DIB, 8, /*Unsigned=*/true));
-  return intDIType(DIB, 8, /*Unsigned=*/true);
+  unsigned Bits = Cell.SizeBits <= 8    ? 8
+                  : Cell.SizeBits <= 16 ? 16
+                  : Cell.SizeBits <= 32 ? 32
+                                        : 64;
+  return intDIType(DIB, Bits, TI.isUnsigned(Access));
 }
 
 // Build the pointee for a pointer base: a struct when two or more distinct
@@ -106,12 +110,14 @@ DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
   // Module normalization shares one layout across direct callers. Keep its
   // named LLVM struct and DI schema together instead of creating a second,
   // function-local layout from the subset of fields observed here.
-  for (const User *U : Base->users())
-    if (const auto *G = dyn_cast<GetElementPtrInst>(U))
-      if (MDNode *MD = G->getMetadata("revenant.pointee"))
-        if (MD->getNumOperands() == 1)
-          if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
-            return Ty;
+  if (Base->hasUseList()) {
+    for (const User *U : Base->users())
+      if (const auto *G = dyn_cast<GetElementPtrInst>(U))
+        if (MDNode *MD = G->getMetadata("revenant.pointee"))
+          if (MD->getNumOperands() == 1)
+            if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
+              return Ty;
+  }
   if (!FA || FA->Fields.empty()) {
     // No field evidence: opaque byte pointee (reference Unknown(8)).
     DIType *Byte = intDIType(DIB, 8, /*Unsigned=*/true);
