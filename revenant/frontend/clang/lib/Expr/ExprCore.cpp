@@ -247,6 +247,10 @@ static CastKind boolDestKind(QualType T, CastKind K, const Expr *Op) {
 }
 
 Expr *ExprBuilderImpl::makeCStyleCast(QualType T, CastKind K, Expr *Op) {
+  // A wide record on either side is outside Clang's C-style-cast rules;
+  // the model spells the conversion as a compound literal or a `.lo`.
+  if (Expr *Wide = wideIntConvert(*AST, T, Op, K))
+    return Wide;
   // `(T)a + b` casts only `a`: a binary operand needs its own parentheses.
   Op = parenIfNeeded(Op, Prec::Unary);
   K = boolDestKind(T, K, Op);
@@ -317,6 +321,11 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
                                         SourceLocation());
     T = AST->IntTy;
   }
+  // A wide record has no C spelling for a decimal literal, and Clang's
+  // IntegerLiteral cannot carry a record type. The model spells the value
+  // as a compound literal instead.
+  if (clang::Expr *Wide = wideIntLiteral(*AST, T, V))
+    return Wide;
   unsigned W = (unsigned)AST->getIntWidth(T);
   // No C/C++ spelling exists for a >64-bit decimal literal: Clang's
   // printer emits the raw digits and clang-cl rejects them ("integer
@@ -733,6 +742,10 @@ Expr *ExprBuilderImpl::retVal(llvm::Value *V, ExprScope &Scope) {
   // Convert to the declared return type so `return v;` type-checks.
   QualType Want = CurFD ? CurFD->getReturnType() : QualType();
   if (!Want.isNull() && !Want->isVoidType() && E->getType() != Want) {
+    // A wide return has no cast rule of its own; the model builds the
+    // compound literal (or reads `.lo`) so `return v;` type-checks.
+    if (isWideIntRecord(Want) || isWideIntRecord(E->getType()))
+      return wideIntConvert(*AST, Want, E, clang::CK_IntegralCast);
     if (E->getType()->isIntegerType() && Want->isIntegerType())
       E = makeCStyleCast(Want, CK_IntegralCast, E);
     else if (E->getType()->isPointerType() && Want->isPointerType())

@@ -137,6 +137,9 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
     Dst = derefPointer(Ptr, Pointee);
   QualType DestType = Dst->getType();
   if (Val->getType() != DestType && !DestType.isNull()) {
+    // A wide destination has no cast rule of its own.
+    if (isWideIntRecord(DestType) || isWideIntRecord(Val->getType()))
+      return makeWideStore(*AST, Dst, Val);
     if (Val->getType()->isIntegerType() && DestType->isIntegerType())
       Val = makeCStyleCast(DestType, CK_IntegralCast, Val);
     else if (Val->getType()->isPointerType() && DestType->isPointerType())
