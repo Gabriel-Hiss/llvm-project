@@ -68,6 +68,28 @@ void copyProvenance(Instruction *New, Instruction *Old) {
 
 bool hasOpaque(Instruction *I) { return I->hasMetadata("revenant.opaque"); }
 
+// Argument count the phase-2 intrinsic rewrites read for `ID`. An intrinsic
+// outside this set takes no rewrite at all; one with fewer operands than its
+// rewrite needs is left alone. Lifted code meets zero-argument intrinsics
+// such as `llvm.x86.rdrand.32()`.
+unsigned idiomArity(Intrinsic::ID ID) {
+  switch (ID) {
+  case Intrinsic::scmp:
+  case Intrinsic::ucmp:
+  case Intrinsic::smin:
+  case Intrinsic::smax:
+  case Intrinsic::umin:
+  case Intrinsic::umax:
+  case Intrinsic::usub_sat:
+  case Intrinsic::uadd_sat:
+    return 2;
+  case Intrinsic::abs:
+    return 1;
+  default:
+    return ~0u;
+  }
+}
+
 // ---- magic division: concrete DAG evaluator ------------------------------
 // Interprets an instruction DAG as q(x) with wrap-around semantics.
 // Values are carried as 128-bit APInts holding a W-bit value.
@@ -774,13 +796,12 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
     for (Instruction &I : make_early_inc_range(instructions(F))) {
       if (hasOpaque(&I))
         continue;
-      if (auto *Call = dyn_cast<CallInst>(&I)) {
-          B.SetInsertPoint(Call);
-        Function *Callee = Call->getCalledFunction();
-        if (Callee && Callee->isIntrinsic()) {
-          if (Call->arg_size() < 2)
-            continue;
-          Intrinsic::ID ID = Callee->getIntrinsicID();
+        if (auto *Call = dyn_cast<CallInst>(&I)) {
+            B.SetInsertPoint(Call);
+          Function *Callee = Call->getCalledFunction();
+          if (Callee && Callee->isIntrinsic() &&
+              Call->arg_size() >= idiomArity(Callee->getIntrinsicID())) {
+            Intrinsic::ID ID = Callee->getIntrinsicID();
           Value *A = Call->getArgOperand(0);
           Value *R = nullptr;
           Value *Cond = nullptr;
