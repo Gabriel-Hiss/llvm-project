@@ -167,6 +167,42 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
 
   Expr *L = value(LHS, Scope);
   Expr *R = value(RHS, Scope);
+  // C promotes i1 operands (BoolTy / UnsignedCharTy) to int, which breaks
+  // mod-2 arithmetic: a + b on bools is 2, not 0. Spell 1-bit arithmetic
+  // as the equivalent boolean ops: add and sub are xor (-x == x mod 2),
+  // mul is and, a left or logical right shift by b keeps a only when b is
+  // 0, and ashr is a no-op (the sign bit is the only bit). Div/rem and the
+  // bitwise ops are already exact under promotion.
+  if (LHS->getType()->isIntegerTy(1)) {
+    switch (Op) {
+    case llvm::Instruction::Add:
+    case llvm::Instruction::Sub:
+      BOp = BO_Xor;
+      P = Prec::Xor;
+      NonAssocRight = false;
+      break;
+    case llvm::Instruction::Mul:
+      BOp = BO_And;
+      P = Prec::And;
+      break;
+    case llvm::Instruction::Shl:
+    case llvm::Instruction::LShr: {
+      Expr *Not = UnaryOperator::Create(
+          *AST, parenIfNeeded(R, Prec::Unary), UO_LNot, AST->BoolTy,
+          VK_PRValue, OK_Ordinary, SourceLocation(), false,
+          FPOptionsOverride());
+      clang::BinaryOperator *B = BinaryOperator::Create(
+          *AST, parenIfNeeded(L, Prec::And), Not, BO_And, exprTypeOf(&I),
+          VK_PRValue, OK_Ordinary, SourceLocation(), FPOptionsOverride());
+      return ensureTemp(llvm::cast<llvm::Instruction>(&I), Scope, B);
+    }
+    case llvm::Instruction::AShr:
+      return ensureTemp(llvm::cast<llvm::Instruction>(&I), Scope, L);
+    default:
+      break;
+    }
+  }
+
 
   // `x + -k` prints as `x - k` (emit-c Bin rule).
   if (BOp == BO_Add) {

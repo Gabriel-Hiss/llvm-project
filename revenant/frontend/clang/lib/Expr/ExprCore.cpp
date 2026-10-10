@@ -355,10 +355,15 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
       return Or;
     return makeCStyleCast(T, CK_IntegralCast, Or);
   }
-  llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative() &&
-                     V.getBitWidth() > 1)
-                        ? V.sextOrTrunc(W)
-                        : V.zextOrTrunc(W);
+  llvm::APInt Val;
+  if (T->isSignedIntegerType() && V.isNegative() && V.getBitWidth() > 1)
+    Val = V.sextOrTrunc(W);
+  else
+    Val = V.zextOrTrunc(W);
+  // IntegerLiteral asserts hasSignedIntegerRepresentation when the APInt
+  // is negative; for unsigned types, the value must be zero-extended.
+  if (!T->isSignedIntegerType())
+    Val = Val.zextOrTrunc(W);
   // Single characters in a char-typed slot print as 'x'.
   if ((T->isSpecificBuiltinType(BuiltinType::Char_S) ||
        T->isSpecificBuiltinType(BuiltinType::Char_U) ||
