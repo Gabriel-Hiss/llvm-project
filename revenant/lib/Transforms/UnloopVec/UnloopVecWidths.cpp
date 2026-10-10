@@ -239,7 +239,9 @@ bool scalarizeLoop(BasicBlock *BB, PHINode *IV, ConstantInt *Step, Function &F) 
     if (auto *LI = dyn_cast<LoadInst>(I)) {
       Value *Ptr = LI->getPointerOperand();
       auto *SL = B.CreateLoad(ElemTy, Ptr);
-      SL->setAlignment(LI->getAlign());
+      unsigned ElemBits = ElemTy->getPrimitiveSizeInBits();
+      Align MinAlign(ElemBits / 8);
+      SL->setAlignment(std::min(LI->getAlign(), MinAlign));
       SL->setVolatile(LI->isVolatile());
       LaneMap[I] = SL;
     } else if (auto *SI = dyn_cast<StoreInst>(I)) {
@@ -266,7 +268,9 @@ bool scalarizeLoop(BasicBlock *BB, PHINode *IV, ConstantInt *Step, Function &F) 
         LaneVal = Val;
       }
       auto *SS = B.CreateStore(LaneVal, Ptr);
-      SS->setAlignment(SI->getAlign());
+      unsigned ElemBits = ElemTy->getPrimitiveSizeInBits();
+      Align MinAlign(ElemBits / 8);
+      SS->setAlignment(std::min(SI->getAlign(), MinAlign));
       SS->setVolatile(SI->isVolatile());
       LaneMap[I] = SS;
     } else if (auto *CI = dyn_cast<ICmpInst>(I)) {
