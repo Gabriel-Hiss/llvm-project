@@ -141,6 +141,11 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
 
 
   QualType ResTy = exprTypeOf(&I);
+  // A wide record has no operator spelling in C; the model spells the
+  // operator as a call to one of its wrappers.
+  if (clang::Expr *Wide = wideIntArithmetic(*AST, ResTy, Op, 0, L, R))
+    return ensureTemp(llvm::cast<llvm::Instruction>(&I), Scope, Wide);
+
   bool SignedOp = Op == llvm::Instruction::SDiv ||
                   Op == llvm::Instruction::SRem ||
                   Op == llvm::Instruction::AShr;
@@ -276,6 +281,11 @@ Expr *ExprBuilderImpl::buildCmp(llvm::CmpInst &I, ExprScope &Scope) {
   Expr *Rp = parenIfNeeded(R, P, NonAssocRight);
   QualType BoolTy =
       Ctx.isCPlusPlus() ? AST->BoolTy : AST->UnsignedCharTy;
+  // A wide record has no comparison spelling in C.
+  if (clang::Expr *Wide = wideIntArithmetic(
+          *AST, L->getType(), llvm::Instruction::ICmp,
+          (unsigned)llvm::cast<llvm::CmpInst>(&I)->getPredicate(), L, R))
+    return ensureTemp(&I, Scope, Wide);
   clang::BinaryOperator *B =
       BinaryOperator::Create(*AST, Lp, Rp, BOp, BoolTy, VK_PRValue,
                              OK_Ordinary, SourceLocation(),
