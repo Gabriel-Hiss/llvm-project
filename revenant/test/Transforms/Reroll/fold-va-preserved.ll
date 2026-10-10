@@ -16,7 +16,10 @@ L:
   %l1 = load i32, ptr %g1, align 4, !revenant.va !7
   %s2 = add i32 %s1, %l1, !revenant.va !8
   %inext = add i32 %i, 2, !revenant.va !9
-  %c = icmp ult i32 %inext, %n, !revenant.va !10
+  ; Exit on the step value against a bound that is a multiple of the
+  ; 2-window step, so folding the step to 1 keeps the trip count.
+  %scaled = shl i32 %n, 1
+  %c = icmp ult i32 %inext, %scaled, !revenant.va !10
   br i1 %c, label %L, label %X
 
 X:
