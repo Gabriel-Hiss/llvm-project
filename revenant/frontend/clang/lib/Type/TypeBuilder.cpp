@@ -35,6 +35,8 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/Support/Casting.h"
@@ -244,11 +246,18 @@ public:
   }
 
   clang::QualType functionType(Function &F) override {
-    // Prefer DISubprogram element types over the IR signature (interface
-    // contract: recovered signature lives in DI). Arity still comes from
-    // the IR: callers create one ParmVarDecl per Argument, so the proto
-    // must have F.arg_size() params. DI lists [ret, p1..pN] and may be
-    // shorter (partial recovery) or longer (elements beyond params).
+    // Parameter locals carry TypeRecovery's authoritative types, including
+    // when the lifted DISubprogram signature still has placeholder types.
+    SmallVector<const DIType *, 8> ParamDI(F.arg_size(), nullptr);
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *DVI = dyn_cast<DbgVariableIntrinsic>(&I))
+          if (DILocalVariable *V = DVI->getVariable())
+            if (V->isParameter() && V->getArg() > 0 &&
+                V->getArg() <= ParamDI.size() && V->getType() &&
+                !ParamDI[V->getArg() - 1])
+              ParamDI[V->getArg() - 1] = V->getType();
+
     unsigned IRArity = F.arg_size();
     if (DISubprogram *SP = F.getSubprogram()) {
       if (const auto *Sig = dyn_cast_or_null<DISubroutineType>(SP->getType())) {
@@ -264,23 +273,31 @@ public:
           }
           if (Params.size() >= IRArity)
             break;
-          Params.push_back(T ? mapDIOrFallback(T) : uintptrT());
+          unsigned I = Params.size();
+          if (ParamDI[I])
+            Params.push_back(
+                typeOf(F.getFunctionType()->getParamType(I), ParamDI[I]));
+          else
+            Params.push_back(T ? mapDIOrFallback(T)
+                               : typeOfIR(F.getFunctionType()->getParamType(I)));
         }
-        // Partial or missing DI params: fill from the IR signature.
-        unsigned P = 0;
-        for (Type *PT : F.getFunctionType()->params()) {
-          if (P++ < Params.size())
-            continue;
-          Params.push_back(typeOfIR(PT));
+        while (Params.size() < IRArity) {
+          unsigned I = Params.size();
+          Params.push_back(
+              ParamDI[I] ? typeOf(F.getFunctionType()->getParamType(I),
+                                  ParamDI[I])
+                         : typeOfIR(F.getFunctionType()->getParamType(I)));
         }
         return buildFunctionType(Ret, Params, F.getFunctionType()->isVarArg());
       }
     }
-    clang::QualType Ret = typeOfIR(F.getReturnType());
     SmallVector<clang::QualType, 8> Params;
-    for (Type *P : F.getFunctionType()->params())
-      Params.push_back(typeOfIR(P));
-    return buildFunctionType(Ret, Params, F.getFunctionType()->isVarArg());
+    for (unsigned I = 0; I < IRArity; ++I)
+      Params.push_back(
+          ParamDI[I] ? typeOf(F.getFunctionType()->getParamType(I), ParamDI[I])
+                     : typeOfIR(F.getFunctionType()->getParamType(I)));
+    return buildFunctionType(typeOfIR(F.getReturnType()), Params,
+                             F.getFunctionType()->isVarArg());
   }
 
   clang::QualType globalType(GlobalVariable &GV) override {

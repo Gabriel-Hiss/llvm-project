@@ -348,6 +348,10 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
     const char *Suffix = compareWrapper(Pred, Signed);
     if (!Suffix)
       return nullptr;
+    // If one operand is narrow (e.g. a u64 literal), convert it to the
+    // wide record so the wrapper call type-checks.
+    if (!isWideIntRecord(RHS->getType()))
+      RHS = wideIntConvert(A, OperandTy, RHS, clang::CK_IntegralCast);
     llvm::SmallString<64> Name(recordName(WideIntBits, Signed));
     Name += "_";
     Name += Suffix;
@@ -363,6 +367,19 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
   if (!Suffix)
     return nullptr;
   const bool Signed = isSigned(ResTy);
+  // Shifts: the second operand is a narrow count (unsigned int), not a
+  // wide record. Do not convert it; the wrapper signature expects unsigned.
+  const bool IsShift = Op == llvm::Instruction::Shl ||
+                       Op == llvm::Instruction::LShr ||
+                       Op == llvm::Instruction::AShr;
+  if (!IsShift) {
+    // If one operand is narrow (e.g. a u64 literal), convert it to the
+    // wide record so the wrapper call type-checks.
+    if (!isWideIntRecord(LHS->getType()))
+      LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
+    else if (!isWideIntRecord(RHS->getType()))
+      RHS = wideIntConvert(A, ResTy, RHS, clang::CK_IntegralCast);
+  }
   llvm::SmallString<64> Name(recordName(WideIntBits, Signed));
   Name += "_";
   Name += Suffix;
