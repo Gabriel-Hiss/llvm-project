@@ -1,3 +1,9 @@
+; The middle <4 x i32> tier adds a different constant (999) than the
+; scalar tail (%2): the lane-equivalence gate must keep the fold off
+; and the vector tier must survive. Negative test for the
+; LunaReviewDeoptR blocker (vector/scalar operation mismatch).
+; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
+
 define void @avx2_add_mismatch(ptr %0, ptr %1, i32 %2, i32 %3) {
 entry:
   %o = icmp slt i32 %3, 1
@@ -7,7 +13,6 @@ entry.ok:
   %outer.cond = icmp ugt i32 %3, 31
   br i1 %outer.cond, label %bb_140001a68, label %bb_140001a9a
 bb_140001a68:
-                                     
   %m.and = and i32 %3, 28
   %c265 = icmp eq i32 %m.and, 0
   br i1 %c265, label %bb_140001a9a, label %bb_140001a6c
@@ -95,3 +100,8 @@ bb_140001b0b:
                                      
   ret void
 }
+
+; The vector tier must survive the gated fold.
+; CHECK-LABEL: define{{.*}}void @avx2_add_mismatch
+; CHECK: <4 x i32>
+; CHECK: ret void
