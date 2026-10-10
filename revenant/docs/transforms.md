@@ -98,12 +98,18 @@ every use reads lane 0 and all layouts agree; anything else keeps 128
 bits. Runs first inside devectorize so the later phases see plain scalar
 loops.
 
-**revenant-devectorize, phases 2-3.** Expects lane-0 output.
+**revenant-devectorize, phases 2-4.** Expects lane-0 output.
 Explodes auto-vectorized `i128`/`__v*` work into per-lane scalar ops:
 vector streams become per-element scalars in loops, reduction accumulators
 collapse to one scalar phi; straight-line slices scalarize for reroll.
-Guarantees conservative bail-outs: ymm/zmm upper lanes, cross-lane ops,
-unrecognized vector phis stay vector.
+The straight-line phase also explodes cross-width lane splits (`<2 x i64>`
+to `<4 x i32>`), lane-0 broadcasts (insertelement / zext+bitcast + shuffle),
+and manual i128 shift/bitcast/add horizontal folds, with per-lane alignment
+(common alignment of vector alignment and lane offset) and exact float lane
+constants. A final pair-split phase turns scalar-i128 copy webs (constant /
+load / phi webs feeding only stores) into i64 halves. Guarantees
+conservative bail-outs: ymm/zmm upper lanes, cross-lane ops, unrecognized
+vector phis, i128 arithmetic webs, and shared copy webs stay vector.
 
 **revenant-reroll (owner: MuseTxReroll).** Expects scalarized loops.
 Folds unrolled iteration copies back into one induction-variable step

@@ -16,9 +16,10 @@
 
 #include "Lane0.h"
 #include "LoopDevec.h"
+#include "PairSplit.h"
 #include "StraightDevec.h"
-
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 
 using namespace llvm;
 
@@ -27,13 +28,18 @@ namespace revenant {
 PreservedAnalyses DevectorizePass::run(Function &F, FunctionAnalysisManager &) {
   if (F.isDeclaration() || F.hasOptNone())
     return PreservedAnalyses::all();
+  // Lane splitting reads low bytes at low offsets: only sound little-endian.
+  if (!F.getParent()->getDataLayout().isLittleEndian())
+    return PreservedAnalyses::all();
   // Phase 1: lane-0 scalarization exposes scalar low-lane accumulators.
   unsigned Changed = lane0::propagate(F);
   // Phase 2: single-block integer reduction loops explode into scalar
   // acc chains. Phase 3: straight-line SLP webs explode in place.
-  // No CFG change in any phase.
+  // Phase 4: scalar i128 copy webs (loads/phis/stores of 16-byte units)
+  // split into i64 halves. No CFG change in any phase.
   Changed += loopdevec::devectorizeLoops(F);
   Changed += straight::explodeStraight(F);
+  Changed += pairsplit::splitPairs(F);
   if (Changed == 0)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
