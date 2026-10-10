@@ -83,6 +83,55 @@ static const Signature *signatureFor(const Signatures *Sigs, Va Addr) {
   return Sigs ? Sigs->of(Addr) : nullptr;
 }
 
+// Count of contiguous repetitions of one straight-line opcode window.
+// Several asm copies sharing the function's single Location record is
+// evidence they implement one source statement (an unrolled loop body).
+// Returns 0 when no repeated window is worth reporting. Windows may not
+// cross branches, calls, returns or traps; opcode equality ignores
+// registers/immediates, so this is confirmation-grade evidence only and
+// never a rewrite proof on its own.
+static unsigned repeatedWindowFactor(const std::vector<Instr> &Instrs) {
+  constexpr size_t MinWindow = 4;
+  constexpr size_t MinCovered = 8;
+  constexpr size_t MaxWindow = 64;
+  constexpr unsigned MaxFactor = 64;
+  size_t N = Instrs.size();
+  if (N < MinCovered)
+    return 0;
+  std::vector<int64_t> Op(N, -1);
+  for (size_t I = 0; I < N; ++I)
+    if (Instrs[I].Flow == FlowKind::None)
+      Op[I] = (int64_t)Instrs[I].Inst.getOpcode();
+  unsigned Best = 0;
+  for (size_t M = MinWindow, End = std::min(N / 2, MaxWindow); M <= End; ++M) {
+    for (size_t S = 0; S + 2 * M <= N; ++S) {
+      bool Straight = true;
+      for (size_t K = 0; K < M; ++K)
+        if (Op[S + K] < 0) {
+          Straight = false;
+          break;
+        }
+      if (!Straight)
+        continue;
+      unsigned K = 1;
+      while (K < MaxFactor && S + (size_t)(K + 1) * M <= N) {
+        bool Same = true;
+        for (size_t J = 0; J < M; ++J)
+          if (Op[S + (size_t)K * M + J] != Op[S + J]) {
+            Same = false;
+            break;
+          }
+        if (!Same)
+          break;
+        ++K;
+      }
+      if (K >= 2 && (size_t)K * M >= MinCovered && K > Best)
+        Best = K;
+    }
+  }
+  return Best;
+}
+
 static void attachVa(llvm::Instruction *I, uint64_t VA) {
   if (I)
     ir::setInstructionVA(*I, VA);
@@ -376,6 +425,34 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
         Strings.push_back(llvm::MDString::get(M.getContext(), String));
       Fn->setMetadata("rev.strings", llvm::MDNode::get(M.getContext(), Strings));
     }
+    // Unroll evidence: repeated straight-line asm windows sharing this
+    // function's single Location record. Gated on crash metadata so
+    // --meta=none (empty Embedded) emits nothing. Confirmation only.
+    if (!Meta.SourceFile.empty() || !Meta.PanicMessages.empty()) {
+      if (unsigned D = repeatedWindowFactor(Instrs))
+        Fn->setMetadata("rev.unroll",
+                        llvm::MDNode::get(M.getContext(),
+                                          llvm::ConstantAsMetadata::get(
+                                              llvm::ConstantInt::get(
+                                                  llvm::Type::getInt32Ty(
+                                                      M.getContext()),
+                                                  D))));
+    }
+  }
+  // Cold-part boundaries: the function's disjoint code ranges as
+  // (start, end) VA pairs. Plain address facts, attached regardless of
+  // meta mode.
+  if (F.Chunks.size() > 1) {
+    std::vector<llvm::Metadata *> Ranges;
+    for (const auto &[Lo, Hi] : F.Chunks) {
+      llvm::Metadata *Ends[] = {
+          llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt64Ty(M.getContext()), Lo.Value)),
+          llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt64Ty(M.getContext()), Hi.Value))};
+      Ranges.push_back(llvm::MDNode::get(M.getContext(), Ends));
+    }
+    Fn->setMetadata("rev.chunks", llvm::MDNode::get(M.getContext(), Ranges));
   }
   if (!P.EmbeddedTypes.empty()) {
     llvm::NamedMDNode *Types = M.getOrInsertNamedMetadata("rev.types");
