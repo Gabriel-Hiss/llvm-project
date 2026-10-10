@@ -18,8 +18,8 @@
 #include "LoopDevec.h"
 #include "PairSplit.h"
 #include "StraightDevec.h"
-
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 
 using namespace llvm;
 
@@ -27,6 +27,9 @@ namespace revenant {
 
 PreservedAnalyses DevectorizePass::run(Function &F, FunctionAnalysisManager &) {
   if (F.isDeclaration() || F.hasOptNone())
+    return PreservedAnalyses::all();
+  // Lane splitting reads low bytes at low offsets: only sound little-endian.
+  if (!F.getParent()->getDataLayout().isLittleEndian())
     return PreservedAnalyses::all();
   // Phase 1: lane-0 scalarization exposes scalar low-lane accumulators.
   unsigned Changed = lane0::propagate(F);
