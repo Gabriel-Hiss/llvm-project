@@ -224,17 +224,29 @@ TEST(StringsTest, MergedConstantStopsAtTemplateBytes) {
   EXPECT_EQ(*S, "assertion failed: src.len() == dst.len()");
 }
 
-// The UTF-16 reader still owns real wide text. Its units are printable bytes
-// from an ASCII reading, but it decodes as many characters as that reading
-// does, so a tie keeps the wide branch.
-TEST(StringsTest, WideNonAsciiAccepted) {
+// A run whose first four bytes are printable is narrow text even when the
+// rest of it would read as UTF-16: interleaving text bytes into units returns
+// mojibake, so the narrow reader keeps the bytes. Latin wide text still
+// reaches the UTF-16 reader, because its first unit is NUL.
+TEST(StringsTest, TextBeatsWideBranch) {
   Image Img = testImage();
   Va At(0x140002010ULL);
   // U+4F60, U+597D, U+4E16, U+754C in UTF-16LE.
   poke(Img, At, {0x60, 0x4F, 0x7D, 0x59, 0x16, 0x4E, 0x4C, 0x75, 0, 0});
   auto S = stringAt(Img, At);
   ASSERT_TRUE(S.has_value());
-  EXPECT_EQ(*S, "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C");
+  EXPECT_EQ(*S, "`O}Y");
+}
+
+// A wide run whose first unit is NUL is not text at all, so the UTF-16
+// reader owns it.
+TEST(StringsTest, WideNulTerminatedAccepted) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  poke(Img, At, wide("WideText"));
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S, "WideText");
 }
 
 } // end anonymous namespace

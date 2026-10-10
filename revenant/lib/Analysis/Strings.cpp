@@ -34,10 +34,9 @@ constexpr size_t MinLen = 4;
 // A referenced run may hold UTF-8 text: rustc concatenates string fragments
 // into one constant, so a merged panic message mixes plain ASCII with
 // multi-byte characters. The walk below describes the longest textual prefix
-// of the run, counting its bytes and characters.
+// of the run.
 struct TextRun {
   size_t Bytes = 0;
-  size_t Chars = 0;
   bool Complete = false;
 };
 
@@ -56,7 +55,6 @@ TextRun textualUTF8Prefix(llvm::StringRef Run) {
         (Cp < 0x20 || (Cp >= 0x7f && Cp <= 0x9f)))
       return Out;
     Out.Bytes = static_cast<size_t>(Cursor - Start);
-    ++Out.Chars;
   }
   Out.Complete = true;
   return Out;
@@ -71,10 +69,10 @@ std::optional<std::string> stringAt(const Image &Img, Va Addr) {
 
   // ASCII, including UTF-8 text. A merged constant mixes plain ASCII with
   // multi-byte characters and is followed by `Arguments` template bytes
-  // instead of more text, so the longest textual prefix is the string. Reads
-  // that start with non-textual bytes fall through to the UTF-16 reader.
-  std::optional<std::string> Narrow;
-  size_t NarrowChars = 0;
+  // instead of more text, so the longest textual prefix is the string. The
+  // narrow reader owns any run that starts with text: reading text as UTF-16
+  // interleaves its bytes and returns mojibake. Runs the narrow reader cannot
+  // read fall through to the UTF-16 reader below.
   if (auto Bytes = Img.readAtMost(Addr, AsciiCap)) {
     size_t End = 0;
     while (End < Bytes->size() && (*Bytes)[End] != 0)
@@ -84,10 +82,8 @@ std::optional<std::string> stringAt(const Image &Img, Va Addr) {
           llvm::StringRef((const char *)Bytes->data(), End));
       if (Run.Complete)
         return std::string((const char *)Bytes->data(), End);
-      if (Run.Bytes >= MinLen) {
-        Narrow = std::string((const char *)Bytes->data(), Run.Bytes);
-        NarrowChars = Run.Chars;
-      }
+      if (Run.Bytes >= MinLen)
+        return std::string((const char *)Bytes->data(), Run.Bytes);
     }
   }
 
@@ -122,17 +118,11 @@ std::optional<std::string> stringAt(const Image &Img, Va Addr) {
         }
         ++CharsSeen;
       }
-      if (Clean && CharsSeen >= MinLen) {
-        // A merged constant starts with its narrow text and its template
-        // bytes are not text, so the wide reader owns the bytes only when it
-        // reads at least as many characters as the narrow reader does.
-        if (!Narrow || CharsSeen >= NarrowChars)
-          return Text;
-        return Narrow;
-      }
+      if (Clean && CharsSeen >= MinLen)
+        return Text;
     }
   }
-  return Narrow;
+  return std::nullopt;
 }
 
 std::map<Va, std::string> collectStrings(const Image &Img, const Xrefs &Xr) {
