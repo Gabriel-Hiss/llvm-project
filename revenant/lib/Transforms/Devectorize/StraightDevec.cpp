@@ -411,6 +411,48 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
       unsigned L = 0;
       Type *E = nullptr;
+      // Scalar i128 loads (clang SLP shape) model as 4 x i32 lanes
+      // LE-first, but only when every user is a bitcast to a vector type:
+      // loads feeding i128 stores are whole-object copies owned by the
+      // pair-split phase and stay whole.
+      bool IsI128Load =
+          LI->getType()->isIntegerTy(128) && !LI->isVolatile() &&
+          LI->isSimple() && LI->getPointerAddressSpace() == 0;
+      if (IsI128Load) {
+        for (const Use &U : LI->uses()) {
+          auto *UI = dyn_cast<BitCastInst>(U.getUser());
+          if (!UI || !isa<FixedVectorType>(UI->getDestTy()) ||
+              UI->getParent() != BB) {
+            IsI128Load = false;
+            break;
+          }
+        }
+      }
+      if (IsI128Load) {
+        Type *I32 = Type::getInt32Ty(Ctx);
+        unsigned ElemABI =
+            F.getParent()->getDataLayout().getABITypeAlign(I32).value();
+        SmallVector<Value *, 4> Ls;
+        for (unsigned j = 0; j < 4; ++j) {
+          uint64_t ByteOff = (uint64_t)j * 4;
+          auto *Off = ConstantInt::get(I64, ByteOff);
+          auto *G = GetElementPtrInst::Create(
+              I8, LI->getPointerOperand(), Off, LI->getName() + ".p",
+              LI->getIterator());
+          inheritMeta(LI, G);
+          auto *Ln = new LoadInst(I32, G, LI->getName() + ".l",
+                                  LI->isVolatile(), LI->getIterator());
+          inheritMeta(LI, Ln);
+          Ln->setAlignment(laneAlign(LI->getAlign(), ByteOff, ElemABI));
+          LocalEmitted.push_back(G);
+          LocalEmitted.push_back(Ln);
+          ++Cx.Changed;
+          Ls.push_back(Ln);
+        }
+        Cx.Lanes[LI] = Ls;
+        Cx.Kill.push_back(LI);
+        continue;
+      }
       if (!vecParts(LI->getType(), L, E))
         continue;
       if (LI->isVolatile() || !LI->isSimple())
