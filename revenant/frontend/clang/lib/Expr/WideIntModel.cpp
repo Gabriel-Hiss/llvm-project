@@ -115,7 +115,10 @@ clang::Expr *cStyleCast(ASTContext &A, QualType T, CastKind K, Expr *Op) {
 }
 
 clang::IntegerLiteral *intLiteral(ASTContext &A, uint64_t V, QualType T) {
-  return clang::IntegerLiteral::Create(A, llvm::APInt(64, V), T,
+  // The APInt width must match the type width exactly (Expr.cpp:968);
+  // callers pass u64 fields and 32-bit counts through this helper.
+  const unsigned W = (unsigned)A.getIntWidth(T);
+  return clang::IntegerLiteral::Create(A, llvm::APInt(W, V), T,
                                        SourceLocation());
 }
 
@@ -176,8 +179,10 @@ clang::Expr *wrapperCall(ASTContext &A, clang::FunctionDecl *FD, Expr *A0,
 }
 
 /// Build (once) the prototype for a wrapper named `Name` on record `Rec`.
+/// Shift wrappers take a narrow `unsigned` count, matching the preamble.
 clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
-                                  bool Binary, bool Predicate) {
+                                  bool Binary, bool Predicate,
+                                  bool ShiftCount = false) {
   QualType Param = Rec;
   llvm::SmallVector<QualType, 2> Params;
   if (Predicate) {
@@ -186,10 +191,10 @@ clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
   } else {
     Params.push_back(Param);
     if (Binary)
-      Params.push_back(Param);
+      Params.push_back(ShiftCount ? A.UnsignedIntTy : Param);
   }
-  QualType Ret = Predicate ? A.IntTy : Rec;
   clang::FunctionProtoType::ExtProtoInfo EPI;
+  QualType Ret = Predicate ? A.IntTy : Rec;
   clang::QualType FT = A.getFunctionType(Ret, Params, EPI);
   clang::IdentifierInfo &II = A.Idents.get(Name);
   clang::TranslationUnitDecl *TU = A.getTranslationUnitDecl();
@@ -264,10 +269,14 @@ clang::Expr *wideIntConvert(ASTContext &A, clang::QualType Dst, Expr *Op,
                                A, Op, false, halfField(A, Src, 1), Src,
                                clang::VK_LValue, clang::OK_Ordinary));
 
-  // wide -> narrow: the low half carries the truncated value.
+  // wide -> narrow: the low half carries the truncated value. Cast the
+  // u64 field to the destination width so the literal bit width matches
+  // the cast type (Expr.cpp:968 asserts exact width match).
   if (SrcWide) {
     Expr *Lo = lowHalf(A, Src, Op);
-    return cStyleCast(A, Dst, K, Lo);
+    if (Lo->getType() != Dst)
+      Lo = cStyleCast(A, Dst, K, Lo);
+    return Lo;
   }
 
   // narrow -> wide: the operand is the low half and the high half is the
@@ -379,12 +388,22 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
       LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
     else if (!isWideIntRecord(RHS->getType()))
       RHS = wideIntConvert(A, ResTy, RHS, clang::CK_IntegralCast);
+  } else {
+    // Shift counts in the IR have the operand's width, so they arrive as a
+    // wide record (often a (record){n, 0} literal). The helper wants
+    // `unsigned`; the low half carries the count, and the helpers return
+    // zero when n >= 128, which covers any high-half contribution.
+    if (isWideIntRecord(RHS->getType()))
+      RHS = wideIntConvert(A, A.UnsignedIntTy, RHS, clang::CK_IntegralCast);
+    if (!isWideIntRecord(LHS->getType()))
+      LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
   }
   llvm::SmallString<64> Name(recordName(WideIntBits, Signed));
   Name += "_";
   Name += Suffix;
   clang::FunctionDecl *FD =
-      wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false);
+      wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
+                   /*ShiftCount=*/IsShift);
   return wrapperCall(A, FD, LHS, RHS);
 }
 
