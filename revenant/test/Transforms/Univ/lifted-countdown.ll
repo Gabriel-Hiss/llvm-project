@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUniv.dll -passes=revenant-univ,verify -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
 
 ; Shape from lifted c-o2 `copy_bytes` (VA 0x140001320): two `ptr` PHIs stepped
 ; by 1-element byte GEPs, an i64 counter mirror that only feeds itself and the

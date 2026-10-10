@@ -1,3 +1,5 @@
+; RUN: %revenant-opt -passes=revenant-univ,verify -S %s | %FileCheck %s
+
 ; Fixture: the shape c-o2 `dot4` (VA 0x140001420) has AFTER revenant-reroll
 ; folds its 2x-unrolled body: one element per iteration, the i64 index
 ; stepping 1, the accumulators merged, and the countdown trip counter that
