@@ -172,10 +172,15 @@ static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
       unsigned Bits = std::max(1u, Sig->Ret->Bits);
       if (Sig->Ret->Float) {
         Ret = LS.regRead(llvm::X86::XMM0);
-        llvm::Type *Ty = Bits == 32
+        // xmm slots are i128: truncate to the scalar width first (a
+        // direct i128->double bitcast is an invalid cast); widths
+        // above 64 still return one double in the low lane.
+        unsigned ValBits = Bits == 32 ? 32 : 64;
+        llvm::Type *Ty = ValBits == 32
                              ? llvm::Type::getFloatTy(LS.Mod.getContext())
                              : llvm::Type::getDoubleTy(LS.Mod.getContext());
-        Ret = LS.B.CreateBitCast(LS.extTo(Ret, Bits), Ty);
+        Ret = LS.B.CreateBitCast(LS.B.CreateTrunc(Ret, LS.iN(ValBits)),
+                                 Ty, "retf");
       } else {
         Ret = LS.regRead(llvm::X86::RAX);
         Ret = LS.extTo(Ret, Bits);

@@ -84,6 +84,62 @@ TEST(SignaturesTest, InfersRegisterParameterAndObservedReturn) {
   EXPECT_EQ(Sig->Ret.Bits, 32u);
 }
 
+TEST(SignaturesTest, WrapperReturningCallResultKeepsReturn) {
+  // Wrapper: call target; ret. The only caller ignores the result, but
+  // the wrapper returns exactly what the call left in eax and the target
+  // computes a full 32-bit value on every path to ret (cpp-clang-o2
+  // `sum_vec`: caller ignores eax, target must-defines it). Both must
+  // keep the return; dropping it is wrong code for differential calls.
+  constexpr uint64_t Base = 0x140020000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x30;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // target @+0x00: mov eax,ecx; ret
+  Text.Data[0x00] = 0x8B;
+  Text.Data[0x01] = 0xC1;
+  Text.Data[0x02] = 0xC3;
+  // wrapper @+0x10: call target; ret
+  Text.Data[0x10] = 0xE8;
+  Text.Data[0x11] = 0xEB;
+  Text.Data[0x12] = 0xFF;
+  Text.Data[0x13] = 0xFF;
+  Text.Data[0x14] = 0xFF;
+  Text.Data[0x15] = 0xC3;
+  // caller @+0x20: call wrapper; xor edx,edx; ret (ignores eax)
+  Text.Data[0x20] = 0xE8;
+  Text.Data[0x21] = 0xEB;
+  Text.Data[0x22] = 0xFF;
+  Text.Data[0x23] = 0xFF;
+  Text.Data[0x24] = 0xFF;
+  Text.Data[0x25] = 0x31;
+  Text.Data[0x26] = 0xD2;
+  Text.Data[0x27] = 0xC3;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va TargetVa(Base), WrapVa(Base + 0x10), CallerVa(Base + 0x20);
+  P.Functions.emplace(TargetVa, record(TargetVa, 0, 3, {0, 2}));
+  P.Functions.emplace(WrapVa, record(WrapVa, 0x10, 6, {0x10, 0x15}));
+  P.Functions.emplace(CallerVa,
+                      record(CallerVa, 0x20, 8, {0x20, 0x25, 0x27}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *WrapSig = S.of(WrapVa);
+  ASSERT_NE(WrapSig, nullptr);
+  EXPECT_TRUE(WrapSig->HasRet) << "wrapper lost its return";
+  EXPECT_EQ(WrapSig->Ret.Bits, 32u);
+  const Signature *TargetSig = S.of(TargetVa);
+  ASSERT_NE(TargetSig, nullptr);
+  EXPECT_TRUE(TargetSig->HasRet) << "call target lost its return";
+}
+
 TEST(SignaturesTest, RecognizesVarArgsHomeSpillsWithoutInventingParameters) {
   constexpr uint64_t Base = 0x140003000;
   Program P;
@@ -226,6 +282,143 @@ TEST(SignaturesTest, TailJumpThunkInheritsTargetParameters) {
   EXPECT_EQ(Sig->Params[0].Loc.Tag, ParamLoc::Kind::Reg);
   EXPECT_EQ(Sig->Params[0].Bits, 32u);
 }
+TEST(SignaturesTest, ReturnObservedPastLaterCall) {
+  // Caller: call callee; call other; cvttsd2si r10d, xmm0; ret.
+  // The xmm0 read sits after another call in the same block (gcc -O2
+  // `main` calling `sum_vec_d`, then `cmp_vec`, then converting the
+  // double). The old scan stopped at the next call and dropped the
+  // callee's double return.
+  constexpr uint64_t Base = 0x140010000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x40;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // callee @+0x00: pxor xmm0,xmm0; addsd xmm0,[rcx]; ret
+  const uint8_t Callee[] = {0x66, 0x0F, 0xEF, 0xC0, 0xF2, 0x0F,
+                            0x58, 0x01, 0xC3};
+  std::copy(std::begin(Callee), std::end(Callee), Text.Data.begin());
+  // other @+0x10: xor eax,eax; ret
+  Text.Data[0x10] = 0x31;
+  Text.Data[0x11] = 0xC0;
+  Text.Data[0x12] = 0xC3;
+  // caller @+0x20: call callee; call other; cvttsd2si r10d,xmm0; ret
+  const uint8_t Caller[] = {
+      0xE8, 0xDB, 0xFF, 0xFF, 0xFF, // call callee (rel to +0x00)
+      0xE8, 0xE6, 0xFF, 0xFF, 0xFF, // call other (rel to +0x10)
+      0xF2, 0x44, 0x0F, 0x2C, 0xD0, // cvttsd2si r10d, xmm0
+      0xC3,                         // ret
+  };
+  std::copy(std::begin(Caller), std::end(Caller),
+            Text.Data.begin() + 0x20);
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va CalleeVa(Base), OtherVa(Base + 0x10), CallerVa(Base + 0x20);
+  P.Functions.emplace(CalleeVa, record(CalleeVa, 0, 9, {0, 4, 8}));
+  P.Functions.emplace(OtherVa, record(OtherVa, 0x10, 3, {0x10, 0x12}));
+  P.Functions.emplace(CallerVa,
+                      record(CallerVa, 0x20, 0x10, {0x20, 0x25, 0x2A, 0x2F}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(CalleeVa);
+  ASSERT_NE(Sig, nullptr);
+  EXPECT_TRUE(Sig->HasRet);
+  EXPECT_TRUE(Sig->Ret.Float);
+  // Double: the lifter maps any non-32-bit float width to double.
+  EXPECT_NE(Sig->Ret.Bits, 32u);
+}
+
+TEST(SignaturesTest, TailJumpThunkForwardsReturn) {
+  // Wrapper: mov r8d,r8d; jmp target. Target returns eax and is read
+  // by a caller (zlib `crc32_z` wrapper `sub_1400016F0` tail-jumping
+  // to the real body). The wrapper must forward the target's return.
+  constexpr uint64_t Base = 0x140011000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x30;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // wrapper @+0x00: mov r8d,r8d (45 89 c0); jmp target @+0x10
+  const uint8_t Wrap[] = {0x45, 0x89, 0xC0, 0xE9, 0x08,
+                          0x00, 0x00, 0x00};
+  std::copy(std::begin(Wrap), std::end(Wrap), Text.Data.begin());
+  // target @+0x10: mov eax,ecx; ret
+  Text.Data[0x10] = 0x8B;
+  Text.Data[0x11] = 0xC1;
+  Text.Data[0x12] = 0xC3;
+  // caller @+0x20: call wrapper; test eax,eax; ret
+  const uint8_t Caller[] = {
+      0xE8, 0xDB, 0xFF, 0xFF, 0xFF, // call wrapper (rel to +0x00)
+      0x85, 0xC0,                   // test eax,eax
+      0xC3,                         // ret
+  };
+  std::copy(std::begin(Caller), std::end(Caller),
+            Text.Data.begin() + 0x20);
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va WrapVa(Base), TargetVa(Base + 0x10), CallerVa(Base + 0x20);
+  P.Functions.emplace(WrapVa, record(WrapVa, 0, 8, {0, 3}));
+  P.Functions.emplace(TargetVa, record(TargetVa, 0x10, 3, {0x10, 0x12}));
+  P.Functions.emplace(CallerVa,
+                      record(CallerVa, 0x20, 8, {0x20, 0x25, 0x27}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *WrapSig = S.of(WrapVa);
+  ASSERT_NE(WrapSig, nullptr);
+  EXPECT_TRUE(WrapSig->HasRet);
+  EXPECT_EQ(WrapSig->Ret.Bits, 32u);
+}
+
+TEST(SignaturesTest, ExportWithoutCallerStillReturns) {
+  constexpr uint64_t Base = 0x140012000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x20;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  Text.Data[0x00] = 0x8B;
+  Text.Data[0x01] = 0xC1;
+  Text.Data[0x02] = 0xE8;
+  Text.Data[0x03] = 0x09;
+  Text.Data[0x04] = 0x00;
+  Text.Data[0x05] = 0x00;
+  Text.Data[0x06] = 0x00;
+  Text.Data[0x07] = 0xC3;
+  Text.Data[0x10] = 0x8B;
+  Text.Data[0x11] = 0xC1;
+  Text.Data[0x12] = 0xC3;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va BodyVa(Base), AllocVa(Base + 0x10);
+  P.Functions.emplace(BodyVa, record(BodyVa, 0, 8, {0, 2, 7}));
+  P.Functions.emplace(AllocVa, record(AllocVa, 0x10, 3, {0x10, 0x12}));
+  P.Exports.insert(BodyVa);
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(BodyVa);
+  ASSERT_NE(Sig, nullptr);
+  EXPECT_TRUE(Sig->HasRet);
+  EXPECT_EQ(Sig->Ret.Bits, 64u);
+}
+
 
 TEST(SignaturesTest, LibraryMatchIgnoresTrailingArchiveAlignmentPadding) {
   constexpr uint64_t Base = 0x140009000;

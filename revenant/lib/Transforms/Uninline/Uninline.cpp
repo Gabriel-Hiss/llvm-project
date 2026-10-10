@@ -64,6 +64,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if __has_include("revenant/Evidence/Evidence.h")
+#include "revenant/Evidence/Evidence.h"
+#define REVENANT_HAS_EVIDENCE 1
+#endif
 #include "revenant/Transforms/Uninline/Uninline.h"
 #include "revenant/Evidence/Evidence.h"
 #include "llvm/ADT/DenseMap.h"
@@ -167,8 +171,8 @@ struct CalleeBody {
   SmallVector<const Instruction *, 16> Insts;
   const Value *RetVal = nullptr; // null for `ret void`
   bool Valid = false;
-  // Tiny exact-match body held only by lift-recorded evidence: the caller
-  // must confirm regionMatchesEvidence before any rewrite.
+  // Tiny exact-match body held only by lift-recorded evidence: a rewrite
+  // additionally requires regionMatchesEvidence on the candidate region.
   bool EvidenceOnly = false;
 };
 
@@ -211,6 +215,12 @@ CalleeBody analyzeCallee(Function &F) {
   }
   if (B.Insts.size() > MaxCalleeInsts || B.Insts.empty())
     return B;
+  // The returned value drives the escape binding in matchWindow. Without
+  // it every match takes the `ret void` path and outlines the region's
+  // last instruction whatever its type, building an ill-typed call on
+  // real modules (CallInst::Create / replaceUses asserts). Null here
+  // means `ret void`, which matchWindow handles explicitly.
+  B.RetVal = Ret->getReturnValue();
   // Minimum evidence: a one- or two-instruction body (a lone load, a
   // gep+load pair) matches coincidental code far more often than true
   // inline remnants (measured: a 2-instruction getter body matched 7
@@ -223,12 +233,19 @@ CalleeBody analyzeCallee(Function &F) {
     if (isa<CallBase>(I))
       HasCall = true;
   if (B.Insts.size() < 3 && !HasCall) {
-    // Tiny bodies stay eligible only with lift-recorded evidence; the
-    // caller confirms regionMatchesEvidence per candidate region.
-    // --meta=none keeps the reject: empty evidence never confirms.
+    // Tiny bodies stay eligible only with lift-recorded evidence; each
+    // candidate region must then confirm regionMatchesEvidence.
+    // Evidence-empty modules keep the reject, so --meta=none behavior is
+    // unchanged. (revenant.lib survives none mode, so Library evidence
+    // can still confirm there; the structural match stays exact, so the
+    // output stays correct.)
+#ifdef REVENANT_HAS_EVIDENCE
     if (revenant::evidence::uninlineEvidence(F).empty())
       return B;
     B.EvidenceOnly = true;
+#else
+    return B;
+#endif
   }
   // Wrapper disambiguation: a body that only forwards its arguments to
   // one inner call (`mz_free(p)` = `free(p)`) is indistinguishable from
@@ -290,7 +307,13 @@ public:
   bool matchOperand(const Value *C, const Value *R) {
     if (C == R)
       return true;
-    // Constants are uniqued: pointer equality is value equality.
+    // The rewrite rebuilds a call with the bound values as arguments and
+    // has no conversion logic: differently-typed bindings would build an
+    // ill-typed call (caught here, not at CallInst::Create). Constants
+    // are uniqued, so pointer equality above already implies type
+    // equality for them.
+    if (C->getType() != R->getType())
+      return false;
     if (isa<Constant>(C))
       return false;
     if (const Argument *A = dyn_cast<Argument>(C)) {
@@ -521,15 +544,14 @@ bool matchWindow(const CalleeBody &CB,
   // Bind the return value.
   if (!CB.RetVal) {
     Escape = nullptr; // `ret void`: set below to the region end marker
-  } else if (const auto *RC = dyn_cast<Constant>(CB.RetVal)) {
-    // Callee returns a constant: the region's last value must be that
-    // constant. Only accept when the last region instruction produces it
-    // (a trailing materialization), else there is no escaping def.
-    Instruction *Last = Body[Start + N - 1];
-    if (!matchInst(CB.Insts.back(), Last, M))
-      return false;
-    (void)RC;
-    Escape = Last;
+  } else if (isa<Constant>(CB.RetVal)) {
+    // Callee returns a constant: its body computations are dead, so any
+    // same-shaped caller region computing a live value is not the same
+    // computation. Replacing outside uses of the region end with the
+    // call's constant result would change behavior (and ill-typed
+    // regions assert in replaceUsesWithIf). Reject: nothing sound to
+    // outline.
+    return false;
   } else if (const Argument *A = dyn_cast<Argument>(CB.RetVal)) {
     auto Args = M.args();
     auto It = Args.find(A);
@@ -576,11 +598,14 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
       }
     }
   }
-  // Evidence for EvidenceOnly callees is a pure function read: compute
-  // once per callee, not per candidate region.
-  const revenant::evidence::InlineEvidence Ev =
-      CB.EvidenceOnly ? revenant::evidence::uninlineEvidence(*Callee)
-                      : revenant::evidence::InlineEvidence{};
+  // Evidence is read once per callee, not per region: it is function-level
+  // metadata and cannot change during this caller's rewrite. Without the
+  // evidence header no callee is EvidenceOnly, so this stays empty.
+#ifdef REVENANT_HAS_EVIDENCE
+  revenant::evidence::InlineEvidence Ev;
+  if (CB.EvidenceOnly)
+    Ev = revenant::evidence::uninlineEvidence(*Callee);
+#endif
   bool Changed = false;
   // Snapshot blocks: the rewrite erases instructions but never adds or
   // removes blocks, so iterating blocks directly is safe.
@@ -608,27 +633,45 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
         SmallVector<Instruction *, 16> RegionInsts;
         for (unsigned i = 0; i != CB.Insts.size(); ++i)
           RegionInsts.push_back(Body[S + i]);
-        // Evidence-only bodies rewrite solely when the region or the
-        // escape's users reference the same distinctive strings or
-        // library body as the callee: the string use of an inlined
-        // value naturally sits outside the spliced body.
-        if (CB.EvidenceOnly) {
-          SmallVector<Instruction *, 16> EvRegion(RegionInsts.begin(),
-                                                  RegionInsts.end());
-          // matchWindow leaves Escape null when RetVal is unset; mirror
-          // the fallback below so escape users still join the check.
-          Value *EvEscape = Escape ? Escape : RegionInsts.back();
-          for (User *U : EvEscape->users())
-            if (auto *UI = dyn_cast<Instruction>(U))
-              if (UI->getParent() == &BB)
-                EvRegion.push_back(UI);
-          if (!revenant::evidence::regionMatchesEvidence(Ev, EvRegion))
-            continue;
-        }
+        // Evidence-only bodies rewrite solely when the region references
+        // the same distinctive strings or library body as the callee.
+        // The structural match above already passed fully; evidence only
+        // confirms tiny exact matches (the assert-string family).
+#ifdef REVENANT_HAS_EVIDENCE
+        if (CB.EvidenceOnly &&
+            !revenant::evidence::regionMatchesEvidence(Ev, RegionInsts))
+          continue;
+#endif
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
-          // region end.
+          // region end. Unlike a real escape, nothing replaces the uses
+          // of the region end, so it must already be dead outside the
+          // region (a live-out value has no call result to take its
+          // place; erasing it would dangle its users and change
+          // behavior). Debug uses are fine.
           Escape = RegionInsts.back();
+          bool LiveOut = false;
+          for (User *U : Escape->users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI) {
+              LiveOut = true;
+              break;
+            }
+            if (isa<DbgInfoIntrinsic>(UI))
+              continue;
+            bool Inside = false;
+            for (Instruction *RI : RegionInsts)
+              if (UI == RI) {
+                Inside = true;
+                break;
+              }
+            if (!Inside) {
+              LiveOut = true;
+              break;
+            }
+          }
+          if (LiveOut)
+            continue;
         }
         if (!regionEscapesCleanly(RegionInsts, Escape, Caller))
           continue;

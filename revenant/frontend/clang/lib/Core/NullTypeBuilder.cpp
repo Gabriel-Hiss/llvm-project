@@ -40,7 +40,7 @@ static c::QualType intType(c::ASTContext &AST, unsigned Bits, bool Signed) {
     return AST.getConstantArrayType(
         AST.UnsignedCharTy, APInt(64, (Bits + 7) / 8), nullptr,
         c::ArraySizeModifier::Normal, 0);
-  if (Signed)
+  if (Signed && (T->isSignedIntegerType() || T->isUnsignedIntegerType()))
     T = AST.getCorrespondingSignedType(T);
   return T;
 }

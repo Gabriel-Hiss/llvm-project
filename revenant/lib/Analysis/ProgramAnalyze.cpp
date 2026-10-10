@@ -119,8 +119,11 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
     (*P.Externs)[I.IatVa] = {I.IatVa, Name, isNoreturnImport(Name)};
     (*P.Names)[I.IatVa] = Name;
   }
-  for (const Export &E : Pe.Exports)
+  for (const Export &E : Pe.Exports) {
     (*P.Names)[E.ExportVa] = E.Name;
+    if (!E.Forwarder && P.Img && P.Img->isExecutable(E.ExportVa))
+      P.Exports.insert(E.ExportVa);
+  }
   (*P.Names)[Pe.EntryPoint] = "entry";
 
   auto ExpectedDis = Disasm::create(*P.Img);
