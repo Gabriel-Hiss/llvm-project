@@ -20,6 +20,10 @@ RELEASE_SUFFIXES = (
     "-o1", "-o2", "-o3", "-ox", "-os", "-oz", "-o2lto", "-o2gl",
     "-o2avx2", "-o2hsw",
 )
+TYPE = re.compile(r"\b(?:void|ptr|i[0-9]+|half|float|double|label|metadata|token)\b")
+BLOCK_COMMENT = re.compile(r"; preds =.*$", re.MULTILINE)
+BLOCK_LABEL = re.compile(r"(?m)^([ \t]*)bb_[^:\n]*:")
+
 
 
 def release_targets(root: Path) -> list[str]:
@@ -39,10 +43,15 @@ METADATA_DEF = re.compile(r"^![A-Za-z0-9_.-]+ *=.*$", re.MULTILINE)
 
 
 def normalize(ir: str) -> str:
-    # Debug and named metadata are presentation-only. Keep instructions,
-    # constants, terminators, and their order intact.
+    # Debug and named metadata are presentation-only, and so are block
+    # labels (`bb_<va>`, `bb_<va>.<va>_crit_edge`, LLVM's numeric
+    # suffixes on duplicate labels). Keep instructions, constants,
+    # terminators, and their order intact.
     ir = METADATA_DEF.sub("", ir)
     ir = METADATA.sub("", ir)
+    ir = TYPE.sub("TY", ir)
+    ir = BLOCK_COMMENT.sub("", ir)
+    ir = BLOCK_LABEL.sub(r"\1BB:", ir)
     ir = DEBUG_RECORD.sub("", ir)
     globals = {}
     types = {}
@@ -94,6 +103,17 @@ def run_mode(exe: Path, binary: Path, mode: str, targets: list[str],
         return None
     return normalize(Path(str(base) + ".ir-final.ll").read_text(encoding="utf-8"))
 
+def run_whole(exe: Path, binary: Path, mode: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [str(exe), str(binary), "--meta=" + mode,
+             "--emit=ir-final", "--no-artifacts"],
+            check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return normalize(result.stdout)
+
 
 def selected_functions(exe: Path, binary: Path, sample: int, seed: int) -> list[str]:
     output = subprocess.run(
@@ -136,6 +156,7 @@ def main() -> int:
     parser.add_argument("--all-release", action="store_true")
     parser.add_argument("--sample", type=int, default=300)
     parser.add_argument("--seed", type=int, default=211009)
+    parser.add_argument("--whole", action="store_true")
     args = parser.parse_args()
     args.exe = args.exe.resolve()
     args.corpus = args.corpus.resolve()
@@ -173,6 +194,18 @@ def main() -> int:
                     print("c-o2: FAIL --meta=pdb did not report not implemented yet",
                           file=sys.stderr)
                     failures.append(name)
+            if args.whole:
+                none = run_whole(driver, binary, "none")
+                embedded = run_whole(driver, binary, "embedded")
+                if none is not None and embedded is not None and none == embedded:
+                    print(f"{name}: PASS whole-binary invariant")
+                else:
+                    print(f"{name}: FAIL whole-binary invariant "
+                          f"(none_failed={none is None}, "
+                          f"embedded_failed={embedded is None}, "
+                          f"diff={none is not None and embedded is not None})")
+                    failures.append(name)
+                continue
             functions = selected_functions(driver, binary, args.sample, args.seed)
             output = scratch / name
             output.mkdir()

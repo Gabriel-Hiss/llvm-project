@@ -67,6 +67,8 @@ per line.
 `-o <base>` writes `<base>.asm.txt`, `<base>.ir-raw.ll`, `<base>.ir-clean.ll`,
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
 (only the stages that ran). `--time` prints the elapsed time of each stage.
+`--no-artifacts` prints the requested stage on stdout without writing any
+artifact file.
 
 `--list --classify` uses `Session::classifyFunctions`. It traces the user
 entry and reachability from the PE entry even without a library database;
@@ -88,15 +90,20 @@ line holds a few hundred `--func` arguments, so chunk large sets or use
 `--func-file`.
 
 `test/meta-mode/invariant.py` samples 300 functions per release binary with
-seed 211009, normalizes identifiers and type names, then compares final IR
-for `none` and `embedded`. A function that crashes in both modes is counted
-separately and excluded; a one-mode crash or differing IR fails the check.
+seed 211009, normalizes identifiers, type names and block labels, then
+compares final IR for `none` and `embedded`. Names and types may differ
+between the modes; control flow, statements and call argument counts may
+not. A function that crashes in both modes is counted separately and
+excluded; a one-mode crash or differing IR fails the check.
+For a full-binary run without retaining intermediate `.ll` dumps, add
+`--whole`; this also passes `--no-artifacts` to the driver.
 `test/meta-mode/recovery-report.py` compares sampled real names with oracle
 PDB or map symbols. Both scripts accept `--all-release`.
 
 ```text
 python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity> --all-release --sample 300 --seed 211009
 python test/meta-mode/recovery-report.py --exe <revenant-decompile.exe> --corpus <target/parity> --pdbutil <llvm-pdbutil.exe> --all-release --sample 300 --seed 211009
+python test/meta-mode/invariant.py --exe <revenant-decompile.exe> --corpus <target/parity> --targets c-o2 cpp-o2 rust-o2 cpp-gcc-o2 --whole
 ```
 
 ## Rust path
