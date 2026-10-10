@@ -2349,6 +2349,10 @@ PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
   for (BasicBlock *B : Blocks)
     if (tryRerollFull(F, *B, Notes))
       Changed = true;
+  // Chained-region full unrolls (Rust vec_ops family) run after the
+  // straight-line lanes: multi-block CFG shape, disjoint matcher.
+  if (tryRerollRegions(F, Notes))
+    Changed = true;
   SmallVector<BasicBlock *, 16> SynthBlocks;
   for (BasicBlock &B : F)
     SynthBlocks.push_back(&B);

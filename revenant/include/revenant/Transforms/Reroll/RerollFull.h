@@ -28,13 +28,20 @@
 // source statement's copies at consecutive addresses); this is evidence
 // only, never semantics: `--meta=none` output is identical.
 //
+// `revenant::tryRerollRegions`: re-rolls N chained isomorphic
+// single-entry/single-exit diamond regions (guard + optional grow + join
+// with PHIs, e.g. Rust vec_ops' 8 push sequences) into one counted loop
+// reusing region 0's blocks. Guard consts must be affine in the copy
+// index, stored consts must fit a quadratic (solved from the first three
+// copies, verified on all), grow blocks must call one identical callee
+// with identical args.
+//
 // On success the run rewrites to a counted loop around window 0's body
 // with the value operand rewired to `c*i + d` and returns the trip count.
 // Anything ambiguous stays put.
 //
 // Owned by MuseUnrollFullR; StepRerollR owns Reroll.cpp and calls this
 // from `RerollPass::run`.
-//
 //===----------------------------------------------------------------------===//
 
 #ifndef REVENANT_TRANSFORMS_REROLL_REROLLFULL_H
@@ -51,6 +58,12 @@ namespace revenant {
 // Appends the preheader block name to Notes on success.
 unsigned tryRerollFull(llvm::Function &F, llvm::BasicBlock &B,
                        llvm::SmallVectorImpl<llvm::StringRef> &Notes);
+
+// Re-roll N chained isomorphic single-entry/single-exit diamond regions
+// (guard + optional grow + join with PHIs) into one counted loop reusing
+// region 0's blocks. Returns N on success, 0 otherwise.
+unsigned tryRerollRegions(llvm::Function &F,
+                          llvm::SmallVectorImpl<llvm::StringRef> &Notes);
 
 } // namespace revenant
 

@@ -61,6 +61,8 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 
+#include <cstdint>
+#include <vector>
 using namespace llvm;
 
 namespace revenant {
@@ -902,6 +904,650 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
     } // next length
   } // next base
   return 0;
+}
+
+// Chained-region full unroll (Rust vec_ops family): N single-entry /
+// single-exit diamond regions, each guard-keys on a loop-carried length
+// and stores a per-copy constant fitting a quadratic in the copy index.
+// Region j: guard G_j (`cmp len_j, g_j`, br grow_j / join_j), optional
+// grow block (same callee, same args, br join_j), join J_j (buf/len PHIs
+// merging guard/grow paths, `store sq_j` at element index j, latch br to
+// G_{j+1} or the function tail). The rolled loop carries (i, buf, len):
+// the guard becomes `len == g(i)`, the square store becomes sq(i), the
+// grow path stays a conditional side block inside the loop.
+unsigned tryRerollRegions(Function &F, SmallVectorImpl<StringRef> &Notes) {
+  // Linear block walk: follow single-successor joins into next guards.
+  SmallVector<BasicBlock *, 32> Order;
+  for (BasicBlock &B : F)
+    Order.push_back(&B);
+  // Candidate guards: cond-br blocks whose condition is `icmp eq X, C`
+  // with a constant, where one successor is a grow block (single call +
+  // reloads, unconditional br back) and the other is a join with PHIs.
+  struct Region {
+    BasicBlock *Guard = nullptr;
+    BasicBlock *Grow = nullptr; // may equal Join when no grow call
+    BasicBlock *Join = nullptr;
+    int64_t GuardConst = 0;
+    int64_t SquareConst = 0;
+    bool HasSquare = false;
+  };
+  SmallVector<Region, 8> Regions;
+  for (BasicBlock *G : Order) {
+    auto *BI = dyn_cast<BranchInst>(G->getTerminator());
+    if (!BI || !BI->isConditional())
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+    if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_EQ)
+      continue;
+    auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+    if (!C)
+      continue;
+    auto S = signedConst(C);
+    if (!S)
+      continue;
+    // Successors: one must be a grow (call + br join), other the join.
+    BasicBlock *T = BI->getSuccessor(0), *Fl = BI->getSuccessor(1);
+    Region R;
+    R.Guard = G;
+    R.GuardConst = *S;
+    // Try both orientations.
+    for (int O = 0; O < 2; ++O) {
+      BasicBlock *MaybeGrow = O == 0 ? T : Fl;
+      BasicBlock *MaybeJoin = O == 0 ? Fl : T;
+      // Grow: each non-phi, non-terminator insn is a call to the same
+      // callee or a load; ends with unconditional br to MaybeJoin.
+      auto *GBr = dyn_cast<BranchInst>(MaybeGrow->getTerminator());
+      if (!GBr || GBr->isConditional() || GBr->getSuccessor(0) != MaybeJoin)
+        continue;
+      bool GrowOK = true;
+      for (Instruction &I : *MaybeGrow) {
+        if (isa<PHINode>(&I) || I.isTerminator())
+          continue;
+        if (isa<CallInst>(&I) || isa<LoadInst>(&I))
+          continue;
+        GrowOK = false;
+        break;
+      }
+      if (!GrowOK)
+        continue;
+      // Join: opens with PHIs, contains a square store at element index
+      // SOC, ends with a conditional latch br (next guard) or the tail.
+      bool HasPhi = false;
+      for (Instruction &I : *MaybeJoin) {
+        if (isa<PHINode>(&I))
+          HasPhi = true;
+        break;
+      }
+      if (!HasPhi)
+        continue;
+      R.Grow = MaybeGrow;
+      R.Join = MaybeJoin;
+      break;
+    }
+    if (!R.Join)
+      continue;
+    // Square: a store of a constant to a GEP with constant element
+    // index in the join.
+    for (Instruction &I : *R.Join) {
+      auto *S2 = dyn_cast<StoreInst>(&I);
+      if (!S2)
+        continue;
+      auto *VC = dyn_cast<ConstantInt>(S2->getValueOperand());
+      if (!VC)
+        continue;
+      auto *G2 = dyn_cast<GetElementPtrInst>(S2->getPointerOperand());
+      if (!G2 || G2->getNumIndices() != 1)
+        continue;
+      auto *IC = dyn_cast<ConstantInt>(G2->getOperand(1));
+      if (!IC)
+        continue;
+      auto SV = signedConst(VC);
+      auto IV = signedConst(IC);
+      if (!SV || !IV)
+        continue;
+      // One square per region: the element-index store. Distinguish
+      // from the index-slot store (constant base, non-GEP address).
+      R.SquareConst = *SV;
+      R.HasSquare = true;
+      break;
+    }
+    Regions.push_back(R);
+  }
+  // Chain: the join fuses the next guard's latch compare (one block holds
+  // PHIs + square store + next `cmp len, g`), so join_j must branch to
+  // grow_{j+1}/join_{j+1}. The last join may instead fall to the tail
+  // (no guard compare). Guard consts must be affine g(j) = a*j + b;
+  // squares must fit s(j) = a*j^2 + b*j + c solved from the first three,
+  // verified on all. Grow callees must all match with equal args.
+  // Chain check first (positional).
+  for (size_t j = 0; j + 1 < Regions.size(); ++j) {
+    bool Next = false;
+    for (BasicBlock *S : successors(Regions[j].Join))
+      if (S == Regions[j + 1].Grow || S == Regions[j + 1].Join)
+        Next = true;
+    if (!Next)
+      return 0;
+  }
+  // Guard affine: g(j) = G0 + j * (G1 - G0).
+  int64_t GStep = Regions[1].GuardConst - Regions[0].GuardConst;
+  for (size_t j = 0; j < Regions.size(); ++j)
+    if (Regions[j].GuardConst != Regions[0].GuardConst + (int64_t)j * GStep)
+      return 0;
+  // All regions need squares.
+  for (auto &R : Regions)
+    if (!R.HasSquare)
+      return 0;
+  // Quadratic fit from the first three squares, verified on all.
+  // s(j) = A*j^2 + B*j + C; C = s0; A + B = s1 - s0; 4A + 2B = s2 - s0.
+  int64_t s0 = Regions[0].SquareConst, s1 = Regions[1].SquareConst,
+           s2 = Regions[2].SquareConst;
+  int64_t d1 = s1 - s0, d2 = s2 - s0;
+  // 2A = d2 - 2*d1 must be even.
+  if ((d2 - 2 * d1) % 2 != 0)
+    return 0;
+  int64_t A = (d2 - 2 * d1) / 2;
+  int64_t B = d1 - A;
+  for (size_t j = 0; j < Regions.size(); ++j) {
+    int64_t jj = (int64_t)j;
+    if (A * jj * jj + B * jj + s0 != Regions[j].SquareConst)
+      return 0;
+  }
+  // Grow callees: identical direct callees, identical (loop-invariant)
+  // non-call operands. Only when every region has a grow call.
+  const Function *Callee = nullptr;
+  for (auto &R : Regions) {
+    if (R.Grow == R.Join)
+      return 0;
+    const Function *CF = nullptr;
+    for (Instruction &I : *R.Grow) {
+      auto *CB = dyn_cast<CallInst>(&I);
+      if (!CB || CB->isIndirectCall())
+        continue;
+      if (CF)
+        return 0; // two calls per grow: out of scope
+      CF = CB->getCalledFunction();
+    }
+    if (!CF)
+      return 0;
+    if (!Callee)
+      Callee = CF;
+    else if (Callee != CF)
+      return 0;
+  }
+  // Evidence: guard/store VAs monotonic in one shared range (same rule
+  // as lanes: shape proves, VA confirms).
+  uint64_t PrevVA = 0, FirstVA = 0;
+  for (size_t j = 0; j < Regions.size(); ++j) {
+    auto V = vaOf(*Regions[j].Guard->getTerminator());
+    if (!V)
+      return 0;
+    if (j == 0)
+      FirstVA = *V;
+    else if (*V <= PrevVA)
+      return 0;
+    PrevVA = *V;
+    if (PrevVA - FirstVA > 4096)
+      return 0;
+  }
+  // Build: fold the chain into one loop reusing region 0's three blocks
+  // (guard_0/grow_0/join_0) as the loop body.
+  //   - Header H = guard_0: new counter phi i (0..N-1) plus loop-carried
+  //     buf/len PHIs. Each join_0 PHI merges a guard-path value (the
+  //     previous iteration's value, i.e. the loop PHI) and a grow-path
+  //     value. The loop PHIs take [prologue value, join backedge].
+  //   - Guard const g_j -> GStep*i + G0; square const -> A*i^2 + B*i + s0;
+  //     element index -> baseIdx + i. All computed from the counter.
+  //   - Latch at join_0 end: i+1, ult N -> H : Exit. Regions 1.. erased;
+  //     tail uses of region N-1 values rebound to exit PHIs.
+  size_t N = Regions.size();
+  BasicBlock *H = Regions[0].Guard;
+  BasicBlock *Grow0 = Regions[0].Grow;
+  BasicBlock *J0 = Regions[0].Join;
+  LLVMContext &Ctx = F.getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  // Prologue values: join_0's guard-path PHI incomings (from guard_0's
+  // predecessors outside the chain).
+  struct Carry {
+    PHINode *JoinPhi = nullptr;
+    Value *Prologue = nullptr;
+    PHINode *LoopPhi = nullptr;
+  };
+  SmallVector<Carry, 4> Carries;
+  for (PHINode &P : J0->phis()) {
+    // The guard-path incoming arrives from guard_0 (fallthrough) — find
+    // which incoming comes from outside grow_0.
+    Value *Pro = nullptr;
+    for (unsigned k = 0; k < P.getNumIncomingValues(); ++k) {
+      if (P.getIncomingBlock(k) != Grow0) {
+        Pro = P.getIncomingValue(k);
+        break;
+      }
+    }
+    if (!Pro)
+      return 0;
+    Carries.push_back({&P, Pro, nullptr});
+  }
+  if (Carries.empty())
+    return 0;
+  // The tail: successors of the last join outside the chain, or the last
+  // join itself when it has none (it ends in the function tail: opaque
+  // side effects + noreturn, which must be preserved, not erased). In
+  // the latter case the last join is kept as the loop's exit block: its
+  // PHIs rebase to the loop merges and its incoming blocks retarget.
+  BasicBlock *Tail = nullptr;
+  bool KeepLast = false;
+  {
+    BasicBlock *JL = Regions[N - 1].Join;
+    for (BasicBlock *S : successors(JL)) {
+      bool InChain = false;
+      for (auto &R : Regions)
+        if (S == R.Guard || S == R.Grow || S == R.Join)
+          InChain = true;
+      if (!InChain) {
+        if (Tail)
+          return 0; // two tails: out of scope
+        Tail = S;
+      }
+    }
+    if (!Tail) {
+      Tail = JL;
+      KeepLast = true;
+    }
+  }
+  // ---- Validation phase (read-only; no mutation below this point may
+  // bail: every check that can fail runs here, before the split). ----
+  ICmpInst *GuardCmp = nullptr;
+  unsigned GuardOp = 0;
+  bool GuardTrunc = false;
+  {
+    auto *BI = dyn_cast<BranchInst>(H->getTerminator());
+    if (!BI || !BI->isConditional())
+      return 0;
+    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+    if (!Cmp)
+      return 0;
+    for (unsigned o = 0; o < 2; ++o) {
+      if (auto *CC = dyn_cast<ConstantInt>(Cmp->getOperand(o))) {
+        if (CC->getSExtValue() == Regions[0].GuardConst) {
+          GuardCmp = Cmp;
+          GuardOp = o;
+          auto *OT = Cmp->getOperand(o)->getType();
+          if (OT == I64)
+            GuardTrunc = false;
+          else if (OT->isIntegerTy() && OT->getIntegerBitWidth() < 64)
+            GuardTrunc = true;
+          else
+            return 0;
+          break;
+        }
+      }
+    }
+    if (!GuardCmp)
+      return 0;
+  }
+  // Square store found, types compatible.
+  StoreInst *SqStore = nullptr;
+  GetElementPtrInst *SqGEP = nullptr;
+  bool SqTrunc = false, IxTrunc = false, IxIs64 = false;
+  int64_t BaseIdx = 0;
+  {
+    for (Instruction &I : *J0) {
+      auto *S = dyn_cast<StoreInst>(&I);
+      if (!S)
+        continue;
+      auto *VC = dyn_cast<ConstantInt>(S->getValueOperand());
+      if (!VC || VC->getSExtValue() != Regions[0].SquareConst)
+        continue;
+      auto *G = dyn_cast<GetElementPtrInst>(S->getPointerOperand());
+      if (!G || G->getNumIndices() != 1)
+        continue;
+      Type *VT = S->getValueOperand()->getType();
+      if (VT != I64) {
+        if (VT->isIntegerTy() && VT->getIntegerBitWidth() <= 64)
+          SqTrunc = true;
+        else
+          return 0;
+      }
+      auto *IC = dyn_cast<ConstantInt>(G->getOperand(1));
+      if (!IC)
+        continue;
+      Type *IT = IC->getType();
+      if (IT != I64 && !(IT->isIntegerTy() && IT->getIntegerBitWidth() < 64))
+        continue;
+      SqStore = S;
+      SqTrunc = (VT != I64);
+      IxTrunc = (IT != I64);
+      IxIs64 = (IT == I64);
+      BaseIdx = IC->getSExtValue();
+      break;
+    }
+    if (!SqStore)
+      return 0;
+  }
+  // Tail reads: no outside use of chain-interior values except through
+  // the last join's PHIs (the loop's live-outs).
+  {
+    BasicBlock *JL = Regions[N - 1].Join;
+    SmallPtrSet<Value *, 8> LastPhis;
+    for (PHINode &P : JL->phis())
+      LastPhis.insert(&P);
+    for (BasicBlock &OBB : F) {
+      BasicBlock *OB = &OBB;
+      bool InChain = OB == H || OB == Grow0 || OB == J0;
+      for (auto &R : Regions)
+        if (OB == R.Guard || OB == R.Grow || OB == R.Join)
+          InChain = true;
+      if (InChain)
+        continue;
+      for (Instruction &I : *OB) {
+        for (Use &U : I.operands()) {
+          auto *D = dyn_cast<Instruction>(U.get());
+          if (!D)
+            continue;
+          BasicBlock *PB = D->getParent();
+          bool DefInChain = false;
+          for (auto &R : Regions)
+            if (PB == R.Guard || PB == R.Grow || PB == R.Join)
+              DefInChain = true;
+          if (!DefInChain)
+            continue;
+          if (!LastPhis.count(D))
+            return 0;
+        }
+      }
+    }
+  }
+  // Exit rebind pairs: each last-join PHI pairs with the next join_0 PHI
+  // of the same type in order. The last join may carry a subset (the
+  // tailless last copy has no len PHI: no guard compare follows it).
+  // Every last-join PHI must pair; unpaired join_0 PHIs are fine.
+  SmallVector<std::pair<PHINode *, PHINode *>, 4> ExitPairs;
+  {
+    BasicBlock *JL = Regions[N - 1].Join;
+    SmallVector<PHINode *, 4> J0Phis, JLPhis;
+    for (PHINode &P : J0->phis())
+      J0Phis.push_back(&P);
+    for (PHINode &P : JL->phis())
+      JLPhis.push_back(&P);
+    SmallVector<bool, 4> Used(J0Phis.size(), false);
+    for (PHINode *LP : JLPhis) {
+      bool Found = false;
+      for (size_t k = 0; k < J0Phis.size(); ++k) {
+        if (!Used[k] && J0Phis[k]->getType() == LP->getType()) {
+          Used[k] = true;
+          ExitPairs.push_back({LP, J0Phis[k]});
+          Found = true;
+          break;
+        }
+      }
+      if (!Found)
+        return 0;
+    }
+    if (ExitPairs.empty())
+      return 0;
+  }
+  // Dead-use check: every non-void, non-terminator insn in erased regions
+  // is used only inside erased regions or is a rebound last-join PHI.
+  {
+    SmallPtrSet<BasicBlock *, 12> DeadSet;
+    for (size_t j = 1; j < N; ++j) {
+      DeadSet.insert(Regions[j].Guard);
+      if (Regions[j].Grow != Regions[j].Join)
+        DeadSet.insert(Regions[j].Grow);
+      if (KeepLast && j == N - 1)
+        continue;
+      DeadSet.insert(Regions[j].Join);
+    }
+    SmallPtrSet<Value *, 8> Rebound;
+    for (auto &PR : ExitPairs)
+      Rebound.insert(PR.first);
+    for (BasicBlock *D : DeadSet) {
+      for (Instruction &I : *D) {
+        if (I.getType()->isVoidTy() || I.isTerminator())
+          continue;
+        for (User *U : I.users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI)
+            return 0;
+          if (!DeadSet.count(UI->getParent()) && !Rebound.count(&I))
+            return 0;
+        }
+      }
+    }
+  }
+  // guard compare so Pre keeps the prologue: H = [cmp, br].
+  {
+    auto *BI = dyn_cast<BranchInst>(H->getTerminator());
+    if (!BI || !BI->isConditional())
+      return 0;
+    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+    if (!Cmp)
+      return 0;
+    BasicBlock *NH = H->splitBasicBlock(Cmp, "vec.head");
+    // The prologue half keeps the name/uses; NH is the loop header.
+    H = NH;
+  }
+  // Counter + loop PHIs at the header top.
+  IRBuilder<> HB(&H->front());
+  PHINode *IPhi = HB.CreatePHI(I64, 2, "u0i");
+  // Preheader is now H's single predecessor by construction.
+  BasicBlock *Pre = H->getSinglePredecessor();
+  if (!Pre)
+    return 0;
+  IPhi->addIncoming(ConstantInt::get(I64, 0), Pre);
+  for (auto &C : Carries) {
+    PHINode *LP = HB.CreatePHI(C.JoinPhi->getType(), 2, "u0c");
+    LP->addIncoming(C.Prologue, Pre);
+    C.LoopPhi = LP;
+  }
+  // Redirect guard_0's reads of the prologue values to the loop PHIs:
+  // the join_0 guard-path incomings.
+  for (auto &C : Carries) {
+    for (unsigned k = 0; k < C.JoinPhi->getNumIncomingValues(); ++k)
+      if (C.JoinPhi->getIncomingBlock(k) != Grow0)
+        C.JoinPhi->setIncomingValue(k, C.LoopPhi);
+    // Guard reads the len through the join PHI chain: replace uses of
+    // the prologue value inside guard_0/grow_0 with the loop PHI. Only
+    // safe when the prologue value is defined outside the chain.
+    if (auto *PD = dyn_cast<Instruction>(C.Prologue)) {
+      if (PD->getParent() == H || PD->getParent() == Grow0 ||
+          PD->getParent() == J0)
+        return 0;
+    }
+    // NB: collect first, and skip the loop PHIs' own prologue incomings
+    // (added above); rewriting those would self-reference the loop PHI.
+    SmallVector<Use *, 8> ToRew;
+    for (Use &U : C.Prologue->uses()) {
+      auto *UI = dyn_cast<Instruction>(U.getUser());
+      if (!UI)
+        return 0;
+      if (UI == C.LoopPhi)
+        continue;
+      ToRew.push_back(&U);
+    }
+    for (Use *U : ToRew) {
+      auto *UI = dyn_cast<Instruction>(U->getUser());
+      if (UI->getParent() == H || UI->getParent() == Grow0)
+        U->set(C.LoopPhi);
+    }
+  }
+  // Counter expressions, built at the top of the header (after PHIs).
+  IRBuilder<> EB(&H->front());
+  // Advance past PHIs for insertion.
+  Instruction *InsPt = &H->front();
+  while (isa<PHINode>(InsPt))
+    InsPt = InsPt->getNextNode();
+  EB.SetInsertPoint(InsPt);
+  // Guard const: GStep*i + G0.
+  Value *GExpr = EB.CreateMul(IPhi, ConstantInt::get(I64, GStep), "u0g");
+  if (Regions[0].GuardConst != 0)
+    GExpr = EB.CreateAdd(GExpr, ConstantInt::get(I64, Regions[0].GuardConst),
+                         "u0g");
+  // Find guard_0's icmp and replace its constant operand.
+  {
+    auto *BI = dyn_cast<BranchInst>(H->getTerminator());
+    if (!BI || !BI->isConditional())
+      return 0;
+    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+    if (!Cmp)
+      return 0;
+    bool Rewired = false;
+    for (unsigned o = 0; o < 2; ++o) {
+      if (auto *CC = dyn_cast<ConstantInt>(Cmp->getOperand(o))) {
+        if (CC->getSExtValue() == Regions[0].GuardConst) {
+          // Types: icmp may be narrower than i64; truncate.
+          Value *G = GExpr;
+          if (G->getType() != Cmp->getOperand(o)->getType()) {
+            auto *OT = Cmp->getOperand(o)->getType();
+            if (OT->isIntegerTy() && OT->getIntegerBitWidth() < 64)
+              G = EB.CreateTrunc(G, OT, "u0g");
+            else
+              return 0;
+          }
+          Cmp->setOperand(o, G);
+          Rewired = true;
+          break;
+        }
+      }
+    }
+    if (!Rewired)
+      return 0;
+  }
+  // Square + index rewrite in join_0: find the square store (constant
+  // value + constant-index GEP) and rewire both to counter exprs.
+  Value *SqFinal = nullptr;
+  {
+    bool Done = false;
+    for (Instruction &I : *J0) {
+      auto *S = dyn_cast<StoreInst>(&I);
+      if (!S)
+        continue;
+      auto *VC = dyn_cast<ConstantInt>(S->getValueOperand());
+      if (!VC || VC->getSExtValue() != Regions[0].SquareConst)
+        continue;
+      auto *G = dyn_cast<GetElementPtrInst>(S->getPointerOperand());
+      if (!G || G->getNumIndices() != 1)
+        continue;
+      // Square: A*i^2 + B*i + s0.
+      IRBuilder<> SB(S);
+      Value *I2 = SB.CreateMul(IPhi, IPhi, "u0q");
+      Value *Sq = I2;
+      if (A != 0)
+        Sq = SB.CreateMul(I2, ConstantInt::get(I64, A), "u0q");
+      else
+        Sq = ConstantInt::get(I64, 0);
+      if (B != 0)
+        Sq = SB.CreateAdd(Sq, SB.CreateMul(IPhi, ConstantInt::get(I64, B),
+                                           "u0q"),
+                          "u0q");
+      if (Regions[0].SquareConst != 0 || (A == 0 && B == 0))
+        Sq = SB.CreateAdd(Sq,
+                          ConstantInt::get(I64, Regions[0].SquareConst),
+                          "u0q");
+      Type *VT = S->getValueOperand()->getType();
+      if (Sq->getType() != VT) {
+        if (VT->isIntegerTy() && VT->getIntegerBitWidth() <= 64)
+          Sq = SB.CreateTrunc(Sq, VT, "u0q");
+        else
+          return 0;
+      }
+      S->setOperand(0, Sq);
+      SqFinal = Sq;
+      // Index: baseIdx + i. Recover baseIdx from region 0's GEP index
+      // minus 0 (region j stores at element j => base 0 here); general
+      // form keeps the region-0 index as the i=0 value.
+      auto *IC = dyn_cast<ConstantInt>(G->getOperand(1));
+      if (!IC)
+        return 0;
+      int64_t BaseIdx = IC->getSExtValue();
+      Value *Ix = IPhi;
+      if (BaseIdx != 0)
+        Ix = SB.CreateAdd(IPhi, ConstantInt::get(I64, BaseIdx), "u0x");
+      Type *IT = IC->getType();
+      if (Ix->getType() != IT) {
+        if (IT->isIntegerTy() && IT->getIntegerBitWidth() < 64)
+          Ix = SB.CreateTrunc(Ix, IT, "u0x");
+        else if (IT == I64)
+          ;
+        else
+          return 0;
+      }
+      G->setOperand(1, Ix);
+      copyVA(S, cast<Instruction>(Ix == IPhi ? IPhi : Ix));
+      Done = true;
+      break;
+    }
+    if (!Done)
+      return 0;
+  }
+  // Backedges: join_0 PHIs gain the loop backedge (their own merge
+  // already combines guard/grow paths per iteration); the loop PHIs take
+  // the join_0 merge outputs. Latch: split join_0's latch edge.
+  for (auto &C : Carries) {
+    // The join PHI's per-iteration merge value feeds the loop PHI.
+    C.LoopPhi->addIncoming(C.JoinPhi, J0);
+  }
+  // Latch: rewrite join_0's terminator (which branches to guard_1) to
+  // the counted latch. The only live successor needed is the tail.
+  {
+    Instruction *OldTerm = J0->getTerminator();
+    IRBuilder<> LB(OldTerm);
+    Value *Next = LB.CreateAdd(IPhi, ConstantInt::get(I64, 1), "u0inext");
+    Value *Cond = LB.CreateICmpULT(Next, ConstantInt::get(I64, (int64_t)N),
+                                   "u0c");
+    IPhi->addIncoming(Next, J0);
+    LB.CreateCondBr(Cond, H, Tail);
+    OldTerm->eraseFromParent();
+  }
+  // Erase regions 1..: ExitPairs (validated above) rebind last-join
+  // merges to the loop merges. No bailouts below: all checks ran pre-split.
+  {
+    BasicBlock *JL = Regions[N - 1].Join;
+    for (auto &PR : ExitPairs)
+      PR.first->replaceAllUsesWith(PR.second);
+    // Retarget tail's incoming blocks from the last join to the new exit
+    // edge (the tail is reached from J0's latch now, i.e. from J0).
+    for (Instruction &I : *Tail) {
+      if (auto *P = dyn_cast<PHINode>(&I)) {
+        for (unsigned k = 0; k < P->getNumIncomingValues(); ++k)
+          if (P->getIncomingBlock(k) == JL)
+            P->setIncomingBlock(k, J0);
+      }
+    }
+  }
+  // Erase regions 1..N-1 blocks (leaving H/Grow0/J0, plus the last join
+  // when it is the kept tail). Uses were validated pre-split; the erase
+  // itself cannot fail.
+  if (KeepLast) {
+    // The kept tail's PHIs are rebound to the loop merges above; their
+    // incoming blocks are erased regions, so the PHIs themselves must go.
+    BasicBlock *JL = Regions[N - 1].Join;
+    SmallVector<PHINode *, 4> DeadPhis;
+    for (PHINode &P : JL->phis())
+      DeadPhis.push_back(&P);
+    for (PHINode *P : DeadPhis)
+      P->eraseFromParent();
+  }
+  {
+    SmallVector<BasicBlock *, 8> Dead;
+    for (size_t j = 1; j < N; ++j) {
+      Dead.push_back(Regions[j].Guard);
+      if (Regions[j].Grow != Regions[j].Join)
+        Dead.push_back(Regions[j].Grow);
+      if (KeepLast && j == N - 1)
+        continue; // kept tail: retargeted, not erased
+      Dead.push_back(Regions[j].Join);
+    }
+    for (BasicBlock *D : Dead) {
+      D->dropAllReferences();
+      D->eraseFromParent();
+    }
+  }
+  (void)Callee;
+  (void)GStep;
+  (void)SqFinal;
+  Notes.push_back(H->getName());
+  return (unsigned)N;
 }
 
 } // namespace revenant
