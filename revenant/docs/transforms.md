@@ -315,3 +315,45 @@ inlined drop glue re-outlined into `drop_glue.unrust` when every operand the
 free arm reads is remappable. Guarantees semantics-preserving rewrites only,
 `!revenant.va` preserved, `!revenant.opaque` untouched. Runs explicitly via
 `-passes=revenant-unrust`, not in the default pipeline.
+
+## Deopt evidence (owner: MuseDeoptEvidence)
+
+One evidence API that deopt passes query, built from embedded metadata and
+libdb: `revenant/include/revenant/Evidence/Evidence.h`. Header-only pure
+reads, no analysis manager, safe to include from statically linked plugin
+DLLs. Every query defaults to absent when the module carries no metadata,
+so `--meta=none` output stays valid and correct.
+
+Rule: evidence only confirms a rewrite the shape matcher already allows;
+it never enables one on its own. When evidence and shape disagree, shape
+wins.
+
+The lifter attaches per-function `rev.*` metadata from the analyzed
+Program next to the existing `rev.source`/`rev.panic`/`rev.eh.types`/
+`rev.class`/`rev.strings` slots: `!rev.unroll !{i32 D}` is the count of
+repeated straight-line asm opcode windows sharing the function's single
+Location record (gated on crash metadata, so `none` emits nothing);
+`!rev.chunks !{!{i64 start, i64 end}, ...}` lists the disjoint code ranges
+of split functions (plain address facts, always attached). `revenant.lib`
+function attributes carry libdb matches, `!revenant.va` carries per
+instruction provenance, and `!revenant.eh.region` marks invokes inside
+decoded try ranges.
+
+Queries: `evidence::unrollFactor(F)` returns the recorded factor or
+nullopt. Reroll's straight-line synthesis proves every run structurally
+(uniform delta, acc threads, latch) but only acts at K >= 4 alone; with
+factor evidence present the worth-it threshold drops to K >= 2. The
+factor's exact value never gates K, and the in-loop fold keeps its
+`step % D` gate unconditionally (relaxing it on agreement is always
+wrong-code: a dense pre-fold needs Step == D*g, which already implies
+divisibility). `evidence::uninlineEvidence(callee)` returns the callee's
+Location, referenced strings and lib name; tiny exact-match bodies below
+the 3-instruction minimum stay eligible only with non-empty evidence,
+and rewrite only when `regionMatchesEvidence` finds the same string or
+lib reference in the region or the escape's users. The wrapper veto
+stays absolute. `evidence::chunkRanges(F)` returns cold-part boundaries;
+`evidence::ehRegion(I)` returns the try-region id. Corresponding tests:
+`unittests/Evidence/`,
+`test/Transforms/Reroll/evidence-unroll-confirms.ll`,
+`test/Transforms/Reroll/evidence-synth-confirms.ll`,
+`test/Transforms/Uninline/evidence-inline-confirms.ll`.
