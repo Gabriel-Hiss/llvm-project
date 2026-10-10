@@ -381,11 +381,16 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     llvm::NamedMDNode *Types = M.getOrInsertNamedMetadata("rev.types");
     if (Types->getNumOperands() == 0) {
       for (const EmbeddedTypeMetadata &Type : P.EmbeddedTypes) {
+        // Row layout: name, decorated name, vftable (null when the class has
+        // none), base class names, then virtual function addresses.
         std::vector<llvm::Metadata *> Fields{
             llvm::MDString::get(M.getContext(), Type.Name),
-            llvm::MDString::get(M.getContext(), Type.DecoratedName),
-            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-                llvm::Type::getInt64Ty(M.getContext()), Type.VTable.Value))};
+            llvm::MDString::get(M.getContext(), Type.DecoratedName)};
+        if (Type.VTable.Value)
+          Fields.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt64Ty(M.getContext()), Type.VTable.Value)));
+        else
+          Fields.push_back(llvm::MDNode::get(M.getContext(), {}));
         for (const std::string &Base : Type.BaseClasses)
           Fields.push_back(llvm::MDString::get(M.getContext(), Base));
         for (Va Target : Type.VirtualFunctions)
