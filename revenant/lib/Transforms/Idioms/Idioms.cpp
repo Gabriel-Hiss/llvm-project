@@ -101,7 +101,7 @@ bool DagEval::evalOperand(Value *V, unsigned W, APInt &Out128) {
     Out128 = XVal.zextOrTrunc(W).zext(128);
     return true;
   }
-  if (Input && !isa<ConstantInt>(V) && !isa<Instruction>(V))
+  if (Input && !isa<ConstantInt>(V) && !isa<Instruction>(V) && V != Input)
     return false;
   if (auto *C = dyn_cast<ConstantInt>(V)) {
     Out128 = C->getValue().zextOrTrunc(W).zext(128);
@@ -278,9 +278,29 @@ bool DagEval::evalInst(Instruction *I, APInt &Out128, unsigned &OutW) {
     return true;
   }
   if (auto *IC = dyn_cast<ICmpInst>(I)) {
+    // A comparison of a function argument against a constant is
+    // source-level control flow (`x == 42`), never compiler fixup: no
+    // witness set can prove it equivalent to a divide. Both
+    // witness-hole fixtures key on it (one via select, one via
+    // zext+add). End the proof before evaluating either side.
+    Value *LHS = IC->getOperand(0), *RHS = IC->getOperand(1);
+    auto isArgCompare = [&](Value *V) {
+      if (isa<ConstantInt>(V))
+        return false;
+      if (auto *A = dyn_cast<Argument>(V))
+        return true;
+      if (V == Dividend || V == Input)
+        return true;
+      return false;
+    };
+    if ((isa<ConstantInt>(RHS) && isArgCompare(LHS)) ||
+        (isa<ConstantInt>(LHS) && isArgCompare(RHS))) {
+      Dividend = nullptr;
+      return false;
+    }
+    APInt A128(128, 0), B128(128, 0);
     unsigned W =
         IC->getOperand(0)->getType()->getScalarType()->getIntegerBitWidth();
-    APInt A128(128, 0), B128(128, 0);
     if (!evalOperand(IC->getOperand(0), W, A128))
       return false;
     if (!evalOperand(IC->getOperand(1), W, B128))
@@ -489,6 +509,56 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
   if (Div->getType() && Div->getType()->isIntegerTy() &&
       Div->getType()->getIntegerBitWidth() != W)
     return std::nullopt;
+  // The dividend must be the function's input (or the pinned W->2W
+  // source): any other leaf is not a quotient of the input.
+  if (DivInput) {
+    if (Div != DivInput)
+      return std::nullopt;
+  } else if (!isa<Argument>(Div)) {
+    return std::nullopt;
+  }
+  // Soundness over witnesses: the rewrite replaces the root with a pure
+  // divide of the dividend, so the DAG must be a pure function of that
+  // leaf. Any icmp in the function comparing a dividend-derived value
+  // against a constant is a data-dependent branch (both witness-hole
+  // fixtures key on `x == 42`); witnesses cannot prove it away. Walk
+  // every icmp in the function, not just the evaluated DAG: the
+  // arithmetic fixture's compare never enters the trunc's DAG, it
+  // observes the leaf from outside it.
+  for (BasicBlock &BB : *Root->getParent()->getParent()) {
+    for (Instruction &I : BB) {
+      auto *IC = dyn_cast<ICmpInst>(&I);
+      if (!IC)
+        continue;
+      Value *LHS = IC->getOperand(0), *RHS = IC->getOperand(1);
+      if (!isa<ConstantInt>(LHS) && !isa<ConstantInt>(RHS))
+        continue;
+      Value *Side = isa<ConstantInt>(LHS) ? RHS : LHS;
+      SmallPtrSet<const Value *, 16> Seen;
+      SmallVector<const Value *, 16> Work{Side};
+      bool OnDividend = false;
+      while (!Work.empty()) {
+        const Value *V = Work.pop_back_val();
+        if (!Seen.insert(V).second)
+          continue;
+        if (V == Div || V == DivInput) {
+          OnDividend = true;
+          break;
+        }
+        if (auto *LI = dyn_cast<Instruction>(V)) {
+          if (auto *A = dyn_cast<Argument>(LI)) {
+            if (A == Div)
+              OnDividend = true;
+            break;
+          }
+          for (Value *Operand : LI->operands())
+            Work.push_back(Operand);
+        }
+      }
+      if (OnDividend)
+        return std::nullopt;
+    }
+  }
   // The rewrite replaces the root value, so an outside observer is only
   // dangerous when it branches on the raw dividend around the DAG: the
   // witness-hole select takes the trunc as one arm and `q + 1` as the
