@@ -1171,13 +1171,18 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     Type *F64Vec = FixedVectorType::get(F64, 2);
     Value *Vec = As(I128, F64Vec);
     Value *Lane0 = B.CreateExtractElement(Vec, uint64_t(0));
-    Value *Rounded;
-    switch (Imm & 0x3) {
-      case 0: Rounded = B.CreateUnaryIntrinsic(Intrinsic::round, Lane0); break;
-      case 1: Rounded = B.CreateUnaryIntrinsic(Intrinsic::floor, Lane0); break;
-      case 2: Rounded = B.CreateUnaryIntrinsic(Intrinsic::ceil, Lane0); break;
-      case 3: Rounded = B.CreateUnaryIntrinsic(Intrinsic::trunc, Lane0); break;
+    Intrinsic::ID IID;
+    if (Imm & 0x4) {
+      IID = Intrinsic::nearbyint;
+    } else {
+      switch (Imm & 0x3) {
+        case 0: IID = Intrinsic::nearbyint; break;
+        case 1: IID = Intrinsic::floor; break;
+        case 2: IID = Intrinsic::ceil; break;
+        default: IID = Intrinsic::trunc; break;
+      }
     }
+    Value *Rounded = B.CreateUnaryIntrinsic(IID, Lane0);
     return B.CreateBitCast(
         B.CreateInsertElement(Vec, Rounded, uint64_t(0)), iN(128));
   }
@@ -1185,13 +1190,18 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     Type *F32Vec = FixedVectorType::get(F32, 4);
     Value *Vec = As(I128, F32Vec);
     Value *Lane0 = B.CreateExtractElement(Vec, uint64_t(0));
-    Value *Rounded;
-    switch (Imm & 0x3) {
-      case 0: Rounded = B.CreateUnaryIntrinsic(Intrinsic::round, Lane0); break;
-      case 1: Rounded = B.CreateUnaryIntrinsic(Intrinsic::floor, Lane0); break;
-      case 2: Rounded = B.CreateUnaryIntrinsic(Intrinsic::ceil, Lane0); break;
-      case 3: Rounded = B.CreateUnaryIntrinsic(Intrinsic::trunc, Lane0); break;
+    Intrinsic::ID IID;
+    if (Imm & 0x4) {
+      IID = Intrinsic::nearbyint;
+    } else {
+      switch (Imm & 0x3) {
+        case 0: IID = Intrinsic::nearbyint; break;
+        case 1: IID = Intrinsic::floor; break;
+        case 2: IID = Intrinsic::ceil; break;
+        default: IID = Intrinsic::trunc; break;
+      }
     }
+    Value *Rounded = B.CreateUnaryIntrinsic(IID, Lane0);
     return B.CreateBitCast(
         B.CreateInsertElement(Vec, Rounded, uint64_t(0)), iN(128));
   }
