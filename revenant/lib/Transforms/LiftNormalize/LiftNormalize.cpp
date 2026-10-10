@@ -6,6 +6,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
@@ -144,17 +145,40 @@ Value *pointerFor(Value *V, Type *PT, IRBuilder<> &B, const DataLayout &DL,
                   unsigned Depth = 0) {
   if (Depth > 16 || !V->getType()->isIntegerTy(DL.getPointerTypeSizeInBits(PT)))
     return nullptr;
-  if (auto *P = dyn_cast<PtrToIntInst>(V))
+  // PtrToIntOperator also covers the folded ConstantExpr form, so a
+  // constant `ptrtoint @g` inedge unwraps to the global directly.
+  if (auto *P = dyn_cast<PtrToIntOperator>(V))
     return P->getPointerOperand()->getType() == PT ? P->getPointerOperand()
                                                  : nullptr;
+  if (auto *P = dyn_cast<PtrToAddrOperator>(V))
+    return P->getPointerOperand()->getType() == PT ? P->getPointerOperand()
+                                                 : nullptr;
+  // No other constant is pointer-derivable: lifting knows nothing about
+  // absolute values, so wrapping a bare ConstantInt sentinel (-1, -2,
+  // whatever the register held) in inttoptr invents a pointer from nothing
+  // and hands downstream passes a ConstantExpr they must treat as opaque.
+  // Refuse; the caller keeps the value integer-typed instead.
+  if (isa<Constant>(V))
+    return nullptr;
   if (auto *Phi = dyn_cast<PHINode>(V)) {
     auto It = PointerPhis.find(Phi);
     if (It != PointerPhis.end())
       return It->second;
-    for (unsigned J = 0; J < Phi->getNumIncomingValues(); ++J)
-      if (isa<InvokeInst>(Phi->getIncomingBlock(J)->getTerminator()) ||
-          Phi->getIncomingBlock(J)->isEHPad())
+    for (unsigned J = 0; J < Phi->getNumIncomingValues(); ++J) {
+      BasicBlock *Pred = Phi->getIncomingBlock(J);
+      if (isa<InvokeInst>(Pred->getTerminator()) || Pred->isEHPad())
         return nullptr;
+      // A constant inedge must already hold a pointer-derived value
+      // (ptrtoint of a symbol). Anything else, most often a -1 sentinel,
+      // would arrive here only through the inttoptr fallback, which folds
+      // to a ConstantExpr. The integer phi keeps the original semantics,
+      // so decline before P exists: an abandoned phi could not be erased
+      // once a cyclic partner already references it.
+      if (isa<Constant>(Phi->getIncomingValue(J)) &&
+          !pointerFor(Phi->getIncomingValue(J), PT, B, DL, PointerPhis,
+                      Depth + 1))
+        return nullptr;
+    }
     auto *P = PHINode::Create(PT, Phi->getNumIncomingValues(),
                              Phi->getName() + ".ptr", Phi->getIterator());
     PointerPhis[Phi] = P;
@@ -170,7 +194,15 @@ Value *pointerFor(Value *V, Type *PT, IRBuilder<> &B, const DataLayout &DL,
       Value *Incoming = Phi->getIncomingValue(J);
       Value *Ptr = pointerFor(Incoming, PT, Edge, DL, PointerPhis, Depth + 1);
       if (!Ptr) {
-        Ptr = Edge.CreateIntToPtr(Incoming, PT);
+        if (isa<Constant>(Incoming)) {
+          // Unreachable per the inedge scan; keep a non-folding cast so a
+          // contract drift can never smuggle in a ConstantExpr.
+          Ptr = CastInst::Create(Instruction::IntToPtr, Incoming, PT,
+                                 Incoming->getName() + ".ptr",
+                                 Pred->getTerminator()->getIterator());
+        } else {
+          Ptr = Edge.CreateIntToPtr(Incoming, PT);
+        }
         provenance(Ptr, *Phi);
       }
       P->addIncoming(Ptr, Pred);
@@ -189,6 +221,10 @@ Value *pointerFor(Value *V, Type *PT, IRBuilder<> &B, const DataLayout &DL,
     Offset = Op->getOperand(0);
   }
   if (!Base) {
+    // A constant first operand is not pointer-derivable either; converting
+    // it here would only restate the value as an inttoptr ConstantExpr.
+    if (isa<Constant>(Op->getOperand(0)))
+      return nullptr;
     Base = B.CreateIntToPtr(Op->getOperand(0), PT, "base.ptr");
     provenance(Base, *Op);
     Offset = Op->getOperand(1);

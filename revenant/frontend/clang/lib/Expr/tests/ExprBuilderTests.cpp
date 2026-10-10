@@ -553,6 +553,127 @@ TEST_F(ExprTest, VirtualCallThroughVfptrSlot) {
   EXPECT_TRUE(S.find("Method") != std::string::npos);
   EXPECT_TRUE(S.find("->") != std::string::npos);
 }
+TEST_F(ExprTest, SExtI1SpellsNegation) {
+  // IR i1 has no signed C counterpart: `sext i1 x` is `-(int)x`, not a
+  // cast through a nonexistent signed 1-bit type.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "c");
+  llvm::Value *W = B.CreateSExt(Cmp, Type::getInt32Ty(LLCtx), "w");
+  EXPECT_EQ(print(Exprs->value(W, Scope)),
+            "-(int)((unsigned int)a < (unsigned int)b)");
+}
+
+TEST_F(ExprTest, SExtI1BoolTypeDoesNotAssert) {
+  // C++ mode types i1 as BoolTy; getCorrespondingSignedType asserts on
+  // Bool (ASTContext.cpp:12299). The sext path must not ask for it.
+  LangOpts.CPlusPlus = 1;
+  FCtx = std::make_unique<revenant::clangx::FrontendContext>(
+      *ACtx, *M, revenant::clangx::SourceLang::CPlusPlus);
+  Types = std::make_unique<TestTypes>(FCtx.get());
+  Exprs = std::make_unique<ExprBuilderImpl>(*FCtx, *Types);
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "c");
+  llvm::Value *W = B.CreateSExt(Cmp, Type::getInt32Ty(LLCtx), "w");
+  EXPECT_EQ(print(Exprs->value(W, Scope)),
+            "-(int)((unsigned int)a < (unsigned int)b)");
+}
+
+TEST_F(ExprTest, I1ConstantTruePrintsOne) {
+  // `xor i1 x, true` is a boolean not; the i1 `true` APInt is the signed
+  // value -1 and must print as `1`, not `-1`.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "c");
+  llvm::Value *Not = B.CreateXor(Cmp, ConstantInt::getTrue(LLCtx), "n");
+  llvm::Value *Z = B.CreateZExt(Not, Type::getInt32Ty(LLCtx), "z");
+  std::string S = print(Exprs->value(Z, Scope));
+  EXPECT_TRUE(S.find("^ 1") != std::string::npos) << S;
+  EXPECT_TRUE(S.find("-1") == std::string::npos) << S;
+}
+
+TEST_F(ExprTest, I1AddIsXor) {
+  // C promotes bool operands to int: a + b on i1 would print 1+1=2, but IR
+  // i1 arithmetic is mod 2, so add/sub emit as xor and mul as and.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *X = B.CreateICmpULT(H.A, H.B, "x");
+  llvm::Value *Y = B.CreateICmpUGT(H.A, H.B, "y");
+  llvm::Value *Sum = B.CreateAdd(X, Y, "s");
+  llvm::Value *Z = B.CreateZExt(Sum, Type::getInt32Ty(LLCtx), "z");
+  std::string S = print(Exprs->value(Z, Scope));
+  EXPECT_TRUE(S.find('^') != std::string::npos) << S;
+  EXPECT_TRUE(S.find('+') == std::string::npos) << S;
+}
+
+TEST_F(ExprTest, I1MulIsAnd) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *X = B.CreateICmpULT(H.A, H.B, "x");
+  llvm::Value *Y = B.CreateICmpUGT(H.A, H.B, "y");
+  llvm::Value *Prod = B.CreateMul(X, Y, "p");
+  llvm::Value *Z = B.CreateZExt(Prod, Type::getInt32Ty(LLCtx), "z");
+  std::string S = print(Exprs->value(Z, Scope));
+  EXPECT_TRUE(S.find('&') != std::string::npos) << S;
+  EXPECT_TRUE(S.find('*') == std::string::npos) << S;
+}
+
+TEST_F(ExprTest, I1SubIsXor) {
+  // -x == x (mod 2), so sub on i1 is also xor.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *X = B.CreateICmpULT(H.A, H.B, "x");
+  llvm::Value *Y = B.CreateICmpUGT(H.A, H.B, "y");
+  llvm::Value *Diff = B.CreateSub(X, Y, "d");
+  llvm::Value *Z = B.CreateZExt(Diff, Type::getInt32Ty(LLCtx), "z");
+  std::string S = print(Exprs->value(Z, Scope));
+  EXPECT_TRUE(S.find('^') != std::string::npos) << S;
+  EXPECT_TRUE(S.find('-') == std::string::npos) << S;
+}
+
+TEST_F(ExprTest, I1ShlKeepsOperandWhenShiftIsZero) {
+  // shl i1 a, b is a only when b == 0: emit a & !b.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *X = B.CreateICmpULT(H.A, H.B, "x");
+  llvm::Value *Sh = B.CreateICmpUGT(H.A, H.B, "sh");
+  llvm::Value *V = B.CreateShl(X, Sh, "v");
+  llvm::Value *Z = B.CreateZExt(V, Type::getInt32Ty(LLCtx), "z");
+  std::string S = print(Exprs->value(Z, Scope));
+  EXPECT_TRUE(S.find('&') != std::string::npos) << S;
+  EXPECT_TRUE(S.find('!') != std::string::npos) << S;
+  EXPECT_TRUE(S.find("<<") == std::string::npos) << S;
+}
+
+TEST_F(ExprTest, I1AShrIsIdentity) {
+  // ashr i1 can only ever reproduce its operand; emitting a shift on the
+  // signed -1/0 value would read a >> -1.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *X = B.CreateICmpULT(H.A, H.B, "x");
+  llvm::Value *Sh = B.CreateICmpUGT(H.A, H.B, "sh");
+  llvm::Value *V = B.CreateAShr(X, Sh, "v");
+  std::string S = print(Exprs->value(V, Scope));
+  EXPECT_TRUE(S.find(">>") == std::string::npos) << S;
+}
+
 
 TEST_F(ExprTest, WideConstantStoreKeepsBothHalves) {
   // zlib-cl-o2 sub_140050B44: a folded i128 store must keep both halves,
