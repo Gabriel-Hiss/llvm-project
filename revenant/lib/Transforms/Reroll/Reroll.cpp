@@ -38,7 +38,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/Reroll/Reroll.h"
-
+#include "revenant/Evidence/Evidence.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
@@ -1010,8 +1010,17 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
         WSets.push_back(WJ);
         ++K;
       }
-      if (K < MinWindowsForSynth)
-        continue;
+      // Short runs below the worth-it threshold synthesize only with
+      // lift-recorded unroll evidence for the function: the construction
+      // is correct for any K >= 2 (uniform delta, acc threads, latch),
+      // but K < 4 alone is too thin to act on. The recorded factor's
+      // exact value does not gate K (asm windows and IR windows count
+      // different things); its presence confirms the function holds
+      // unrolled copies worth re-rolling. Absent metadata keeps the skip.
+      if (K < MinWindowsForSynth) {
+        if (K < 2 || !revenant::evidence::unrollFactor(F))
+          continue;
+      }
       if (Threads.empty())
         continue; // independent windows: vector work, not a loop
       if (!Delta)
