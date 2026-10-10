@@ -93,6 +93,14 @@ The LLVM type controls the emitted C/C++ expression category. Debug info may
 refine signedness and record layout, but a conflicting pointer/integer type
 must not override the IR type.
 
+The C/C++ statement builder uses `!revenant.region` annotations to emit
+structured branches and loops. It also recovers early returns when a local
+return slot feeds the region's return block and each outgoing arm stores its
+return value before branching there. Volatile, atomic, or escaped return slots
+keep their ordinary memory operations. Shared switch destinations emit one
+body under all matching case labels, including `default`.
+
+
 
 ## Driver
 

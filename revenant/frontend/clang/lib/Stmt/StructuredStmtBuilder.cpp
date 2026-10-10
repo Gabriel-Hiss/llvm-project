@@ -150,6 +150,8 @@ private:
 
   // ---- emission ------------------------------------------------------
   void emitBlockStmts(BasicBlock *BB, SmallVectorImpl<Stmt *> &Out);
+  void collectReturnStores();
+  StoreInst *returnStoreForEdge(BasicBlock *Target, BasicBlock *Pred);
   Stmt *emitTerminator(BasicBlock *BB, const Region *Rgn);
   void emitMembers(const Region &R, const SmallPtrSetImpl<BasicBlock *> &Set,
                    SmallVectorImpl<Stmt *> &Out);
@@ -193,6 +195,7 @@ private:
   /// Instructions consumed by a for-init or for-step; skipped during leaf
   /// emission.
   DenseSet<Instruction *> ForClaimed;
+  DenseMap<StoreInst *, BasicBlock *> ReturnStoreFollows;
   /// Invoke blocks already emitted inside a try statement.
   SmallPtrSet<BasicBlock *, 8> EHClaimed;
   /// Blocks whose code already printed: nested if regions sharing one
@@ -277,7 +280,13 @@ bool StructuredStmtBuilder::parseRegion(BasicBlock *BB, Region &R) {
       return false;
     R.Latch = L;
   } else {
-    if (!arg(1, R.Follow))
+    // A follow of -1 marks a region whose arms terminate without a merge.
+    StringRef S;
+    int64_t Idx = -1;
+    if (!regionOperand(N, 1, S, Idx) || !S.empty())
+      return false;
+    R.Follow = Idx >= 0 ? blockOf(Idx) : nullptr;
+    if (Idx >= 0 && !R.Follow)
       return false;
   }
   return true;
@@ -285,28 +294,56 @@ bool StructuredStmtBuilder::parseRegion(BasicBlock *BB, Region &R) {
 
 void StructuredStmtBuilder::computeIfMembers(Region &R) {
   for (BasicBlock *BB : Blocks) {
-    if (BB == R.Header || BB == R.Follow)
+    if (BB == R.Header || BB == R.Follow ||
+        !DT->dominates(R.Header, BB))
       continue;
-    if (!DT->dominates(R.Header, BB) || !PDT->dominates(R.Follow, BB))
+    if (R.Follow) {
+      if (!PDT->dominates(R.Follow, BB))
+        continue;
+      // Post-dominance is vacuous for non-terminating exits, so require a
+      // path from each member to the region's follow as well.
+      SmallVector<BasicBlock *, 16> Stack{BB};
+      SmallPtrSet<BasicBlock *, 16> Seen;
+      bool ReachesFollow = false;
+      while (!Stack.empty() && !ReachesFollow) {
+        BasicBlock *N = Stack.pop_back_val();
+        if (N == R.Follow) {
+          ReachesFollow = true;
+          break;
+        }
+        if (!Seen.insert(N).second || !DT->dominates(R.Header, N))
+          continue;
+        for (BasicBlock *S : successors(N))
+          Stack.push_back(S);
+      }
+      if (ReachesFollow)
+        R.Members.insert(BB);
+    }
+  }
+
+  if (R.Follow)
+    return;
+
+  // With no merge, keep the arm that continues through the function outside
+  // the if. The other dominated blocks form the terminating arm(s).
+  BasicBlock *Continuation = nullptr;
+  for (BasicBlock *BB : llvm::reverse(Blocks)) {
+    if (BB == R.Header || !DT->dominates(R.Header, BB))
       continue;
-    // Exclude blocks that can never reach Follow (infinite loops, exits):
-    // they post-dominate vacuously but do not belong to the region.
-    SmallVector<BasicBlock *, 16> Stack{BB};
-    SmallPtrSet<BasicBlock *, 16> Seen;
-    bool ReachesFollow = false;
-    while (!Stack.empty() && !ReachesFollow) {
-      BasicBlock *N = Stack.pop_back_val();
-      if (N == R.Follow) {
-        ReachesFollow = true;
+    for (BasicBlock *Succ : successors(R.Header))
+      if (Succ != BB && DT->dominates(Succ, BB)) {
+        Continuation = Succ;
         break;
       }
-      if (!Seen.insert(N).second || !DT->dominates(R.Header, N))
-        continue;
-      for (BasicBlock *S : successors(N))
-        Stack.push_back(S);
-    }
-    if (ReachesFollow)
-      R.Members.insert(BB);
+    break;
+  }
+  for (BasicBlock *BB : Blocks) {
+    if (BB == R.Header || !DT->dominates(R.Header, BB))
+      continue;
+    if (Continuation &&
+        (BB == Continuation || DT->dominates(Continuation, BB)))
+      continue;
+    R.Members.insert(BB);
   }
 }
 
@@ -349,6 +386,7 @@ void StructuredStmtBuilder::collectRegions() {
       computeIfMembers(R);
     Regions[&BB] = std::make_unique<Region>(std::move(R));
   }
+  collectReturnStores();
   // An edge entering the interior of a region from outside forces a label
   // on the target and degrades that region to goto emission. Members
   // branching inward stay structured; only foreign entries degrade.
@@ -365,6 +403,95 @@ void StructuredStmtBuilder::collectRegions() {
         SR->Degraded = true;
     }
   }
+}
+void StructuredStmtBuilder::collectReturnStores() {
+  ReturnStoreFollows.clear();
+  for (const auto &Entry : Regions) {
+    Region &R = *Entry.second;
+    if (R.Kind != RegionKind::If || !R.Follow)
+      continue;
+    auto *RI = dyn_cast<ReturnInst>(R.Follow->getTerminator());
+    auto *ReturnLoad =
+        RI ? dyn_cast_or_null<LoadInst>(RI->getReturnValue()) : nullptr;
+    auto *Slot = ReturnLoad
+                     ? dyn_cast<AllocaInst>(ReturnLoad->getPointerOperand())
+                     : nullptr;
+    if (!Slot || ReturnLoad->isVolatile() || ReturnLoad->isAtomic())
+      continue;
+
+    bool SlotEscapes = false;
+    for (User *U : Slot->users()) {
+      if (isa<DbgInfoIntrinsic>(U))
+        continue;
+      if (auto *Load = dyn_cast<LoadInst>(U)) {
+        SlotEscapes |= Load->getPointerOperand() != Slot;
+        continue;
+      }
+      if (auto *Store = dyn_cast<StoreInst>(U)) {
+        SlotEscapes |= Store->getPointerOperand() != Slot;
+        continue;
+      }
+      SlotEscapes = true;
+      break;
+    }
+    if (SlotEscapes)
+      continue;
+
+    for (BasicBlock *BB : R.Members) {
+      auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+      if (!BI || !BI->isUnconditional() ||
+          BI->getSuccessor(0) != R.Follow)
+        continue;
+      StoreInst *LastStore = nullptr;
+      for (Instruction &I : llvm::reverse(*BB)) {
+        if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I))
+          continue;
+        LastStore = dyn_cast<StoreInst>(&I);
+        break;
+      }
+      if (!LastStore || LastStore->isVolatile() || LastStore->isAtomic() ||
+          LastStore->getPointerOperand() != Slot)
+        continue;
+      ReturnStoreFollows[LastStore] = R.Follow;
+    }
+  }
+}
+
+
+StoreInst *StructuredStmtBuilder::returnStoreForEdge(BasicBlock *Target,
+                                                     BasicBlock *Pred) {
+  if (Emitted.contains(Target) || pred_size(Target) != 1 ||
+      *pred_begin(Target) != Pred)
+    return nullptr;
+
+  StoreInst *ReturnStore = nullptr;
+  for (const auto &Entry : ReturnStoreFollows)
+    if (Entry.first->getParent() == Target) {
+      ReturnStore = Entry.first;
+      break;
+    }
+  if (!ReturnStore)
+    return nullptr;
+
+  SmallPtrSet<const Value *, 16> Needed;
+  SmallVector<const Value *, 16> Work{ReturnStore->getValueOperand()};
+  while (!Work.empty()) {
+    const Value *V = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || I->getParent() != Target || !Needed.insert(V).second)
+      continue;
+    for (const Use &Operand : I->operands())
+      Work.push_back(Operand.get());
+  }
+  for (Instruction &I : *Target) {
+    if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
+        &I == ReturnStore)
+      continue;
+    if (!Needed.contains(&I) || isa<StoreInst>(I))
+      return nullptr;
+  }
+  Emitted.insert(Target);
+  return ReturnStore;
 }
 
 Region *StructuredStmtBuilder::enclosingRegion(BasicBlock *BB) {
@@ -406,6 +533,9 @@ void StructuredStmtBuilder::emitBlockStmts(BasicBlock *BB,
     if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I))
       continue;
     if (ForClaimed.contains(&I))
+      continue;
+    if (auto *Store = dyn_cast<StoreInst>(&I);
+        Store && ReturnStoreFollows.contains(Store))
       continue;
     if (Stmt *S = Exprs->instr(I, *Scope))
       Out.push_back(S);
@@ -496,6 +626,11 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
   if (auto *BI = dyn_cast<BranchInst>(T)) {
     if (BI->isUnconditional()) {
       BasicBlock *S = BI->getSuccessor(0);
+      for (const auto &Entry : ReturnStoreFollows)
+        if (Entry.first->getParent() == BB && Entry.second == S)
+          return ReturnStmt::Create(
+              *AST, SourceLocation(),
+              Exprs->retVal(Entry.first->getValueOperand(), *Scope), nullptr);
       if (Rgn && !Rgn->Degraded) {
         // A non-latch edge back to the header is a source-level continue;
         // in a for-loop, Clang routes it through the emitted increment.
@@ -520,6 +655,11 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     // `if (!c) break;`; we produce the same AST shape directly.
     BasicBlock *TS = BI->getSuccessor(0), *FS = BI->getSuccessor(1);
     auto arm = [&](BasicBlock *S) -> Stmt * {
+      if (TS != FS)
+        if (StoreInst *Store = returnStoreForEdge(S, BB))
+          return ReturnStmt::Create(
+              *AST, SourceLocation(),
+              Exprs->retVal(Store->getValueOperand(), *Scope), nullptr);
       if (Rgn && !Rgn->Degraded) {
         // Same rule as the unconditional edge: break only when the arm
         // exits the construct it is lexically emitted inside.
@@ -1000,7 +1140,7 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
       DestCases[D];
       DestOrder.push_back(D);
     }
-    DestCases[D].push_back(Case.getCaseValue());
+      DestCases[D].push_back(Case.getCaseValue());
     DestSet.insert(D);
   }
   BasicBlock *Def = SI->getDefaultDest();
@@ -1047,25 +1187,38 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
   };
 
   for (BasicBlock *D : DestOrder) {
-    Stmt *CS = emitCase(D);
-    CaseStmt *First = nullptr, *Prev = nullptr;
+    Stmt *CaseBody = emitCase(D);
+    bool SharesDefault = Def == D;
+    Stmt *First = nullptr;
+    SwitchCase *Prev = nullptr;
+    auto setSubStmt = [&](SwitchCase *Label, Stmt *Sub) {
+      if (auto *Case = dyn_cast<CaseStmt>(Label))
+        Case->setSubStmt(Sub);
+      else
+        cast<DefaultStmt>(Label)->setSubStmt(Sub);
+    };
+    auto appendLabel = [&](SwitchCase *Label) {
+      if (Prev)
+        setSubStmt(Prev, Label);
+      else
+        First = Label;
+      Prev = Label;
+    };
+    if (SharesDefault)
+      appendLabel(new (*AST)
+                      DefaultStmt(SourceLocation(), SourceLocation(), nullptr));
     for (ConstantInt *V : DestCases[D]) {
       Expr *LH = caseValue(V, CT);
-      CaseStmt *Cur = CaseStmt::Create(*AST, LH, nullptr, SourceLocation(),
-                                       SourceLocation(), SourceLocation());
-      if (Prev)
-        Prev->setSubStmt(Cur);
-      else
-        First = Cur;
-      Prev = Cur;
+      appendLabel(CaseStmt::Create(*AST, LH, nullptr, SourceLocation(),
+                                   SourceLocation(), SourceLocation()));
     }
-    Prev->setSubStmt(CS);
+    setSubStmt(Prev, CaseBody);
     Body.push_back(First);
   }
-  if (Def)
+  if (Def && !DestCases.count(Def))
     Body.push_back(new (*AST)
                        DefaultStmt(SourceLocation(), SourceLocation(),
-                                   gotoTo(Def)));
+                                   emitCase(Def)));
   SW->setBody(CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                    SourceLocation(), SourceLocation()));
   return SW;
