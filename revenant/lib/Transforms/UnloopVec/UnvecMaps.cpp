@@ -205,6 +205,29 @@ static bool countdownSecondaryOK(BasicBlock *Mid, ScalarLoopInfo &V,
     return false;
   return stripCountDerivation(InitAnd->getOperand(0), F) == N;
 }
+
+// Partition-coverage acceptance for outer tiers: the middle bound
+// strips to the same trip-count root N as the tail bound, the tail
+// spans to N, and the drain is a countdown remainder from the S
+// resume. Then drain [resume, drain_end] plus tail [drain_end, N]
+// cover [resume, N], a superset of any same-N middle range, so the
+// middle tier is redundant. All roots compare by pointer after
+// stripping derivations.
+static bool partitionCoverageOK(Value *MidBound, ScalarLoopInfo &Drain,
+                                ScalarLoopInfo &Tail, const Function &F) {
+  Value *TailBound = loopBound(Tail);
+  if (!TailBound || !MidBound)
+    return false;
+  if (stripCountDerivation(MidBound, F) !=
+      stripCountDerivation(TailBound, F))
+    return false;
+  // Drain must be a countdown (latch against 0).
+  Value *DrainBound = loopBound(Drain);
+  auto *Zero = dyn_cast_or_null<ConstantInt>(DrainBound);
+  if (!Zero || !Zero->isZero())
+    return false;
+  return true;
+}
 static bool secondaryStartOK(Value *Start, const BasicBlock *B,
                              const DenseSet<BasicBlock *> &R,
                              const DenseSet<const PHINode *> &Resume) {
@@ -224,20 +247,26 @@ static bool secondaryStartOK(Value *Start, const BasicBlock *B,
 // one vector store of the same type. All memory ops simple
 // (non-volatile, non-atomic, align 1).
 static bool isMapBody(BasicBlock *B) {
-  LoadInst *VL = nullptr;
-  StoreInst *VS = nullptr;
+  // Interleaved/unrolled tiers repeat the load/add/store group
+  // several times per iteration (corpus AVX2 add: 4x <8 x i32>
+  // loads, adds, stores). Collect every vector memory op and every
+  // lane-wise add; all must share one element type.
+  Type *Elem = nullptr;
+  unsigned Loads = 0, Stores = 0;
   for (Instruction &I : *B) {
     if (isa<PHINode>(&I) || isa<BranchInst>(&I) ||
         isa<GetElementPtrInst>(&I) || isa<ICmpInst>(&I) ||
         isa<CastInst>(&I))
       continue;
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
-      if (!isa<FixedVectorType>(LI->getType()) || LI->isVolatile() ||
-          !LI->isSimple())
+      auto *VT = dyn_cast<FixedVectorType>(LI->getType());
+      if (!VT || LI->isVolatile() || !LI->isSimple())
         return false;
-      if (VL)
+      if (!Elem)
+        Elem = VT->getElementType();
+      else if (Elem != VT->getElementType())
         return false;
-      VL = LI;
+      ++Loads;
       continue;
     }
     if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
@@ -245,28 +274,33 @@ static bool isMapBody(BasicBlock *B) {
         // Lane-wise vector arithmetic: only add is a map.
         if (BO->getOpcode() != Instruction::Add)
           return false;
+        auto *VT = cast<FixedVectorType>(BO->getType());
+        if (!Elem)
+          Elem = VT->getElementType();
+        else if (Elem != VT->getElementType())
+          return false;
       }
       // Scalar ALU (address math, IV steps, bounds) is fine.
       continue;
     }
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
-      if (!isa<FixedVectorType>(SI->getValueOperand()->getType()) ||
-          SI->isVolatile() || !SI->isSimple())
+      auto *VT =
+          dyn_cast<FixedVectorType>(SI->getValueOperand()->getType());
+      if (!VT || SI->isVolatile() || !SI->isSimple())
         return false;
-      if (VS)
+      if (!Elem)
+        Elem = VT->getElementType();
+      else if (Elem != VT->getElementType())
         return false;
-      VS = SI;
+      ++Stores;
       continue;
     }
     if (isa<InsertElementInst>(&I) || isa<ShuffleVectorInst>(&I))
       continue;
     return false;
   }
-  if (!VL || !VS)
-    return false;
-  return VL->getType() == VS->getValueOperand()->getType();
+  return Elem && Loads >= 1 && Stores >= 1;
 }
-
 // Root pointer behind GEP/index chains: the base allocation both
 // sides must share for lane correspondence.
 static Value *ptrBase(Value *P) {
@@ -282,20 +316,22 @@ static Value *ptrBase(Value *P) {
 // recursed, commutative retry). Same memory bases on both sides.
 // Returns false (no fold) on anything unproven.
 static bool midLanesEqualMidVsDrain(BasicBlock *Mid, BasicBlock *Drain) {
-  LoadInst *VL = nullptr;
-  BinaryOperator *VAdd = nullptr;
-  StoreInst *VS = nullptr;
+  // Every vector load/add/store in the tier; every lane group must
+  // prove equal against the drain's scalar computation.
+  SmallVector<LoadInst *, 4> VLoads;
+  SmallVector<BinaryOperator *, 4> VAdds;
+  SmallVector<StoreInst *, 4> VStores;
   for (Instruction &I : *Mid) {
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
       if (isa<FixedVectorType>(LI->getType()))
-        VL = LI;
+        VLoads.push_back(LI);
     } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
       if (isa<FixedVectorType>(BO->getType()) &&
           BO->getOpcode() == Instruction::Add)
-        VAdd = BO;
+        VAdds.push_back(BO);
     } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
       if (isa<FixedVectorType>(SI->getValueOperand()->getType()))
-        VS = SI;
+        VStores.push_back(SI);
     }
   }
   LoadInst *SL = nullptr;
@@ -315,51 +351,66 @@ static bool midLanesEqualMidVsDrain(BasicBlock *Mid, BasicBlock *Drain) {
         SS = SI;
     }
   }
-  if (!VL || !VS || !SL || !SS)
+  if (VLoads.empty() || VStores.empty() || !SL || !SS)
     return false;
-  // Same memory bases: the vector load/store and scalar load/store
-  // must root at identical base pointers.
-  if (ptrBase(VL->getPointerOperand()) !=
-          ptrBase(SL->getPointerOperand()) ||
-      ptrBase(VS->getPointerOperand()) !=
-          ptrBase(SS->getPointerOperand()))
+  // Same memory bases on every memory op.
+  for (LoadInst *VL : VLoads)
+    if (ptrBase(VL->getPointerOperand()) != ptrBase(SL->getPointerOperand()))
+      return false;
+  for (StoreInst *VS : VStores)
+    if (ptrBase(VS->getPointerOperand()) != ptrBase(SS->getPointerOperand()))
+      return false;
+  // Copy (no adds either side): every stored lane group equals the
+  // loaded lanes.
+  if (VAdds.empty() && !SAdd) {
+    for (StoreInst *VS : VStores) {
+      TailCmp TC;
+      TC.A = Mid;
+      TC.B = Drain;
+      for (LoadInst *VL : VLoads)
+        TC.MapAB[VL] = SL;
+      if (!TC.laneEq(VS->getValueOperand(), SS->getValueOperand(),
+                     TailCmp::MaxDepth))
+        return false;
+    }
+    return true;
+  }
+  // Add: every lane-wise vector add must equal the scalar add. Each
+  // vector add must consume one of the tier's loads.
+  if (VAdds.empty() || !SAdd)
     return false;
-  // Copy: stored lanes are the loaded lanes.
-  if (!VAdd && !SAdd) {
+  if (SAdd->getOperand(0) != SL && SAdd->getOperand(1) != SL)
+    return false;
+  for (BinaryOperator *VAdd : VAdds) {
+    LoadInst *Used = nullptr;
+    for (LoadInst *VL : VLoads)
+      if (VAdd->getOperand(0) == VL || VAdd->getOperand(1) == VL)
+        Used = VL;
+    if (!Used)
+      return false;
     TailCmp TC;
     TC.A = Mid;
     TC.B = Drain;
-    TC.MapAB[VL] = SL;
-    return TC.laneEq(VS->getValueOperand(), SS->getValueOperand(),
-                     TailCmp::MaxDepth);
+    for (LoadInst *VL : VLoads)
+      TC.MapAB[VL] = SL;
+    // Operand order may differ (splat-first vs load-first): retry
+    // swapped for commutative add. laneEq itself stays positional.
+    if (TC.laneEq(VAdd, SAdd, TailCmp::MaxDepth))
+      continue;
+    if (VAdd->getNumOperands() != 2 || SAdd->getNumOperands() != 2)
+      return false;
+    TailCmp TCSwap;
+    TCSwap.A = Mid;
+    TCSwap.B = Drain;
+    for (LoadInst *VL : VLoads)
+      TCSwap.MapAB[VL] = SL;
+    if (!TCSwap.laneEq(VAdd->getOperand(0), SAdd->getOperand(1),
+                       TailCmp::MaxDepth) ||
+        !TCSwap.laneEq(VAdd->getOperand(1), SAdd->getOperand(0),
+                       TailCmp::MaxDepth))
+      return false;
   }
-  // Add: lane-wise add over the same load and splat operand.
-  if (!VAdd || !SAdd)
-    return false;
-  // The scalar add must consume its block's load.
-  if (SAdd->getOperand(0) != SL && SAdd->getOperand(1) != SL)
-    return false;
-  // The vector add must consume its block's load.
-  if (VAdd->getOperand(0) != VL && VAdd->getOperand(1) != VL)
-    return false;
-  TailCmp TC;
-  TC.A = Mid;
-  TC.B = Drain;
-  TC.MapAB[VL] = SL;
-  // Operand order may differ (splat-first vs load-first): retry
-  // swapped for commutative add. laneEq itself stays positional.
-  if (TC.laneEq(VAdd, SAdd, TailCmp::MaxDepth))
-    return true;
-  if (VAdd->getNumOperands() != 2 || SAdd->getNumOperands() != 2)
-    return false;
-  TailCmp TCSwap;
-  TCSwap.A = Mid;
-  TCSwap.B = Drain;
-  TCSwap.MapAB[VL] = SL;
-  return TCSwap.laneEq(VAdd->getOperand(0), SAdd->getOperand(1),
-                       TailCmp::MaxDepth) &&
-         TCSwap.laneEq(VAdd->getOperand(1), SAdd->getOperand(0),
-                       TailCmp::MaxDepth);
+  return true;
 }
 
 // Match the inner cascade around dispatch D with scalar entry S:
@@ -368,7 +419,6 @@ static bool midLanesEqualMidVsDrain(BasicBlock *Mid, BasicBlock *Drain) {
 // a preheader) whose bound the countdown check accepts against the
 // drain. Region R covers the middle preheader, tier, and exit plus
 // any dispatch blocks between D and the preheader. Returns true with
-// C filled on a full structural match; no mutation.
 static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
                               InnerCascade &C) {
   // S must route to exactly the drain and the tail entries.
@@ -421,41 +471,74 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
       continue;
     BasicBlock *V = DBr->getSuccessor(0) == S ? DBr->getSuccessor(1)
                                               : DBr->getSuccessor(0);
-    // Walk from V to the middle preheader: a block whose single
-    // successor is a vector self-loop.
-    BasicBlock *MidPre = V;
+    // BFS from V for the middle vector tier: the first vector
+    // self-loop with a map body. Its preheader is its single
+    // non-self predecessor (or the block the search stepped from).
+    // The search threads through dispatch blocks (conditional or
+    // not) without entering S/drain/tail.
+    BasicBlock *MidPre = nullptr;
     BasicBlock *Mid = nullptr;
     ScalarLoopInfo MidLoop;
-    for (unsigned Walk = 0; Walk < 8 && MidPre && !Mid; ++Walk) {
-      for (BasicBlock *Su : successors(MidPre)) {
-        if (Su == S || Su == MaybeDrain || Su == TailBB)
+    {
+      SmallVector<BasicBlock *, 16> Work{V};
+      DenseSet<BasicBlock *> Seen{V};
+      DenseMap<BasicBlock *, BasicBlock *> Pred;
+      for (unsigned Steps = 0; !Work.empty() && !Mid && Steps < 64;
+           ++Steps) {
+        BasicBlock *BB = Work.pop_back_val();
+        if (BB == S || BB == MaybeDrain || BB == TailBB)
           continue;
         ScalarLoopInfo Loop;
-        if (matchScalarLoop(Su, Loop) && isMapBody(Su)) {
-          Mid = Su;
+        if (BB != V && matchScalarLoop(BB, Loop) && isMapBody(BB)) {
+          Mid = BB;
           MidLoop = Loop;
+          MidPre = Pred.lookup(BB);
           break;
         }
+        auto *T = dyn_cast<BranchInst>(BB->getTerminator());
+        if (!T)
+          continue;
+        // Through single-successor blocks and dispatch arms alike;
+        // S/drain/tail/exit arms are pruned, not followed.
+        for (BasicBlock *Su : T->successors()) {
+          if (Su == S || Su == MaybeDrain || Su == TailBB)
+            continue;
+          if (isa<ReturnInst>(Su->getTerminator()) ||
+              isa<UnreachableInst>(Su->getTerminator()))
+            continue;
+          if (!Seen.insert(Su).second)
+            continue;
+          if (!Pred.count(Su))
+            Pred[Su] = BB;
+          Work.push_back(Su);
+        }
       }
-      if (Mid)
-        break;
-      // Step through unconditional single-successor blocks.
-      auto *WBr = dyn_cast<BranchInst>(MidPre->getTerminator());
-      if (!WBr || WBr->isConditional())
-        break;
-      MidPre = WBr->getSuccessor(0);
-      if (MidPre == S || MidPre == MaybeDrain || MidPre == TailBB)
-        break;
     }
-    if (!Mid)
+    if (!Mid || !MidPre)
       continue;
+    // The preheader must feed the tier directly.
+    {
+      bool Feeds = false;
+      for (BasicBlock *Su : successors(MidPre))
+        Feeds = Feeds || Su == Mid;
+      if (!Feeds)
+        continue;
+    }
     uint64_t Step = MidLoop.Step->getZExtValue();
     if (Step < 2)
       continue;
-    // Trip coverage: the middle bound must be the countdown
-    // complement of the drain remainder over the same N.
-    if (!countdownSecondaryOK(Mid, MidLoop, Drain, F, Step))
-      continue;
+    // Trip coverage, two forms: the countdown complement (middle
+    // bound N&~(K-1) with drain remainder N&(K-1)) or the outer-tier
+    // partition form (middle and tail bounds share the N root while
+    // drain+tail span to N, so the middle is redundant).
+    {
+      Value *MidBound = loopBound(MidLoop);
+      bool TripOK =
+          countdownSecondaryOK(Mid, MidLoop, Drain, F, Step) ||
+          partitionCoverageOK(MidBound, Drain, Tail, F);
+      if (!TripOK)
+        continue;
+    }
     // Lane equivalence (board bug 25, shared TailCmp gate): every
     // middle lane must equal the drain's scalar. The +100-vs-+1
     // mismatch fails here and bails.
@@ -647,46 +730,68 @@ static bool foldInnerCascade(Function &F, const InnerCascade &C) {
 // dispatches UnloopVec leaves behind.
 bool runUnvecMaps(llvm::Function &F) {
   bool Changed = false;
-  // Collect-then-rewrite: matching never mutates.
-  SmallVector<InnerCascade, 4> Cands;
-  for (BasicBlock &BB : F) {
-    auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!Br || !Br->isConditional())
-      continue;
-    for (unsigned SIdx = 0; SIdx < 2; ++SIdx) {
-      InnerCascade C;
-      if (matchInnerCascade(&BB, Br->getSuccessor(SIdx), F, C))
-        Cands.push_back(std::move(C));
+  // Fixpoint rounds (bounded): each round re-scans the mutated
+  // graph. Candidates run inner-first (reverse block order):
+  // inner cascades sit later in layout, and folding them first
+  // keeps the outer candidates' blocks valid. Stale candidates
+  // (blocks erased by an earlier fold) are skipped by parent
+  // check. Collect-then-rewrite within each round: matching never
+  // mutates.
+  for (unsigned Round = 0; Round < 4; ++Round) {
+    SmallVector<InnerCascade, 4> Cands;
+    SmallVector<BasicBlock *, 16> Order;
+    for (BasicBlock &BB : F) {
+      auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+      if (!Br || !Br->isConditional())
+        continue;
+      Order.push_back(&BB);
     }
-  }
-  DenseSet<BasicBlock *> Taken;
-  for (InnerCascade &C : Cands) {
-    if (Taken.count(C.D) || Taken.count(C.S) || Taken.count(C.Mid) ||
-        Taken.count(C.L) || Taken.count(C.T))
-      continue;
-    bool Overlap = false;
-    for (BasicBlock *BB : C.R)
-      Overlap = Overlap || Taken.count(BB);
-    // An earlier fold may have erased blocks this candidate
-    // references. Erased blocks have no parent; skip the stale
-    // candidate instead of touching freed memory.
-    for (BasicBlock *BB : {C.D, C.S, C.Mid, C.MidPre, C.L, C.T})
-      if (!BB || BB->getParent() != &F)
-        Overlap = true;
-    if (Overlap)
-      continue;
-    Taken.insert(C.D);
-    Taken.insert(C.S);
-    Taken.insert(C.Mid);
-    Taken.insert(C.MidPre);
-    Taken.insert(C.L);
-    Taken.insert(C.T);
-    for (BasicBlock *BB : C.R)
-      Taken.insert(BB);
-    // The lane-equivalence proof runs inside the matcher
-    // (midLanesEqualMidVsDrain over the shared TailCmp); only
-    // proved candidates reach this fold.
-    Changed |= foldInnerCascade(F, C);
+    for (auto It = Order.rbegin(); It != Order.rend(); ++It) {
+      BasicBlock *D = *It;
+      if (D->getParent() != &F)
+        continue;
+      auto *Br = dyn_cast<BranchInst>(D->getTerminator());
+      if (!Br || !Br->isConditional())
+        continue;
+      for (unsigned SIdx = 0; SIdx < 2; ++SIdx) {
+        InnerCascade C;
+        if (matchInnerCascade(D, Br->getSuccessor(SIdx), F, C))
+          Cands.push_back(std::move(C));
+      }
+    }
+    DenseSet<BasicBlock *> Taken;
+    bool RoundChanged = false;
+    for (InnerCascade &C : Cands) {
+      if (Taken.count(C.D) || Taken.count(C.S) || Taken.count(C.Mid) ||
+          Taken.count(C.L) || Taken.count(C.T))
+        continue;
+      bool Overlap = false;
+      for (BasicBlock *BB : C.R)
+        Overlap = Overlap || Taken.count(BB);
+      // An earlier fold may have erased blocks this candidate
+      // references. Erased blocks have no parent; skip the stale
+      // candidate instead of touching freed memory.
+      for (BasicBlock *BB : {C.D, C.S, C.Mid, C.MidPre, C.L, C.T})
+        if (!BB || BB->getParent() != &F)
+          Overlap = true;
+      if (Overlap)
+        continue;
+      Taken.insert(C.D);
+      Taken.insert(C.S);
+      Taken.insert(C.Mid);
+      Taken.insert(C.MidPre);
+      Taken.insert(C.L);
+      Taken.insert(C.T);
+      for (BasicBlock *BB : C.R)
+        Taken.insert(BB);
+      // The lane-equivalence proof runs inside the matcher
+      // (midLanesEqualMidVsDrain over the shared TailCmp); only
+      // proved candidates reach this fold.
+      RoundChanged |= foldInnerCascade(F, C);
+    }
+    Changed |= RoundChanged;
+    if (!RoundChanged)
+      break;
   }
   return Changed;
 }
