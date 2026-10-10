@@ -124,7 +124,6 @@ Expr *ExprBuilderImpl::buildLoadValue(llvm::LoadInst &I, ExprScope &Scope) {
 }
 
 Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
-  Expr *Val = value(I.getValueOperand(), Scope);
   Expr *Ptr = value(I.getPointerOperand(), Scope);
   QualType Pointee = Types.typeOf(I.getValueOperand()->getType(),
                                   debugTypeOf(I.getValueOperand()));
@@ -136,6 +135,125 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
   else
     Dst = derefPointer(Ptr, Pointee);
   QualType DestType = Dst->getType();
+
+  auto *Update = llvm::dyn_cast<llvm::BinaryOperator>(I.getValueOperand());
+  llvm::Value *UpdateRHS = Update ? Update->getOperand(1) : nullptr;
+  auto *OldValue =
+      Update ? llvm::dyn_cast<llvm::LoadInst>(Update->getOperand(0)) : nullptr;
+  bool IsCommutativeInt = Update && Update->getType()->isIntegerTy() &&
+                          (Update->getOpcode() == llvm::Instruction::Add ||
+                           Update->getOpcode() == llvm::Instruction::Mul ||
+                           Update->getOpcode() == llvm::Instruction::And ||
+                           Update->getOpcode() == llvm::Instruction::Or ||
+                           Update->getOpcode() == llvm::Instruction::Xor);
+  if ((!OldValue ||
+       OldValue->getPointerOperand() != I.getPointerOperand()) &&
+      IsCommutativeInt) {
+    OldValue = llvm::dyn_cast<llvm::LoadInst>(Update->getOperand(1));
+    if (OldValue &&
+        OldValue->getPointerOperand() == I.getPointerOperand())
+      UpdateRHS = Update->getOperand(0);
+  }
+  BinaryOperatorKind CompoundOp = BO_Assign;
+  bool SameDestinationType = AST->hasSameType(DestType, Pointee);
+  if (!SameDestinationType && DestType->isIntegerType() &&
+      Pointee->isIntegerType())
+    SameDestinationType =
+        AST->getTypeSize(DestType) == AST->getTypeSize(Pointee) &&
+        DestType->isSignedIntegerType() == Pointee->isSignedIntegerType();
+  bool CanCompound = OldValue &&
+                     OldValue->getPointerOperand() == I.getPointerOperand() &&
+                     !I.getValueOperand()->getType()->isAggregateType() &&
+                     !I.getValueOperand()->getType()->isVectorTy() &&
+                     Update->getOperand(0)->getType() ==
+                         I.getValueOperand()->getType() &&
+                     Update->getOperand(1)->getType() ==
+                         I.getValueOperand()->getType() &&
+                     SameDestinationType;
+  if (CanCompound) {
+    switch (Update->getOpcode()) {
+    case llvm::Instruction::Add:
+    case llvm::Instruction::FAdd:
+      CompoundOp = BO_AddAssign;
+      break;
+    case llvm::Instruction::Sub:
+    case llvm::Instruction::FSub:
+      CompoundOp = BO_SubAssign;
+      break;
+    case llvm::Instruction::Mul:
+    case llvm::Instruction::FMul:
+      CompoundOp = BO_MulAssign;
+      break;
+    case llvm::Instruction::SDiv:
+      if (!DestType->isSignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_DivAssign;
+      break;
+    case llvm::Instruction::UDiv:
+      if (!DestType->isUnsignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_DivAssign;
+      break;
+    case llvm::Instruction::FDiv:
+      CompoundOp = BO_DivAssign;
+      break;
+    case llvm::Instruction::SRem:
+      if (!DestType->isSignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_RemAssign;
+      break;
+    case llvm::Instruction::URem:
+      if (!DestType->isUnsignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_RemAssign;
+      break;
+    case llvm::Instruction::And:
+      CompoundOp = BO_AndAssign;
+      break;
+    case llvm::Instruction::Or:
+      CompoundOp = BO_OrAssign;
+      break;
+    case llvm::Instruction::Xor:
+      CompoundOp = BO_XorAssign;
+      break;
+    case llvm::Instruction::Shl:
+      CompoundOp = BO_ShlAssign;
+      break;
+    case llvm::Instruction::LShr:
+      if (!DestType->isUnsignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_ShrAssign;
+      break;
+    case llvm::Instruction::AShr:
+      if (!DestType->isSignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_ShrAssign;
+      break;
+    default:
+      CanCompound = false;
+      break;
+    }
+  }
+  if (CanCompound) {
+    Expr *RHS = value(UpdateRHS, Scope);
+    return clang::CompoundAssignOperator::Create(
+        *AST, Dst, RHS, CompoundOp, DestType, VK_PRValue, OK_Ordinary,
+        SourceLocation(), FPOptionsOverride(), DestType, DestType);
+  }
+
+  Expr *Val = value(I.getValueOperand(), Scope);
   if (Val->getType() != DestType && !DestType.isNull()) {
     // A wide destination has no cast rule of its own.
     if (isWideIntRecord(DestType) || isWideIntRecord(Val->getType()))
@@ -152,10 +270,9 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
     else if (Val->getType()->isPointerType() && DestType->isIntegerType())
       Val = makeCStyleCast(DestType, CK_PointerToIntegral, Val);
   }
-  clang::BinaryOperator *Assign = BinaryOperator::Create(
-      *AST, Dst, Val, BO_Assign, Dst->getType(), VK_PRValue, OK_Ordinary,
-      SourceLocation(), FPOptionsOverride());
-  return Assign;
+  return BinaryOperator::Create(*AST, Dst, Val, BO_Assign, Dst->getType(),
+                                VK_PRValue, OK_Ordinary, SourceLocation(),
+                                FPOptionsOverride());
 }
 
 Expr *ExprBuilderImpl::buildGEPValue(llvm::GetElementPtrInst &I, ExprScope &Scope) {

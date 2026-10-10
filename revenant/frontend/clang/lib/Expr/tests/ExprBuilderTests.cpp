@@ -382,7 +382,27 @@ TEST_F(ExprTest, LoadStoreDeref) {
   clang::PrintingPolicy Policy(LangOpts);
   St->printPretty(OS, nullptr, Policy);
   EXPECT_EQ(std::string(OS.str()), "v = a");
+
+  StoreInst *Update = B.CreateStore(
+      B.CreateAdd(B.CreateLoad(Type::getInt32Ty(LLCtx), All), H.A), All);
+  St = Exprs->instr(*Update, Scope);
+  ASSERT_NE(St, nullptr);
+  Buf.clear();
+  clang::PrintingPolicy UpdatePolicy(LangOpts);
+  llvm::raw_svector_ostream UpdateOS(Buf);
+  St->printPretty(UpdateOS, nullptr, UpdatePolicy);
+  EXPECT_EQ(std::string(UpdateOS.str()), "v += a");
+
+  StoreInst *Reversed = B.CreateStore(
+      B.CreateAdd(H.A, B.CreateLoad(Type::getInt32Ty(LLCtx), All)), All);
+  St = Exprs->instr(*Reversed, Scope);
+  ASSERT_NE(St, nullptr);
+  Buf.clear();
+  llvm::raw_svector_ostream ReversedOS(Buf);
+  St->printPretty(ReversedOS, nullptr, UpdatePolicy);
+  EXPECT_EQ(std::string(ReversedOS.str()), "v += a");
 }
+
 
 TEST_F(ExprTest, GepArraySubscript) {
   FuncHost H = makeFunc();

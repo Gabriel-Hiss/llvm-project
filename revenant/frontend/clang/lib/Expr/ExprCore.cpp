@@ -251,6 +251,8 @@ Expr *ExprBuilderImpl::makeCStyleCast(QualType T, CastKind K, Expr *Op) {
   // the model spells the conversion as a compound literal or a `.lo`.
   if (Expr *Wide = wideIntConvert(*AST, T, Op, K))
     return Wide;
+  if (AST->hasSameType(T, Op->getType()))
+    return Op;
   // `(T)a + b` casts only `a`: a binary operand needs its own parentheses.
   Op = parenIfNeeded(Op, Prec::Unary);
   K = boolDestKind(T, K, Op);
