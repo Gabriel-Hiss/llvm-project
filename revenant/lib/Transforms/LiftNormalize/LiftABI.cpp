@@ -206,6 +206,10 @@ void copyOrigin(Instruction *To, const Instruction &From) {
 Value *toPointer(Value *V, IRBuilder<> &B) {
   if (auto *P = dyn_cast<PtrToIntInst>(V))
     return P->getPointerOperand();
+  if (V->getType()->isPointerTy())
+    return V;
+  if (!V->getType()->isIntegerTy(64))
+    return nullptr;
   return B.CreateIntToPtr(V, B.getPtrTy(), "abi.ptr");
 }
 struct Signature {
@@ -260,8 +264,12 @@ void rewriteSignature(Function &F, Signature &S) {
   if (S.PointerReturn)
     for (BasicBlock &BB : *N)
       if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        if (!R->getReturnValue())
+          continue;
         IRBuilder<> B(R);
         Value *V = toPointer(R->getReturnValue(), B);
+        if (!V)
+          continue;
         if (auto *I = dyn_cast<Instruction>(V))
           if (I != R->getReturnValue())
             copyOrigin(I, *R);
@@ -282,6 +290,8 @@ void rewriteSignature(Function &F, Signature &S) {
     for (unsigned J = 0; J < Params.size(); ++J)
       if (S.Pointers[J]) {
         Value *Arg = toPointer(C->getArgOperand(J), B);
+        if (!Arg)
+          continue;
         if (auto *I = dyn_cast<Instruction>(Arg))
           if (I != C->getArgOperand(J))
             copyOrigin(I, *C);

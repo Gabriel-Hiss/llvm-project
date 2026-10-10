@@ -84,6 +84,62 @@ TEST(SignaturesTest, InfersRegisterParameterAndObservedReturn) {
   EXPECT_EQ(Sig->Ret.Bits, 32u);
 }
 
+TEST(SignaturesTest, WrapperReturningCallResultKeepsReturn) {
+  // Wrapper: call target; ret. The only caller ignores the result, but
+  // the wrapper returns exactly what the call left in eax and the target
+  // computes a full 32-bit value on every path to ret (cpp-clang-o2
+  // `sum_vec`: caller ignores eax, target must-defines it). Both must
+  // keep the return; dropping it is wrong code for differential calls.
+  constexpr uint64_t Base = 0x140020000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x30;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // target @+0x00: mov eax,ecx; ret
+  Text.Data[0x00] = 0x8B;
+  Text.Data[0x01] = 0xC1;
+  Text.Data[0x02] = 0xC3;
+  // wrapper @+0x10: call target; ret
+  Text.Data[0x10] = 0xE8;
+  Text.Data[0x11] = 0xEB;
+  Text.Data[0x12] = 0xFF;
+  Text.Data[0x13] = 0xFF;
+  Text.Data[0x14] = 0xFF;
+  Text.Data[0x15] = 0xC3;
+  // caller @+0x20: call wrapper; xor edx,edx; ret (ignores eax)
+  Text.Data[0x20] = 0xE8;
+  Text.Data[0x21] = 0xEB;
+  Text.Data[0x22] = 0xFF;
+  Text.Data[0x23] = 0xFF;
+  Text.Data[0x24] = 0xFF;
+  Text.Data[0x25] = 0x31;
+  Text.Data[0x26] = 0xD2;
+  Text.Data[0x27] = 0xC3;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va TargetVa(Base), WrapVa(Base + 0x10), CallerVa(Base + 0x20);
+  P.Functions.emplace(TargetVa, record(TargetVa, 0, 3, {0, 2}));
+  P.Functions.emplace(WrapVa, record(WrapVa, 0x10, 6, {0x10, 0x15}));
+  P.Functions.emplace(CallerVa,
+                      record(CallerVa, 0x20, 8, {0x20, 0x25, 0x27}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *WrapSig = S.of(WrapVa);
+  ASSERT_NE(WrapSig, nullptr);
+  EXPECT_TRUE(WrapSig->HasRet) << "wrapper lost its return";
+  EXPECT_EQ(WrapSig->Ret.Bits, 32u);
+  const Signature *TargetSig = S.of(TargetVa);
+  ASSERT_NE(TargetSig, nullptr);
+  EXPECT_TRUE(TargetSig->HasRet) << "call target lost its return";
+}
+
 TEST(SignaturesTest, RecognizesVarArgsHomeSpillsWithoutInventingParameters) {
   constexpr uint64_t Base = 0x140003000;
   Program P;
