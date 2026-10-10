@@ -65,7 +65,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/Uninline/Uninline.h"
-
+#include "revenant/Evidence/Evidence.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -167,6 +167,9 @@ struct CalleeBody {
   SmallVector<const Instruction *, 16> Insts;
   const Value *RetVal = nullptr; // null for `ret void`
   bool Valid = false;
+  // Tiny exact-match body held only by lift-recorded evidence: the caller
+  // must confirm regionMatchesEvidence before any rewrite.
+  bool EvidenceOnly = false;
 };
 
 CalleeBody analyzeCallee(Function &F) {
@@ -219,8 +222,14 @@ CalleeBody analyzeCallee(Function &F) {
   for (const Instruction *I : B.Insts)
     if (isa<CallBase>(I))
       HasCall = true;
-  if (B.Insts.size() < 3 && !HasCall)
-    return B;
+  if (B.Insts.size() < 3 && !HasCall) {
+    // Tiny bodies stay eligible only with lift-recorded evidence; the
+    // caller confirms regionMatchesEvidence per candidate region.
+    // --meta=none keeps the reject: empty evidence never confirms.
+    if (revenant::evidence::uninlineEvidence(F).empty())
+      return B;
+    B.EvidenceOnly = true;
+  }
   // Wrapper disambiguation: a body that only forwards its arguments to
   // one inner call (`mz_free(p)` = `free(p)`) is indistinguishable from
   // hand-written calls to the inner function (measured: all 16 `free`
@@ -567,6 +576,11 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
       }
     }
   }
+  // Evidence for EvidenceOnly callees is a pure function read: compute
+  // once per callee, not per candidate region.
+  const revenant::evidence::InlineEvidence Ev =
+      CB.EvidenceOnly ? revenant::evidence::uninlineEvidence(*Callee)
+                      : revenant::evidence::InlineEvidence{};
   bool Changed = false;
   // Snapshot blocks: the rewrite erases instructions but never adds or
   // removes blocks, so iterating blocks directly is safe.
@@ -594,6 +608,23 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
         SmallVector<Instruction *, 16> RegionInsts;
         for (unsigned i = 0; i != CB.Insts.size(); ++i)
           RegionInsts.push_back(Body[S + i]);
+        // Evidence-only bodies rewrite solely when the region or the
+        // escape's users reference the same distinctive strings or
+        // library body as the callee: the string use of an inlined
+        // value naturally sits outside the spliced body.
+        if (CB.EvidenceOnly) {
+          SmallVector<Instruction *, 16> EvRegion(RegionInsts.begin(),
+                                                  RegionInsts.end());
+          // matchWindow leaves Escape null when RetVal is unset; mirror
+          // the fallback below so escape users still join the check.
+          Value *EvEscape = Escape ? Escape : RegionInsts.back();
+          for (User *U : EvEscape->users())
+            if (auto *UI = dyn_cast<Instruction>(U))
+              if (UI->getParent() == &BB)
+                EvRegion.push_back(UI);
+          if (!revenant::evidence::regionMatchesEvidence(Ev, EvRegion))
+            continue;
+        }
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
           // region end.
