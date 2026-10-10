@@ -354,7 +354,8 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
       return Or;
     return makeCStyleCast(T, CK_IntegralCast, Or);
   }
-  llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative())
+  llvm::APInt Val = (T->isSignedIntegerType() && V.isNegative() &&
+                     V.getBitWidth() > 1)
                         ? V.sextOrTrunc(W)
                         : V.zextOrTrunc(W);
   // Single characters in a char-typed slot print as 'x'.
