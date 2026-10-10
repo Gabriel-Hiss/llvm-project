@@ -2,9 +2,9 @@
 //
 // See revenant/Analysis/Strings.h. Ports crates/analysis/src/strings.rs 1:1:
 //
-// - ASCII: NUL-terminated bytes, all printable (0x20..0x7e) or tab, >= 4.
-//   The printable range is plain ASCII, so the Rust side's UTF-8 validity
-//   check holds by construction.
+// - ASCII: NUL-terminated bytes, legal UTF-8 whose characters are printable
+//   or tab, newline and carriage return, >= 4. rustc concatenates string
+//   fragments, so one constant may mix plain ASCII with multi-byte text.
 // - UTF-16: LE units up to the first NUL, strictly decoded (lone
 //   surrogates reject, like Rust's `String::from_utf16`), >= 4 chars, all
 //   non-control or tab.
@@ -15,9 +15,11 @@
 #include "revenant/Analysis/Strings.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ConvertUTF.h"
 
 namespace revenant {
@@ -27,30 +29,45 @@ constexpr size_t AsciiCap = 4096;
 constexpr size_t WideCap = 8192;
 constexpr size_t MinLen = 4;
 
-bool isAsciiPrintable(uint8_t B) {
-  return (B >= 0x20 && B < 0x7f) || B == '\t';
+// A referenced run may hold UTF-8 text: rustc concatenates string fragments
+// into one constant, so a merged panic message mixes plain ASCII with
+// multi-byte characters. The run is legal UTF-8 and every character is
+// printable, with tab, newline and carriage return the control characters
+// kept. Reads that fail either test fall through to the UTF-16 reader.
+bool isTextualUTF8(llvm::StringRef Run) {
+  const llvm::UTF8 *Cursor = reinterpret_cast<const llvm::UTF8 *>(Run.data());
+  const llvm::UTF8 *RunEnd = Cursor + Run.size();
+  while (Cursor < RunEnd) {
+    llvm::UTF32 Cp = 0;
+    if (llvm::convertUTF8Sequence(&Cursor, RunEnd, &Cp,
+                                  llvm::strictConversion) !=
+        llvm::conversionOK)
+      return false;
+    if (Cp == '\t' || Cp == '\n' || Cp == '\r')
+      continue;
+    if (Cp < 0x20 || (Cp >= 0x7f && Cp <= 0x9f))
+      return false;
+  }
+  return true;
 }
 
-}
-
+} // anonymous namespace
 
 std::optional<std::string> stringAt(const Image &Img, Va Addr) {
   const Section *Sec = Img.sectionOf(Addr);
   if (!Sec || Sec->Flags.Execute || !Sec->Flags.Read)
     return std::nullopt;
 
-  // ASCII.
+  // ASCII, including UTF-8 text. A merged constant mixes plain ASCII with
+  // multi-byte characters, so the run is decoded as UTF-8 rather than checked
+  // byte by byte; reads that are not textual fall through to the UTF-16
+  // reader below.
   if (auto Bytes = Img.readAtMost(Addr, AsciiCap)) {
     size_t End = 0;
     while (End < Bytes->size() && (*Bytes)[End] != 0)
       ++End;
-    bool Printable = true;
-    for (size_t I = 0; I < End; ++I)
-      if (!isAsciiPrintable((*Bytes)[I])) {
-        Printable = false;
-        break;
-      }
-    if (End >= MinLen && Printable)
+    if (End >= MinLen &&
+        isTextualUTF8(llvm::StringRef((const char *)Bytes->data(), End)))
       return std::string((const char *)Bytes->data(), End);
   }
 

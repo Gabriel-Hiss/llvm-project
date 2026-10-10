@@ -177,4 +177,42 @@ TEST(StringsTest, CollectKeepsOnlyStrings) {
   EXPECT_EQ(Got.begin()->second, "good!");
 }
 
+// rustc concatenates string fragments into one constant, so a merged panic
+// string mixes plain ASCII with UTF-8 text. The whole run is one string and
+// must not be read back through the UTF-16 branch, which turns "called" into
+// mojibake.
+TEST(StringsTest, MergedUtf8ConstantAccepted) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  const char *Prefix = "mainfatal runtime error: drop of the panic payload";
+  std::vector<uint8_t> Bytes(Prefix, Prefix + std::strlen(Prefix));
+  Bytes.push_back('\n');
+  Bytes.push_back('\t');
+  const char *Middle = "thread '";
+  Bytes.insert(Bytes.end(), Middle, Middle + std::strlen(Middle));
+  Bytes.push_back((uint8_t)0xCF); // U+03C0, as rustc emits it
+  Bytes.push_back((uint8_t)0x80);
+  const char *Suffix = "' failed";
+  Bytes.insert(Bytes.end(), Suffix, Suffix + std::strlen(Suffix));
+  Bytes.push_back(0);
+  poke(Img, At, Bytes);
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S,
+            "mainfatal runtime error: drop of the panic payload\n\tthread '\xCF"
+            "\x80' failed");
+}
+
+// The UTF-16 reader must still accept wide text: the ASCII branch runs first
+// but rejects it, so the wide branch owns those bytes.
+TEST(StringsTest, WideNonAsciiAccepted) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  // U+4F60, U+597D, U+4E16, U+754C in UTF-16LE.
+  poke(Img, At, {0x60, 0x4F, 0x7D, 0x59, 0x16, 0x4E, 0x4C, 0x75, 0, 0});
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S, "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C");
+}
+
 } // end anonymous namespace
