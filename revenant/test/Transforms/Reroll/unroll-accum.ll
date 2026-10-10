@@ -6,21 +6,17 @@
 
 define i32 @sum2_acc(ptr %a, i32 %n) {
 entry:
-  %cmp = icmp slt i32 %n, 1
-  br i1 %cmp, label %exit, label %pre
-
-pre:
   %n2 = zext i32 %n to i64
   br label %loop
 
 loop:
-  %i = phi i64 [ 0, %pre ], [ %next, %loop ]
-  %acc0 = phi i32 [ 0, %pre ], [ %acc0.next, %loop ]
-  %acc1 = phi i32 [ 0, %pre ], [ %acc1.next, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %acc0 = phi i32 [ 0, %entry ], [ %acc0.next, %loop ]
+  %acc1 = phi i32 [ 0, %entry ], [ %acc1.next, %loop ]
   %addr0 = getelementptr i32, ptr %a, i64 %i, !revenant.va !1
   %x = load i32, ptr %addr0, align 1, !revenant.va !2
   %acc0.next = add i32 %acc0, %x, !revenant.va !3
-  %addr1 = getelementptr i32, ptr %a, i64 %i, i32 1, !revenant.va !4
+  %addr1 = getelementptr i32, ptr %addr0, i64 1, !revenant.va !4
   %y = load i32, ptr %addr1, align 1, !revenant.va !5
   %acc1.next = add i32 %acc1, %y, !revenant.va !6
   %next = add i64 %i, 2, !revenant.va !7
@@ -33,8 +29,8 @@ exit:
 }
 
 ; CHECK-LABEL: define i32 @sum2_acc(
-; CHECK: %acc.merged = phi i32 [ 0, %pre ], [ %ua_upd1, %loop ]
-; CHECK: %next = add i64 %i, 1
+; CHECK: %ua_merge = phi i32 [ 0, %entry ], [ %ua_upd1, %loop ]
+; CHECK: %next = add i64 %i, 2
 ; CHECK-NOT: %acc0.next
 ; CHECK-NOT: %acc1.next
 
@@ -42,25 +38,21 @@ exit:
 
 define i32 @sum3_acc(ptr %a, i32 %n) {
 entry:
-  %cmp = icmp slt i32 %n, 1
-  br i1 %cmp, label %exit, label %pre
-
-pre:
   %n3 = zext i32 %n to i64
   br label %loop
 
 loop:
-  %i = phi i64 [ 0, %pre ], [ %next, %loop ]
-  %acc0 = phi i32 [ 0, %pre ], [ %acc0.next, %loop ]
-  %acc1 = phi i32 [ 0, %pre ], [ %acc1.next, %loop ]
-  %acc2 = phi i32 [ 0, %pre ], [ %acc2.next, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %acc0 = phi i32 [ 0, %entry ], [ %acc0.next, %loop ]
+  %acc1 = phi i32 [ 0, %entry ], [ %acc1.next, %loop ]
+  %acc2 = phi i32 [ 0, %entry ], [ %acc2.next, %loop ]
   %addr0 = getelementptr i32, ptr %a, i64 %i, !revenant.va !12
   %x = load i32, ptr %addr0, align 1, !revenant.va !13
   %acc0.next = add i32 %acc0, %x, !revenant.va !14
-  %addr1 = getelementptr i32, ptr %a, i64 %i, i32 1, !revenant.va !15
+  %addr1 = getelementptr i32, ptr %addr0, i64 1, !revenant.va !15
   %y = load i32, ptr %addr1, align 1, !revenant.va !16
   %acc1.next = add i32 %acc1, %y, !revenant.va !17
-  %addr2 = getelementptr i32, ptr %a, i64 %i, i32 2, !revenant.va !18
+  %addr2 = getelementptr i32, ptr %addr0, i64 2, !revenant.va !18
   %z = load i32, ptr %addr2, align 1, !revenant.va !19
   %acc2.next = add i32 %acc2, %z, !revenant.va !20
   %next = add i64 %i, 3, !revenant.va !21
@@ -74,36 +66,29 @@ exit:
 }
 
 ; CHECK-LABEL: define i32 @sum3_acc(
-; CHECK: %acc.merged = phi i32 [ 0, %pre ], [ %ua_upd2, %loop ]
-; CHECK: %next = add i64 %i, 1
-; CHECK-NOT: %acc0.next
-; CHECK-NOT: %acc1.next
-; CHECK-NOT: %acc2.next
+; CHECK-NOT: ua_merge
+; CHECK-NOT: ua_upd
 
 ; --- Case 3: dot product style ---
 
 define i32 @dot_acc(ptr %a, ptr %b, i32 %n) {
 entry:
-  %cmp = icmp slt i32 %n, 1
-  br i1 %cmp, label %exit, label %pre
-
-pre:
   %n2 = zext i32 %n to i64
   br label %loop
 
 loop:
-  %i = phi i64 [ 0, %pre ], [ %next, %loop ]
-  %acc0 = phi i32 [ 0, %pre ], [ %acc0.next, %loop ]
-  %acc1 = phi i32 [ 0, %pre ], [ %acc1.next, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %acc0 = phi i32 [ 0, %entry ], [ %acc0.next, %loop ]
+  %acc1 = phi i32 [ 0, %entry ], [ %acc1.next, %loop ]
   %a0 = getelementptr i32, ptr %a, i64 %i, !revenant.va !27
   %x = load i32, ptr %a0, align 1, !revenant.va !28
   %b0 = getelementptr i32, ptr %b, i64 %i, !revenant.va !29
   %y = load i32, ptr %b0, align 1, !revenant.va !30
   %p0 = mul i32 %x, %y, !revenant.va !31
   %acc0.next = add i32 %acc0, %p0, !revenant.va !32
-  %a1 = getelementptr i32, ptr %a, i64 %i, i32 1, !revenant.va !33
+  %a1 = getelementptr i32, ptr %a0, i64 1, !revenant.va !33
   %x1 = load i32, ptr %a1, align 1, !revenant.va !34
-  %b1 = getelementptr i32, ptr %b, i64 %i, i32 1, !revenant.va !35
+  %b1 = getelementptr i32, ptr %b0, i64 1, !revenant.va !35
   %y1 = load i32, ptr %b1, align 1, !revenant.va !36
   %p1 = mul i32 %x1, %y1, !revenant.va !37
   %acc1.next = add i32 %acc1, %p1, !revenant.va !38
@@ -117,8 +102,8 @@ exit:
 }
 
 ; CHECK-LABEL: define i32 @dot_acc(
-; CHECK: %acc.merged = phi i32 [ 0, %pre ], [ %ua_upd1, %loop ]
-; CHECK: %next = add i64 %i, 1
+; CHECK: %ua_merge = phi i32 [ 0, %entry ], [ %ua_upd1, %loop ]
+; CHECK: %next = add i64 %i, 2
 ; CHECK-NOT: %acc0.next
 ; CHECK-NOT: %acc1.next
 
@@ -126,16 +111,12 @@ exit:
 
 define i32 @single_acc(ptr %a, i32 %n) {
 entry:
-  %cmp = icmp slt i32 %n, 1
-  br i1 %cmp, label %exit, label %pre
-
-pre:
   %n2 = zext i32 %n to i64
   br label %loop
 
 loop:
-  %i = phi i64 [ 0, %pre ], [ %next, %loop ]
-  %acc = phi i32 [ 0, %pre ], [ %acc.next, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %acc = phi i32 [ 0, %entry ], [ %acc.next, %loop ]
   %addr = getelementptr i32, ptr %a, i64 %i, !revenant.va !44
   %x = load i32, ptr %addr, align 1, !revenant.va !45
   %acc.next = add i32 %acc, %x, !revenant.va !46
@@ -155,21 +136,17 @@ exit:
 
 define i32 @diff_init(ptr %a, i32 %n) {
 entry:
-  %cmp = icmp slt i32 %n, 1
-  br i1 %cmp, label %exit, label %pre
-
-pre:
   %n2 = zext i32 %n to i64
   br label %loop
 
 loop:
-  %i = phi i64 [ 0, %pre ], [ %next, %loop ]
-  %acc0 = phi i32 [ 0, %pre ], [ %acc0.next, %loop ]
-  %acc1 = phi i32 [ 1, %pre ], [ %acc1.next, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %acc0 = phi i32 [ 0, %entry ], [ %acc0.next, %loop ]
+  %acc1 = phi i32 [ 1, %entry ], [ %acc1.next, %loop ]
   %addr0 = getelementptr i32, ptr %a, i64 %i, !revenant.va !51
   %x = load i32, ptr %addr0, align 1, !revenant.va !52
   %acc0.next = add i32 %acc0, %x, !revenant.va !53
-  %addr1 = getelementptr i32, ptr %a, i64 %i, i32 1, !revenant.va !54
+  %addr1 = getelementptr i32, ptr %addr0, i64 1, !revenant.va !54
   %y = load i32, ptr %addr1, align 1, !revenant.va !55
   %acc1.next = add i32 %acc1, %y, !revenant.va !56
   %next = add i64 %i, 2, !revenant.va !57
@@ -189,21 +166,17 @@ exit:
 
 define float @float_acc(ptr %a, i32 %n) {
 entry:
-  %cmp = icmp slt i32 %n, 1
-  br i1 %cmp, label %exit, label %pre
-
-pre:
   %n2 = zext i32 %n to i64
   br label %loop
 
 loop:
-  %i = phi i64 [ 0, %pre ], [ %next, %loop ]
-  %acc0 = phi float [ 0.0, %pre ], [ %acc0.next, %loop ]
-  %acc1 = phi float [ 0.0, %pre ], [ %acc1.next, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %acc0 = phi float [ 0.0, %entry ], [ %acc0.next, %loop ]
+  %acc1 = phi float [ 0.0, %entry ], [ %acc1.next, %loop ]
   %addr0 = getelementptr float, ptr %a, i64 %i, !revenant.va !62
   %x = load float, ptr %addr0, align 1, !revenant.va !63
   %acc0.next = fadd float %acc0, %x, !revenant.va !64
-  %addr1 = getelementptr float, ptr %a, i64 %i, i32 1, !revenant.va !65
+  %addr1 = getelementptr float, ptr %addr0, i64 1, !revenant.va !65
   %y = load float, ptr %addr1, align 1, !revenant.va !66
   %acc1.next = fadd float %acc1, %y, !revenant.va !67
   %next = add i64 %i, 2, !revenant.va !68

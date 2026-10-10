@@ -79,17 +79,15 @@ bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
   int64_t SignedStep = C->getSExtValue();
   if (SignedStep == INT64_MIN)
     return false;
-  int64_t Step = SignedStep;
-  if (BO->getOpcode() == Instruction::Sub)
-    Step = -Step;
-  int64_t Mag = Step >= 0 ? Step : -Step;
-  if (Mag < 2 || Mag > 4096)
+  if (SignedStep < 0)
     return false;
-  StepOut = (uint64_t)Mag;
+  int64_t Step = SignedStep;
+  if (Step < 2 || Step > 4096)
+    return false;
+  StepOut = (uint64_t)Step;
   StepInstOut = BO;
   return true;
 }
-
 
 // Trace the update chain for an accumulator PHI.
 bool traceAccChain(PHINode *Phi, BasicBlock *H,
@@ -134,44 +132,51 @@ bool traceAccChain(PHINode *Phi, BasicBlock *H,
   return !Chain.empty();
 }
 
-// Check that all accumulator PHIs have the same preheader initial value.
+// Check that all accumulator PHIs have the same preheader initial value,
+// and that value is zero (so merging K accumulators into one with the same
+// init is semantically correct).
 bool sameInitialValue(const SmallVector<PHINode *, 4> &AccPhis) {
   if (AccPhis.empty())
     return true;
   Value *Init = AccPhis[0]->getIncomingValue(0);
+  if (!isa<ConstantInt>(Init) || !cast<ConstantInt>(Init)->isZero())
+    return false;
   for (unsigned i = 1; i < AccPhis.size(); ++i)
     if (AccPhis[i]->getIncomingValue(0) != Init)
       return false;
   return true;
 }
 
-// Check that accumulator PHIs used outside the loop form a single combine
-// tree (each PHI feeds exactly one external user, and those users form a
-// connected DAG).
+// Check that accumulator PHIs used outside the loop form a single-level
+// combine tree (one binop reading all acc PHIs directly). Returns the
+// combine instruction via `CombineOut` if valid.
 bool combineTreeOutside(const SmallVector<PHINode *, 4> &AccPhis,
-                        BasicBlock *H) {
-  SmallVector<Instruction *, 8> ExternalUsers;
+                        BasicBlock *H,
+                        Instruction **CombineOut) {
+  SmallPtrSet<Instruction *, 8> ExternalSet;
   for (PHINode *P : AccPhis)
     for (User *U : P->users()) {
       auto *UI = dyn_cast<Instruction>(U);
       if (!UI || UI->getParent() != H)
-        ExternalUsers.push_back(UI);
+        ExternalSet.insert(UI);
     }
-  if (ExternalUsers.empty())
+  if (ExternalSet.empty()) {
+    *CombineOut = nullptr;
     return true;
-  for (Instruction *I : ExternalUsers) {
-    auto *BO = dyn_cast<BinaryOperator>(I);
-    if (!BO)
-      return false;
-    bool ReadsAcc = false;
-    for (Value *Op : BO->operands())
-      if (isa<PHINode>(Op)) {
-        ReadsAcc = true;
-        break;
-      }
-    if (!ReadsAcc)
-      return false;
   }
+  if (ExternalSet.size() != 1)
+    return false;
+  auto *BO = dyn_cast<BinaryOperator>(*ExternalSet.begin());
+  if (!BO)
+    return false;
+  bool ReadsAcc = false;
+  for (Value *Op : BO->operands())
+    if (isa<PHINode>(Op)) {
+      ReadsAcc = true;
+      break;
+    }
+  if (!ReadsAcc)
+    return false;
   for (PHINode *P : AccPhis) {
     bool Reaches = false;
     for (User *U : P->users()) {
@@ -184,78 +189,7 @@ bool combineTreeOutside(const SmallVector<PHINode *, 4> &AccPhis,
     if (!Reaches)
       return false;
   }
-  return true;
-}
-
-// Collect all load addresses used by a value, unfolding through pure defs.
-void collectLoadAddrs(Value *V, const DefLookup &DL,
-                       SmallVector<GetElementPtrInst *, 8> &Addrs) {
-  if (auto *LI = dyn_cast<LoadInst>(V)) {
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand()))
-      Addrs.push_back(GEP);
-    return;
-  }
-  Instruction *Def = DL.find(V);
-  if (!Def)
-    return;
-  for (Use &U : Def->operands())
-    collectLoadAddrs(U.get(), DL, Addrs);
-}
-
-// Verify that the non-chain operands of a chain's updates access memory
-// with a uniform stride: each load address in window w differs from the
-// corresponding address in window 0 by exactly w elements.
-bool uniformAddressStride(const SmallVector<Instruction *, 8> &Chain,
-                          PHINode *AccPhi, Value *IV, const DefLookup &DL) {
-  int64_t D = (int64_t)Chain.size();
-  if (D < 2)
-    return false;
-
-  // Collect the non-chain operand of each update.
-  SmallVector<Value *, 8> Others;
-  for (int64_t w = 0; w < D; ++w) {
-    auto *BO = cast<BinaryOperator>(Chain[(size_t)w]);
-    Value *Other = nullptr;
-    for (Value *Op : BO->operands())
-      if (Op != AccPhi && (w == 0 || Op != Chain[(size_t)w - 1])) {
-        Other = Op;
-        break;
-      }
-    if (!Other)
-      return false;
-    Others.push_back(Other);
-  }
-
-  // Collect load addresses for window 0.
-  SmallVector<GetElementPtrInst *, 8> Addrs0;
-  collectLoadAddrs(Others[0], DL, Addrs0);
-  if (Addrs0.empty())
-    return false;
-
-  // For each subsequent window, collect load addresses and verify stride.
-  for (int64_t w = 1; w < D; ++w) {
-    SmallVector<GetElementPtrInst *, 8> AddrsW;
-    collectLoadAddrs(Others[(size_t)w], DL, AddrsW);
-    if (AddrsW.size() != Addrs0.size())
-      return false;
-    for (size_t i = 0; i < Addrs0.size(); ++i) {
-      auto *GEP0 = Addrs0[i];
-      auto *GEPW = AddrsW[i];
-      if (GEP0->getPointerOperand() != GEPW->getPointerOperand())
-        return false;
-      if (GEP0->getNumIndices() != GEPW->getNumIndices())
-        return false;
-      for (unsigned j = 0; j < GEP0->getNumIndices(); ++j) {
-        auto *Idx0 = dyn_cast<ConstantInt>(GEP0->idx_begin()[j]);
-        auto *IdxW = dyn_cast<ConstantInt>(GEPW->idx_begin()[j]);
-        if (!Idx0 || !IdxW)
-          return false;
-        int64_t Diff = IdxW->getSExtValue() - Idx0->getSExtValue();
-        if (Diff != w)
-          return false;
-      }
-    }
-  }
+  *CombineOut = BO;
   return true;
 }
 
@@ -300,12 +234,6 @@ unsigned tryFoldMultiAcc(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
   if (AccPhis.size() < 2)
     return 0;
 
-  // Build DefLookup for affine analysis.
-  DefLookup DL;
-  for (Instruction &DI : *H)
-    if (!DI.getType()->isVoidTy())
-      DL.Map[&DI] = &DI;
-
   // Trace update chains for each accumulator PHI.
   SmallVector<SmallVector<Instruction *, 8>, 4> Chains;
   for (PHINode *P : AccPhis) {
@@ -315,16 +243,17 @@ unsigned tryFoldMultiAcc(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     Chains.push_back(Chain);
   }
 
-  // All chains must have the same length D >= 2.
+  // All chains must have the same length D == 1 (one update per accumulator
+  // per iteration; D>1 multi-accumulator unrolls are not handled yet).
   int64_t D = (int64_t)Chains[0].size();
-  if (D < 2)
+  if (D != 1)
     return 0;
   for (auto &Chain : Chains)
     if ((int64_t)Chain.size() != D)
       return 0;
 
-  // The IV step must equal the fold factor D.
-  if (Step != D)
+  // The IV step must equal the number of accumulators K.
+  if (Step != (int64_t)AccPhis.size())
     return 0;
 
   // All chains must use the same operation.
@@ -353,55 +282,40 @@ unsigned tryFoldMultiAcc(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
   if (!sameInitialValue(AccPhis))
     return 0;
 
-  // Accumulators used outside the loop must form a combine tree.
-  if (!combineTreeOutside(AccPhis, H))
+  // Accumulators used outside the loop must form a single-level combine tree.
+  Instruction *CombineInst = nullptr;
+  if (!combineTreeOutside(AccPhis, H, &CombineInst))
     return 0;
 
-  // Verify uniform address stride for each chain.
-  for (auto &Chain : Chains)
-    if (!uniformAddressStride(Chain, AccPhis[&Chain - &Chains[0]], IVPhi, DL))
-      return 0;
-
   // --- Fold ---
-  // Drop updates 1..D-1 from each chain.
-  SmallPtrSet<Instruction *, 16> Drop;
-  for (auto &Chain : Chains)
-    for (size_t i = 1; i < Chain.size(); ++i)
-      Drop.insert(Chain[i]);
-
-  // Iteratively drop instructions whose uses are all dropped.
-  bool Changed = true;
-  while (Changed) {
-    Changed = false;
-    for (Instruction &I : *H) {
-      if (Drop.count(&I) || isa<PHINode>(&I) || &I == StepInst ||
-          I.isTerminator())
-        continue;
-      bool AllUsesDropped = true;
-      bool HasUses = false;
-      for (User *U : I.users()) {
-        auto *UI = dyn_cast<Instruction>(U);
-        if (!UI || UI->getParent() != H)
-          continue;
-        HasUses = true;
-        if (!Drop.count(UI))
-          AllUsesDropped = false;
-      }
-      if (HasUses && AllUsesDropped) {
-        Drop.insert(&I);
-        Changed = true;
-      }
+  // Create merged PHI at block start (after existing PHIs).
+  Instruction *InsertPoint = &*H->getFirstNonPHIIt();
+  IRBuilder<> B(InsertPoint);
+  PHINode *NewPhi = B.CreatePHI(Chains[0][0]->getType(), 2, "ua_merge");
+  // Find the first acc PHI incoming from outside the loop (pred != H).
+  BasicBlock *EntryPred = nullptr;
+  Value *EntryVal = nullptr;
+  for (unsigned i = 0; i < AccPhis.size(); ++i) {
+    BasicBlock *Pred = AccPhis[i]->getIncomingBlock(0);
+    if (Pred != H) {
+      EntryPred = Pred;
+      EntryVal = AccPhis[i]->getIncomingValue(0);
+      break;
     }
   }
+  if (!EntryPred)
+    return 0;
+  // Combine all acc initial values into one (for zero init, stays zero).
+  for (unsigned i = 0; i < AccPhis.size(); ++i) {
+    Value *Init = AccPhis[i]->getIncomingValue(0);
+    if (Init == EntryVal)
+      continue;
+    EntryVal = B.CreateBinOp(static_cast<Instruction::BinaryOps>(OpCode),
+                             EntryVal, Init, "ua_init");
+  }
+  NewPhi->addIncoming(EntryVal, EntryPred);
 
-  // Merge accumulators into one PHI.
-  IRBuilder<> B(H->begin());
-  PHINode *NewPhi = B.CreatePHI(Chains[0][0]->getType(), 2, "ua_merge");
-  for (unsigned i = 0; i < AccPhis.size(); ++i)
-    NewPhi->addIncoming(AccPhis[i]->getIncomingValue(0),
-                        AccPhis[i]->getIncomingBlock(0));
-
-  // Combine the first updates into a single chain at the end of the block.
+  // Create merged updates at end of block (before terminator).
   Instruction *Term = H->getTerminator();
   IRBuilder<> B2(Term);
   Value *Acc = NewPhi;
@@ -416,24 +330,56 @@ unsigned tryFoldMultiAcc(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       }
     if (!Other)
       return 0;
-    Instruction *NewUpdate =
-        B2.CreateBinOp(OpCode, Acc, Other, "ua_upd");
+    Instruction *NewUpdate = cast<Instruction>(
+        B2.CreateBinOp(static_cast<Instruction::BinaryOps>(OpCode), Acc, Other, "ua_upd"));
     copyProvenance(FirstUpdate, NewUpdate);
     Acc = NewUpdate;
   }
   NewPhi->addIncoming(Acc, H);
 
-  // Drop the original first updates (replaced by the merged chain).
-  for (auto &Chain : Chains)
-    Drop.insert(Chain[0]);
+  // Fix blocker #1: when there's a combine instruction, replace IT with
+  // NewPhi and erase it. Don't replaceAllUsesWith on the old PHIs (that
+  // would turn `add acc0,acc1` into `add NewPhi,NewPhi`).
+  if (CombineInst) {
+    // Check that every operand is an acc PHI (combine is fully redundant).
+    for (Value *Op : CombineInst->operands()) {
+      bool IsAcc = false;
+      for (PHINode *P : AccPhis)
+        if (Op == P) { IsAcc = true; break; }
+      if (!IsAcc)
+        return 0; // Can't safely fold complex combine.
+    }
+    CombineInst->replaceAllUsesWith(NewPhi);
+    CombineInst->eraseFromParent();
+  } else {
+    // No external combine: safe to replace all acc PHI uses.
+    for (PHINode *P : AccPhis)
+      P->replaceAllUsesWith(NewPhi);
+  }
+  // Clear incoming references from old PHIs (they point to dropped instructions).
+  for (PHINode *P : AccPhis)
+    P->dropAllReferences();
 
-  // Re-run dead-code elimination.
-  Changed = true;
+  // Rewrite the IV step: D*K -> K (each iteration processes K elements).
+  if (auto *BO = dyn_cast<BinaryOperator>(StepInst)) {
+    int64_t K = (int64_t)AccPhis.size();
+    BO->setOperand(1, ConstantInt::get(BO->getOperand(1)->getType(), K));
+  }
+
+  // Collect all instructions to drop: all chain updates + old PHIs + dead code.
+  SmallPtrSet<Instruction *, 32> Drop;
+  for (auto &Chain : Chains)
+    for (Instruction *I : Chain)
+      Drop.insert(I);
+  for (PHINode *P : AccPhis)
+    Drop.insert(P);
+
+  // Iteratively drop instructions whose uses are all dropped.
+  bool Changed = true;
   while (Changed) {
     Changed = false;
     for (Instruction &I : *H) {
-      if (Drop.count(&I) || isa<PHINode>(&I) || &I == StepInst ||
-          I.isTerminator())
+      if (Drop.count(&I) || &I == StepInst || I.isTerminator())
         continue;
       bool AllUsesDropped = true;
       bool HasUses = false;
@@ -452,21 +398,8 @@ unsigned tryFoldMultiAcc(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     }
   }
 
-  // Rewire all uses of old accumulator PHIs to the new PHI.
-  for (PHINode *P : AccPhis) {
-    P->replaceAllUsesWith(NewPhi);
-    Drop.insert(P);
-  }
-
-  // Rewrite the IV step: D -> 1.
-  if (auto *BO = dyn_cast<BinaryOperator>(StepInst)) {
-    int64_t Old = cast<ConstantInt>(BO->getOperand(1))->getSExtValue();
-    int64_t Sign = Old >= 0 ? 1 : -1;
-    BO->setOperand(1, ConstantInt::get(BO->getOperand(1)->getType(), Sign));
-  }
-
   // Erase dropped instructions in reverse program order.
-  SmallVector<Instruction *, 16> Dead;
+  SmallVector<Instruction *, 32> Dead;
   for (Instruction &I : *H)
     if (Drop.count(&I))
       Dead.push_back(&I);
