@@ -19,6 +19,32 @@ Evidence-empty modules keep the old reject, so `--meta=none` output is
 unchanged apart from `revenant.lib` confirmations, which stay correct
 because the match itself remains exact.
 
+## Corpus acceptance (c-o2/c-clang-o2/c-gcc-o2/rust-o3)
+
+Running `revenant-uninline,verify` over the full decompiler `ir-clean`
+modules with the release binary, all with LLVM verification clean:
+
+| target | rewritten callers | user-helper fires | notes |
+| --- | ---: | ---: | --- |
+| c-o2 (3,381 funcs) | 498 | 0 | CRT duplicate consolidation (`X__VA` copies call canonical names); user `main` still calls all 36 source helpers, byte-identical call sets before/after |
+| c-clang-o2 | 0 | 0 | compiler pre/post call sets identical module-wide (only delta: two self-recursion to loop conversions, correctly out of scope); user `main` 36/36 |
+| c-gcc-o2 | 0 | 0 | user `main` 36/36; module-wide source-edge check finds no missing retained-callee edge |
+| rust-o3 (22 lifted user funcs) | 0 | 0 | surviving functions keep their calls; fully-inlined helpers have no retained callee to outline to |
+
+The corpus C sources mark every helper `NOINLINE` (except address-taken
+`add_op`/`sub_op`), so ~0 user fires is the correct result, not a matcher
+gap: there are no retained-callee inline events to recover. Fuzzed
+rewrites (`deoptfuzz/fuzz.py`, same binary): the multi-block
+constant-return outline
+`_wcsicmp_validate_param__140065b30` passes 198/200 trials (2 invalid
+inputs skipped), and the store-preserving single-block outline
+`charNode__getString` passes 122/200 (78 pointer-input skips). Audited
+by hand: `__acrt_show_narrow_message_box__140054d10` (8 import calls
+moved one level down into the canonical twin, all preserved),
+`strcpy_s`/`wcscpy_s`/`wcscat_s` import thunks calling their local
+copies. Mismatched-type bindings, constant-return single-block regions
+and live-out `ret void` regions are rejected rather than outlined.
+
 ## Corpus measurement
 
 The scripts under `test/Transforms/Uninline` consume the read-only parity
