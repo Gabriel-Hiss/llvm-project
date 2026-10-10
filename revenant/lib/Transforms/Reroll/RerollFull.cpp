@@ -361,21 +361,52 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
     for (size_t j = 1; j < K; ++j)
       if (Anchors[Idx[j - 1]].Pos + 1 > Anchors[Idx[j]].Pos)
         Tiled = false;
-    if (!Tiled)
-      continue;
-    // Lane widths: lanes whose stored value is a bare leaf/constant need
+    // Tank classification: instructions inside lane ranges that neither
+    // feed the anchor (transitively) nor are the anchor/address GEP.
+    // Loop-independent, side-effect-free Tank (no calls/stores/volatile,
+    // operands all loop-invariant, i.e. not Lane defs) is sunk after the
+    // loop at build time; anything else vetoes. Corpus arrays lane 7
+    // brackets the table load (`and`/global-GEP/double-load feeding the
+    // return) between its value def and store.
+    auto FeedsAnchor = [&](size_t j) {
+      SmallPtrSet<Value *, 8> Feed;
+      SmallVector<Value *, 8> Stack;
+      auto *S = cast<StoreInst>(Insns[Anchors[Idx[j]].Pos]);
+      Feed.insert(S->getValueOperand());
+      Stack.push_back(S->getValueOperand());
+      while (!Stack.empty()) {
+        Value *V = Stack.pop_back_val();
+        if (auto *D = dyn_cast<Instruction>(V)) {
+          if (!Def.count(V) || Def[V]->getParent() != &B)
+            continue;
+          for (Use &U : D->operands()) {
+            if (Feed.insert(U.get()).second)
+              Stack.push_back(U.get());
+          }
+        }
+      }
+      return Feed;
+    };
     // no value def, so leading lanes may be narrower. Find the first full
     // lane First (containing a computed value); all lanes j >= First
     // share width M, and all lanes j < First are narrow prologue (each
     // holds only its address GEP and anchor store). First must leave
     // >= MinWindows full lanes.
     size_t First = K;
-    size_t M = 0;
     for (size_t j = 0; j < K; ++j) {
       auto *S = cast<StoreInst>(Insns[Anchors[Idx[j]].Pos]);
       Value *V = S->getValueOperand();
+      // Full lane: the value is computed by an instruction inside this
+      // lane's own range (a bare leaf read from prologue, like lane 1's
+      // %t, does not make a full lane).
+      size_t LB0 = (j == 0) ? Start : Anchors[Idx[j - 1]].Pos + 1;
+      size_t LE0 = Anchors[Idx[j]].Pos + 1;
       if (auto *DI = dyn_cast<Instruction>(V)) {
-        if (Def.count(V) && Def[V]->getParent() == &B) {
+        bool InLane = false;
+        for (size_t i = LB0; i < LE0; ++i)
+          if (Insns[i] == DI)
+            InLane = true;
+        if (InLane && Def.count(V) && Def[V]->getParent() == &B) {
           (void)DI;
           First = j;
           break;
@@ -383,9 +414,6 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
       }
     }
     if (First >= K || First + 1 >= K)
-      continue;
-    M = Anchors[Idx[First + 1]].Pos - Anchors[Idx[First]].Pos;
-    if (M == 0)
       continue;
     // Worth-it threshold: K - First >= 4 runs on structure alone; a
     // 3-lane run additionally needs metadata evidence. Shape proves N;
@@ -400,51 +428,133 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
         continue;
     }
 #endif
-    bool WidthOK = true;
-    for (size_t j = First + 1; j < K; ++j)
-      if (Anchors[Idx[j]].Pos - Anchors[Idx[j - 1]].Pos != M)
-        WidthOK = false;
-    if (!WidthOK)
-      continue;
-    // Narrow lanes before F hold only address GEP + store.
-    for (size_t j = 0; j < First && WidthOK; ++j) {
+    // Tank pass: classify every in-range instruction. Lane = anchor,
+    // address GEP, or transitive anchor feeder. Tank = side-effect-free
+    // (no call/store/invoke/volatile), loop-invariant (no operand is a
+    // Lane def of any lane), and not feeding any anchor. Anything else
+    // vetoes. Tank is sunk after the loop at build time.
+    SmallPtrSet<Instruction *, 16> Tank;
+    bool TankOK = true;
+    // Lane-feeder sets per lane, plus the union of all Lane defs (an
+    // instruction feeding lane j's anchor is Lane even if textually
+    // inside another lane's range, which cannot happen for tiled lanes
+    // but is checked anyway).
+    std::vector<SmallPtrSet<Value *, 8>> FeedSets;
+    for (size_t j = 0; j < K; ++j)
+      FeedSets.push_back(FeedsAnchor(j));
+    SmallPtrSet<Instruction *, 32> LaneDefs;
+    for (size_t j = 0; j < K; ++j) {
       size_t LB0 = (j == 0) ? Start : Anchors[Idx[j - 1]].Pos + 1;
       size_t LE0 = Anchors[Idx[j]].Pos + 1;
-      if (LE0 - LB0 > M)
-        WidthOK = false;
-      for (size_t i = LB0; i < LE0 && WidthOK; ++i) {
+      auto *S = cast<StoreInst>(Insns[Anchors[Idx[j]].Pos]);
+      for (size_t i = LB0; i < LE0; ++i) {
         Instruction *I = Insns[i];
-        auto *S = cast<StoreInst>(Insns[Anchors[Idx[j]].Pos]);
-        if (I == S || I == S->getPointerOperand())
-          continue;
-        WidthOK = false;
+        if (I == S || I == S->getPointerOperand() || FeedSets[j].count(I)) {
+          LaneDefs.insert(I);
+        }
       }
     }
+    for (size_t j = 0; j < K && TankOK; ++j) {
+      size_t LB0 = (j == 0) ? Start : Anchors[Idx[j - 1]].Pos + 1;
+      size_t LE0 = Anchors[Idx[j]].Pos + 1;
+      for (size_t i = LB0; i < LE0 && TankOK; ++i) {
+        Instruction *I = Insns[i];
+        if (LaneDefs.count(I))
+          continue;
+        // Candidate Tank: pure, loop-invariant, anchor-independent.
+        if (I->mayHaveSideEffects() || isa<CallInst>(I) || isa<InvokeInst>(I) ||
+            isa<StoreInst>(I) || isa<LoadInst>(I) || isa<CmpInst>(I) ||
+            isa<BranchInst>(I) || isa<SwitchInst>(I) || isa<PHINode>(I)) {
+          // Loads are Tank only when loop-invariant and alias-free vs the
+          // loop's stores (globals/constants); compare/branch never Tank.
+          if (auto *L = dyn_cast<LoadInst>(I)) {
+            bool Invariant = true;
+            for (Use &U : L->operands())
+              if (LaneDefs.count(dyn_cast<Instruction>(U.get())) ||
+                  U.get() == KV.first)
+                Invariant = false;
+            if (Invariant &&
+                (L->getPointerOperand() == L->getPointerOperand())) {
+              // Loop-invariant address; alias check below covers stores.
+            } else {
+              TankOK = false;
+              break;
+            }
+          } else {
+            TankOK = false;
+            break;
+          }
+        }
+        for (Use &U : I->operands())
+          if (LaneDefs.count(dyn_cast<Instruction>(U.get()))) {
+            TankOK = false;
+            break;
+          }
+        if (TankOK)
+          Tank.insert(I);
+      }
+    }
+    if (!TankOK)
+      continue;
+    // Tank must not alias the loop's stores: every Tank load must read
+    // outside the stored base's object. Anchors store through KV.first;
+    // a Tank load through any other root is alias-free by construction
+    // (different alloca/global). Loads through KV.first vetoed above.
+    // Lane widths count Lane insns only (Tank excluded): full lanes
+    // j >= First share Lane-width M.
+    auto LaneWidth = [&](size_t j) -> size_t {
+      size_t LB0 = (j == 0) ? Start : Anchors[Idx[j - 1]].Pos + 1;
+      size_t LE0 = Anchors[Idx[j]].Pos + 1;
+      size_t W = 0;
+      for (size_t i = LB0; i < LE0; ++i)
+        if (!Tank.count(Insns[i]))
+          ++W;
+      return W;
+    };
+    bool WidthOK = true;
+    for (size_t j = First + 1; j < K; ++j)
+      if (LaneWidth(j) != LaneWidth(First))
+        WidthOK = false;
+    size_t M = LaneWidth(First);
+    if (M < 2)
+      WidthOK = false;
     if (!WidthOK)
       continue;
     size_t RunEnd = Anchors[Idx[K - 1]].Pos + 1;
-    // Structural check on full lanes j >= First: only the address GEP
-    // (position M-2) must match structurally (same base operand); the
-    // value-def prefix (positions 0..M-3) differs per lane by design
-    // (shl vs mul of the shared leaf) and is covered by the affine
-    // model below, and the anchor store (M-1) likewise.
+    // Explicit per-lane Lane vectors (Tank excluded). Full lanes share
+    // Lane-width M; each ends in its anchor store with the address GEP
+    // second-to-last (value defs before it differ per lane by design).
+    std::vector<std::vector<Instruction *>> Lanes;
+    for (size_t j = 0; j < K; ++j) {
+      size_t LB0 = (j == 0) ? Start : Anchors[Idx[j - 1]].Pos + 1;
+      size_t LE0 = Anchors[Idx[j]].Pos + 1;
+      std::vector<Instruction *> L;
+      for (size_t i = LB0; i < LE0; ++i)
+        if (!Tank.count(Insns[i]))
+          L.push_back(Insns[i]);
+      Lanes.push_back(std::move(L));
+    }
+    // Structural check on full lanes j >= First: same Lane-width M, same
+    // address GEP shape (same base operand), anchor store last.
     bool ShapeOK = true;
-    if (M < 2)
-      ShapeOK = false;
-    for (size_t j = First + 1; j < K && ShapeOK; ++j) {
-      Instruction *A = Insns[Anchors[Idx[First]].Pos - 1];
-      Instruction *C = Insns[Anchors[Idx[j]].Pos - 1];
-      auto *GA = dyn_cast<GetElementPtrInst>(A);
-      auto *GC = dyn_cast<GetElementPtrInst>(C);
-      if (!GA || !GC)
+    for (size_t j = First; j < K && ShapeOK; ++j) {
+      if (Lanes[j].size() != M) {
         ShapeOK = false;
-      else if (GA->getPointerOperand() != GC->getPointerOperand() ||
-               GA->getNumIndices() != GC->getNumIndices())
+        break;
+      }
+      auto *S = dyn_cast<StoreInst>(Lanes[j].back());
+      auto *G = Lanes[j].size() >= 2
+                    ? dyn_cast<GetElementPtrInst>(Lanes[j][M - 2])
+                    : nullptr;
+      if (!S || !G)
+        ShapeOK = false;
+      else if (G->getPointerOperand() != KV.first)
         ShapeOK = false;
     }
     if (!ShapeOK)
       continue;
-    // Lane base helper: first instruction index of lane j.
+    // Lane base helper: first instruction index of lane j (raw positions;
+    // Tank members interleave but ranges still tile).
     size_t FirstFullBase = Anchors[Idx[First]].Pos - M + 1;
     auto LaneBase = [&](size_t j) -> size_t {
       if (j < First)
@@ -513,6 +623,8 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
       size_t LB0 = LaneBase(j), LE0 = Anchors[Idx[j]].Pos + 1;
       for (size_t i = LB0; i < LE0 && Clean; ++i) {
         Instruction *I = Insns[i];
+        if (Tank.count(I))
+          continue; // vetted for sinking at classification
         if (isa<CallInst>(I) || isa<InvokeInst>(I))
           Clean = false;
         if (auto *L = dyn_cast<LoadInst>(I))
@@ -550,21 +662,21 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
       continue;
     if (PrevVA - FirstVA > 512)
       continue;
-    // Liveness: no earlier lane's value read outside the run (same rule
-    // as trySynthesize); only the last lane's values may be live out.
-    // Run membership includes the lane stores (void): an address GEP
-    // used by its own lane store is internal, not a live-out.
+    // Liveness: no earlier lane's Lane value read outside the run (same
+    // rule as trySynthesize); only the last lane's values may be live
+    // out. Run membership is Lane insns + Tank + anchors: an address GEP
+    // used by its own lane store is internal, not a live-out. Tank defs
+    // feeding outside the run are expected (they sink after the loop)
+    // and never block.
     SmallPtrSet<Value *, 16> RunSet;
-    for (size_t j = 0; j < K; ++j) {
-      size_t LB0 = LaneBase(j), LE0 = Anchors[Idx[j]].Pos + 1;
-      for (size_t i = LB0; i < LE0; ++i)
-        RunSet.insert(Insns[i]);
-    }
+    for (size_t j = 0; j < K; ++j)
+      for (Instruction *I : Lanes[j])
+        RunSet.insert(I);
+    for (Instruction *T : Tank)
+      RunSet.insert(T);
     bool Blocked = false;
     for (size_t j = 0; j + 1 < K && !Blocked; ++j) {
-      size_t LB0 = LaneBase(j), LE0 = Anchors[Idx[j]].Pos + 1;
-      for (size_t i = LB0; i < LE0 && !Blocked; ++i) {
-        Value *D = Insns[i];
+      for (Instruction *D : Lanes[j]) {
         if (D->getType()->isVoidTy())
           continue;
         for (User *U : D->users()) {
@@ -580,18 +692,18 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
       continue;
 
     // Live-out last-lane dsts become exit PHIs. The loop body keeps only
-    // the address GEP and anchor store (see below); a live-out lane value
-    // def (e.g. the last lane's mul, read by the return) has no kept
-    // counterpart, so it is recorded here and rebound to the rewired
-    // value expression after the rewire below (LiveValueDef).
-    size_t BodyM = M;
-    size_t BodyBase = FirstFullBase;
+    // the address GEP and anchor store of lane First (see below); a
+    // live-out lane value def (e.g. the last lane's mul, read by the
+    // return) has no kept counterpart, so it is recorded here and
+    // rebound to the rewired value expression after the rewire below
+    // (LiveValueDef).
     SmallVector<std::pair<Value *, Value *>, 4> LiveOut;
     Value *LiveValueDef = nullptr; // last lane's value def, if live out
     {
-      size_t LB0 = Anchors[Idx[K - 1]].Pos - M + 1;
-      for (size_t p = 0; p < M; ++p) {
-        Value *D = Insns[LB0 + p];
+      auto &Last = Lanes[K - 1];
+      auto &Body = Lanes[First];
+      for (size_t p = 0; p < Last.size(); ++p) {
+        Value *D = Last[p];
         if (D->getType()->isVoidTy())
           continue;
         bool Outside = false;
@@ -604,11 +716,10 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
         }
         if (!Outside)
           continue;
-        Value *Counter = Insns[BodyBase + p];
-        // The anchor store (void) never reaches here; the address GEP
-        // pairs positionally; a value def is rebound post-rewire.
-        if (Counter == Insns[BodyBase + BodyM - 1]->getOperand(1) ||
-            isa<GetElementPtrInst>(Counter))
+        Value *Counter = p < Body.size() ? Body[p] : nullptr;
+        // The address GEP pairs positionally; a value def is rebound
+        // post-rewire.
+        if (Counter && isa<GetElementPtrInst>(Counter))
           LiveOut.push_back({D, Counter});
         else
           LiveValueDef = D;
@@ -624,36 +735,28 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
                            : Pre->splitBasicBlock(Pre->getTerminator(),
                                                   "unroll.exit");
     BasicBlock *Loop = Pre->splitBasicBlock(Insns[Start], "unroll");
-    // Drop every lane after the body: the loop keeps [BodyBase,
-    // BodyBase + BodyM), i.e. lane 1's shape. Lane 0's narrower prefix
-    // ([Start, BodyBase)) is prologue that the rewired body subsumes.
+    // The loop keeps lane First's address GEP + anchor store; every
+    // other Lane insn joins the drop set. Tank insns are sunk to the
+    // exit front (they are loop-invariant and side-effect-free).
     SmallPtrSet<Instruction *, 16> DropSet;
-    {
-      SmallVector<Instruction *, 16> InLoop;
-      for (Instruction &I : *Loop)
-        if (!I.isTerminator())
-          InLoop.push_back(&I);
-      // InLoop[0] == Insns[Start]; body starts at BodyBase.
-      size_t BodyOff = BodyBase - Start;
-      for (size_t i = 0; i < InLoop.size(); ++i)
-        if (i < BodyOff || i >= BodyOff + BodyM)
-          DropSet.insert(InLoop[i]);
-    }
+    auto &BodyLane = Lanes[First];
+    auto *BodyStore = cast<StoreInst>(BodyLane.back());
+    Value *BodyAddr = BodyStore->getPointerOperand();
     SmallVector<Instruction *, 8> BodyInsns;
-    // The body keeps only the address GEP and the anchor store: lane 1's
-    // value def (mul/shl of the leaf) is subsumed by the rewired
-    // Leaf*(Step*i + Scale0) expression, so it joins the drop set.
-    {
-      auto *BodyStore = cast<StoreInst>(Insns[BodyBase + BodyM - 1]);
-      Value *BodyAddr = BodyStore->getPointerOperand();
-      for (size_t p = 0; p < BodyM; ++p) {
-        Instruction *I = Insns[BodyBase + p];
-        if (I == BodyStore || I == BodyAddr)
-          BodyInsns.push_back(I);
-        else
-          DropSet.insert(I);
-      }
+    for (Instruction *I : BodyLane) {
+      if (I == BodyStore || I == BodyAddr)
+        BodyInsns.push_back(I);
+      else
+        DropSet.insert(I);
     }
+    for (size_t j = 0; j < K; ++j) {
+      if (j == First)
+        continue;
+      for (Instruction *I : Lanes[j])
+        DropSet.insert(I);
+    }
+    // Narrow prologue lanes (j < First) are included above (all j != First
+    // drop); the rewired body subsumes them.
     IRBuilder<> LB(Loop->getContext());
     LB.SetInsertPoint(Loop, Loop->begin());
     Type *I64 = Type::getInt64Ty(Ctx);
@@ -738,13 +841,25 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
     }
     BasicBlock *ExitBlk = Exit;
     IRBuilder<> XB(&ExitBlk->front());
+    // Sink Tank insns after the exit PHIs, in original order (they are
+    // loop-invariant and side-effect-free; operands are available:
+    // nothing sunk reads a Lane def, checked at classification).
+    Instruction *SinkPt = &ExitBlk->front();
+    while (isa<PHINode>(SinkPt))
+      SinkPt = SinkPt->getNextNode();
+    for (size_t j = 0; j < K; ++j) {
+      size_t LB0 = (j == 0) ? Start : Anchors[Idx[j - 1]].Pos + 1;
+      size_t LE0 = Anchors[Idx[j]].Pos + 1;
+      for (size_t i = LB0; i < LE0; ++i)
+        if (Tank.count(Insns[i]))
+          Insns[i]->moveBefore(SinkPt);
+    }
     DenseMap<Value *, Value *> Rename;
     for (auto &LO : LiveOut) {
       PHINode *P = XB.CreatePHI(LO.second->getType(), 1, "u0x");
       P->addIncoming(LO.second, Loop);
       if (auto *D = dyn_cast<Instruction>(LO.second))
         copyVA(D, P);
-      Rename[LO.first] = P;
     }
     // A live-out lane value def carries the last iteration's rewired
     // value (RewiredFinal dominates the latch, hence the exit).
