@@ -81,6 +81,86 @@ def normalize(ir: str) -> str:
     return "\n".join(line for line in output if line)
 
 
+# Inputs for `--selftest`: one function written twice, once the way
+# `--meta=none` spells it and once the way `--meta=embedded` spells it.
+# Only names, types and metadata differ. `#0` is kept on both sides
+# because the attribute group is semantic content, not presentation.
+SELFTEST_NONE = """\
+source_filename = "sub.exe"
+define i64 @sub_140001000(i64 %n, ptr %p) #0 {
+bb_140001000:
+  %a = alloca i64, align 8, !revenant.va !0
+  store i64 0, ptr %a, align 8, !revenant.va !1
+  br label %bb_140001010
+
+bb_140001010:                                      ; preds = %bb_140001000
+  %i = phi i64 [ 0, %bb_140001000 ], [ %next, %bb_140001010 ], !revenant.va !2
+  %c = icmp slt i64 %i, %n, !revenant.va !3
+  br i1 %c, label %bb_140001010, label %bb_140001020, !revenant.va !4
+
+bb_140001020:                                      ; preds = %bb_140001010
+  %v = add i64 %i, 7, !revenant.va !5
+  store i8 %v, ptr null, align 1
+  %q = icmp uge i64 %i, 3
+  br i1 %q, label %bb_140001020.bb_140001030_crit_edge, label %bb_140001040
+
+bb_140001020.bb_140001030_crit_edge:                                   ; preds = %bb_140001020
+  br label %bb_140001030
+
+bb_140001030:
+  ret void
+
+bb_140001040:                                      ; preds = %bb_140001020
+  call void @sub_140001100(i64 %v, ptr %p)
+  %next = phi i64 [ 0, %bb_140001000 ], [ %i, %bb_140001020 ]
+  br label %bb_1400010107
+
+bb_1400010107:                                     ; preds = %bb_140001040
+  ret void
+}
+"""
+
+SELFTEST_EMBEDDED = """\
+source_filename = "sub.exe"
+define i64 @realname(i64 %argc, ptr %argv) #0 {
+bb_140002000:
+  %v.local = alloca i64, align 8, !dbg !20
+    #dbg_declare(ptr %v.local, !21, !DIExpression(), !22)
+  store i64 0, ptr %v.local, align 8, !dbg !23
+  br label %bb_140002010, !dbg !24
+
+bb_140002010:                                      ; preds = %bb_140002000
+  %counter = phi i64 [ 0, %bb_140002000 ], [ %nxt, %bb_140002010 ], !dbg !25
+  %flag = icmp slt i64 %counter, %argc, !dbg !26
+  br i1 %flag, label %bb_140002010, label %bb_140002020, !dbg !27
+
+bb_140002020:                                      ; preds = %bb_140002010
+  %delta = add i64 %counter, 7, !dbg !28
+  store i8 %delta, ptr null, align 1
+  %wide = icmp uge i64 %counter, 3
+  br i1 %wide, label %bb_140002020.bb_140002030_crit_edge, label %bb_140002040
+
+bb_140002020.bb_140002030_crit_edge:                                   ; preds = %bb_140002020
+  br label %bb_140002030
+
+bb_140002030:
+  ret void
+
+bb_140002040:                                      ; preds = %bb_140002020
+  call void @othername(i64 %delta, ptr %argv)
+  %nxt = phi i64 [ 0, %bb_140002000 ], [ %counter, %bb_140002020 ]
+  br label %bb_14000201017
+
+bb_14000201017:                                    ; preds = %bb_140002040
+  ret void
+}
+
+!llvm.dbg.cu = !{!0}
+!0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1)
+!1 = !DIFile(filename: "a.c", directory: "d")
+"""
+
+
 def copy_driver(exe: Path, directory: Path) -> Path:
     copied = directory / exe.name
     shutil.copy2(exe, copied)
@@ -148,16 +228,100 @@ def compare_group(exe: Path, binary: Path, targets: list[str], output: Path,
     compare_group(exe, binary, targets[Middle:], output, counts, serial)
 
 
+def selftest() -> int:
+    """Check the comparison itself: presentation may move, semantics may not.
+
+    The first pair is one function spelled the two metadata modes' way; the
+    normalizer must call them equal. The rest are edits to the `none` copy
+    that change instructions, so the normalized forms must differ.
+    """
+    def eq(a: str, b: str) -> bool:
+        return normalize(a) == normalize(b)
+
+    # Every presentation dimension the two modes may differ in.
+    assert eq(SELFTEST_NONE, SELFTEST_EMBEDDED), "none vs embedded spelling"
+    # Debug info, named metadata and metadata numbering are presentation.
+    extra = '\n!rev.strings = !{!"panic message"}\n'
+    assert eq(SELFTEST_NONE,
+              SELFTEST_NONE.replace("!revenant.va !5", "!dbg !999") + extra), \
+        "metadata-only edits"
+    # Normalizing twice must not change the result.
+    once = normalize(SELFTEST_NONE)
+    assert normalize(once) == once, "idempotent normalization"
+
+    # A statement that exists in one mode and not the other is a diff.
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("  %v = add i64 %i, 7, !revenant.va !5",
+                                        "  %v = add i64 %i, 7, !revenant.va !5\n"
+                                        "  %w = add i64 %v, 1")), "extra statement"
+    # A different opcode is control flow, not presentation.
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("icmp slt i64 %i, %n", "icmp sgt i64 %i, %n")
+                  ), "different opcode"
+    # A different constant is semantics.
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("%v = add i64 %i, 7", "%v = add i64 %i, 8")
+                  ), "different constant"
+    # Call arity is semantics: one argument either side of the invariant.
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("call void @sub_140001100(i64 %v, ptr %p)",
+                                        "call void @sub_140001100(i64 %v)")
+                  ), "call with fewer arguments"
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("call void @sub_140001100(i64 %v, ptr %p)",
+                                        "call void @sub_140001100(i64 %v, ptr %p, i64 %i)"
+                                        )
+                  ), "call with more arguments"
+    # A swapped terminator is a different CFG.
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("br i1 %c, label %bb_140001010, label %bb_140001020",
+                                        "br i1 %c, label %bb_140001020, label %bb_140001010")
+                  ), "swapped branch targets"
+    # A removed block reachable through a terminator is a different CFG.
+    assert not eq(SELFTEST_NONE,
+                  SELFTEST_NONE.replace("br label %bb_140001030", "ret void")
+                  ), "replaced terminator"
+    # Renaming a block label and every reference to it is presentation: the
+    # lifter numbers split blocks per mode, so the spellings legitimately
+    # differ and the comparison must not see them.
+    renamed = SELFTEST_NONE.replace("bb_140001030", "bb_140099999")
+    assert renamed != SELFTEST_NONE and eq(SELFTEST_NONE, renamed), \
+        "renamed block labels"
+
+    # The release sweep must cover O1/O2/O3/Os/Oz/LTO/PGO, and only directories
+    # that hold a binary.
+    with tempfile.TemporaryDirectory(prefix="revenant-selftest-") as tmp:
+        root = Path(tmp)
+        for name, with_binary in (("x-o1", True), ("x-o2", True), ("x-o3", True),
+                                  ("x-ox", True), ("x-os", True), ("x-oz", True),
+                                  ("x-o2lto", True), ("x-o2pgo", True), ("x", False)):
+            (root / name).mkdir()
+            if with_binary:
+                (root / name / f"{name}.exe").write_bytes(b"MZ")
+        found = release_targets(root)
+        expected = ["x-o1", "x-o2", "x-o2lto", "x-o2pgo", "x-o3", "x-os",
+                    "x-ox", "x-oz"]
+        assert found == expected, f"release targets {found} != {expected}"
+
+    print("selftest: normalization keeps statements, control flow and call "
+          "arity; presentation may differ")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", required=True, type=Path)
-    parser.add_argument("--corpus", required=True, type=Path)
+    parser.add_argument("--exe", type=Path)
+    parser.add_argument("--corpus", type=Path)
     parser.add_argument("--targets", nargs="*", default=BINARIES)
     parser.add_argument("--all-release", action="store_true")
     parser.add_argument("--sample", type=int, default=300)
     parser.add_argument("--seed", type=int, default=211009)
     parser.add_argument("--whole", action="store_true")
+    parser.add_argument("--selftest", action="store_true",
+                        help="check the comparison without a corpus or driver")
     args = parser.parse_args()
+    if args.selftest:
+        return selftest()
     args.exe = args.exe.resolve()
     args.corpus = args.corpus.resolve()
 
