@@ -283,13 +283,16 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         Reduces.push_back(CI);
         continue;
       }
-      // One lane-wise add combining acc backs in the exit block is part
-      // of the reduction (merged_val in the reference); record it for
-      // erasure after aliasing, still no other outside uses allowed.
+      // One lane-wise combine of acc backs in the exit block is part of the
+      // reduction (merged_val in the reference); record it for erasure after
+      // aliasing, still no other outside uses allowed. The combine opcode
+      // must equal the reduction opcode: reduce distributes over a lane-wise
+      // combine only when both apply the same operation (add over add); a
+      // mul-reduction over an add-combine has no chain-end form.
       auto *BO = dyn_cast<BinaryOperator>(const_cast<Instruction *>(UI));
       unsigned CL = 0;
       Type *CE = nullptr;
-      if (BO && BO->getOpcode() == Instruction::Add &&
+      if (BO && BO->getOpcode() == Opcode &&
           isIntVec128(BO->getType(), CL, CE) && CL == Lanes && CE == Elem &&
           AccTree(BO->getOperand(0), 0) && AccTree(BO->getOperand(1), 0)) {
         Combines.push_back(BO);
@@ -298,14 +301,35 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       return 0;
     }
   }
-  // At least one reduce intrinsic must consume the accumulators: with only
-  // an exit-block combine (manual i128 horizontal fold, no reduce) the emit
-  // stage would scalarize the body yet leave the fold feeding severed vector
-  // phis (undef backedges) while the scalar chains feed nothing (WRONG CODE;
-  // MSVC c-o2 sum_vec fires this shape). The manual-fold family is staged
-  // UnvecReductions work, not v1 scope.
-  if (Reduces.empty())
-    return 0;
+  // Reduces over an exit-block combine: the combine lives outside H so the
+  // loop above never visits its users. Every combine must feed at least one
+  // matching reduce (else the scalar chains would not cover its value), and
+  // no other outside use is allowed. (devectorize-mixed-reduce-roots.ll: the
+  // second reduce over acc+acc was missed here, left on the severed vector
+  // PHI, and returned 16 instead of 24.)
+  DenseSet<const Instruction *> SeenReduce;
+  for (Instruction *R : Reduces)
+    SeenReduce.insert(R);
+  for (BinaryOperator *C : Combines) {
+    bool FedReduce = false;
+    for (User *U : C->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() == H)
+        return 0;
+      auto *CI = dyn_cast<CallInst>(UI);
+      auto *II = CI ? dyn_cast<IntrinsicInst>(CI) : nullptr;
+      if (II && II->getIntrinsicID() == reduceIntrinsic(Opcode) &&
+          AccTree(II->getOperand(0), 0)) {
+        if (SeenReduce.insert(CI).second)
+          Reduces.push_back(CI);
+        FedReduce = true;
+        continue;
+      }
+      return 0;
+    }
+    if (!FedReduce)
+      return 0;
+  }
   for (BasicBlock *S : Br->successors()) {
     if (S == H)
       continue;
@@ -691,10 +715,11 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   for (Instruction *R : Reduces) {
     auto *II = cast<IntrinsicInst>(R);
     Value *Root = II->getOperand(0);
-    // Peel one lane-wise add combine of acc backs (the exit-block merge).
+    // Peel one lane-wise combine of acc backs (the exit-block merge). The
+    // opcode must match the precheck's combine rule (== reduction Opcode).
     Value *AddL = nullptr, *AddR = nullptr;
     if (auto *BO = dyn_cast<BinaryOperator>(Root)) {
-      if (BO->getOpcode() == Instruction::Add &&
+      if (BO->getOpcode() == Opcode &&
           isa<FixedVectorType>(BO->getType()) && BO->getParent() != H) {
         AddL = BO->getOperand(0);
         AddR = BO->getOperand(1);
@@ -713,19 +738,19 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         return 0; // precheck promised acc-rooted; defensive
       Repl = Chains[(unsigned)Idx];
     } else {
+      // reduce distributes over the lane-wise combine (same opcode, checked
+      // in the precheck): reduce(a+b) = reduce(a) OP reduce(b). With both
+      // sides on one accumulator (devectorize-mixed-reduce-roots.ll) that is
+      // Chain OP Chain, NOT Chain: reduce(x+x) doubles the sum.
       int L = AccIndexOf(AddL), RR = AccIndexOf(AddR);
       if (L < 0 || RR < 0)
         return 0;
-      if (L == RR) {
-        Repl = Chains[(unsigned)L];
-      } else {
-        auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
-                                         Chains[(unsigned)L],
-                                         Chains[(unsigned)RR], "s.unopt.m",
-                                         R->getIterator());
-        inheritMeta(R, N);
-        Repl = N;
-      }
+      auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode,
+                                       Chains[(unsigned)L],
+                                       Chains[(unsigned)RR], "s.unopt.m",
+                                       R->getIterator());
+      inheritMeta(R, N);
+      Repl = N;
     }
     R->replaceAllUsesWith(Repl);
     if (R->use_empty()) {
