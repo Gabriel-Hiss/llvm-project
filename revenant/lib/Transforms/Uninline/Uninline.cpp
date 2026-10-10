@@ -215,6 +215,12 @@ CalleeBody analyzeCallee(Function &F) {
   }
   if (B.Insts.size() > MaxCalleeInsts || B.Insts.empty())
     return B;
+  // The returned value drives the escape binding in matchWindow. Without
+  // it every match takes the `ret void` path and outlines the region's
+  // last instruction whatever its type, building an ill-typed call on
+  // real modules (CallInst::Create / replaceUses asserts). Null here
+  // means `ret void`, which matchWindow handles explicitly.
+  B.RetVal = Ret->getReturnValue();
   // Minimum evidence: a one- or two-instruction body (a lone load, a
   // gep+load pair) matches coincidental code far more often than true
   // inline remnants (measured: a 2-instruction getter body matched 7
@@ -301,7 +307,13 @@ public:
   bool matchOperand(const Value *C, const Value *R) {
     if (C == R)
       return true;
-    // Constants are uniqued: pointer equality is value equality.
+    // The rewrite rebuilds a call with the bound values as arguments and
+    // has no conversion logic: differently-typed bindings would build an
+    // ill-typed call (caught here, not at CallInst::Create). Constants
+    // are uniqued, so pointer equality above already implies type
+    // equality for them.
+    if (C->getType() != R->getType())
+      return false;
     if (isa<Constant>(C))
       return false;
     if (const Argument *A = dyn_cast<Argument>(C)) {
@@ -532,15 +544,14 @@ bool matchWindow(const CalleeBody &CB,
   // Bind the return value.
   if (!CB.RetVal) {
     Escape = nullptr; // `ret void`: set below to the region end marker
-  } else if (const auto *RC = dyn_cast<Constant>(CB.RetVal)) {
-    // Callee returns a constant: the region's last value must be that
-    // constant. Only accept when the last region instruction produces it
-    // (a trailing materialization), else there is no escaping def.
-    Instruction *Last = Body[Start + N - 1];
-    if (!matchInst(CB.Insts.back(), Last, M))
-      return false;
-    (void)RC;
-    Escape = Last;
+  } else if (isa<Constant>(CB.RetVal)) {
+    // Callee returns a constant: its body computations are dead, so any
+    // same-shaped caller region computing a live value is not the same
+    // computation. Replacing outside uses of the region end with the
+    // call's constant result would change behavior (and ill-typed
+    // regions assert in replaceUsesWithIf). Reject: nothing sound to
+    // outline.
+    return false;
   } else if (const Argument *A = dyn_cast<Argument>(CB.RetVal)) {
     auto Args = M.args();
     auto It = Args.find(A);
@@ -633,8 +644,34 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
 #endif
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
-          // region end.
+          // region end. Unlike a real escape, nothing replaces the uses
+          // of the region end, so it must already be dead outside the
+          // region (a live-out value has no call result to take its
+          // place; erasing it would dangle its users and change
+          // behavior). Debug uses are fine.
           Escape = RegionInsts.back();
+          bool LiveOut = false;
+          for (User *U : Escape->users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI) {
+              LiveOut = true;
+              break;
+            }
+            if (isa<DbgInfoIntrinsic>(UI))
+              continue;
+            bool Inside = false;
+            for (Instruction *RI : RegionInsts)
+              if (UI == RI) {
+                Inside = true;
+                break;
+              }
+            if (!Inside) {
+              LiveOut = true;
+              break;
+            }
+          }
+          if (LiveOut)
+            continue;
         }
         if (!regionEscapesCleanly(RegionInsts, Escape, Caller))
           continue;
