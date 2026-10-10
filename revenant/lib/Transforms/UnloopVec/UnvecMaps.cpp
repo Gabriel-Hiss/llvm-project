@@ -48,6 +48,7 @@ using unloopvec::loopBound;
 using unloopvec::matchScalarLoop;
 using unloopvec::ScalarLoopInfo;
 using unloopvec::stripCountDerivation;
+using unloopvec::TailCmp;
 
 // Pass-local candidate: the inner dispatch D, its scalar entry S,
 // the countdown drain L plus the counted tail T, the middle vector
@@ -266,6 +267,101 @@ static bool isMapBody(BasicBlock *B) {
   return VL->getType() == VS->getValueOperand()->getType();
 }
 
+// Root pointer behind GEP/index chains: the base allocation both
+// sides must share for lane correspondence.
+static Value *ptrBase(Value *P) {
+  while (auto *G = dyn_cast<GetElementPtrInst>(P))
+    P = G->getPointerOperand();
+  return P;
+}
+
+// Lane-equivalence gate for one middle vector tier against one
+// scalar loop (the countdown drain): every vector lane provably
+// equals the scalar the drain computes, through the shared TailCmp
+// proof (loads pre-seeded, splats projected, lane-wise ALU
+// recursed, commutative retry). Same memory bases on both sides.
+// Returns false (no fold) on anything unproven.
+static bool midLanesEqualMidVsDrain(BasicBlock *Mid, BasicBlock *Drain) {
+  LoadInst *VL = nullptr;
+  BinaryOperator *VAdd = nullptr;
+  StoreInst *VS = nullptr;
+  for (Instruction &I : *Mid) {
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (isa<FixedVectorType>(LI->getType()))
+        VL = LI;
+    } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (isa<FixedVectorType>(BO->getType()) &&
+          BO->getOpcode() == Instruction::Add)
+        VAdd = BO;
+    } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (isa<FixedVectorType>(SI->getValueOperand()->getType()))
+        VS = SI;
+    }
+  }
+  LoadInst *SL = nullptr;
+  BinaryOperator *SAdd = nullptr;
+  StoreInst *SS = nullptr;
+  for (Instruction &I : *Drain) {
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (!isa<FixedVectorType>(LI->getType()) && !SL)
+        SL = LI;
+    } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (!isa<FixedVectorType>(BO->getType()) &&
+          BO->getOpcode() == Instruction::Add && !SAdd)
+        SAdd = BO;
+    } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (!isa<FixedVectorType>(SI->getValueOperand()->getType()) &&
+          !SS)
+        SS = SI;
+    }
+  }
+  if (!VL || !VS || !SL || !SS)
+    return false;
+  // Same memory bases: the vector load/store and scalar load/store
+  // must root at identical base pointers.
+  if (ptrBase(VL->getPointerOperand()) !=
+          ptrBase(SL->getPointerOperand()) ||
+      ptrBase(VS->getPointerOperand()) !=
+          ptrBase(SS->getPointerOperand()))
+    return false;
+  // Copy: stored lanes are the loaded lanes.
+  if (!VAdd && !SAdd) {
+    TailCmp TC;
+    TC.A = Mid;
+    TC.B = Drain;
+    TC.MapAB[VL] = SL;
+    return TC.laneEq(VS->getValueOperand(), SS->getValueOperand(),
+                     TailCmp::MaxDepth);
+  }
+  // Add: lane-wise add over the same load and splat operand.
+  if (!VAdd || !SAdd)
+    return false;
+  // The scalar add must consume its block's load.
+  if (SAdd->getOperand(0) != SL && SAdd->getOperand(1) != SL)
+    return false;
+  // The vector add must consume its block's load.
+  if (VAdd->getOperand(0) != VL && VAdd->getOperand(1) != VL)
+    return false;
+  TailCmp TC;
+  TC.A = Mid;
+  TC.B = Drain;
+  TC.MapAB[VL] = SL;
+  // Operand order may differ (splat-first vs load-first): retry
+  // swapped for commutative add. laneEq itself stays positional.
+  if (TC.laneEq(VAdd, SAdd, TailCmp::MaxDepth))
+    return true;
+  if (VAdd->getNumOperands() != 2 || SAdd->getNumOperands() != 2)
+    return false;
+  TailCmp TCSwap;
+  TCSwap.A = Mid;
+  TCSwap.B = Drain;
+  TCSwap.MapAB[VL] = SL;
+  return TCSwap.laneEq(VAdd->getOperand(0), SAdd->getOperand(1),
+                       TailCmp::MaxDepth) &&
+         TCSwap.laneEq(VAdd->getOperand(1), SAdd->getOperand(0),
+                       TailCmp::MaxDepth);
+}
+
 // Match the inner cascade around dispatch D with scalar entry S:
 // S routes to a countdown drain L and a counted tail T; the other
 // arm reaches a middle vector tier Mid (single-block self-loop with
@@ -296,7 +392,6 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
     if (!Zero || !Zero->isZero())
       continue;
     // The tail entry is either the counted tail itself or a block
-    // leading to it; find the single-block counted self-loop below.
     ScalarLoopInfo Tail;
     BasicBlock *TailBB = nullptr;
     if (matchScalarLoop(MaybeTailEntry, Tail)) {
@@ -353,6 +448,18 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
         break;
     }
     if (!Mid)
+      continue;
+    uint64_t Step = MidLoop.Step->getZExtValue();
+    if (Step < 2)
+      continue;
+    // Trip coverage: the middle bound must be the countdown
+    // complement of the drain remainder over the same N.
+    if (!countdownSecondaryOK(Mid, MidLoop, Drain, F, Step))
+      continue;
+    // Lane equivalence (board bug 25, shared TailCmp gate): every
+    // middle lane must equal the drain's scalar. The +100-vs-+1
+    // mismatch fails here and bails.
+    if (!midLanesEqualMidVsDrain(Mid, MaybeDrain))
       continue;
     // The middle preheader may have outer-region preds (the outer
     // dispatch's small-N arm) when each feeds constant 0 to its
@@ -576,11 +683,10 @@ bool runUnvecMaps(llvm::Function &F) {
     Taken.insert(C.T);
     for (BasicBlock *BB : C.R)
       Taken.insert(BB);
-    // Lane-equivalence gate (LunaReviewDeoptR blocker): the fold
-    // stays disabled until the shared gate from MuseUnloopVecR
-    // (board bug 25, commit 239141051) lands and is wired here.
-    // Matching still runs for measurement; nothing is erased.
-    (void)foldInnerCascade;
+    // The lane-equivalence proof runs inside the matcher
+    // (midLanesEqualMidVsDrain over the shared TailCmp); only
+    // proved candidates reach this fold.
+    Changed |= foldInnerCascade(F, C);
   }
   return Changed;
 }

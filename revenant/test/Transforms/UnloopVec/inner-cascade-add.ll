@@ -1,8 +1,7 @@
-; Inner-cascade map candidate (currently gated, no fold): middle
-; <4 x i32> tier plus preheader/exit above a countdown drain and a
-; counted tail. The lane-equivalence gate holds the fold off until
-; the shared gate (board bug 25) lands; this test pins the no-fire
-; behavior. Corpus shape: c-clang-o2avx2 add_vec inner dispatch.
+; Inner-cascade map fold: the middle <4 x i32> tier plus its
+; preheader and exit are erased through the shared lane-equivalence
+; gate, leaving the countdown drain and the counted tail to cover
+; the full range. Corpus shape: c-clang-o2avx2 add_vec inner dispatch.
 ; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
 define void @avx2_add_inner(ptr %0, ptr %1, i32 %2, i32 %3) {
@@ -102,10 +101,11 @@ bb_140001b0b:
                                      
   ret void
 }
-
-; The lane-equivalence gate holds the fold off until the shared gate
-; lands: the middle <4 x i32> tier must survive. (Fold CHECK lines
-; return with the gate: CHECK-NOT <4 x i32>, drain+tail stores.)
+; The middle tier is gone through the shared lane-equivalence gate;
+; the countdown drain and the counted tail remain.
 ; CHECK-LABEL: define{{.*}}void @avx2_add_inner
-; CHECK: <4 x i32>
+; CHECK-NOT: <4 x i32>
+; CHECK: br label %bb_140001a9a
+; CHECK: store i32 %d.sum
+; CHECK: store i32 %t.sum
 ; CHECK: ret void
