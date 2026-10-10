@@ -7,6 +7,7 @@ add_library(RevenantClangExpr STATIC
   ExprScalar.cpp
   ExprMemory.cpp
   ExprCalls.cpp
+  WideIntModel.cpp
 )
 target_include_directories(RevenantClangExpr PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/../../include
@@ -58,20 +59,23 @@ if(TARGET llvm_gtest OR TARGET GTest::gtest)
   endif()
   set_target_properties(RevenantClangExprTests PROPERTIES CXX_STANDARD 17)
 
-  # Test-only driver: run ExprBuilder over contract .ll modules.
-  add_executable(RevenantExprContractHarness
-    tests/ExprContractHarness.cpp
-    tests/FrontendContextTestShim.cpp
-  )
-  target_link_libraries(RevenantExprContractHarness PRIVATE
-    RevenantClangExpr
-    clangAST
-    clangBasic
-    clangFrontend
-    clangLex
-    LLVMSupport
-    LLVMCore
-    LLVMAsmParser
-  )
-  set_target_properties(RevenantExprContractHarness PROPERTIES CXX_STANDARD 17)
 endif()
+
+# Test-only driver: run ExprBuilder over contract .ll modules. Unlike the
+# gtests above it links no test framework, so it builds everywhere; keep it
+# outside the GTest guard.
+add_executable(RevenantExprContractHarness
+  tests/ExprContractHarness.cpp
+  tests/FrontendContextTestShim.cpp
+)
+target_link_libraries(RevenantExprContractHarness PRIVATE
+  RevenantClangExpr
+  clangAST
+  clangBasic
+  clangFrontend
+  clangLex
+  LLVMSupport
+  LLVMCore
+  LLVMAsmParser
+)
+set_target_properties(RevenantExprContractHarness PROPERTIES CXX_STANDARD 17)

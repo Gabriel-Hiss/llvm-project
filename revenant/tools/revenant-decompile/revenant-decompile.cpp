@@ -3,7 +3,7 @@
 //   revenant-decompile <pe> [--func <va|name>]... [--lang c|cpp|rust]
 //                        [--meta none|embedded|pdb]
 //                        [--emit asm|ir-raw|ir-clean|ir-final|source]
-//                        [-o <file>] [--patterns] [--list]
+//                        [-o <file>] [--patterns] [--list] [--no-artifacts]
 //
 // Runs the whole decompiler pipeline (object -> analysis -> sigs -> lift ->
 // transforms -> structure -> source) and writes every stage artifact next
@@ -62,6 +62,8 @@ static cl::opt<bool> ClassifyFuncs(
     "classify", cl::desc("with --list, classify each function as user/library/startup"));
 static cl::opt<bool> Patterns("patterns",
                               cl::desc("run the opt-in revenant-patterns pass"));
+static cl::opt<bool> NoArtifacts("no-artifacts",
+                                 cl::desc("do not write stage artifact files"));
 static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
 static cl::opt<std::string>
     MetaOpt("meta", cl::desc("metadata: none|embedded|pdb (default: embedded)"),
@@ -136,8 +138,8 @@ int main(int Argc, char **Argv) {
     errs() << "revenant-decompile: --meta=pdb is not implemented yet\n";
     return 2;
   }
-
-
+  if (LibraryDB.empty() && !sys::fs::exists(LibraryDBPath))
+    LibraryDBPath.clear();
   auto SOrErr = Session::open(Input);
   if (!SOrErr) {
     errs() << "revenant-decompile: " << toString(SOrErr.takeError()) << "\n";
@@ -245,10 +247,12 @@ int main(int Argc, char **Argv) {
   Opts.Emit = Emit;
   Opts.Patterns = Patterns;
   Opts.LibraryDBPath = LibraryDBPath.str().str();
-  // Artifact base: the output path if given, else <pe>.decompiled.
-  std::string Base =
-      Output.empty() ? (Input + ".decompiled") : Output.getValue();
-  Opts.ArtifactBase = Base;
+  if (!NoArtifacts) {
+    // Artifact base: the output path if given, else <pe>.decompiled.
+    std::string Base =
+        Output.empty() ? (Input + ".decompiled") : Output.getValue();
+    Opts.ArtifactBase = Base;
+  }
 
   auto DOrErr = S->decompileAll(Targets, Out, Opts);
   if (!DOrErr) {
