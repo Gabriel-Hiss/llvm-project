@@ -846,9 +846,12 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
       BasicBlock *FalseSucc = BI->getSuccessor(1);
       if (TrueSucc == R.Header) {
         // True arm continues -> negate
-        Cond = Exprs->inverted(condOf(BI, R.Header), *Scope);
+        Expr *RawCond = condOf(BI, R.Header);
+        Cond = clang::UnaryOperator::Create(*AST, RawCond, clang::UO_LNot,
+                                     RawCond->getType(), VK_PRValue,
+                                     OK_Ordinary, SourceLocation(),
+                                     false, FPOptionsOverride());
       } else {
-        // False arm continues -> use as-is
         Cond = condOf(BI, R.Header);
       }
     } else {
