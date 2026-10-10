@@ -59,6 +59,7 @@ struct InnerCascade {
   BasicBlock *S = nullptr;
   BasicBlock *Mid = nullptr;
   BasicBlock *MidPre = nullptr;
+  SmallVector<BasicBlock *, 2> MidBypass;
   ScalarLoopInfo MidLoop;
   BasicBlock *L = nullptr; // countdown drain
   ScalarLoopInfo DrainLoop;
@@ -353,15 +354,32 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
     }
     if (!Mid)
       continue;
-    uint64_t Step = MidLoop.Step->getZExtValue();
-    if (Step < 2)
-      continue;
-    if (!countdownSecondaryOK(Mid, MidLoop, Drain, F, Step))
-      continue;
+    // The middle preheader may have outer-region preds (the outer
+    // dispatch's small-N arm) when each feeds constant 0 to its
+    // phis: the bypass restart, same zero the dispatch edge feeds.
+    // Recorded for re-routing in the fold.
+    SmallVector<BasicBlock *, 2> MidBypass;
+    for (BasicBlock *P : predecessors(MidPre)) {
+      if (P == D)
+        continue;
+      bool ZeroFeed = true;
+      for (PHINode &Phi : MidPre->phis()) {
+        int Idx = Phi.getBasicBlockIndex(P);
+        if (Idx < 0)
+          continue;
+        auto *C0 = dyn_cast<ConstantInt>(Phi.getIncomingValue(Idx));
+        if (!C0 || !C0->isZero())
+          ZeroFeed = false;
+      }
+      if (!ZeroFeed)
+        return false;
+      MidBypass.push_back(P);
+    }
     C.D = D;
     C.S = S;
     C.Mid = Mid;
     C.MidPre = MidPre;
+    C.MidBypass.assign(MidBypass.begin(), MidBypass.end());
     C.MidLoop = MidLoop;
     C.L = MaybeDrain;
     C.DrainLoop = Drain;
@@ -371,7 +389,6 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
   }
   return false;
 }
-
 // Fold an inner cascade: point D directly at S, drop the middle
 // region blocks, and let the drain plus counted tail cover the full
 // range from the zero restart. The middle tier's element range is
@@ -409,10 +426,12 @@ static bool foldInnerCascade(Function &F, const InnerCascade &C) {
   }
   if (!R.count(C.Mid) || !R.count(C.MidPre))
     return false;
-  // Single entry: every R pred is in R or D.
+  // Single entry: every R pred is in R, D, or a recorded MidPre
+  // bypass (re-routed to S below).
+  DenseSet<BasicBlock *> Bypass(C.MidBypass.begin(), C.MidBypass.end());
   for (BasicBlock *BB : R)
     for (BasicBlock *P : predecessors(BB))
-      if (!R.count(P) && P != C.D)
+      if (!R.count(P) && P != C.D && !(BB == C.MidPre && Bypass.count(P)))
         return false;
   // Escape: no R def may feed kept code except S phis through
   // R edges (dropped below) and dead-in-R users.
@@ -439,12 +458,44 @@ static bool foldInnerCascade(Function &F, const InnerCascade &C) {
         return false;
       }
     }
-  // Rewrite: D jumps to S; S drops R incomings.
+  // Rewrite: D jumps to S; each MidPre bypass jumps to S too (its
+  // zero restart is exactly the folded-path start). S drops R
+  // incomings. No kept instruction changes.
   BranchInst *NewBr = BranchInst::Create(C.S, DBr);
   if (MDNode *MD = DBr->getMetadata("revenant.va"))
     NewBr->setMetadata("revenant.va", MD);
   NewBr->setDebugLoc(DBr->getDebugLoc());
   DBr->eraseFromParent();
+  for (BasicBlock *BP : C.MidBypass) {
+    auto *BT = dyn_cast<BranchInst>(BP->getTerminator());
+    if (!BT)
+      return false;
+    bool ToMidPre = false;
+    for (BasicBlock *Su : BT->successors())
+      ToMidPre = ToMidPre || Su == C.MidPre;
+    if (!ToMidPre)
+      return false;
+    // The bypass edge must carry no live values into S: S phis
+    // either lack a bypass incoming or carry the same zero the
+    // dispatch edge feeds (proven at match time).
+    for (PHINode &Phi : C.S->phis()) {
+      int Idx = Phi.getBasicBlockIndex(BP);
+      if (Idx < 0)
+        continue;
+      auto *C0 = dyn_cast<ConstantInt>(Phi.getIncomingValue(Idx));
+      if (!C0 || !C0->isZero())
+        return false;
+    }
+    for (PHINode &Phi : C.S->phis()) {
+      if (Phi.getBasicBlockIndex(BP) >= 0)
+        continue;
+      // No bypass incoming: the path entered the middle at 0
+      // (MidPre 0-feed proven at match time), so the scalar tail
+      // restarts at 0 on this path too.
+      Phi.addIncoming(ConstantInt::getNullValue(Phi.getType()), BP);
+    }
+    BT->replaceSuccessorWith(C.MidPre, C.S);
+  }
   for (PHINode &Phi : C.S->phis()) {
     SmallVector<BasicBlock *, 4> Kill;
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
@@ -509,6 +560,12 @@ bool runUnvecMaps(llvm::Function &F) {
     bool Overlap = false;
     for (BasicBlock *BB : C.R)
       Overlap = Overlap || Taken.count(BB);
+    // An earlier fold may have erased blocks this candidate
+    // references. Erased blocks have no parent; skip the stale
+    // candidate instead of touching freed memory.
+    for (BasicBlock *BB : {C.D, C.S, C.Mid, C.MidPre, C.L, C.T})
+      if (!BB || BB->getParent() != &F)
+        Overlap = true;
     if (Overlap)
       continue;
     Taken.insert(C.D);

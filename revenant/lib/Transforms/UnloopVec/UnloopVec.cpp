@@ -1956,10 +1956,11 @@ bool runOnFunction(Function &F) {
     // 1. Fold D to the scalar edge: replace the conditional branch
     // with an unconditional one at S. No kept instruction changes.
     auto *Br = cast<BranchInst>(C.D->getTerminator());
+    errs() << "unloopvec fold D=" << C.D->getName() << " S=" << C.S->getName()
+           << " in " << F.getName() << "\n";
     BranchInst *NewBr = BranchInst::Create(C.S, Br);
     copyVA(Br, NewBr);
     // Preserve the debug location of the old terminator.
-    NewBr->setDebugLoc(Br->getDebugLoc());
     Br->eraseFromParent();
     for (PHINode &Phi : C.S->phis()) {
       SmallVector<BasicBlock *, 4> Kill;
