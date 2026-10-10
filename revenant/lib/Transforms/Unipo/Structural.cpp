@@ -72,7 +72,6 @@ bool paramAddressExposed(const Function &F, unsigned ArgNo, unsigned Depth) {
         const Function *CF = CB->getCalledFunction();
         if (!CF || CF->isDeclaration())
           return true;
-        bool Hidden = true;
         bool Found = false;
         for (unsigned K = 0; K < CB->arg_size(); ++K) {
           const Value *A = CB->getArgOperand(K)->stripPointerCasts();
