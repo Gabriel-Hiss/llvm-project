@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "../ExprBuilderImpl.h"
+#include "revenant/Clang/WideIntModel.h"
 
 #include "revenant/Clang/FrontendContext.h"
 
@@ -65,6 +66,10 @@ public:
         return Signed ? A.ShortTy : A.UnsignedShortTy;
       case 32:
         return Signed ? A.IntTy : A.UnsignedIntTy;
+      case 64:
+        return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
+      case 128:
+        return revenant::clangx::wideIntType(A, 128, Signed);
       default:
         return Signed ? A.LongLongTy : A.UnsignedLongLongTy;
       }

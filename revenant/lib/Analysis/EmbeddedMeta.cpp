@@ -159,7 +159,7 @@ void collectRtti(Program &P, const Image &Img) {
       TypeByName.emplace(Name, Index);
       TypeByDescriptor.emplace(Descriptor, Index);
       P.EmbeddedTypes.push_back(
-          {Descriptor, std::move(Name), Decorated.str(), Va(), {}});
+          {Descriptor, std::move(Name), Decorated.str(), Va(), {}, {}});
     }
   }
 

@@ -11,6 +11,7 @@
 #include "revenant/Clang/ExprBuilder.h"
 #include "revenant/Clang/FrontendContext.h"
 #include "revenant/Clang/TypeBuilder.h"
+#include "revenant/Clang/WideIntModel.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"

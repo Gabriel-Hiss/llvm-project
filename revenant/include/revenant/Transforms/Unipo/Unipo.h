@@ -4,8 +4,10 @@
 //
 // Inverts selected LLVM IPO transforms on lifted IR: source-DI-backed return
 // restoration, DI-backed dead-formal restoration, named clone recovery, and
-// same-signature structural clone folding. Every signature rewrite needs
-// independent evidence for its source-level shape; see Unipo.cpp guards.
+// the narrow GCC constprop `this`-formal restoration. Structural clone
+// folding is disabled (no body comparison proves shared source identity).
+// Every signature rewrite needs independent evidence for its source-level
+// shape; see Unipo.cpp guards.
 //
 // Runs on LLVM IR only, as the module pass `revenant-unipo` (signature
 // rewrites need a new Function object; see revenant-unabi for why a

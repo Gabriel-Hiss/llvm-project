@@ -207,7 +207,7 @@ static std::vector<uint64_t> runNative(llvm::ArrayRef<uint8_t> Code) {
 }
 
 static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
-                      std::string &Err) {
+                      std::string &Err, bool Execute = true) {
   auto Img = std::make_shared<Image>();
   Img->Base = Va(0x140000000);
   Section Sec;
@@ -247,6 +247,8 @@ static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
     return false;
   }
   std::string Name = Lifted->Fn->getName().str();
+  if (!Execute)
+    return true;
   // COFF constant-pool symbols (__ymm@...) do not link in the JIT, so compile
   // the lifted module as ELF for the host CPU. One JIT serves every case,
   // each in its own dylib, because a JIT per case exhausts the host.
@@ -311,10 +313,29 @@ TEST(LiftSemantics, MatchesNativeExecution) {
   const char *Only = std::getenv("REVENANT_SEM_FILTER");
   const bool Verbose = std::getenv("REVENANT_SEM_VERBOSE") != nullptr;
   for (const Case &C : Cases) {
-    if (C.Requires && !HostFeatures.lookup(C.Requires)) {
+    // A case the host CPU cannot run still has to lift: assemble it and run
+    // the lifter so a wrong lowering fails to lift. Only the execution and
+    // the native-vs-lifted comparison are skipped.
+    bool RunNative = !C.Requires || HostFeatures.lookup(C.Requires);
+    if (!RunNative) {
       ++Skipped;
       if (Verbose)
-        llvm::errs() << "skip " << C.Name << " (needs " << C.Requires << ")\n";
+        llvm::errs() << "lift-only " << C.Name << " (needs " << C.Requires
+                     << ")\n";
+      if (Only && C.Name.find(Only) == std::string::npos)
+        continue;
+      std::string Err;
+      std::vector<uint8_t> Code;
+      if (!assemble(snippet(C, false), Code, Err)) {
+        ADD_FAILURE() << C.Name << ": assemble: " << Err;
+        ++Failures;
+        continue;
+      }
+      std::vector<uint64_t> Got;
+      if (!runLifted(Code, Got, Err, /*Execute=*/false)) {
+        ADD_FAILURE() << C.Name << ": lift: " << Err;
+        ++Failures;
+      }
       continue;
     }
     if (Only && C.Name.find(Only) == std::string::npos)

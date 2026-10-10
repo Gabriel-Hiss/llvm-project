@@ -17,7 +17,8 @@ RELEASE_SUFFIXES = (
     "-o2avx2", "-o2hsw",
 )
 PUBLIC_NAME = re.compile(r"`([^`]+)`")
-MAP_LINE = re.compile(r"\b[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{4,16}\s+(.+?)\s*$")
+MAP_LINE = re.compile(
+    r"(?:\b[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{4,16}|\b0x[0-9A-Fa-f]{8,16})\s+(.+?)\s*$")
 MAP_SYMBOL = re.compile(r"[?$A-Za-z_][?$A-Za-z_0-9@.$:?<>]*")
 
 
