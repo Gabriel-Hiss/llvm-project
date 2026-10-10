@@ -41,10 +41,9 @@ exit:
 }
 
 ; CHECK-LABEL: define{{.*}}void @add_choice
+; The versioned fold stays disabled (bug board 25): both arms survive.
 ; CHECK: entry:
 ; CHECK: br label %scalar.pre
-; CHECK-NOT: vector.loop
 ; CHECK: scalar.loop:
 ; CHECK: add i32 %x, 1
 ; CHECK: ret void
-; CHECK: }

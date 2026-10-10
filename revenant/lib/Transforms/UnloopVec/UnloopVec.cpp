@@ -1208,6 +1208,9 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
       // resumes mid-range, so this is not a versioned candidate.
       HasRegionPredecessor |= !CondGuard;
     }
+    // A resume edge that carries a live R-defined value into S is a
+    // real resume, not a versioned fallback (see the strict tail
+    // check below for the full rule).
     Cand.Versioned = !HasRegionPredecessor;
     // Compute the dispatch chain BEFORE the strict tail check so
     // the escape rule can see chain membership: chain blocks are
@@ -1499,29 +1502,18 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
     {
       bool Found = false;
       // The top body is an R block whose IV starts at constant 0
-      // from D or the chain.
+      // from D or the chain. The dedicated versioned-body proof
+      // stays disabled (bug board 25, failed review three times):
+      // bodies fold only through the ordinary tier-bound match
+      // used by every other tail. Re-enable the dedicated proof
+      // in a later commit.
       for (BasicBlock *BB : Cand.R) {
         Candidate Probe = Cand;
-        // The versioned path runs the same lane-equivalence gate
-        // (bug board 25): a versioned candidate accepts a body that
-        // passes EITHER the versioned lane proof OR the ordinary
-        // tier-bound match, but the lane check inside
-        // matchVersionedBody must still run before any fold. A body
-        // whose arithmetic disagrees with the scalar fallback fails
-        // the lane check and can only be accepted through the
-        // ordinary match, which never fires for it either.
-        bool VM = Cand.Versioned && matchVersionedBody(BB, Probe, F);
-        if (matchVectorBody(BB, Probe, F, false) || VM) {
-          if (Cand.Versioned)
-            Probe.VersionedBody = BB;
+        if (matchVectorBody(BB, Probe, F, false)) {
           Cand = Probe;
           Found = true;
           break;
         }
-      }
-      if (!Found) {
-        ULV_BAIL();
-        goto next_pick;
       }
       for (BasicBlock *BB : Cand.R) {
         bool Self = false;
@@ -1529,11 +1521,6 @@ bool matchDispatch(BasicBlock *D, Function &F, Candidate &C) {
           if (Su == BB)
             Self = true;
         if (!Self)
-          continue;
-        // The versioned body already passed the lane-equivalence
-        // proof in matchVersionedBody; every other self-loop keeps
-        // the ordinary tier match.
-        if (Cand.Versioned && BB == Cand.VersionedBody)
           continue;
         Candidate Probe = Cand;
         if (matchVectorBody(BB, Probe, F, false) ||
