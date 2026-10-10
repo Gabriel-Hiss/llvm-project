@@ -13,11 +13,7 @@
 //   shapes): identify the widened dividend and evaluate the arithmetic DAG
 //   as q(x), even when x is itself an instruction. Recover |d| from the
 //   first positive nonzero result, then exhaustively verify i8/i16 or check
-//   quotient boundaries and extrema for i32/i64 before rewriting. A
-//   select whose condition reads the dividend is input-dependent control
-//   flow, not compiler fixup arithmetic: no finite witness set can prove
-//   it equivalent to a divide, so the evaluation refuses to fold through
-//   it.
+//   quotient boundaries and extrema for i32/i64 before rewriting.
 // - abs/min/max/clamp, three-way comparisons and unsigned saturation
 //   intrinsics return to source-level compare/subtract/select operations.
 //   Signed subtraction-flag chains also become comparisons/selects, never
@@ -107,7 +103,6 @@ struct DagEval {
   bool WidthConflict = false;
   bool WideMul = false;
   Value *Input = nullptr;
-  const Instruction *Root = nullptr;
   unsigned Budget = 256;
   SmallPtrSet<Value *, 16> Visited;
   DenseMap<Value *, std::optional<std::pair<APInt, unsigned>>> Memo;
@@ -167,15 +162,6 @@ bool DagEval::evalInst(Instruction *I, APInt &Out128, unsigned &OutW) {
   if (Budget == 0)
     return false;
   --Budget;
-  // Quotient DAGs are loop-free compiler arithmetic: a PHI is a loop
-  // carried value, not a multiply-high chain. Refuse it (the popcount
-  // loop's add recurses through its own PHI and never terminates as a
-  // quotient proof).
-  if (isa<PHINode>(I)) {
-    Dividend = nullptr;
-    return false;
-  }
-  Visited.insert(I);
   // Integer arithmetic only: a pointer, vector or float anywhere in the node
   // (ptrtoint, pointer select/icmp) ends the evaluation.
   if (!I->getType()->isIntegerTy() ||
@@ -299,6 +285,19 @@ bool DagEval::evalInst(Instruction *I, APInt &Out128, unsigned &OutW) {
     OutW = TW;
     return true;
   }
+  if (auto *SI = dyn_cast<SelectInst>(I)) {
+    unsigned W = SI->getType()->getIntegerBitWidth();
+    APInt C(128, 0);
+    if (!evalOperand(SI->getCondition(), 1, C))
+      return false;
+    APInt V(128, 0);
+    if (!evalOperand(C.isZero() ? SI->getFalseValue() : SI->getTrueValue(),
+                     W, V))
+      return false;
+    Out128 = V;
+    OutW = W;
+    return true;
+  }
   if (auto *IC = dyn_cast<ICmpInst>(I)) {
     unsigned W =
         IC->getOperand(0)->getType()->getScalarType()->getIntegerBitWidth();
@@ -345,45 +344,6 @@ bool DagEval::evalInst(Instruction *I, APInt &Out128, unsigned &OutW) {
     }
     Out128 = APInt(128, R ? 1 : 0);
     OutW = 1;
-    return true;
-  }
-  if (auto *SI = dyn_cast<SelectInst>(I)) {
-    // A select inside a quotient DAG is a data-dependent branch until
-    // proven otherwise: the condition may read the dividend (the
-    // witness-hole fixture's `x == 42` does), and no finite witness set
-    // can prove such a branch equivalent to a divide. Walk the
-    // condition DAG for the dividend leaf and bail on a match.
-    auto condReadsDividend = [&]() {
-      SmallPtrSet<const Value *, 16> Seen;
-      SmallVector<const Value *, 16> Work{SI->getCondition()};
-      while (!Work.empty()) {
-        const Value *V = Work.pop_back_val();
-        if (!Seen.insert(V).second)
-          continue;
-        if (V == Dividend)
-          return true;
-        if (auto *CI = dyn_cast<Instruction>(V))
-          for (Value *Operand : CI->operands())
-            Work.push_back(Operand);
-      }
-      return false;
-    };
-    // The walk needs the dividend: evaluate the condition first so the
-    // leaf is known, then check the walk before touching either arm.
-    unsigned W = SI->getType()->getIntegerBitWidth();
-    APInt C(128, 0);
-    if (!evalOperand(SI->getCondition(), 1, C))
-      return false;
-    if (condReadsDividend()) {
-      Dividend = nullptr;
-      return false;
-    }
-    APInt V(128, 0);
-    if (!evalOperand(C.isZero() ? SI->getFalseValue() : SI->getTrueValue(),
-                     W, V))
-      return false;
-    Out128 = V;
-    OutW = W;
     return true;
   }
   return false;
@@ -448,7 +408,6 @@ std::optional<APInt> evalRoot(Instruction *Root, const APInt &X, unsigned W,
   DagEval E;
   E.XVal = X.zextOrTrunc(W);
   E.Input = Input;
-  E.Root = Root;
   APInt Out(128, 0);
   unsigned OutW = 0;
   if (!E.evalInst(Root, Out, OutW))
@@ -511,53 +470,6 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
   if (Div->getType() && Div->getType()->isIntegerTy() &&
       Div->getType()->getIntegerBitWidth() != W)
     return std::nullopt;
-  // The rewrite replaces the root value, so an outside observer is only
-  // dangerous when it branches on the raw dividend around the DAG: the
-  // witness-hole select takes the trunc as one arm and `q + 1` as the
-  // other under `x == 42`. No witness set can prove that branch away.
-  // Bail when a live select in the same function takes a member of this
-  // DAG as an arm while its condition reads the dividend. Pure
-  // arithmetic reuses (the urem7 quotient feeding `q * -7`) stay legal:
-  // they compute from the quotient, not around it.
-  {
-    Value *D3 = nullptr;
-    bool W3 = false, C3 = false;
-    SmallVector<Value *, 8> Reachable;
-    evalRoot(Root, Zero, W, D3, W3, C3, &Reachable, DivInput);
-    SmallPtrSet<const Value *, 32> InDag;
-    InDag.insert(Root);
-    for (Value *M : Reachable)
-      InDag.insert(M);
-    InDag.insert(Div);
-    for (BasicBlock &BB : *Root->getParent()->getParent()) {
-      for (Instruction &I : BB) {
-        auto *SI = dyn_cast<SelectInst>(&I);
-        if (!SI)
-          continue;
-        bool ArmInDag = InDag.count(SI->getTrueValue()) ||
-                        InDag.count(SI->getFalseValue());
-        if (!ArmInDag)
-          continue;
-        SmallPtrSet<const Value *, 16> SeenC;
-        SmallVector<const Value *, 16> WorkC{SI->getCondition()};
-        bool CondOnDiv = false;
-        while (!WorkC.empty()) {
-          const Value *C = WorkC.pop_back_val();
-          if (!SeenC.insert(C).second)
-            continue;
-          if (C == Div) {
-            CondOnDiv = true;
-            break;
-          }
-          if (auto *CI = dyn_cast<Instruction>(C))
-            for (Value *Operand : CI->operands())
-              WorkC.push_back(Operand);
-        }
-        if (CondOnDiv)
-          return std::nullopt;
-      }
-    }
-  }
 
   // |d| = smallest positive x with q(x) != 0. Exponential probe then
   // binary search (quotient-like functions are 0 up to |d|).
@@ -644,36 +556,6 @@ std::optional<Quotient> analyzeQuotient(Instruction *Root) {
       bool W3 = false, C3 = false;
       evalRoot(Root, APInt(W, (uint64_t)D), W, D3, W3, C3, &Q.Members,
                DivInput);
-      llvm::sort(Q.Members);
-      Q.Members.erase(std::unique(Q.Members.begin(), Q.Members.end()),
-                      Q.Members.end());
-      // Every member must die with the rewrite: a member feeding an
-      // outside user keeps its old value alive past the fold. The
-      // witness-hole trunc feeds the select arm as well as the accepted
-      // root, so it can never be a member of a sound rewrite. Dead
-      // members and the dividend leaf are exempt: dead members have no
-      // observer, and the leaf has no quotient to preserve.
-      for (Value *M : Q.Members) {
-        auto *MI = dyn_cast<Instruction>(M);
-        if (!MI || MI->getParent() == nullptr)
-          return std::nullopt;
-        if (MI->use_empty() || M == Div)
-          continue;
-        SmallVector<User *, 4> MUsers(M->users().begin(), M->users().end());
-        for (User *U : MUsers) {
-          auto *UI = dyn_cast<Instruction>(U);
-          if (!UI || UI->getParent() == nullptr)
-            return std::nullopt;
-          bool UserInside = UI == Q.Root;
-          for (Value *N : Q.Members)
-            if (U == N) {
-              UserInside = true;
-              break;
-            }
-          if (!UserInside)
-            return std::nullopt;
-        }
-      }
       return Q;
     }
   }
@@ -844,7 +726,6 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
         if (auto Q = analyzeQuotient(I)) {
           for (Value *M : Q->Members)
             Consumed.insert(M);
-          Consumed.insert(Q->Root);
           Quotients.push_back(std::move(*Q));
         }
       }
@@ -866,46 +747,6 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
       Div->takeName(Q.Root);
       Q.Root->eraseFromParent();
       Changed = true;
-    }
-    // Cleanup canonicalizes `sub x, sdiv(y,C)` (C > 0) into
-    // `add x, sdiv(y,-C)`. The negated divisor is correct IR but no C
-    // source divides by a negative constant here, and the backend
-    // emitter prints the negative form less faithfully; fold back to
-    // the source shape. `sdiv` by INT_MIN has no positive negation.
-    for (Instruction &I : make_early_inc_range(instructions(F))) {
-      auto *Add = dyn_cast<BinaryOperator>(&I);
-      if (!Add || Add->getOpcode() != Instruction::Add)
-        continue;
-      for (int K = 0; K < 2; ++K) {
-        Value *X = Add->getOperand(1 - K);
-        auto *Div = dyn_cast<BinaryOperator>(Add->getOperand(K));
-        if (!Div || Div->getOpcode() != Instruction::SDiv)
-          continue;
-        auto *D = dyn_cast<ConstantInt>(Div->getOperand(1));
-        if (!D || !D->isNegative() || D->getValue().isMinSignedValue())
-          continue;
-        B.SetInsertPoint(Add);
-        Value *PosD = ConstantExpr::getNeg(cast<Constant>(Div->getOperand(1)));
-        Value *PosDiv = Div;
-        if (Div->hasOneUse()) {
-          // Sole user: negate the divisor in place, no dead divide left.
-          Div->setOperand(1, PosD);
-        } else {
-          PosDiv = B.CreateSDiv(Div->getOperand(0), PosD);
-          auto *PosDivI = cast<Instruction>(PosDiv);
-          copyProvenance(PosDivI, Div);
-          PosDivI->copyMetadata(*Div);
-        }
-        Value *Sub = B.CreateSub(X, PosDiv);
-        auto *SubI = cast<Instruction>(Sub);
-        copyProvenance(SubI, Add);
-        SubI->copyMetadata(*Add);
-        Add->replaceAllUsesWith(Sub);
-        Sub->takeName(Add);
-        Add->eraseFromParent();
-        Changed = true;
-        break;
-      }
     }
     // Phase 2: rem formation on the rewritten quotients (plus any
     // pre-existing udiv/sdiv + mul shapes).
@@ -992,8 +833,6 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                 A, Bv);
             R = B.CreateSelect(Cond, A, Bv);
           } else if (ID == Intrinsic::abs) {
-            if (Call->arg_size() < 1)
-              continue;
             Value *A = Call->getArgOperand(0);
             Cond = B.CreateICmpSLT(
                 A, ConstantInt::getNullValue(A->getType()));
