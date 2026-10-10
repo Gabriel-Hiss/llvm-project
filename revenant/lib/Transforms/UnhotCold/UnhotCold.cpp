@@ -279,7 +279,22 @@ bool mergeCold(Function &Hot, Function &Cold, const ColdMerge &M) {
     if (RetCount != 1)
       return false;
   }
-
+  // Call-shape validation runs before any block moves: the checks below
+  // must all pass while both functions are still intact, since a bail
+  // after moving leaves an orphan block and an empty donor behind.
+  if (auto *CB = dyn_cast<CallBase>(M.EdgeInst)) {
+    if (!callIsNoReturn(CB))
+      return false;
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || !Callee->hasFnAttribute(Attribute::NoReturn))
+      return false;
+    if (const Instruction *Next = CB->getNextNode())
+      if (!isa<UnreachableInst>(Next))
+        return false;
+    if (!ColdEntry->getTerminator() ||
+        !isa<UnreachableInst>(ColdEntry->getTerminator()))
+      return false;
+  }
   // Move cold blocks into Hot, preserving order and names/VA metadata
   // (instructions are moved, never recreated, so metadata rides along).
   // Insert right after HotPred for locality.
@@ -310,13 +325,12 @@ bool mergeCold(Function &Hot, Function &Cold, const ColdMerge &M) {
     }
   } else if (auto *CB = dyn_cast<CallBase>(M.EdgeInst)) {
     // `call cold()` shape: inline the cold body at the call site. Erase
-    // the call, splice the cold entry's non-phi instructions before it,
-    // and branch to the cold entry's successor. Only the single-block
-    // noreturn shape merges here (multi-block call-target chunks need a
-    // full inline pass, out of scope).
-    if (!CB->hasFnAttr(Attribute::NoReturn))
-      return false;
-    if (!ColdEntry->getTerminator() || !isa<UnreachableInst>(ColdEntry->getTerminator()))
+    // the call, splice the cold entry's non-phi instructions before it.
+    // Only the single-block noreturn shape merges here (multi-block
+    // call-target chunks need a full inline pass, out of scope). All
+    // noreturn/unreachable conditions were validated before the move.
+    if (!callIsNoReturn(CB) || !ColdEntry->getTerminator() ||
+        !isa<UnreachableInst>(ColdEntry->getTerminator()))
       return false;
     // Cold body = entry block's calls before the unreachable.
     SmallVector<Instruction *, 8> Body;
