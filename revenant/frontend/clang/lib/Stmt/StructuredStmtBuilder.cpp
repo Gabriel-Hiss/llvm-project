@@ -1085,6 +1085,7 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
                                      OK_Ordinary, SourceLocation(),
                                      false, FPOptionsOverride());
       } else {
+        // False arm continues -> use as-is
         Cond = condOf(BI, R.Header);
       }
     } else {
