@@ -64,7 +64,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if __has_include("revenant/Evidence/Evidence.h")
 #include "revenant/Evidence/Evidence.h"
+#define REVENANT_HAS_EVIDENCE 1
+#endif
 #include "revenant/Transforms/Uninline/Uninline.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -230,9 +233,13 @@ CalleeBody analyzeCallee(Function &F) {
     // unchanged. (revenant.lib survives none mode, so Library evidence
     // can still confirm there; the structural match stays exact, so the
     // output stays correct.)
+#ifdef REVENANT_HAS_EVIDENCE
     if (revenant::evidence::uninlineEvidence(F).empty())
       return B;
     B.EvidenceOnly = true;
+#else
+    return B;
+#endif
   }
   // Wrapper disambiguation: a body that only forwards its arguments to
   // one inner call (`mz_free(p)` = `free(p)`) is indistinguishable from
@@ -581,10 +588,13 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
     }
   }
   // Evidence is read once per callee, not per region: it is function-level
-  // metadata and cannot change during this caller's rewrite.
+  // metadata and cannot change during this caller's rewrite. Without the
+  // evidence header no callee is EvidenceOnly, so this stays empty.
+#ifdef REVENANT_HAS_EVIDENCE
   revenant::evidence::InlineEvidence Ev;
   if (CB.EvidenceOnly)
     Ev = revenant::evidence::uninlineEvidence(*Callee);
+#endif
   bool Changed = false;
   // Snapshot blocks: the rewrite erases instructions but never adds or
   // removes blocks, so iterating blocks directly is safe.
@@ -616,9 +626,11 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
         // the same distinctive strings or library body as the callee.
         // The structural match above already passed fully; evidence only
         // confirms tiny exact matches (the assert-string family).
+#ifdef REVENANT_HAS_EVIDENCE
         if (CB.EvidenceOnly &&
             !revenant::evidence::regionMatchesEvidence(Ev, RegionInsts))
           continue;
+#endif
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
           // region end.
