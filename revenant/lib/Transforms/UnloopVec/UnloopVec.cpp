@@ -259,23 +259,70 @@ struct TailCmp {
     return OK;
   }
 
-  // Position I of both blocks compares equal (non-phi). Memory opcodes
-  // additionally require equal volatile/atomic flags (callers already
-  // rejected volatile; check ordering flags stay equal).
-  bool insnEq(const Instruction *X, const Instruction *Y, unsigned Depth) {
-    if (X->getOpcode() != Y->getOpcode())
+  // Lane projection: X is a vector-typed def in A whose every lane
+  // must equal scalar value Y. Handles the vectorizer's own idioms:
+  // the loaded lanes (X maps to Y directly), a splat of a scalar S
+  // (lanes equal S, so require S == Y), and a lane-wise ALU op over
+  // lane-equal operands (recurse per side). Anything else fails.
+  bool laneEq(const Value *X, const Value *Y, unsigned Depth) {
+    if (Depth == 0)
       return false;
-    if (X->getType() != Y->getType())
+    if (X == Y)
+      return true;
+    auto It = MapAB.find(X);
+    if (It != MapAB.end())
+      return It->second == Y;
+    if (const auto *CX = dyn_cast<Constant>(X)) {
+      if (const auto *CY = dyn_cast<Constant>(Y))
+        return CX == CY;
       return false;
-    if (X->getNumOperands() != Y->getNumOperands())
+    }
+    // Splat of a scalar: every lane equals the splatted value.
+    if (auto *Splat = laneSplat(X))
+      return valEq(Splat, Y, Depth - 1);
+    const auto *IX = dyn_cast<Instruction>(X);
+    const auto *IY = dyn_cast<Instruction>(Y);
+    if (!IX || !IY || IX->getParent() != A || IY->getParent() != B)
       return false;
-    for (unsigned I = 0; I < X->getNumOperands(); ++I)
-      if (!valEq(X->getOperand(I), Y->getOperand(I), Depth))
+    // Lane-wise ALU over lane-equal operands.
+    if (IX->getOpcode() != IY->getOpcode())
+      return false;
+    if (IX->getNumOperands() != IY->getNumOperands())
+      return false;
+    if (!IX->getType()->isVectorTy())
+      return false;
+    if (auto *VT = dyn_cast<FixedVectorType>(IX->getType()))
+      if (VT->getElementType() != IY->getType())
         return false;
-    return true;
+    if (!InProgress.insert({X, Y}).second)
+      return true;
+    bool OK = true;
+    for (unsigned I = 0; OK && I < IX->getNumOperands(); ++I)
+      OK = laneEq(IX->getOperand(I), IY->getOperand(I), Depth - 1);
+    if (!OK)
+      InProgress.erase({X, Y});
+    return OK;
+  }
+
+  // The splatted scalar behind insertelement+shufflevector, else null.
+  const Value *laneSplat(const Value *X) const {
+    auto *Shuffle = dyn_cast<ShuffleVectorInst>(X);
+    if (!Shuffle)
+      return nullptr;
+    auto *Insert =
+        dyn_cast<InsertElementInst>(Shuffle->getOperand(0));
+    if (!Insert)
+      return nullptr;
+    auto *Index = dyn_cast<ConstantInt>(Insert->getOperand(2));
+    if (!Index || !Index->isZero())
+      return nullptr;
+    for (int I = 0, E = static_cast<int>(Shuffle->getShuffleMask().size());
+         I != E; ++I)
+      if (Shuffle->getMaskValue(I) != 0)
+        return nullptr;
+    return Insert->getOperand(1);
   }
 };
-
 struct ScalarLoopInfo {
   BasicBlock *Header = nullptr; // single-block self-loop
   PHINode *IV = nullptr;        // steps by constant
@@ -1599,10 +1646,26 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
       VectorAdds[0]->getOperand(0) == VectorLoads[0] ? 1 : 0);
   Value *ScalarOther = ScalarAdds[0]->getOperand(
       ScalarAdds[0]->getOperand(0) == ScalarLoads[0] ? 1 : 0);
-  if (broadcastScalar(VectorOther) != ScalarOther ||
-      (ScalarAdds[0]->getOperand(0) != ScalarLoads[0] &&
+  if ((ScalarAdds[0]->getOperand(0) != ScalarLoads[0] &&
        ScalarAdds[0]->getOperand(1) != ScalarLoads[0]))
     return false;
+  // Lane-wise equivalence against the scalar fallback (bug board 25):
+  // the vector ALU must be the lane-wise image of the scalar ALU.
+  // Require the other vector operand to be a splat of the scalar's
+  // operand, then confirm structurally with laneEq. A body that adds
+  // a different constant (+100 vs +1) fails here and bails.
+  if (broadcastScalar(VectorOther) != ScalarOther)
+    return false;
+  {
+    TailCmp TC;
+    TC.A = B;
+    TC.B = C.L;
+    TC.MapAB[Vector.IV] = Scalar.IV;
+    TC.MapAB[Vector.Step] = Scalar.Step;
+    TC.MapAB[VectorLoads[0]] = ScalarLoads[0];
+    if (!TC.laneEq(VectorAdds[0], ScalarAdds[0], TailCmp::MaxDepth))
+      return false;
+  }
   auto *SOverflow = dyn_cast<OverflowingBinaryOperator>(ScalarAdds[0]);
   auto *VOverflow = dyn_cast<OverflowingBinaryOperator>(VectorAdds[0]);
   if (ScalarLoads[0]->isVolatile() || ScalarLoads[0]->isAtomic() ||
@@ -2885,7 +2948,20 @@ bool lowerUniformStoreUnroll(Function &F) {
         LanesMatch = false;
     if (!LanesMatch)
       continue;
-
+    // Trip-count divisibility (bug board 23): narrowing the step from
+    // ByteStep to ByteStep/Stores.size() drops stores unless the
+    // loop's trip count is a multiple of the old step. The latch
+    // compares IV.next against the bound with the IV starting at 0,
+    // so require the bound to be a constant multiple of the old
+    // step. Anything else keeps the loop untouched.
+    {
+      Value *Bound = loopBound(Loop);
+      bool Divisible = false;
+      if (auto *CBound = dyn_cast<ConstantInt>(Bound))
+        Divisible = CBound->getZExtValue() % ByteStep == 0;
+      if (!Divisible)
+        continue;
+    }
     auto *StepUpdate =
         dyn_cast<BinaryOperator>(Loop.IV->getIncomingValueForBlock(&BB));
     if (!StepUpdate)
