@@ -163,7 +163,7 @@ runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
-**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies that are identical modulo renaming except for equivalent constant data, and every call must target the same callee (same `Function*`): calls to different declarations are always different, whatever their attributes (same type, noreturn, unused results, unreachable successors prove nothing; linked definitions may exit with distinct codes). A global is interchangeable with a byte-identical twin only when its address is never observed: passing it to a declaration or indirect callee exposes its identity (a linked definition may record it); only marker intrinsics, pure data access, and checked same-module callees keep it hidden. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
+**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural clone folding is disabled: no body comparison can prove two entry points came from one source function (distinct declarations linked to different behavior, opaque observers, distinct exit codes, volatile loads from different objects), and identical bodies are not proof of shared source identity either. The pass keeps signature restoration (returns, dead formals, named clones, the narrow GCC constprop `this` formal), which requires source-signature evidence and rebinds only the same constant object. Uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
 **revenant-locals-to-slots (owner: LunaLocalsToSlots).** Expects structured,
 type-recovered SSA. Restores the `-O0` storage shape: every parameter gets an
@@ -232,28 +232,19 @@ stale. Named-clone recovery requires a clone suffix. Folded constant-global
 recovery is limited to one global passed only as the first call argument, the
 GCC constprop `this` shape.
 
-New calls preserve instruction metadata and VA provenance. Structural matching
-rejects opaque instructions, region annotations, and outlined `.part.N` or
-`.cold` bodies rather than rewriting those paths.
+New calls preserve instruction metadata and VA provenance. Signature
+restoration rejects opaque instructions, region annotations, and outlined
+`.part.N` or `.cold` bodies rather than rewriting those paths.
 
 
-Measured with the standalone plugin and `revenant-unipo,verify` on fresh
-normalized GCC lifts:
-
-| Target | Oracle clone entries | Recovered / 9 | Named clone entries merged/restored | Cold partitions |
-| --- | ---: | ---: | --- | --- |
-| cpp-gcc-o2 | 9 | 2 | pool free and allocate signatures restored | both unchanged |
-| cpp-gcc-o3 | 9 | 2 | pool free and allocate signatures restored | both unchanged |
-
-The pool constprop clones regain their folded pool-object formal by rebinding
-the equivalent internal constant global. Their remaining arguments stay
-site-specific, so callers retain distinct allocation sizes rather than
-requiring a unanimous constant. The `_S_construct.isra` pair no longer
-folds: its bodies call distinct `sub_0x` declarations, and calls to
-different declarations are always different under the callee-identity
-rule. Pooled data is treated as equal only when constant initializers
-match and its address is not compared, including never passing it to a
-declaration or indirect callee. Four named entries remain:
+Structural folding previously recovered the `_S_construct.isra` pair on
+fresh normalized GCC lifts by matching equivalent string data with
+equivalent trap tails; that fold is removed with the rest of structural
+matching (see above). The pool constprop clones keep their folded
+pool-object formal by rebinding the same constant object. Their
+remaining arguments stay site-specific, so callers retain distinct
+allocation sizes rather than requiring a unanimous constant. Four named
+entries remain:
 `_M_construct.isra` at VA `0x14001bca0` (O2) / `0x14001bf40` (O3), whose body
 CFG/opcode shapes differ from unspecialized `_M_construct` at `0x14001bbf0` /
 `0x14001be90`; `d_demangle_callback.constprop` at `0x14000aa20` / `0x14000ac30`
@@ -292,10 +283,9 @@ changes; `revenant-unipo,verify` succeeds. The map and PDB remain scoring-only.
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
 `sub_140001017` call sequence that stores 2 in RCX before calling
-`sub_140003A10`. They cover same-signature structural matches, constant
-specialization rejection, DI-backed return recovery, address-taking, and
-outlined cold partitions. They do not claim controlled fixture clones existed
-in the measured binaries.
+`sub_140003A10`. They cover constant specialization rejection, DI-backed
+return recovery, address-taking, and outlined cold partitions. They do
+not claim controlled fixture clones existed in the measured binaries.
 
 Raw clang LTO emission succeeds with the current driver. Its `ir-final` path
 currently aborts in RerollPass on `sub_140001930` because an APInt exceeds the

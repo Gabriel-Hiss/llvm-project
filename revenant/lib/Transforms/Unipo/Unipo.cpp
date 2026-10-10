@@ -6,9 +6,8 @@
 // FunctionPassManager pass cannot erase safely mid-iteration (LLVM's own
 // ArgPromotion and DeadArgElim are module passes for the same reason).
 //
-// Structural.cpp folds equal-signature bodies only when distinct constant-data
-// references and equivalent trap tails support clone identity. It does not
-// infer source formals from caller constants. This file restores returns and
+// Structural clone folding is disabled (Structural.cpp keeps only strict
+// constant identity for operand rebinding). This file restores returns and
 // arguments only when debug or named-clone evidence provides the missing
 // signature shape; folded-global recovery handles the narrow GCC constprop
 // case. Calls copied during signature changes retain instruction metadata and
@@ -40,8 +39,7 @@ using namespace llvm;
 
 namespace revenant {
 bool foldStructuralIPO(Module &M);
-// Constant equivalence modulo dedup'd constant data and trap-stub
-// declarations (Structural.cpp).
+// Strict constant identity (Structural.cpp): the same object only.
 bool constantsEquivalent(const Constant *A, const Constant *B);
 }
 
