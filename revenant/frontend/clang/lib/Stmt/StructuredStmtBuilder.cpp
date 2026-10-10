@@ -48,11 +48,11 @@ namespace revenant::clangx {
 
 namespace {
 
-enum class RegionKind { If, While, DoWhile, For, Switch };
+enum class RegionKind { If, While, DoWhile, For, Loop, Switch };
 
 static bool isLoopKind(RegionKind K) {
   return K == RegionKind::While || K == RegionKind::DoWhile ||
-         K == RegionKind::For;
+         K == RegionKind::For || K == RegionKind::Loop;
 }
 
 /// Parsed `!revenant.region` annotation on a header block.
@@ -241,54 +241,90 @@ Stmt *StructuredStmtBuilder::gotoTo(BasicBlock *BB) {
 
 bool StructuredStmtBuilder::parseRegion(BasicBlock *BB, Region &R) {
   MDNode *N = BB->getTerminator()->getMetadata("revenant.region");
-  if (!N || N->getNumOperands() < 2)
+  if (!N || N->getNumOperands() == 0)
     return false;
-  StringRef Tag;
-  int64_t I0 = -1;
-  if (!regionOperand(N, 0, Tag, I0) || Tag.empty())
-    return false;
-  auto arg = [&](unsigned I, BasicBlock *&Out) {
-    StringRef S;
-    int64_t Idx = -1;
-    if (!regionOperand(N, I, S, Idx) || !S.empty())
-      return false;
-    Out = blockOf(Idx);
-    return Out != nullptr;
-  };
-  if (Tag == "sc") {
-    BasicBlock *Partner;
-    if (arg(1, Partner))
-      ScTags[BB] = ScTag{Partner};
-    return false;
-  }
-  if (Tag == "if")
-    R.Kind = RegionKind::If;
-  else if (Tag == "switch")
-    R.Kind = RegionKind::Switch;
-  else if (Tag == "while")
-    R.Kind = RegionKind::While;
-  else if (Tag == "dowhile")
-    R.Kind = RegionKind::DoWhile;
-  else if (Tag == "for")
-    R.Kind = RegionKind::For;
-  else
-    return false;
-  R.Header = BB;
-  if (isLoopKind(R.Kind)) {
-    BasicBlock *H, *L;
-    if (!arg(1, H) || !arg(2, L) || !arg(3, R.Follow))
-      return false;
-    R.Latch = L;
+
+  SmallVector<MDNode *, 4> Descriptors;
+  if (isa<MDString>(N->getOperand(0))) {
+    Descriptors.push_back(N);
   } else {
-    // A follow of -1 marks a region whose arms terminate without a merge.
-    StringRef S;
-    int64_t Idx = -1;
-    if (!regionOperand(N, 1, S, Idx) || !S.empty())
-      return false;
-    R.Follow = Idx >= 0 ? blockOf(Idx) : nullptr;
-    if (Idx >= 0 && !R.Follow)
-      return false;
+    for (const MDOperand &Op : N->operands())
+      if (auto *D = dyn_cast_or_null<MDNode>(Op.get()))
+        Descriptors.push_back(D);
   }
+
+  auto indexArg = [](MDNode *D, unsigned I, int64_t &Idx) {
+    StringRef Tag;
+    return regionOperand(D, I, Tag, Idx) && Tag.empty();
+  };
+  int BestRank = -1;
+  Region Best;
+  for (MDNode *D : Descriptors) {
+    StringRef Tag;
+    int64_t Unused = -1;
+    if (!regionOperand(D, 0, Tag, Unused) || Tag.empty())
+      continue;
+    if (Tag == "sc") {
+      int64_t PartnerIdx = -1;
+      if (indexArg(D, 1, PartnerIdx))
+        if (BasicBlock *Partner = blockOf(PartnerIdx))
+          ScTags[BB] = ScTag{Partner};
+      continue;
+    }
+
+    Region Candidate;
+    Candidate.Header = BB;
+    if (Tag == "if")
+      Candidate.Kind = RegionKind::If;
+    else if (Tag == "switch")
+      Candidate.Kind = RegionKind::Switch;
+    else if (Tag == "while")
+      Candidate.Kind = RegionKind::While;
+    else if (Tag == "dowhile")
+      Candidate.Kind = RegionKind::DoWhile;
+    else if (Tag == "for")
+      Candidate.Kind = RegionKind::For;
+    else if (Tag == "loop")
+      Candidate.Kind = RegionKind::Loop;
+    else
+      continue;
+
+    int64_t FollowIdx = -1;
+    if (isLoopKind(Candidate.Kind)) {
+      int64_t HeaderIdx = -1, LatchIdx = -1;
+      if (!indexArg(D, 1, HeaderIdx) || blockOf(HeaderIdx) != BB ||
+          !indexArg(D, 2, LatchIdx) || !indexArg(D, 3, FollowIdx))
+        continue;
+      Candidate.Latch = blockOf(LatchIdx);
+      if (!Candidate.Latch)
+        continue;
+    } else if (!indexArg(D, 1, FollowIdx)) {
+      continue;
+    }
+    if (FollowIdx < -1)
+      continue;
+    Candidate.Follow = FollowIdx == -1 ? nullptr : blockOf(FollowIdx);
+    if (FollowIdx >= 0 && !Candidate.Follow)
+      continue;
+
+    int Rank = isLoopKind(Candidate.Kind)
+                   ? 3
+                   : Candidate.Kind == RegionKind::Switch ? 2 : 1;
+    if (Rank > BestRank) {
+      BestRank = Rank;
+      Best.Kind = Candidate.Kind;
+      Best.Header = Candidate.Header;
+      Best.Latch = Candidate.Latch;
+      Best.Follow = Candidate.Follow;
+    }
+  }
+
+  if (BestRank < 0)
+    return false;
+  R.Kind = Best.Kind;
+  R.Header = Best.Header;
+  R.Latch = Best.Latch;
+  R.Follow = Best.Follow;
   return true;
 }
 
@@ -1037,9 +1073,30 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
                              SourceLocation());
   }
 
-  // while / for: test at the header.
+  // Generic loops run until an explicit break; other loop kinds test at the header.
   auto *BI = dyn_cast<BranchInst>(R.Header->getTerminator());
-  if (BI && BI->isConditional()) {
+  if (R.Kind == RegionKind::Loop) {
+    Cond = IntegerLiteral::Create(*AST, APInt(32, 1), AST->IntTy,
+                                  SourceLocation());
+    SmallPtrSet<Instruction *, 4> FeedsCond;
+    if (BI && BI->isConditional()) {
+      if (auto *CmpI = dyn_cast<Instruction>(BI->getCondition()))
+        FeedsCond.insert(CmpI);
+      if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition()))
+        for (Value *Op : Cmp->operands())
+          if (auto *I = dyn_cast<Instruction>(Op))
+            FeedsCond.insert(I);
+    }
+    for (Instruction &I : *R.Header) {
+      if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
+          FeedsCond.contains(&I))
+        continue;
+      if (Stmt *S = Exprs->instr(I, *Scope))
+        Body.push_back(S);
+    }
+    if (Stmt *T = emitTerminator(R.Header, &R))
+      Body.push_back(T);
+  } else if (BI && BI->isConditional()) {
     // Continuing edge is the successor that is not the exit.
     BasicBlock *Cont = BI->getSuccessor(0) == R.Follow
                            ? BI->getSuccessor(1)
@@ -1237,6 +1294,7 @@ Stmt *StructuredStmtBuilder::emitRegionHeader(Region &R,
   case RegionKind::While:
   case RegionKind::DoWhile:
   case RegionKind::For:
+  case RegionKind::Loop:
     S = emitLoop(R, Outer);
     break;
   case RegionKind::Switch:

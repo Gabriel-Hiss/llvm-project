@@ -135,21 +135,21 @@ the plugin loads under stock `opt`, the pass also reads
 Guarantees tolerance of commuted operands and extra code, and no change
 when the pattern set is missing or empty or confidence is low.
 
-**revenant-structure (owner: Swe2Structure).** Expects unopt (or patterns)
-output. Regions become `if`/`while`/`dowhile`/`for`/`switch` with
-`!revenant.region` on header terminators (block-list indices, `-1` none);
-irreducible edges get `!revenant.region !{!"goto", target}`. Guarantees a
-frontend ignoring annotations still emits correct code via labels + `goto`.
+**revenant-types (owner: MuseTypeRecovery, after unopt).** Expects deoptimized
+IR. Recovers locals/parameters and struct/class/vtable/enum shapes, expressed
+as DI (`DILocalVariable`, `DIBasicType`, `DIDerivedType`, `DICompositeType`)
+via RevenantIR helpers. It does not require region annotations.
 
-**revenant-types (owner: MuseTypeRecovery, post-structure).** Expects
-structured IR with region annotations. Recovers locals/parameters and
-struct/class/vtable/enum shapes, expressed as DI (`DILocalVariable`,
-`DIBasicType`, `DIDerivedType`, `DICompositeType`) via RevenantIR helpers.
-Guarantees region annotations and provenance survive; types only refine.
+**revenant-ssaout (owner: MuseSsaOut, after types).** Expects typed SSA. Undoes
+mem2reg/sroa into named `alloca`s with DI for the frontends. It may add
+critical-edge blocks for phi copies.
 
-**revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
-structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the
-frontends. Guarantees stable `bb_<va>` names and intact annotations.
+**revenant-structure (owner: LunaShapeCtrlR, terminal).** Expects typed SSA-out
+IR and runs after critical-edge splitting so descriptors use indices into the
+final block list. Regions become `if`/`while`/`dowhile`/`for`/`switch` with
+`!revenant.region` on header terminators (block-list indices, `-1` means none);
+irreducible edges get `!revenant.region !{!"goto", target}`. A frontend that
+ignores annotations still emits correct code with labels and `goto`.
 
 **revenant-unabi (owner: MuseDeoptAbi).** Module pass (not function): rewrites
 function signatures, snapshotting the function list first so erasure is safe.

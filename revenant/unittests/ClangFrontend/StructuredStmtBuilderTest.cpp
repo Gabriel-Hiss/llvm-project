@@ -702,4 +702,37 @@ TEST(StructuredStmtBuilderTest, NestedReturnArmsDoNotNeedGotoEdges) {
   EXPECT_EQ(S.find("goto"), std::string::npos);
 }
 
+TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_generic_loop", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_generic_loop", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_f000", F);
+  llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_f010", F);
+  llvm::BasicBlock *Body = BasicBlock::Create(C, "bb_f020", F);
+  llvm::BasicBlock *BreakTest = BasicBlock::Create(C, "bb_f030", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_f040", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Header);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 0)), Body,
+                 BreakTest);
+  B.SetInsertPoint(Body);
+  B.CreateBr(Header);
+  B.SetInsertPoint(BreakTest);
+  B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)), Exit,
+                 Body);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(X);
+  tagRegion(Header->getTerminator(), "loop",
+            {indexOf(*F, Header), indexOf(*F, Body), indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("while"), std::string::npos);
+  EXPECT_NE(S.find("break"), std::string::npos);
+}
+
 } // namespace
