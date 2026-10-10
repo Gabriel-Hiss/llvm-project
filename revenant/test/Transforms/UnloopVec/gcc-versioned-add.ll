@@ -85,7 +85,6 @@ exit:
 }
 
 ; CHECK-LABEL: define{{.*}}void @add_vec
-; CHECK-NOT: <4 x i32>
 ; CHECK: entry:
 ; CHECK: br label %scalar.pre
 ; CHECK: scalar.pre:
@@ -96,5 +95,6 @@ exit:
 ; CHECK: add i32
 ; CHECK: store i32
 ; CHECK: br i1
+; CHECK-NOT: <4 x i32>
 ; CHECK: ret void
 ; CHECK: }

@@ -1,11 +1,13 @@
 ; Lifted source shape: c-gcc-o3 fill_vec in corpus/src/c/main.c:205-207.
 ; The x86 lifter expands an eight-element store group into scalar stores.
-; Revenant must undo the group stride as well as the vector splat.
+; Revenant may narrow the group stride only when the trip bound is a
+; proven multiple of the old step (constant 32 here); a symbolic bound
+; keeps the loop untouched (see uniform-store-nodiv.ll).
 ; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
-define void @fill_unrolled(ptr %dst, i32 %value, i64 %limit) {
+define void @fill_unrolled(ptr %dst, i32 %value) {
 entry:
-  %empty = icmp eq i64 %limit, 0
+  %empty = icmp eq i64 32, 0
   br i1 %empty, label %exit, label %loop
 
 loop:
@@ -28,7 +30,7 @@ loop:
   store i32 %value, ptr %p7, align 1
   %iv.next = add i64 %iv, 32
   %p.next = getelementptr i8, ptr %p, i64 32
-  %done = icmp eq i64 %iv.next, %limit
+  %done = icmp eq i64 %iv.next, 32
   br i1 %done, label %exit, label %loop
 
 exit:
@@ -41,5 +43,5 @@ exit:
 ; CHECK-NOT: store i32 %value
 ; CHECK: %iv.next = add i64 %iv, 4
 ; CHECK: %p.next = getelementptr i8, ptr %p, i64 4
-; CHECK: %done = icmp eq i64 %iv.next, %limit
+; CHECK: %done = icmp eq i64 %iv.next, 32
 ; CHECK: }
