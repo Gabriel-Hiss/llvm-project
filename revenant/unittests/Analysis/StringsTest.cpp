@@ -3,7 +3,8 @@
 // Ports crates/analysis/src/strings.rs behavior: ASCII >= 4 printable bytes
 // and UTF-16 >= 4 non-control chars, readable non-executable sections only,
 // with the Rust side's rejection cases (short, non-printable, executable,
-// lone surrogates, control chars).
+// lone surrogates, control chars). rustc merges string fragments, so the
+// narrow reader keeps the longest textual prefix of a merged constant.
 //
 //===----------------------------------------------------------------------===//
 
@@ -178,8 +179,9 @@ TEST(StringsTest, CollectKeepsOnlyStrings) {
 }
 
 // rustc concatenates string fragments into one constant, so a merged panic
-// string mixes plain ASCII with UTF-8 text. The whole run is one string and
-// must not be read back through the UTF-16 branch, which turns "called" into
+// string mixes plain ASCII with UTF-8 text and the constant that follows it
+// holds `Arguments` template bytes. The longest textual prefix is the string:
+// the UTF-16 branch must not read the run, which turns "called" into
 // mojibake.
 TEST(StringsTest, MergedUtf8ConstantAccepted) {
   Image Img = testImage();
@@ -203,8 +205,28 @@ TEST(StringsTest, MergedUtf8ConstantAccepted) {
             "\x80' failed");
 }
 
-// The UTF-16 reader must still accept wide text: the ASCII branch runs first
-// but rejects it, so the wide branch owns those bytes.
+// The trailing template bytes of a merged constant are not text, so the run
+// stops at the message.
+TEST(StringsTest, MergedConstantStopsAtTemplateBytes) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  const char *Message = "assertion failed: src.len() == dst.len()";
+  std::vector<uint8_t> Bytes(Message, Message + std::strlen(Message));
+  Bytes.push_back((uint8_t)0xA8); // rustc `Arguments` template bytes
+  Bytes.push_back((uint8_t)0xD5);
+  Bytes.push_back('%');
+  Bytes.push_back('@');
+  Bytes.push_back((uint8_t)0x01);
+  Bytes.push_back(0);
+  poke(Img, At, Bytes);
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S, "assertion failed: src.len() == dst.len()");
+}
+
+// The UTF-16 reader still owns real wide text. Its units are printable bytes
+// from an ASCII reading, but it decodes as many characters as that reading
+// does, so a tie keeps the wide branch.
 TEST(StringsTest, WideNonAsciiAccepted) {
   Image Img = testImage();
   Va At(0x140002010ULL);
