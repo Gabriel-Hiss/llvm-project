@@ -194,6 +194,11 @@ runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
+**revenant-unvecsearch (owner: MuseUnvecSearchR).** Expects devectorize output.
+Folds vectorized early-exit scans over i8/i16/i32 lanes back into scalar
+search loops when the needle, tail bound and resume address are proven.
+Preserves `!revenant.va`; runs explicitly, outside the default pipeline.
+
 **revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural clone folding is disabled: no body comparison can prove two entry points came from one source function (distinct declarations linked to different behavior, opaque observers, distinct exit codes, volatile loads from different objects), and identical bodies are not proof of shared source identity either. The pass keeps signature restoration (returns, dead formals, named clones, the narrow GCC constprop `this` formal), which requires source-signature evidence and rebinds only the same constant object. Uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
 **revenant-locals-to-slots (owner: LunaLocalsToSlots).** Expects structured,
