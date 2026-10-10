@@ -553,6 +553,52 @@ TEST_F(ExprTest, VirtualCallThroughVfptrSlot) {
   EXPECT_TRUE(S.find("Method") != std::string::npos);
   EXPECT_TRUE(S.find("->") != std::string::npos);
 }
+TEST_F(ExprTest, SExtI1SpellsNegation) {
+  // IR i1 has no signed C counterpart: `sext i1 x` is `-(int)x`, not a
+  // cast through a nonexistent signed 1-bit type.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "c");
+  llvm::Value *W = B.CreateSExt(Cmp, Type::getInt32Ty(LLCtx), "w");
+  EXPECT_EQ(print(Exprs->value(W, Scope)),
+            "-(int)((unsigned int)a < (unsigned int)b)");
+}
+
+TEST_F(ExprTest, SExtI1BoolTypeDoesNotAssert) {
+  // C++ mode types i1 as BoolTy; getCorrespondingSignedType asserts on
+  // Bool (ASTContext.cpp:12299). The sext path must not ask for it.
+  LangOpts.CPlusPlus = 1;
+  FCtx = std::make_unique<revenant::clangx::FrontendContext>(
+      *ACtx, *M, revenant::clangx::SourceLang::CPlusPlus);
+  Types = std::make_unique<TestTypes>(FCtx.get());
+  Exprs = std::make_unique<ExprBuilderImpl>(*FCtx, *Types);
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "c");
+  llvm::Value *W = B.CreateSExt(Cmp, Type::getInt32Ty(LLCtx), "w");
+  EXPECT_EQ(print(Exprs->value(W, Scope)),
+            "-(int)((unsigned int)a < (unsigned int)b)");
+}
+
+TEST_F(ExprTest, I1ConstantTruePrintsOne) {
+  // `xor i1 x, true` is a boolean not; the i1 `true` APInt is the signed
+  // value -1 and must print as `1`, not `-1`.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Cmp = B.CreateICmpULT(H.A, H.B, "c");
+  llvm::Value *Not = B.CreateXor(Cmp, ConstantInt::getTrue(LLCtx), "n");
+  llvm::Value *Z = B.CreateZExt(Not, Type::getInt32Ty(LLCtx), "z");
+  std::string S = print(Exprs->value(Z, Scope));
+  EXPECT_TRUE(S.find("^ 1") != std::string::npos) << S;
+  EXPECT_TRUE(S.find("-1") == std::string::npos) << S;
+}
+
 
 TEST_F(ExprTest, WideConstantStoreKeepsBothHalves) {
   // zlib-cl-o2 sub_140050B44: a folded i128 store must keep both halves,
