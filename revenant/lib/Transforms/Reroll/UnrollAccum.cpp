@@ -90,82 +90,6 @@ bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
   return true;
 }
 
-// Unfold a value through pure in-block defs into an affine expression
-// (coef, off) with value = base + coef*IV + off. Only unfolds Bin/Cast/GEP.
-using Affine = std::pair<int64_t, int64_t>;
-static constexpr unsigned MaxUnfoldDepth = 8;
-
-struct DefLookup {
-  DenseMap<Value *, Instruction *> Map;
-  Instruction *find(Value *V) const {
-    auto It = Map.find(V);
-    return It == Map.end() ? nullptr : It->second;
-  }
-};
-
-std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
-                                    unsigned Depth) {
-  if (Depth > MaxUnfoldDepth)
-    return Affine{0, 0};
-  if (V == IV)
-    return Affine{1, 0};
-  if (auto *C = dyn_cast<ConstantInt>(V)) {
-    if (!C->getValue().isSignedIntN(64))
-      return std::nullopt;
-    return Affine{0, C->getSExtValue()};
-  }
-  if (Instruction *Def = DL.find(V)) {
-    if (auto *GDef = dyn_cast<GetElementPtrInst>(Def)) {
-      int64_t Scale =
-          (int64_t)GDef->getResultElementType()->getScalarSizeInBits() / 8;
-      if (Scale <= 0)
-        Scale = 1;
-      auto Base = affineOfValue(GDef->getPointerOperand(), IV, DL, Depth + 1);
-      if (!Base)
-        return std::nullopt;
-      Affine Acc = *Base;
-      for (Value *Ix : GDef->indices()) {
-        auto O = affineOfValue(Ix, IV, DL, Depth + 1);
-        if (!O)
-          return std::nullopt;
-        Acc.first += O->first * Scale;
-        Acc.second += O->second * Scale;
-      }
-      return Acc;
-    }
-    switch (Def->getOpcode()) {
-    case Instruction::Add:
-    case Instruction::Sub:
-    case Instruction::Mul:
-    case Instruction::Shl:
-    case Instruction::ZExt:
-    case Instruction::SExt:
-    case Instruction::Trunc:
-    case Instruction::BitCast:
-    case Instruction::PtrToInt:
-    case Instruction::IntToPtr:
-      return affineOfValue(*Def, IV, DL, Depth + 1);
-    default:
-      return Affine{0, 0};
-    }
-  }
-  return Affine{0, 0};
-}
-
-std::optional<Affine> affineOfInsn(const Instruction &I, Value *IV,
-                                    const DefLookup &DL, unsigned Depth) {
-  if (isa<CmpInst>(&I))
-    return std::nullopt;
-  int64_t Coef = 0, Off = 0;
-  for (const Use &U : I.operands()) {
-    auto A = affineOfValue(U.get(), IV, DL, Depth);
-    if (!A)
-      return std::nullopt;
-    Coef += A->first;
-    Off += A->second;
-  }
-  return Affine{Coef, Off};
-}
 
 // Trace the update chain for an accumulator PHI.
 bool traceAccChain(PHINode *Phi, BasicBlock *H,
@@ -263,9 +187,24 @@ bool combineTreeOutside(const SmallVector<PHINode *, 4> &AccPhis,
   return true;
 }
 
-// Verify that the non-chain operands of a chain's updates have uniformly
-// increasing affine offsets. Returns true if the offsets form an arithmetic
-// sequence with a positive common difference.
+// Collect all load addresses used by a value, unfolding through pure defs.
+void collectLoadAddrs(Value *V, const DefLookup &DL,
+                       SmallVector<GetElementPtrInst *, 8> &Addrs) {
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand()))
+      Addrs.push_back(GEP);
+    return;
+  }
+  Instruction *Def = DL.find(V);
+  if (!Def)
+    return;
+  for (Use &U : Def->operands())
+    collectLoadAddrs(U.get(), DL, Addrs);
+}
+
+// Verify that the non-chain operands of a chain's updates access memory
+// with a uniform stride: each load address in window w differs from the
+// corresponding address in window 0 by exactly w elements.
 bool uniformAddressStride(const SmallVector<Instruction *, 8> &Chain,
                           PHINode *AccPhi, Value *IV, const DefLookup &DL) {
   int64_t D = (int64_t)Chain.size();
@@ -287,30 +226,35 @@ bool uniformAddressStride(const SmallVector<Instruction *, 8> &Chain,
     Others.push_back(Other);
   }
 
-  // Compute affine for each operand.
-  SmallVector<Affine, 8> Affines;
-  for (int64_t w = 0; w < D; ++w) {
-    auto A = affineOfValue(Others[(size_t)w], IV, DL, 0);
-    if (!A)
-      return false;
-    Affines.push_back(*A);
-  }
-
-  // All must have the same IV coefficient.
-  for (int64_t w = 1; w < D; ++w)
-    if (Affines[(size_t)w].first != Affines[0].first)
-      return false;
-
-  // Offset differences must form an arithmetic sequence.
-  if (D < 3)
-    return true; // Two windows: any positive stride works.
-  int64_t CommonDiff = Affines[1].second - Affines[0].second;
-  if (CommonDiff <= 0)
+  // Collect load addresses for window 0.
+  SmallVector<GetElementPtrInst *, 8> Addrs0;
+  collectLoadAddrs(Others[0], DL, Addrs0);
+  if (Addrs0.empty())
     return false;
-  for (int64_t w = 2; w < D; ++w) {
-    int64_t Diff = Affines[(size_t)w].second - Affines[(size_t)w - 1].second;
-    if (Diff != CommonDiff)
+
+  // For each subsequent window, collect load addresses and verify stride.
+  for (int64_t w = 1; w < D; ++w) {
+    SmallVector<GetElementPtrInst *, 8> AddrsW;
+    collectLoadAddrs(Others[(size_t)w], DL, AddrsW);
+    if (AddrsW.size() != Addrs0.size())
       return false;
+    for (size_t i = 0; i < Addrs0.size(); ++i) {
+      auto *GEP0 = Addrs0[i];
+      auto *GEPW = AddrsW[i];
+      if (GEP0->getPointerOperand() != GEPW->getPointerOperand())
+        return false;
+      if (GEP0->getNumIndices() != GEPW->getNumIndices())
+        return false;
+      for (unsigned j = 0; j < GEP0->getNumIndices(); ++j) {
+        auto *Idx0 = dyn_cast<ConstantInt>(GEP0->idx_begin()[j]);
+        auto *IdxW = dyn_cast<ConstantInt>(GEPW->idx_begin()[j]);
+        if (!Idx0 || !IdxW)
+          return false;
+        int64_t Diff = IdxW->getSExtValue() - Idx0->getSExtValue();
+        if (Diff != w)
+          return false;
+      }
+    }
   }
   return true;
 }
