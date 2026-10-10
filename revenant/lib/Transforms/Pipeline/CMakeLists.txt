@@ -46,5 +46,4 @@ add_llvm_library(RevenantTransformPipeline
   $<$<TARGET_EXISTS:RevenantTransformUniv>:RevenantTransformUniv>
   $<$<TARGET_EXISTS:RevenantTransformUnswitch>:RevenantTransformUnswitch>
   $<$<TARGET_EXISTS:RevenantTransformUnoutline>:RevenantTransformUnoutline>
-  $<$<TARGET_EXISTS:RevenantTransformUnpeel>:RevenantTransformUnpeel>
   )
