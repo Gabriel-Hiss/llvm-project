@@ -69,7 +69,7 @@
 #define REVENANT_HAS_EVIDENCE 1
 #endif
 #include "revenant/Transforms/Uninline/Uninline.h"
-
+#include "revenant/Evidence/Evidence.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -633,15 +633,23 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
         SmallVector<Instruction *, 16> RegionInsts;
         for (unsigned i = 0; i != CB.Insts.size(); ++i)
           RegionInsts.push_back(Body[S + i]);
-        // Evidence-only bodies rewrite solely when the region references
-        // the same distinctive strings or library body as the callee.
-        // The structural match above already passed fully; evidence only
-        // confirms tiny exact matches (the assert-string family).
-#ifdef REVENANT_HAS_EVIDENCE
-        if (CB.EvidenceOnly &&
-            !revenant::evidence::regionMatchesEvidence(Ev, RegionInsts))
-          continue;
-#endif
+        // Evidence-only bodies rewrite solely when the region or the
+        // escape's users reference the same distinctive strings or
+        // library body as the callee: the string use of an inlined
+        // value naturally sits outside the spliced body.
+        if (CB.EvidenceOnly) {
+          SmallVector<Instruction *, 16> EvRegion(RegionInsts.begin(),
+                                                  RegionInsts.end());
+          // matchWindow leaves Escape null when RetVal is unset; mirror
+          // the fallback below so escape users still join the check.
+          Value *EvEscape = Escape ? Escape : RegionInsts.back();
+          for (User *U : EvEscape->users())
+            if (auto *UI = dyn_cast<Instruction>(U))
+              if (UI->getParent() == &BB)
+                EvRegion.push_back(UI);
+          if (!revenant::evidence::regionMatchesEvidence(Ev, EvRegion))
+            continue;
+        }
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
           // region end. Unlike a real escape, nothing replaces the uses
