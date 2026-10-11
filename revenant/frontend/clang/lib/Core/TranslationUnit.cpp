@@ -437,6 +437,13 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
                          ExprBuilder &Exprs, bool UserBodiesOnly) {
   buildGlobals(M, *T.FCtx, Types);
   for (llvm::Function &F : M) {
+    // An llvm.* intrinsic has no C name of its own: the builders lower the
+    // ones the C library or a TU-level helper covers, and an unlowered one
+    // must surface as an unknown identifier rather than a declaration the
+    // linker could never resolve. Declaring `llvm_2e...` would do exactly
+    // that, so skip them.
+    if (F.getName().starts_with("llvm."))
+      continue;
     // A library body is code the real CRT/SDK ships: emitting ours as well
     // redefines the header's function (MSVC C2371/C2556) and duplicates the
     // definition at link. The declaration stays so calls still resolve, and
@@ -475,11 +482,14 @@ static c::FunctionDecl *prototypeFor(c::FunctionDecl *Definition,
 }
 
 void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
-                          ArrayRef<StringRef> Includes) {
+                          ArrayRef<StringRef> Includes,
+                          ArrayRef<std::string> ExtraIncludes) {
   c::PrintingPolicy Policy = TU->getASTContext().getPrintingPolicy();
   for (StringRef Inc : Includes)
     OS << "#include <" << Inc << ">\n";
-  if (!Includes.empty())
+  for (const std::string &Inc : ExtraIncludes)
+    OS << "#include <" << Inc << ">\n";
+  if (!Includes.empty() || !ExtraIncludes.empty())
     OS << "\n";
   emitWideIntPreamble(OS, TU->getASTContext());
   std::unordered_set<std::string> PrintedRecords;

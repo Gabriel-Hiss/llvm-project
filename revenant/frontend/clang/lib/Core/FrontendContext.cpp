@@ -94,6 +94,13 @@ std::string sanitizeIdentifier(StringRef Name, bool CPlusPlus) {
   return Out;
 }
 
+void FrontendContext::requireInclude(StringRef Header) {
+  for (const std::string &Existing : RequestedIncludes)
+    if (Existing == Header)
+      return;
+  RequestedIncludes.emplace_back(Header.str());
+}
+
 clang::IdentifierInfo *FrontendContext::ident(StringRef Name) {
   std::string S = Name.str();
   if (!isPlainIdentifier(S) || isKeyword(S, isCPlusPlus()))

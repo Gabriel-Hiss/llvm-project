@@ -112,10 +112,13 @@ std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name,
                                             llvm::LLVMContext &Ctx);
 
 /// Print the translation unit as C/C++ source using Clang's own printer.
-/// `Includes` is emitted verbatim as `#include` lines first.
+/// `Includes` is emitted verbatim as `#include` lines first, followed by
+/// `ExtraIncludes`, the headers the builders requested while lowering (see
+/// `FrontendContext::requireInclude`).
 void printTranslationUnit(clang::TranslationUnitDecl *TU,
                           llvm::raw_ostream &OS,
-                          llvm::ArrayRef<llvm::StringRef> Includes);
+                          llvm::ArrayRef<llvm::StringRef> Includes,
+                          llvm::ArrayRef<std::string> ExtraIncludes = {});
 
 /// Read `revenant.lang` off `M`, honoring an explicit override.
 SourceLang langFor(const llvm::Module &M, const ClangFrontendOptions &Opts);

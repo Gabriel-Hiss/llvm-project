@@ -405,6 +405,46 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
                            SourceLocation(), FPOptionsOverride());
       return ensureTemp(&I, Scope, Call);
     }
+    // llvm.memset/memcpy/memmove are the CRT's own calls, so emit them as
+    // such: the library prototype comes from <string.h> instead of a lift of
+    // the intrinsic's synthetic name (which would be unresolved at link).
+    if (N.starts_with("llvm.memset") || N.starts_with("llvm.memcpy") ||
+        N.starts_with("llvm.memmove")) {
+      if (I.arg_size() < 3)
+        return nullptr;
+      const bool IsMemset = N.starts_with("llvm.memset");
+      StringRef CN = IsMemset ? "memset"
+                               : (N.starts_with("llvm.memcpy") ? "memcpy"
+                                                               : "memmove");
+      QualType VoidPtr = AST->VoidPtrTy;
+      // memset(void *, int, size_t); memcpy/memmove(void *, void *, size_t).
+      QualType Params[] = {VoidPtr, IsMemset ? AST->IntTy : VoidPtr,
+                           AST->UnsignedLongLongTy};
+      QualType FT = AST->getFunctionType(VoidPtr, Params, {});
+      IdentifierInfo *Id = Ctx.ident(CN);
+      FunctionDecl *FD = FunctionDecl::Create(
+          *AST, AST->getTranslationUnitDecl(), SourceLocation(),
+          SourceLocation(), Id, FT, AST->getTrivialTypeSourceInfo(FT),
+          SC_Extern);
+      Ctx.requireInclude("string.h");
+      Expr *Ref = declRef(FD);
+      SmallVector<Expr *, 4> Args;
+      for (unsigned A = 0; A != 3; ++A) {
+        Expr *Arg = value(I.getArgOperand(A), Scope);
+        QualType Want = Params[A];
+        if (Arg->getType() != Want)
+          Arg = makeCStyleCast(Want, Want->isIntegerType() ? CK_IntegralCast
+                                                           : CK_BitCast,
+                               Arg);
+        Args.push_back(Arg);
+      }
+      clang::CallExpr *Call = CallExpr::Create(
+          *AST, Ref, Args, VoidPtr, VK_PRValue, SourceLocation(),
+          FPOptionsOverride());
+      if (I.getType()->isVoidTy())
+        return Call;
+      return ensureTemp(&I, Scope, Call);
+    }
   }
 
   // Virtual-dispatch fast path (agreed hook with lib/llvm::Type).

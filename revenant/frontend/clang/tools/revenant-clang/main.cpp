@@ -80,7 +80,8 @@ int main(int argc, char **argv) {
     Inc.push_back("intrin.h");
 
   if (Output.empty()) {
-    printTranslationUnit(T->tu(), outs(), Inc);
+    printTranslationUnit(T->tu(), outs(), Inc,
+                         T->frontend().requestedIncludes());
     return 0;
   }
   std::error_code EC;
@@ -89,7 +90,8 @@ int main(int argc, char **argv) {
     errs() << "revenant-clang: " << Output << ": " << EC.message() << "\n";
     return 1;
   }
-  printTranslationUnit(T->tu(), Out.os(), Inc);
+  printTranslationUnit(T->tu(), Out.os(), Inc,
+                       T->frontend().requestedIncludes());
   Out.keep();
   return 0;
 }
