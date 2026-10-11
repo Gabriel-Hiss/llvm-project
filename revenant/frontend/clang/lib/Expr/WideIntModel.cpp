@@ -122,9 +122,19 @@ clang::IntegerLiteral *intLiteral(ASTContext &A, uint64_t V, QualType T) {
                                        SourceLocation());
 }
 
-/// `(Record){lo, hi}`, the only spelling that builds a wide value from
-/// parts in MSVC C mode.
-clang::Expr *compoundLiteral(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
+/// Build a wide value from two u64 halves. In C, the only spelling is a
+/// compound literal `(Record){lo, hi}`. In C++ (including MSVC C++), compound
+/// literals are not valid (C4576), so call a preamble wrapper instead.
+clang::Expr *makeWideValue(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
+  if (A.getLangOpts().CPlusPlus) {
+    const bool Signed = isSigned(T);
+    llvm::SmallString<64> Name(Signed ? "revenant_i128_s_make"
+                                     : "revenant_i128_u_make");
+    clang::FunctionDecl *FD =
+        wrapperProto(A, T, Name, /*Binary=*/true, /*Predicate=*/false);
+    return wrapperCall(A, FD, Lo, Hi);
+  }
+  // C path: compound literal.
   llvm::SmallVector<Expr *, 2> Inits{Lo, Hi};
   clang::InitListExpr *Init = new (A)
       clang::InitListExpr(A, SourceLocation(), Inits, SourceLocation());
@@ -264,7 +274,7 @@ clang::Expr *wideIntConvert(ASTContext &A, clang::QualType Dst, Expr *Op,
 
   // wide -> wide of the other signedness: copy the halves across.
   if (DstWide && SrcWide)
-    return compoundLiteral(A, Dst, lowHalf(A, Src, Op),
+    return makeWideValue(A, Dst, lowHalf(A, Src, Op),
                            clang::MemberExpr::CreateImplicit(
                                A, Op, false, halfField(A, Src, 1), Src,
                                clang::VK_LValue, clang::OK_Ordinary));
@@ -284,7 +294,7 @@ clang::Expr *wideIntConvert(ASTContext &A, clang::QualType Dst, Expr *Op,
   Expr *Lo = srcUnsignedHalf(A, Op);
   Expr *Hi = isSigned(Dst) ? signFill(A, Op)
                            : intLiteral(A, 0, A.UnsignedLongLongTy);
-  return compoundLiteral(A, Dst, Lo, Hi);
+  return makeWideValue(A, Dst, Lo, Hi);
 }
 
 clang::Expr *wideIntLiteral(ASTContext &A, clang::QualType T,
@@ -293,11 +303,11 @@ clang::Expr *wideIntLiteral(ASTContext &A, clang::QualType T,
     return nullptr;
   if (V.isZero()) {
     Expr *Zero = intLiteral(A, 0, A.UnsignedLongLongTy);
-    return compoundLiteral(A, T, Zero, Zero);
+    return makeWideValue(A, T, Zero, Zero);
   }
   const uint64_t Lo = V.trunc(64).getZExtValue();
   const uint64_t Hi = V.lshr(64).trunc(64).getZExtValue();
-  return compoundLiteral(A, T, intLiteral(A, Lo, A.UnsignedLongLongTy),
+  return makeWideValue(A, T, intLiteral(A, Lo, A.UnsignedLongLongTy),
                          intLiteral(A, Hi, A.UnsignedLongLongTy));
 }
 
@@ -508,6 +518,10 @@ static int revenant_i128_u_cmplt(struct revenant_i128_u a, struct revenant_i128_
 static int revenant_i128_u_cmple(struct revenant_i128_u a, struct revenant_i128_u b) { return revenant_i128_u_cmpge(b, a) != 0; }
 static int revenant_i128_u_cmpeq(struct revenant_i128_u a, struct revenant_i128_u b) { return a.hi == b.hi && a.lo == b.lo; }
 static int revenant_i128_u_cmpne(struct revenant_i128_u a, struct revenant_i128_u b) { return !(a.hi == b.hi && a.lo == b.lo); }
+
+static struct revenant_i128_u revenant_i128_u_make(unsigned long long lo, unsigned long long hi) {
+  struct revenant_i128_u r; r.lo = lo; r.hi = hi; return r;
+}
 )CWRAP";
 
   static const char *Signed = R"CWRAP(
@@ -636,6 +650,9 @@ static int revenant_i128_s_cmplt(struct revenant_i128_s a, struct revenant_i128_
 static int revenant_i128_s_cmple(struct revenant_i128_s a, struct revenant_i128_s b) { return revenant_i128_s_cmpge(b, a) != 0; }
 static int revenant_i128_s_cmpeq(struct revenant_i128_s a, struct revenant_i128_s b) { return a.hi == b.hi && a.lo == b.lo; }
 static int revenant_i128_s_cmpne(struct revenant_i128_s a, struct revenant_i128_s b) { return !(a.hi == b.hi && a.lo == b.lo); }
+static struct revenant_i128_s revenant_i128_s_make(long long lo, long long hi) {
+  struct revenant_i128_s r; r.lo = lo; r.hi = hi; return r;
+}
 )CWRAP";
 
   OS << "struct revenant_i128_u { unsigned long long lo, hi; };\n";
