@@ -38,6 +38,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -743,6 +744,12 @@ Expected<EmitResult> emitClangSource(Module &M, bool Cpp) {
   EmitResult R;
   raw_string_ostream OS(R.Text);
   SmallVector<StringRef, 4> Inc = {"stdint.h", "stddef.h", "stdbool.h"};
+  // The emitter spells `llvm.x86.int 0x29`/`llvm.trap` as the MSVC
+  // intrinsics __fastfail/__debugbreak; those live in <intrin.h>, which
+  // only the MSVC ABI family has, so pull it in there (a bare prototype
+  // does not link: LNK2019). MinGW targets keep the plain three.
+  if (llvm::Triple(M.getTargetTriple()).isKnownWindowsMSVCEnvironment())
+    Inc.push_back("intrin.h");
   clangx::printTranslationUnit(T->tu(), OS, Inc);
   return R;
 }

@@ -17,6 +17,7 @@
 #include "llvm/Support/ToolOutputFile.h"
 
 #include "llvm/Support/FileSystem.h"
+#include "llvm/TargetParser/Triple.h"
 using namespace llvm;
 using namespace revenant::clangx;
 
@@ -71,6 +72,12 @@ int main(int argc, char **argv) {
       if (llvm::find(Inc, S) == Inc.end())
         Inc.insert(Inc.begin(), S);
   }
+  // __fastfail/__debugbreak are spelled as the MSVC intrinsics and live in
+  // <intrin.h>; on the MSVC ABI family that header is the only declaration
+  // that links (a plain prototype gives LNK2019).
+  if (llvm::Triple(M->getTargetTriple()).isKnownWindowsMSVCEnvironment() &&
+      llvm::find(Inc, StringRef("intrin.h")) == Inc.end())
+    Inc.push_back("intrin.h");
 
   if (Output.empty()) {
     printTranslationUnit(T->tu(), outs(), Inc);

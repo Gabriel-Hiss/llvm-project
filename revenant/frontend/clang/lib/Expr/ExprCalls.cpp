@@ -212,29 +212,52 @@ Expr *ExprBuilderImpl::tryVirtualCall(llvm::CallInst &I, ExprScope &Scope) {
   return ensureTemp(&I, Scope, Call);
 }
 
+/// The callee's own prototype when `Callee` names a function directly.
+/// The printed declaration is the contract the compiler checks a call
+/// against; the IR call signature can be less specific (the lifter
+/// bitcasts calls to opaque byte-pointer signatures), so the cast for
+/// each argument comes from the declaration, not from the IR type.
+static const clang::FunctionProtoType *
+namedFunctionType(clang::Expr *Callee) {
+  clang::Expr *E = Callee;
+  while (auto *Cast = llvm::dyn_cast<clang::ImplicitCastExpr>(E))
+    E = Cast->getSubExpr();
+  auto *DRE = llvm::dyn_cast_or_null<clang::DeclRefExpr>(E);
+  if (!DRE)
+    return nullptr;
+  auto *FD = llvm::dyn_cast_or_null<clang::FunctionDecl>(DRE->getFoundDecl());
+  if (!FD)
+    return nullptr;
+  return FD->getType()->getAs<clang::FunctionProtoType>();
+}
+
 Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
                                      Expr *Callee, QualType RetTy) {
   llvm::SmallVector<Expr *, 8> Args;
   llvm::FunctionType *FTy = I.getFunctionType();
+  const clang::FunctionProtoType *DeclTy = namedFunctionType(Callee);
+  unsigned DeclParams = DeclTy ? DeclTy->getNumParams() : 0;
   for (unsigned A = 0; A < I.arg_size(); ++A) {
     Expr *E = value(I.getArgOperand(A), Scope);
-    if (A < FTy->getNumParams()) {
-      QualType Want = Types.typeOf(FTy->getParamType(A), nullptr);
-      QualType Have = E->getType();
-      if (Have != Want) {
-        if (Have->isArrayType() && Want->isPointerType())
-          E = makeCStyleCast(Want, CK_BitCast, E);
-        else if (Have->isPointerType() && Want->isPointerType())
-          E = makeCStyleCast(Want, CK_BitCast, E);
-        else if (Have->isPointerType() && Want->isIntegerType())
-          E = makeCStyleCast(Want, CK_PointerToIntegral, E);
-        else if (Have->isIntegerType() && Want->isPointerType())
-          E = makeCStyleCast(Want, CK_IntegralToPointer, E);
-        else if (Have->isIntegerType() && Want->isIntegerType())
-          E = makeCStyleCast(Want, CK_IntegralCast, E);
-        else if (Have->isFloatingType() && Want->isFloatingType())
-          E = makeCStyleCast(Want, CK_FloatingCast, E);
-      }
+    QualType Want;
+    if (A < FTy->getNumParams())
+      Want = Types.typeOf(FTy->getParamType(A), nullptr);
+    if (A < DeclParams)
+      Want = DeclTy->getParamType(A);
+    QualType Have = E->getType();
+    if (!Want.isNull() && Have != Want) {
+      if (Have->isArrayType() && Want->isPointerType())
+        E = makeCStyleCast(Want, CK_BitCast, E);
+      else if (Have->isPointerType() && Want->isPointerType())
+        E = makeCStyleCast(Want, CK_BitCast, E);
+      else if (Have->isPointerType() && Want->isIntegerType())
+        E = makeCStyleCast(Want, CK_PointerToIntegral, E);
+      else if (Have->isIntegerType() && Want->isPointerType())
+        E = makeCStyleCast(Want, CK_IntegralToPointer, E);
+      else if (Have->isIntegerType() && Want->isIntegerType())
+        E = makeCStyleCast(Want, CK_IntegralCast, E);
+      else if (Have->isFloatingType() && Want->isFloatingType())
+        E = makeCStyleCast(Want, CK_FloatingCast, E);
     }
     Args.push_back(E);
   }
