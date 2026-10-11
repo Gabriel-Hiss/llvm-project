@@ -549,6 +549,16 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       return ClassificationOrErr.takeError();
     FunctionClassification Classification =
         std::move(*ClassificationOrErr);
+    // The narrow CRT handoff names the hosted entry: spell it `main` so
+    // the C emitter applies the hosted argc/argv signature. Only when the
+    // record still has a generic name, and never for Rust output.
+    if (Classification.UserEntryIsNarrowMain && Classification.UserEntry &&
+        (Out == Lang::C || Out == Lang::Cpp)) {
+      auto It = Prog.Functions.find(*Classification.UserEntry);
+      if (It != Prog.Functions.end() &&
+          It->second.Name.rfind("sub_", 0) == 0)
+        It->second.Name = "main";
+    }
     record(R.Stages, "sigs", "ok",
            formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
                    Sigs->Externs.size())
