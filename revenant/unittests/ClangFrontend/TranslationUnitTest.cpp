@@ -11,6 +11,10 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "clang/AST/Type.h"
+#include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
@@ -341,4 +345,82 @@ TEST(TranslationUnitTest, IndirectCallThroughDataSlotCastsCallee) {
   EXPECT_EQ(Src.find("(*f_slot)"), StringRef::npos);
   EXPECT_NE(Src.find("(*("), StringRef::npos);
   EXPECT_EQ(Src.find("return (long long)f_slot("), StringRef::npos);
+}
+
+TEST(TranslationUnitTest, FallsBackWhenRecoveredArrayStrideConflicts) {
+  LLVMContext Context;
+  Module M("array-di-mismatch", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  M.setDataLayout(
+      "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-"
+      "n8:16:32:64-S128");
+
+  Type *I32 = Type::getInt32Ty(Context);
+  auto *IRArray = ArrayType::get(I32, 4);
+  Function *F = Function::Create(FunctionType::get(I32, false),
+                                 Function::ExternalLinkage, "array_probe", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", F);
+  IRBuilder<> Builder(Entry);
+  AllocaInst *AI = Builder.CreateAlloca(IRArray, nullptr, "buf");
+
+  DIBuilder DIB(M);
+  DIFile *File = DIB.createFile("probe.c", ".");
+  DICompileUnit *CU =
+      DIB.createCompileUnit(dwarf::DW_LANG_C, File, "array-probe", false,
+                            "", 0);
+  DIBasicType *RetTy =
+      DIB.createBasicType("int", 32, dwarf::DW_ATE_signed);
+  DISubroutineType *Signature =
+      DIB.createSubroutineType(DIB.getOrCreateTypeArray({RetTy}));
+  DISubprogram *SP = DIB.createFunction(
+      CU, "array_probe", "array_probe", File, 1, Signature, 1,
+      DINode::FlagZero, DISubprogram::SPFlagDefinition);
+  F->setSubprogram(SP);
+
+  DIBasicType *CharTy =
+      DIB.createBasicType("char", 8, dwarf::DW_ATE_signed_char);
+  Metadata *Range = DIB.getOrCreateSubrange(0, 16);
+  DICompositeType *WrongArray =
+      DIB.createArrayType(128, 8, CharTy, DIB.getOrCreateArray({Range}));
+  DILocalVariable *Variable =
+      DIB.createAutoVariable(SP, "buf", File, 2, WrongArray,
+                             /*AlwaysPreserve=*/true);
+  DIB.insertDeclare(AI, Variable, DIB.createExpression(),
+                    DILocation::get(Context, 2, 1, SP),
+                    Builder.GetInsertPoint());
+
+  Value *Zero = ConstantInt::get(Type::getInt64Ty(Context), 0);
+  Value *One = ConstantInt::get(Type::getInt64Ty(Context), 1);
+  Value *P0 = Builder.CreateInBoundsGEP(IRArray, AI, {Zero, Zero});
+  Builder.CreateStore(ConstantInt::get(I32, 0x12345678), P0);
+  Value *P1 = Builder.CreateInBoundsGEP(IRArray, AI, {Zero, One});
+  Builder.CreateStore(ConstantInt::get(I32, 0xDEADBEEF), P1);
+  Value *ByteP = Builder.CreateGEP(
+      Type::getInt8Ty(Context), AI,
+      ConstantInt::get(Type::getInt64Ty(Context), 4));
+  Value *Byte = Builder.CreateLoad(Type::getInt8Ty(Context), ByteP);
+  Builder.CreateRet(Builder.CreateZExt(Byte, I32));
+  DIB.finalize();
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  auto *VD =
+      llvm::dyn_cast_or_null<clang::VarDecl>(TU->frontend().lookupDecl(AI));
+  ASSERT_NE(VD, nullptr);
+  auto *Recovered = llvm::dyn_cast<clang::ConstantArrayType>(
+      VD->getType().getTypePtr());
+  ASSERT_NE(Recovered, nullptr);
+  EXPECT_EQ(Recovered->getSize().getZExtValue(), 4u);
+  EXPECT_EQ(TU->frontend().ast().getTypeSize(Recovered->getElementType()), 32u);
 }

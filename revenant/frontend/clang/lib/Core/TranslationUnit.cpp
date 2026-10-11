@@ -27,6 +27,7 @@
 #include "clang/Basic/TargetOptions.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -104,6 +105,39 @@ static const llvm::DILocalVariable *dbgVarFor(llvm::AllocaInst &AI) {
     if (auto *V = DVR->getVariable())
       return V;
   return nullptr;
+}
+
+
+/// Use a recovered array DI type only when its extent and element storage
+/// shape agree with the LLVM alloca. A wrong element stride changes every
+/// GEP-based access, even when total byte size happens to match.
+static bool arrayDIShapeMatches(c::ASTContext &AST,
+                                const llvm::DataLayout &DL,
+                                llvm::Type *IRTy, c::QualType DIQT) {
+  auto *IRArray = llvm::dyn_cast<llvm::ArrayType>(IRTy);
+  auto *DIArray =
+      llvm::dyn_cast<c::ConstantArrayType>(DIQT.getTypePtr());
+  if (!IRArray || !DIArray ||
+      DIArray->getSize().getZExtValue() != IRArray->getNumElements())
+    return false;
+
+  llvm::Type *IRElem = IRArray->getElementType();
+  c::QualType DIElem = DIArray->getElementType();
+  bool SameCategory =
+      (IRElem->isIntegerTy() && DIElem->isIntegerType()) ||
+      (IRElem->isFloatingPointTy() && DIElem->isFloatingType()) ||
+      (IRElem->isPointerTy() && DIElem->isPointerType()) ||
+      (IRElem->isStructTy() && DIElem->isRecordType()) ||
+      (IRElem->isArrayTy() && DIElem->isArrayType()) ||
+      (IRElem->isVectorTy() && DIElem->isVectorType());
+  if (!SameCategory)
+    return false;
+
+  llvm::TypeSize ElemBits = DL.getTypeStoreSizeInBits(IRElem);
+  llvm::TypeSize ArrayBits = DL.getTypeAllocSizeInBits(IRArray);
+  return !ElemBits.isScalable() && !ArrayBits.isScalable() &&
+         AST.getTypeSize(DIElem) == ElemBits.getFixedValue() &&
+         AST.getTypeSize(DIArray) == ArrayBits.getFixedValue();
 }
 
 /// DWARF arg number -> DILocalVariable, for the function's params.
@@ -239,6 +273,10 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
         c::QualType LT = Types.typeOf(AI->getAllocatedType(), DI);
+        if (AI->getAllocatedType()->isArrayTy() &&
+            !arrayDIShapeMatches(AST, F.getParent()->getDataLayout(),
+                                 AI->getAllocatedType(), LT))
+          LT = Types.typeOf(AI->getAllocatedType(), nullptr);
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
