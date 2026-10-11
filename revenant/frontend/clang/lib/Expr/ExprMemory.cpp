@@ -115,7 +115,15 @@ Expr *ExprBuilderImpl::buildLoadValue(llvm::LoadInst &I, ExprScope &Scope) {
   if (llvm::isa<clang::ArraySubscriptExpr>(Ptr) ||
       llvm::isa<clang::MemberExpr>(Ptr) ||
       isStoredVar(I.getPointerOperand(), Ptr)) {
-    Expr *Use = makeImplicit(Pointee, CK_LValueToRValue, Ptr);
+    QualType UseType = Pointee;
+    // In opaque-pointer IR, the load does not retain the declared pointee
+    // type. Prefer the bound variable/member type when it is more specific.
+    if (Pointee->isPointerType() && Ptr->getType()->isPointerType()) {
+      auto *PT = Ptr->getType()->getAs<clang::PointerType>();
+      if (PT && !PT->getPointeeType()->isVoidType())
+        UseType = Ptr->getType();
+    }
+    Expr *Use = makeImplicit(UseType, CK_LValueToRValue, Ptr);
     return ensureTemp(&I, Scope, Use);
   }
   Expr *D = derefPointer(Ptr, Pointee);

@@ -401,6 +401,35 @@ TEST_F(ExprTest, LoadStoreDeref) {
   llvm::raw_svector_ostream ReversedOS(Buf);
   St->printPretty(ReversedOS, nullptr, UpdatePolicy);
   EXPECT_EQ(std::string(ReversedOS.str()), "v += a");
+  auto PrintUpdate = [&](llvm::Value *Updated) {
+    StoreInst *Store = B.CreateStore(Updated, All);
+    clang::Stmt *UpdateStmt = Exprs->instr(*Store, Scope);
+    EXPECT_NE(UpdateStmt, nullptr);
+    if (!UpdateStmt)
+      return std::string();
+    llvm::SmallString<256> UpdateBuffer;
+    llvm::raw_svector_ostream UpdateStream(UpdateBuffer);
+    UpdateStmt->printPretty(UpdateStream, nullptr, UpdatePolicy);
+    return std::string(UpdateStream.str());
+  };
+  llvm::Value *Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateAdd(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 1))),
+            "++v");
+  Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateSub(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 1))),
+            "--v");
+  Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateAdd(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx),
+                                             (uint64_t)-2, true))),
+            "v -= 2");
+  Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateSub(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx),
+                                             (uint64_t)-2, true))),
+            "v += 2");
 }
 
 
