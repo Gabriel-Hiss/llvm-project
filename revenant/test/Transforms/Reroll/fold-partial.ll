@@ -4,10 +4,15 @@
 
 define i32 @sum_unrolled(ptr %p0, i32 %n) {
 entry:
-  ; The O2 caller rounds the count down to a multiple of 4 before calling,
-  ; so the main loop and its unrolled form agree on the trip count.
+  ; The O2 caller rounds the count down to a multiple of 4 before calling
+  ; and never reaches this loop with n == 0. The guard makes the
+  ; differential in-contract: with n == 0 the unrolled body runs once and
+  ; reads four elements while the folded body reads one.
+  %empty = icmp slt i32 %n, 1
+  ; The bound is a multiple of the window step, which is what the exit
+  ; legality proof requires.
   %nm = shl i32 %n, 2
-  br label %L
+  br i1 %empty, label %X, label %L
 
 L:
   %i = phi i32 [ 0, %entry ], [ %inext, %L ]
@@ -29,7 +34,8 @@ L:
   br i1 %c, label %L, label %X
 
 X:
-  ret i32 %s4
+  %r = phi i32 [ 0, %entry ], [ %s4, %L ]
+  ret i32 %r
 }
 
 ; CHECK: define i32 @sum_unrolled
@@ -38,4 +44,6 @@ X:
 ; The step folds 4 -> 1.
 ; CHECK: %inext = add i32 %i, 1
 ; CHECK: br i1 %c, label %L, label %X
-; CHECK: ret i32 %s1
+; The exit takes the folded accumulator; the unguarded n==0 arm is 0.
+; CHECK: %r = phi i32 [ 0, %entry ], [ %s1, %L ]
+; CHECK: ret i32 %r

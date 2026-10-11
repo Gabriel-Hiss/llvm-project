@@ -1352,6 +1352,49 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       for (Instruction *I : It->second)
         Drop.insert(I);
     }
+    // Extend the drop set with the dead-user closure: once the windows are
+    // gone, the address math that fed ONLY them is dead too, and it has to
+    // be erased rather than left behind reading the divided step.
+    //
+    // This is what a lifted dot4 needs. Its window-1 addresses run
+    // `shl (%iv + 2), 2` -> `gep i8` -> `gep i32 -1`, i.e. straight off the
+    // step instruction, and the step's constant is exactly what the fold
+    // divides. Without the closure the shl survives and computes
+    // `(%iv + 1) * 4` for an iteration that no longer exists.
+    //
+    // The closure never reaches the induction phi, the step instruction, or
+    // the latch-condition chain: each of those keeps a live user, so
+    // "every user is already dropped" fails for them.
+    {
+      SmallPtrSet<Instruction *, 32> ErasedChain;
+      for (Instruction *I : Drop)
+        ErasedChain.insert(I);
+      bool Grew = true;
+      while (Grew) {
+        Grew = false;
+        for (Instruction &I : *H) {
+          if (ErasedChain.count(&I) || isa<PHINode>(&I) ||
+              &I == IV.StepInst || LatchDefs.count(&I))
+            continue;
+          if (I.use_empty())
+            continue; // already dead for its own reasons
+          bool AllDropped = true;
+          for (User *U : I.users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI || !ErasedChain.count(UI)) {
+              AllDropped = false;
+              break;
+            }
+          }
+          if (AllDropped) {
+            ErasedChain.insert(&I);
+            Grew = true;
+          }
+        }
+      }
+      for (Instruction *I : ErasedChain)
+        Drop.insert(I);
+    }
     // Step-instruction discipline. The fold rewrites the step's constant
     // in place, so every user of the step that SURVIVES the fold observes
     // the divided step, which is wrong. The other users are legal only
@@ -1438,12 +1481,21 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     // Erase dropped windows in reverse program order so users vanish
     // before their operands (cycles only pass through kept phis, already
     // remapped above).
-    SmallVector<Instruction *, 16> Dead;
-    for (auto It = H->rbegin(); It != H->rend(); ++It)
-      if (Drop.count(&*It))
-        Dead.push_back(&*It);
-    for (Instruction *I : Dead)
-      I->eraseFromParent();
+    // Erase the dropped set in reverse DEPENDENCY order. Reverse program
+    // order is not the same thing once the dead closure is in the set: a
+    // window's address math (the GEP and the load) is defined before the
+    // dropped add that consumes it, so program order would try to erase
+    // the load while its user is still live. Erasing whatever has become
+    // use-empty, repeatedly, is the dependency order and needs no sort.
+    bool AnyLeft = true;
+    while (AnyLeft) {
+      AnyLeft = false;
+      for (Instruction &I : make_early_inc_range(*H))
+        if (Drop.count(&I) && I.use_empty()) {
+          I.eraseFromParent();
+          AnyLeft = true;
+        }
+    }
     // A dropped window's accumulator phi has no users left once its window
     // is gone; erase it so the header keeps only the rolled accumulator.
     for (Instruction &I : make_early_inc_range(*H)) {
