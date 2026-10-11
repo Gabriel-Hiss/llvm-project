@@ -476,6 +476,8 @@ TEST(TranslationUnitTest, UserBodiesOnlySkipsLibraryDefinitions) {
   EXPECT_NE(Source.find("return 1"), StringRef::npos);
   EXPECT_NE(Source.find("lib_body"), StringRef::npos);
   EXPECT_EQ(Source.find("return 2"), StringRef::npos);
+  // Both lib and user marks: the body is the program's own code and stays.
+  EXPECT_NE(Source.find("return 3"), StringRef::npos);
 }
 
 TEST(TranslationUnitTest, LibraryDeclarationUsesCrtHeaderPrototype) {
