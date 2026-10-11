@@ -1419,6 +1419,10 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   Stmt *Init = nullptr;
   SmallVector<Stmt *, 8> Body;
   SmallVector<Stmt *, 8> LatchBody;
+  /// Statements that must run before the construct: the preheader seeding
+  /// of header instructions the loop test names. Populated by the while
+  /// branch; consumed when the loop statement is built.
+  SmallVector<Stmt *, 8> Preheader;
 
   prepareForLoop(R);
   Init = R.ForInit;
@@ -1505,11 +1509,56 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
                            ? BI->getSuccessor(1)
                            : BI->getSuccessor(0);
     Cond = condOf(BI, Cont);
-    // Header instructions the condition reads fold into the cond
-    // expression through ExprBuilder: instr() returns null for them, so
-    // nothing prints twice. A multi-use operand materializes a temp and
-    // its initializer must print here or the temp reads uninitialized.
-    emitBlockStmts(R.Header, Body);
+    // A while-loop tests before the body, so anything the test names has
+    // to be assigned in the preheader or the loop's init. The header's
+    // own leaf code is per-iteration work and goes at the top of the
+    // body. Only the pure single-use operands the condition folded
+    // inline are dropped: re-emitting them would recompute a value the
+    // test already spelled out, and their temps are read-only here.
+    SmallPtrSet<Instruction *, 8> Folded = condFeeds(Cond, R.Header);
+    // The header computes the step BEFORE the branch, so a multi-use
+    // operand the test names (an incremented IV, typically) must hold a
+    // defined value on the first test. Seed it above the loop with the
+    // same expression the body recomputes, together with the header
+    // instructions it reads: the body refreshes them every iteration,
+    // and the seed covers only iteration 1. `PendingInitializers` is
+    // consumed by the body's `instr()` call, so the seed reuses the
+    // stored expression with its own DeclRefExpr instead of erasing it.
+    SmallPtrSet<Instruction *, 8> Seed;
+    SmallVector<Instruction *, 8> Work(Folded.begin(), Folded.end());
+    Seed.insert(Folded.begin(), Folded.end());
+    while (!Work.empty()) {
+      Instruction *I = Work.pop_back_val();
+      for (Use &Op : I->operands())
+        if (auto *OI = dyn_cast<Instruction>(Op.get()))
+          if (OI->getParent() == R.Header && Seed.insert(OI).second)
+            Work.push_back(OI);
+    }
+    SmallVector<Stmt *, 8> SeedStmts;
+    for (Instruction &I : *R.Header) {
+      if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(&I))
+        continue;
+      if (ForClaimed.contains(&I))
+        continue;
+      if (Folded.contains(&I) && !Ctx.lookupDecl(&I))
+        continue;
+      if (Seed.contains(&I)) {
+        if (auto *D = llvm::dyn_cast_or_null<ValueDecl>(Ctx.lookupDecl(&I))) {
+          auto It = Scope->PendingInitializers.find(&I);
+          if (It != Scope->PendingInitializers.end()) {
+            Expr *Ref = DeclRefExpr::Create(
+                *AST, NestedNameSpecifierLoc(), SourceLocation(), D, false,
+                SourceLocation(), D->getType(), VK_LValue);
+            SeedStmts.push_back(clang::BinaryOperator::Create(
+                *AST, Ref, It->second, BO_Assign, D->getType(), VK_PRValue,
+                OK_Ordinary, SourceLocation(), FPOptionsOverride()));
+          }
+        }
+      }
+      if (Stmt *S = Exprs->instr(I, *Scope))
+        Body.push_back(S);
+    }
+    Preheader = SeedStmts;
   } else {
     Cond = R.Kind == RegionKind::For
                ? nullptr
@@ -1562,6 +1611,14 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   else
     Loop = WhileStmt::Create(*AST, nullptr, Cond, B, SourceLocation(),
                              SourceLocation(), SourceLocation());
+  // The seeding for the while test's named locals runs before the
+  // construct; a for-shaped loop already carries its own init.
+  if (!Preheader.empty() && !(R.Kind == RegionKind::For || R.ForShape)) {
+    SmallVector<Stmt *, 8> Flat(Preheader.begin(), Preheader.end());
+    Flat.push_back(Loop);
+    Loop = CompoundStmt::Create(*AST, Flat, FPOptionsOverride(),
+                                SourceLocation(), SourceLocation());
+  }
   ActiveLoops.pop_back();
   return Loop;
 }
