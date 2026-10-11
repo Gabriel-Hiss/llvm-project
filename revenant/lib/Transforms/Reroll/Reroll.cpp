@@ -1003,7 +1003,8 @@ bool exitTripCompatible(BasicBlock *H, PHINode *IV, Instruction *StepInst,
         for (unsigned K = 0, E = BP->getNumIncomingValues(); K != E; ++K) {
           if (BP->getIncomingBlock(K) == H)
             continue;
-          if (!isa<ConstantInt>(BP->getIncomingValue(K)))
+          auto *Entry = dyn_cast<ConstantInt>(BP->getIncomingValue(K));
+          if (!Entry || Entry->getSExtValue() < D)
             return false;
         }
         for (User *U : BP->users())
@@ -1074,27 +1075,47 @@ bool exitTripCompatible(BasicBlock *H, PHINode *IV, Instruction *StepInst,
     for (Value *E : Entries)
       if (!provedMultipleDiff(Bound, E, Step))
         return false;
-    return true;
+    break;
   }
   case ICmpInst::ICMP_ULT:
   case ICmpInst::ICMP_ULE:
   case ICmpInst::ICMP_SLT:
   case ICmpInst::ICMP_SLE: {
-    // A range exit counts induction values in [entry, bound). That set
-    // scales by D only when both ends sit on the lattice; an exit that
-    // tests the step value counts a shifted range and never scales.
     if (Side.TestsStep || Side.HasOffset)
       return false;
     for (Value *E : Entries)
       if (!provedMultiple(E, Step))
         return false;
-    return provedMultiple(Bound, Step);
+    if (!provedMultiple(Bound, Step))
+      return false;
+    break;
   }
   default:
     return false;
   }
-}
 
+  // A latch-tested loop executes its body before checking the exit. Folding
+  // D windows changes the iteration count by D, so prove the original loop
+  // survives through its first D body executions. Constant entry/bound pairs
+  // are exact; runtime values remain untouched unless separately proven.
+  if (Br->getSuccessor(0) == H || Br->getSuccessor(1) == H) {
+    bool ContinueOnTrue = Br->getSuccessor(0) == H;
+    for (Value *E : Entries) {
+      auto *EntryC = dyn_cast<ConstantInt>(E);
+      auto *BoundC = dyn_cast<ConstantInt>(Bound);
+      if (!EntryC || !BoundC)
+        return false;
+      APInt At = EntryC->getValue();
+      for (int64_t I = 1; I < D; ++I)
+        At += APInt(At.getBitWidth(), Step);
+      bool Continue = ICmpInst::compare(
+          At, BoundC->getValue(), Cmp->getPredicate());
+      if (Continue != ContinueOnTrue)
+        return false;
+    }
+  }
+  return true;
+}
 // Try to fold one single-block self-latch loop: find a stride IV,
 // partition the body into element slots 0..D-1, verify shape, drop windows
 // 1... On success rewrites the step and returns the fold factor D.

@@ -43,8 +43,13 @@ X:
 }
 
 ; CHECK: define i32 @sum_epilogue
-; Main loop folds to step 1.
-; CHECK: %inext = add i32 %i, 1
-; Remainder loop keeps its own step of 1 and still exits to X.
+; `lim` may be zero, but the latch-tested main loop still runs once.
+; The source's unrolled body then reads four values, while a rolled loop
+; could take zero iterations. Keep the main loop unchanged.
+; CHECK: %g3 = getelementptr i32, ptr %g0, i32 3
+; CHECK: %l3 = load i32, ptr %g3, align 4
+; CHECK: %inext = add i32 %i, 4
+; CHECK: %c = icmp ult i32 %inext, %lim
+; CHECK: br i1 %c, label %main, label %rem
 ; CHECK: %jnext = add i32 %j, 1
 ; CHECK: br i1 %d, label %rem, label %X
