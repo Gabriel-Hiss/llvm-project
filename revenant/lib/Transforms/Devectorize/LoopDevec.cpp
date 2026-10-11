@@ -119,21 +119,24 @@ bool isLaneBinop(unsigned Opcode) {
 
 // One lane of an integer splat-ish constant as an Elem-typed scalar.
 // Splat vectors and zeroinitializer fold; per-lane constants of a
-// non-splat ConstantVector fold per lane.
+// non-splat vector fold per lane. getAggregateElement answers for both
+// ConstantVector and ConstantDataVector, which is what ConstantVector::get
+// now returns for integer-element vectors, so a non-zero constant init
+// (splat or per-lane) still yields its per-lane values.
 Value *laneConst(Constant *C, Type *Elem, unsigned Lane) {
   if (isa<UndefValue>(C))
     return UndefValue::get(Elem);
   if (isa<ConstantAggregateZero>(C))
     return ConstantInt::get(Elem, 0);
-  if (auto *CV = dyn_cast<ConstantVector>(C)) {
-    if (Constant *Splat = CV->getSplatValue())
+  if (isa<FixedVectorType>(C->getType())) {
+    if (Constant *Splat = C->getSplatValue())
       C = Splat;
     else {
-      auto *CI = dyn_cast<ConstantInt>(CV->getOperand(Lane));
+      auto *CI = dyn_cast<ConstantInt>(C->getAggregateElement(Lane));
       if (!CI)
         return nullptr;
-      APInt V = CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits());
-      return ConstantInt::get(Elem, V);
+      return ConstantInt::get(
+          Elem, CI->getValue().zextOrTrunc(Elem->getScalarSizeInBits()));
     }
   }
   if (auto *CI = dyn_cast<ConstantInt>(C)) {
