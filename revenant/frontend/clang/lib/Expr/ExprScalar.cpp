@@ -607,8 +607,7 @@ Expr *ExprBuilderImpl::cond(llvm::Value *Cond, ExprScope &Scope) {
     }
   }
   if (auto *Cmp = llvm::dyn_cast<llvm::ICmpInst>(Cond)) {
-    auto Pred = Cmp->getPredicate();
-    if (Pred == llvm::CmpInst::ICMP_EQ || Pred == llvm::CmpInst::ICMP_NE) {
+    if (Cmp->getPredicate() == llvm::CmpInst::ICMP_NE) {
       llvm::Value *Tested = nullptr;
       for (llvm::Value *Op : Cmp->operands()) {
         auto *Zero = llvm::dyn_cast<llvm::Constant>(Op);
@@ -621,15 +620,8 @@ Expr *ExprBuilderImpl::cond(llvm::Value *Cond, ExprScope &Scope) {
           break;
         }
       }
-      if (Tested) {
-        Expr *Test = truthTest(value(Tested, Scope));
-        if (Pred == llvm::CmpInst::ICMP_NE)
-          return Test;
-        return UnaryOperator::Create(
-            *AST, parenIfNeeded(Test, Prec::Unary), UO_LNot, AST->BoolTy,
-            VK_PRValue, OK_Ordinary, SourceLocation(), false,
-            FPOptionsOverride());
-      }
+      if (Tested)
+        return truthTest(value(Tested, Scope));
     }
   }
   Expr *C = value(Cond, Scope);

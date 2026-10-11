@@ -367,7 +367,7 @@ TEST_F(ExprTest, ConditionUsesDirectTruthTestForZeroCompare) {
 
   llvm::Value *IsZero =
       B.CreateICmpEQ(H.A, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0));
-  EXPECT_EQ(print(Exprs->cond(IsZero, Scope)), "!a");
+  EXPECT_EQ(print(Exprs->cond(IsZero, Scope)), "a == 0");
 }
 
 TEST_F(ExprTest, TruncIsCast) {
