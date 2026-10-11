@@ -730,12 +730,64 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       return nullptr;
     Region *Loop = ActiveLoops.back();
     Region *Nested = regionOf(Target);
+    auto *BI = dyn_cast<BranchInst>(Target->getTerminator());
     if (!Nested || Nested->Kind != RegionKind::If || Nested->Degraded ||
-        Nested->Follow != Loop->Follow)
+        Nested->Follow != Loop->Follow || !BI || !BI->isConditional())
       return nullptr;
     if (Emitted.contains(Target))
       return gotoTo(Target);
-    return emitRegionHeader(*Nested, Loop);
+
+    for (Instruction &I : *Target)
+      if (!I.isTerminator() && !isa<PHINode>(I) &&
+          !isa<DbgInfoIntrinsic>(I) && I.mayHaveSideEffects() &&
+          !ForClaimed.contains(&I))
+        return nullptr;
+
+    SmallPtrSet<BasicBlock *, 8> Consumed;
+    auto transfer = [&](BasicBlock *Start) -> Stmt * {
+      BasicBlock *Current = Start;
+      SmallPtrSet<BasicBlock *, 8> Seen;
+      while (Current && Seen.insert(Current).second) {
+        if (Stmt *S = loopTransfer(Current))
+          return S;
+        if (pred_size(Current) != 1)
+          return nullptr;
+        auto *Edge = dyn_cast<BranchInst>(Current->getTerminator());
+        if (!Edge || !Edge->isUnconditional())
+          return nullptr;
+        for (Instruction &I : *Current)
+          if (!I.isTerminator() && !isa<PHINode>(I) &&
+              !isa<DbgInfoIntrinsic>(I) && !ForClaimed.contains(&I))
+            return nullptr;
+        Consumed.insert(Current);
+        Current = Edge->getSuccessor(0);
+      }
+      return nullptr;
+    };
+
+    Stmt *Then = transfer(BI->getSuccessor(0));
+    Stmt *Else = transfer(BI->getSuccessor(1));
+    if (!Then || !Else)
+      return nullptr;
+    for (BasicBlock *Member : Nested->Members)
+      if (Member != Target && Member != Nested->Follow &&
+          !Consumed.contains(Member))
+        return nullptr;
+
+    SmallVector<Stmt *, 8> Body;
+    emitBlockStmts(Target, Body);
+    Body.push_back(IfStmt::Create(
+        *AST, SourceLocation(), IfStatementKind::Ordinary, nullptr, nullptr,
+        Exprs->cond(BI->getCondition(), *Scope), SourceLocation(),
+        SourceLocation(), Then, SourceLocation(), Else));
+    Emitted.insert(Target);
+    for (BasicBlock *Member : Consumed)
+      Emitted.insert(Member);
+    CompoundStmt *Inline = CompoundStmt::Create(
+        *AST, Body, FPOptionsOverride(), SourceLocation(), SourceLocation());
+    if (NeededLabels.contains(Target))
+      return new (*AST) LabelStmt(SourceLocation(), labelFor(Target), Inline);
+    return Inline;
   };
   auto loopTrampolineTransfer = [&](BasicBlock *Target) -> Stmt * {
     if (ActiveLoops.empty() || pred_size(Target) != 1)
