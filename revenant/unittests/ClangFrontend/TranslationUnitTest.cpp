@@ -521,6 +521,38 @@ TEST(TranslationUnitTest, LibraryDeclarationUsesCrtHeaderPrototype) {
             StringRef::npos);
 }
 
+TEST(TranslationUnitTest, MainWithSingleArgumentKeepsItsParameterCount) {
+  LLVMContext Context;
+  Module M("main-one-arg", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Type *I32 = Type::getInt32Ty(Context);
+  FunctionType *FnTy = FunctionType::get(I32, {I32}, false);
+  Function *Main =
+      Function::Create(FnTy, Function::ExternalLinkage, "main", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", Main);
+  IRBuilder<> Builder(Entry);
+  Builder.CreateRet(ConstantInt::get(I32, 0));
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  ASSERT_TRUE(!!TUOrErr) << toString(TUOrErr.takeError());
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  SmallString<512> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  // The return is `int`; the single IR argument keeps its own parameter
+  // instead of the (int, char **) respelling, which would mismatch.
+  StringRef Source = OS.str();
+  EXPECT_NE(Source.find("int main(unsigned int a1)"), StringRef::npos);
+  EXPECT_EQ(Source.find("char **"), StringRef::npos);
+}
+
 TEST(TranslationUnitTest, FullEmitKeepsLibraryBodies) {
   LLVMContext Context;
   Module M("full-emit", Context);
