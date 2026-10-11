@@ -314,6 +314,25 @@ Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
   return Call;
 }
 
+namespace {
+/// True when the callee's own LLVM signature spells the same call shape the
+/// call site carries (arity, parameter types and return type). A direct
+/// call whose declaration matches prints as a plain `name(args)`; a
+/// mismatched one needs the cast spelling below.
+bool matchesCallShape(llvm::Function &F, llvm::CallInst &I) {
+  llvm::FunctionType *FT = F.getFunctionType();
+  llvm::FunctionType *CT = I.getFunctionType();
+  if (FT->getNumParams() != CT->getNumParams())
+    return false;
+  if (FT->getReturnType() != CT->getReturnType())
+    return false;
+  for (unsigned K = 0; K < FT->getNumParams(); ++K)
+    if (FT->getParamType(K) != CT->getParamType(K))
+      return false;
+  return true;
+}
+} // namespace
+
 Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
   // llvm.* intrinsics the lifter can leave behind fold to C idioms
   // (emit-c Call rule): min/max become `?:`.
@@ -374,6 +393,18 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
   if (I.getType()->isVoidTy())
     RetTy = AST->VoidTy;
 
+  // The callee must be a pointer to the function type this call carries;
+  // the IR only records it opaquely (i8* / uintptr_t / a data slot the
+  // lifter re-targeted), so the shape comes from the call itself.
+  llvm::FunctionType *Wanted = I.getFunctionType();
+  QualType RetQT = Types.typeOf(Wanted->getReturnType(), nullptr);
+  llvm::SmallVector<QualType, 8> ParamQTs;
+  for (llvm::Type *PT : Wanted->params())
+    ParamQTs.push_back(Types.typeOf(PT, nullptr));
+  FunctionProtoType::ExtProtoInfo EPI;
+  QualType WantedPtr = AST->getPointerType(
+      AST->getFunctionType(RetQT, ParamQTs, EPI));
+
   if (llvm::Function *DF = llvm::dyn_cast<llvm::Function>(CalleeOp)) {
     // Direct call, including imports (external declarations Core bound).
     Expr *Callee = buildConstant(DF, Scope);
@@ -383,6 +414,15 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
     if (Callee->getType()->isFunctionType())
       Callee = makeImplicit(AST->getPointerType(Callee->getType()),
                             CK_FunctionToPointerDecay, Callee);
+    // A re-targeted direct call can keep a call shape its recovered
+    // declaration does not have (an indirect call the lifter folded onto
+    // one candidate target still carries the register/pointer arity, and an
+    // import recovered with the wrong arity stays at its own). Calling the
+    // name then violates the prototype: spell the callee through a cast to
+    // the call's own function type, which keeps the arguments legal.
+    if (!matchesCallShape(*DF, I)) {
+      Callee = makeCStyleCast(WantedPtr, CK_BitCast, Callee);
+    }
     Expr *Call = buildCallExpr(I, Scope, Callee, RetTy);
     if (I.getType()->isVoidTy())
       return Call;
@@ -393,21 +433,15 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
   // callee parenthesized (emit-c Indirect rule).
   Expr *FP = value(CalleeOp, Scope);
   QualType CalleeTy = FP->getType();
-  // The callee must be a pointer to the function type; llvm::cast when the IR
-  // carried it opaquely (i8* / uintptr_t).
-  llvm::FunctionType *Wanted = I.getFunctionType();
-  // Clang function type for the call shape, mapped param by param.
-  QualType RetQT = Types.typeOf(Wanted->getReturnType(), nullptr);
-  llvm::SmallVector<QualType, 8> ParamQTs;
-  for (llvm::Type *PT : Wanted->params())
-    ParamQTs.push_back(Types.typeOf(PT, nullptr));
-  FunctionProtoType::ExtProtoInfo EPI;
-  QualType WantedPtr = AST->getPointerType(
-      AST->getFunctionType(RetQT, ParamQTs, EPI));
   if (CalleeTy != WantedPtr && !CalleeTy->isFunctionPointerType()) {
     if (CalleeTy->isIntegerType())
       FP = makeCStyleCast(WantedPtr, CK_IntegralToPointer, FP);
-    else if (CalleeTy->isPointerType())
+    // Pointer-typed slots: a C-style cast bit-casts. Array- and
+    // record-typed data slots (a `lea`-ed code address kept as a data
+    // object) decay to a pointer first, then bit-cast, so the printed
+    // callee is a function pointer and the call is legal.
+    else if (CalleeTy->isPointerType() || CalleeTy->isArrayType() ||
+             CalleeTy->isRecordType() || CalleeTy->isVectorType())
       FP = makeCStyleCast(WantedPtr, CK_BitCast, FP);
     CalleeTy = WantedPtr;
   }

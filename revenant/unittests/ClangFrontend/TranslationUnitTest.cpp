@@ -249,3 +249,50 @@ TEST(TranslationUnitTest, ArrayElementLiteralsAvoidNarrowTypeSuffixes) {
   EXPECT_EQ(Src.find("Ui8"), StringRef::npos);
   EXPECT_NE(Src.find("229"), StringRef::npos);
 }
+
+TEST(TranslationUnitTest, IndirectCallThroughDataSlotCastsCallee) {
+  LLVMContext Context;
+  Module M("slot-call", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Type *I64 = Type::getInt64Ty(Context);
+  // The lifter keeps a code address as a data object when it cannot prove
+  // the callee (`ops[which & 1](a, b)` in the corpus reaches its indirect
+  // call this way), so the call names a slot, not a function.
+  ArrayType *SlotTy = ArrayType::get(Type::getInt8Ty(Context), 16);
+  GlobalVariable *Slot = new GlobalVariable(M, SlotTy, false,
+                                            GlobalValue::ExternalLinkage,
+                                            nullptr, "f_slot");
+  Function *Caller =
+      Function::Create(FunctionType::get(I64, {I64, I64, I64}, false),
+                       Function::ExternalLinkage, "caller", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", Caller);
+  IRBuilder<> Builder(Entry);
+  Value *A = Caller->getArg(0), *B = Caller->getArg(1),
+        *C = Caller->getArg(2);
+  Builder.CreateRet(Builder.CreateCall(
+      FunctionType::get(I64, {I64, I64, I64}, false), Slot, {A, B, C}));
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  SmallString<256> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  StringRef Src = OS.str();
+  // `(*data)(args)` and `data(args)` are both rejected by every target
+  // compiler: the callee must be spelled through the call's own function
+  // type.
+  EXPECT_EQ(Src.find("(*f_slot)"), StringRef::npos);
+  EXPECT_NE(Src.find("(*("), StringRef::npos);
+  EXPECT_EQ(Src.find("return (long long)f_slot("), StringRef::npos);
+}
