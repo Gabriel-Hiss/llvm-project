@@ -118,13 +118,20 @@ DIType *pointeeForBase(DIBuilder &DIB, DIScope *Scope, DIFile *File,
             if (auto *Ty = dyn_cast<DICompositeType>(MD->getOperand(0)))
               return Ty;
   }
-  if (!FA || FA->Fields.empty()) {
-    // No field evidence: opaque byte pointee (reference Unknown(8)).
+  if (!FA) {
     DIType *Byte = intDIType(DIB, 8, /*Unsigned=*/true);
     return Byte;
   }
+  if (FA->Fields.empty()) {
+    if (FA->HasDynamicAccess)
+      return diTypeForAccess(DIB, TI, FA->DynamicAccess);
+    return intDIType(DIB, 8, /*Unsigned=*/true);
+  }
   if (FA->Fields.size() == 1) {
-    // A single field stays a scalar pointee, retaining the access type.
+    // A dynamic scalar access is stronger evidence than a lone constant
+    // offset when the base also serves as an array.
+    if (FA->HasDynamicAccess)
+      return diTypeForAccess(DIB, TI, FA->DynamicAccess);
     return diTypeForAccess(DIB, TI, FA->Fields.begin()->second);
   }
 
@@ -195,6 +202,14 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
   // return type occupies slot zero in DWARF's subroutine type array.
   auto signatureType = [&](Type *Ty, const Value *V) -> DIType * {
     if (Ty->isIntegerTy()) {
+      // A zero-extension of an ordered comparison yields 0/1, but the
+      // comparison predicate—not the zext—carries signedness evidence for
+      // the function's declared integer result.
+      if (const auto *ZExt = dyn_cast_or_null<ZExtInst>(V))
+        if (const auto *Cmp = dyn_cast<ICmpInst>(ZExt->getOperand(0)))
+          if (Cmp->isSigned() || Cmp->isUnsigned())
+            return intDIType(DIB, TI.intBits(V, Ty->getIntegerBitWidth()),
+                             Cmp->isUnsigned());
       if (V)
         return diTypeForInteger(DIB, TI, V, Ty->getIntegerBitWidth());
       return intDIType(DIB, Ty->getIntegerBitWidth(), /*Unsigned=*/false);

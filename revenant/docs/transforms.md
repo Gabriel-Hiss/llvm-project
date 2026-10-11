@@ -157,8 +157,12 @@ expressed as DI (`DILocalVariable`, `DISubroutineType`, `DIBasicType`,
 used only through explicit truncations can recover the narrower width. Field
 types come from the widest access at each constant offset. Guarantees region
 annotations and provenance survive; types only refine.
+Variable-index scalar GEP loads/stores supply element-pointee evidence without
+inventing a struct offset; the Clang emitter applies DI types to array locals.
 The Clang emitter uses recovered parameter-variable types and names when a
 lifted `DISubroutineType` still carries placeholder parameter types.
+Return signedness follows ordered comparison predicates across `zext`, and
+unsigned division/remainder/logical-shift results retain unsigned evidence.
 
 **revenant-structure (owner: LunaShapeCtrlR, terminal).** Expects typed SSA-out
 IR and runs after critical-edge splitting so descriptors use indices into the

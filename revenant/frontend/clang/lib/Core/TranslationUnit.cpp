@@ -238,9 +238,7 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = AI->getAllocatedType()->isArrayTy()
-                             ? Types.typeOf(AI->getAllocatedType(), nullptr)
-                             : Types.typeOf(AI->getAllocatedType(), DI);
+        c::QualType LT = Types.typeOf(AI->getAllocatedType(), DI);
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
