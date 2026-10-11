@@ -369,6 +369,37 @@ static const char *compareWrapper(unsigned Pred, bool Signed) {
   }
 }
 
+/// Spell `Op` so its type matches a wrapper's declared parameter `Want`.
+/// A literal argument is rebuilt at the wanted width/signedness so a
+/// constant spelled as u64 (the constant's own type) becomes the record
+/// compound literal or the unsigned shift count the preamble declares;
+/// a non-literal narrows through `.lo` or widens through the compound
+/// literal/sign-fill paths of wideIntConvert.
+clang::Expr *conformWideOperand(ASTContext &A, clang::QualType Want,
+                                clang::Expr *Op) {
+  if (Want.isNull() || Op == nullptr)
+    return Op;
+  if (Op->getType() == Want)
+    return Op;
+  if (auto *Lit = llvm::dyn_cast<clang::IntegerLiteral>(Op)) {
+    if (isWideIntRecord(Want)) {
+      if (clang::Expr *Wide =
+              wideIntLiteral(A, Want, Lit->getValue()))
+        return Wide;
+    } else if (Want->isIntegerType()) {
+      return clang::IntegerLiteral::Create(
+          A, Lit->getValue().sextOrTrunc((unsigned)A.getIntWidth(Want)),
+          Want, SourceLocation());
+    }
+  }
+  if (clang::Expr *Wide =
+          wideIntConvert(A, Want, Op, clang::CK_IntegralCast))
+    return Wide;
+  if (Want->isIntegerType() && Op->getType()->isIntegerType())
+    return cStyleCast(A, Want, clang::CK_IntegralCast, Op);
+  return Op;
+}
+
 clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
                                unsigned Op, unsigned Pred, clang::Expr *LHS,
                                clang::Expr *RHS) {
@@ -378,6 +409,8 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
   // A comparison: `Pred` selects the wrapper, both operands are wide.
   if (Op == (unsigned)llvm::Instruction::ICmp) {
     QualType OperandTy = LHS->getType();
+    if (!isWideIntRecord(OperandTy))
+      OperandTy = RHS->getType();
     if (!isWideIntRecord(OperandTy))
       return nullptr;
     const bool Signed = isSigned(OperandTy);
@@ -393,6 +426,9 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
     Name += Suffix;
     clang::FunctionDecl *FD =
         wrapperProto(A, OperandTy, Name, /*Binary=*/true, /*Predicate=*/true);
+    // Constants and narrow operands conform to the record parameter.
+    LHS = conformWideOperand(A, OperandTy, LHS);
+    RHS = conformWideOperand(A, OperandTy, RHS);
     return wrapperCall(A, FD, LHS, RHS);
   }
 
@@ -432,6 +468,11 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
   clang::FunctionDecl *FD =
       wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
                    /*ShiftCount=*/IsShift);
+  // Constants and narrow operands conform to the declared parameter
+  // types: the record for value operands, `unsigned` for shift counts
+  // (IsShift comes from the narrow-preserving block above).
+  LHS = conformWideOperand(A, ResTy, LHS);
+  RHS = conformWideOperand(A, IsShift ? A.UnsignedIntTy : ResTy, RHS);
   return wrapperCall(A, FD, LHS, RHS);
 }
 
