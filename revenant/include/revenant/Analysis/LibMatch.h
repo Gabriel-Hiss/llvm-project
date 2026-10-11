@@ -71,6 +71,16 @@ struct LibraryMatch {
 std::vector<LibraryMatch> matchLibraryFunctions(const Program &P,
                                                  const LibraryDatabase &DB);
 
+/// Extend byte matches with name-plus-callee evidence: an unmatched function
+/// whose program name equals a database record's name is matched when every
+/// direct call target is already matched (or an import) and at least one
+/// callee agrees with the record's callees. Iterates to a fixpoint so
+/// wrappers around wrappers resolve in layers. Conservative: never matches
+/// without both a name hit and a non-empty callee agreement.
+void extendLibraryMatchesByCalleeEvidence(const Program &P,
+                                           const LibraryDatabase &DB,
+                                           std::vector<LibraryMatch> &Matches);
+
 /// Attach matched names and prototypes to the existing program and inferred
 /// signatures. Ambiguous byte matches are omitted unless callee evidence picks
 /// one database record.

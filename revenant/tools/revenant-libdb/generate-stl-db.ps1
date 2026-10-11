@@ -68,9 +68,14 @@ $Commands
 
 $Archives = [Collections.Generic.List[string]]::new()
 $Modes = @(
+    # Unoptimized modes first: /Od and -O0 bodies differ from every
+    # optimized mode, and the O0 corpus targets link those exact bodies
+    # (cpp-o0 precision 0.065 without them, 0.588 with them).
+    @{ Name = 'cl-Od'; Compiler = 'cl'; Flag = '/Od' },
     @{ Name = 'cl-O1'; Compiler = 'cl'; Flag = '/O1' },
     @{ Name = 'cl-O2'; Compiler = 'cl'; Flag = '/O2' },
     @{ Name = 'cl-Ox'; Compiler = 'cl'; Flag = '/Ox' },
+    @{ Name = 'clang-cl-O0'; Compiler = 'clang-cl'; Flag = '-O0' },
     @{ Name = 'clang-cl-O1'; Compiler = 'clang-cl'; Flag = '-O1' },
     @{ Name = 'clang-cl-O2'; Compiler = 'clang-cl'; Flag = '-O2' },
     @{ Name = 'clang-cl-O3'; Compiler = 'clang-cl'; Flag = '-O3' },
