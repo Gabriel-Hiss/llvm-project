@@ -83,17 +83,15 @@ done:
 ; CHECK: v1 = (unsigned long long)v0
 ; CHECK: v2 = *(unsigned long long *)v0
 ; CHECK: if (v2 == v1)
-; The second test reads the entry block's own bound, not an unassigned temp.
-; CHECK: while (v2 - v1 + 32ULL
-; The loop header's loads reach the body.
-; CHECK: v3 = rax
+; The condition refreshes its header temps before every test.
+; CHECK: while (v3 = rax , v4 = v3 + 32ULL , v2 - v1 + 32ULL == v4)
+; The loop body consumes the computed index.
 ; CHECK: v5 = base
 ; CHECK: v6 = *(struct revenant_i128_u *)((unsigned char *)v5 + (v3 << 2ULL))
 ; CHECK: v7 = *(struct revenant_i128_u *)v5
 ; CHECK: v8 = revenant_i128_u_add(revenant_i128_u_add(acc0, v6), v7)
 ; CHECK: v9 = revenant_i128_u_add(revenant_i128_u_add(acc1, v6), v7)
-; The IV step is assigned inside the loop, not replaced by the bound.
-; CHECK: v4 = v3 + 32ULL
+; The latch stores the value tested by the condition.
 ; The accumulator and IV backedge stores are real values.
 ; CHECK: acc0 = v8
 ; CHECK: acc1 = v9
