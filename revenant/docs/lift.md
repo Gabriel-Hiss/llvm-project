@@ -19,6 +19,14 @@ architectural width.
 mode uses `llvm.nearbyint`, so the JIT does not need x86-specific helper
 symbols. The differential cases live in `LiftSemanticsCases.cpp`.
 
+## AVX masked moves and broadcasts
+
+`VMASKMOVPS`, `VMASKMOVPD`, and `VPMASKMOVD` use each mask lane's sign bit.
+Masked loads zero inactive lanes. Masked stores touch only active lanes and
+use byte alignment because their base address need not be naturally aligned.
+`PTEST`/`VPTEST` calculate CF and ZF across the full 128- or 256-bit value.
+`VPBROADCASTB/W/D/Q` splat the selected scalar element across the destination.
+
 Build the generated dispatcher and context implementations, then run the provenance test:
 
 ```text

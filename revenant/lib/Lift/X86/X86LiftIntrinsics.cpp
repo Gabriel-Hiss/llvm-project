@@ -37,11 +37,10 @@ Value *X86LiftContext::maskLoad(Value *Mask, Value *AddrI64, unsigned W,
   Type *IVT = vecTy(iN(EltBits), N);
   Value *Signs = B.CreateICmpSLT(vcast(Mask, IVT),
                                  Constant::getNullValue(IVT));
-  Type *DataTy = vecTy(iN(8), W / 8);
-  return B.CreateBitCast(
-      B.CreateMaskedLoad(DataTy, B.CreateIntToPtr(AddrI64, ptrTy()),
-                         Align(EltBits / 8), Signs, PoisonValue::get(DataTy)),
-      iN(W));
+  Value *Loaded = B.CreateMaskedLoad(
+      IVT, B.CreateIntToPtr(AddrI64, ptrTy()), Align(1), Signs,
+      Constant::getNullValue(IVT));
+  return B.CreateBitCast(Loaded, iN(W));
 }
 
 void X86LiftContext::maskStore(Value *Mask, Value *V, Value *AddrI64,
@@ -50,9 +49,8 @@ void X86LiftContext::maskStore(Value *Mask, Value *V, Value *AddrI64,
   Type *IVT = vecTy(iN(EltBits), N);
   Value *Signs = B.CreateICmpSLT(vcast(Mask, IVT),
                                  Constant::getNullValue(IVT));
-  B.CreateMaskedStore(vcast(V, vecTy(iN(8), W / 8)),
-                      B.CreateIntToPtr(AddrI64, ptrTy()), Align(EltBits / 8),
-                      Signs);
+  B.CreateMaskedStore(vcast(V, IVT), B.CreateIntToPtr(AddrI64, ptrTy()),
+                      Align(1), Signs);
 }
 
 // ---- AES / carryless multiply ------------------------------------------------

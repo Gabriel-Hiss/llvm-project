@@ -48,6 +48,9 @@ def rv_pmovmskb     : RVOp; // (rv_pmovmskb x): i128 -> i32 sign mask
 def rv_movmskps     : RVOp; // (rv_movmskps x): i128 -> i32
 def rv_movmskpd     : RVOp; // (rv_movmskpd x): i128 -> i32
 def rv_ptest        : RVOp; // (rv_ptest a, b): flags-only
+def rv_maskload : RVOp; // (rv_maskload width, element bits, mask, address)
+def rv_maskstore : RVOp; // (rv_maskstore width, element bits, address, mask, data)
+def rv_vbroadcast : RVOp; // (rv_vbroadcast width, ebits, scalar): repeat scalar
 def rv_vbroadcastb  : RVOp; // (rv_vbroadcastb val): low byte splat -> i128
 def rv_vcvtdq2ps   : RVOp; // (rv_vcvtdq2ps x): signed 4xi32 -> 4xf32
 def rv_vcvtps2dq   : RVOp; // (rv_vcvtps2dq x): 4xf32 -> rounded 4xi32
@@ -914,6 +917,131 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "VPTESTrr";
   dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VPTESTrm";
+  dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VPTESTYrr";
+  dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VPTESTYrm";
+  dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 64, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 64, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSmr";
+  dag Body = (rv_maskstore 128, 32, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSYmr";
+  dag Body = (rv_maskstore 256, 32, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDmr";
+  dag Body = (rv_maskstore 128, 64, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDYmr";
+  dag Body = (rv_maskstore 256, 64, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDmr";
+  dag Body = (rv_maskstore 128, 32, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDYmr";
+  dag Body = (rv_maskstore 256, 32, (rv_addr $dst), $src1, $src2);
+}
+// AVX2 scalar broadcasts from XMM sources or scalar memory cells.
+def : RVMatch {
+  string Glob = "VPBROADCASTBrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 8, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTBrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 8, (rv_load 8, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTBYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 8, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTBYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 8, (rv_load 8, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 16, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 16, (rv_load 16, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 16, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 16, (rv_load 16, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 32, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 32, (rv_load 32, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 32, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 32, (rv_load 32, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 64, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 64, (rv_load 64, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 64, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 64, (rv_load 64, (rv_addr $src))));
 }
 // pblendvb selects per byte from xmm0's sign bits: (mask, if-set, if-clear).
 def rv_vec : RVOp; // (rv_vec "kind", ebits, args...): typed vecOp at the operand width
