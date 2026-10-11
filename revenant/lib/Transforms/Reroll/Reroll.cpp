@@ -632,6 +632,114 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
 }
 
 // ---------------------------------------------------------------------------
+// Step-instruction discipline.
+//
+// The fold rewrites StepInst's constant in place (add/sub by the divided
+// step), so every user of StepInst that SURVIVES the fold observes the
+// divided step, which changes what it computes. The other users are legal
+// only when the fold erases them all.
+//
+// `Erased` is a dead-user closure: seeded with the dropped windows and the
+// accumulator-collapse adds the fold is about to perform, then closed under
+// "every user is already in the set". Window membership alone is not enough
+// — address math in a dropped window can feed a kept slot-0 instruction,
+// and the remap substitutes only dropped values, so that kept instruction
+// would silently read the divided step.
+//
+// The collapse is modelled, not run: collapse erases an `add Old,New`
+// outside the header whose operands are all the kept update (New) and the
+// dropped ones (Old, already in Remap) of the same window position, where
+// New itself reads a loop phi. Predicting it keeps this a pure pre-mutation
+// gate, so a bail leaves the IR exactly as found.
+// ---------------------------------------------------------------------------
+bool stepUsersFolded(BasicBlock *H, Instruction *StepInst, PHINode *Phi,
+                     const SmallPtrSetImpl<Instruction *> &Drop,
+                     const DenseMap<Value *, Value *> &Remap,
+                     const SmallPtrSetImpl<Value *> &Accs) {
+  SmallPtrSet<Instruction *, 32> Erased(Drop.begin(), Drop.end());
+  // Predicted collapse erasures: the add/fadd users of dropped values whose
+  // operands are all {New, Old} of the same remap entry, where New reads a
+  // loop phi. Mirrors the collapse loop below but only records the set.
+  for (auto &KV : Remap) {
+    Value *Old = KV.first, *New = KV.second;
+    auto *NewI = dyn_cast<Instruction>(New);
+    if (!NewI || Drop.count(NewI))
+      continue;
+    bool KeptReadsPhi = false;
+    for (const Use &U : NewI->operands())
+      if (isa<PHINode>(U.get())) {
+        KeptReadsPhi = true;
+        break;
+      }
+    if (!KeptReadsPhi)
+      continue;
+    for (User *U : Old->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() == H || UI->getType()->isVoidTy())
+        continue;
+      if (UI->getOpcode() != Instruction::Add &&
+          UI->getOpcode() != Instruction::FAdd)
+        continue;
+      bool AllSame = true;
+      for (const Use &O : UI->operands())
+        if (O.get() != New && O.get() != Old) {
+          AllSame = false;
+          break;
+        }
+      if (AllSame)
+        Erased.insert(UI);
+    }
+  }
+  // Close the set: an instruction is erased when every one of its users is
+  // already erased. Iterate to a fixed point over the header's
+  // instructions; the closure is small and terminates because each round
+  // only adds.
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (Instruction &I : *H) {
+      if (Erased.count(&I) || isa<PHINode>(&I) || &I == StepInst)
+        continue;
+      if (I.use_empty())
+        continue; // already dead for its own reasons; not our concern here
+      bool AllErased = true;
+      for (User *U : I.users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || !Erased.count(UI)) {
+          AllErased = false;
+          break;
+        }
+      }
+      if (AllErased) {
+        Erased.insert(&I);
+        Changed = true;
+      }
+    }
+  }
+  // Every user of the step must be erased, or be the induction phi, or be
+  // the exit compare's own use of the step (the branch that exitTrip-
+  // Compatible already proved). The compare itself is in LatchDefs and
+  // therefore pinned, and its condition reads the step, so that read is
+  // permitted and is exactly the trip count being preserved.
+  for (User *U : StepInst->users()) {
+    if (U == Phi)
+      continue;
+    if (auto *UI = dyn_cast<Instruction>(U))
+      if (Erased.count(UI))
+        continue;
+    // The latch terminator's condition may read the step through its own
+    // def chain; that is the proved exit, not a surviving consumer.
+    if (auto *UI = dyn_cast<Instruction>(U)) {
+      if (auto *Br = dyn_cast<BranchInst>(H->getTerminator()))
+        if (Br->isConditional() && Br->getCondition() == UI)
+          continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Exit legality for a fold.
 //
 // Folding divides the IV step from S to S/D and keeps the latch condition
@@ -1244,6 +1352,23 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       for (Instruction *I : It->second)
         Drop.insert(I);
     }
+    // Step-instruction discipline. The fold rewrites the step's constant
+    // in place, so every user of the step that SURVIVES the fold observes
+    // the divided step, which is wrong. The other users are legal only
+    // when the fold erases them all.
+    //
+    // The erased set is a dead-user closure, not window membership. Seeded
+    // with the dropped windows plus the accumulator-collapse adds the fold
+    // is about to perform (modelled here, before any mutation, so a bail
+    // leaves the IR untouched), then closed under "every user is already
+    // in the set". Window membership alone would leak: address math in a
+    // dropped window can feed a kept slot-0 instruction, and remap only
+    // substitutes dropped values, so that kept instruction would silently
+    // read the divided step. Predict the collapse rather than running it:
+    // a post-collapse bail would leave the collapse's own mutations
+    // standing on a no-fire path.
+    if (!stepUsersFolded(H, IV.StepInst, IV.Phi, Drop, Remap, Accs))
+      continue;
     // Collapse the unroll's accumulator merge. A multi-accumulator unroll
     // sums its per-window accumulator values after the loop; rolled, they
     // are one accumulator, so the merge outside the header must drop its
