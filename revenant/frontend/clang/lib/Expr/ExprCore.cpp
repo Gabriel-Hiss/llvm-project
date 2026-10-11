@@ -317,7 +317,6 @@ Expr *ExprBuilderImpl::buildIntegerLiteral(const llvm::APInt &V, QualType Ty) {
   // the type width first, preserving the value under the type's own
   // signedness. Non-integer types fall back to `uintptr_t`.
   QualType T = Ty->isIntegerType() ? Ty : uintptrTy();
-
   // Bool context: 0/1 become `false`/`true` in C++ mode. IntegerLiteral
   // cannot carry a bool type, so C prints a plain `0`/`1`.
   if (T->isBooleanType()) {
