@@ -1,8 +1,11 @@
 ; Dual-buffer compare (memcmp-like early exit): 16-wide chunk loop
 ; comparing two buffers lane-wise, continuing while the mask is all-ones
 ; and exiting with cttz of the inverted mask at the first difference.
-; Includes the latch-exit resume chain (bound + stride block) feeding the
-; scalar tail. Adapted from real lifted IR (mingw-gcc -O2 -msse2).
+; NO-FIRE: the tail resume (%trunc + 16 computed down the latch-exit
+; resume chain) is arithmetic on the vector final index, not the index
+; or bound SSA value itself, so the resume-identity gate bails.
+; Arithmetic resume proof is a documented follow-up; the shape stays
+; matched so a future proof only relaxes the gate.
 ; RUN: %revenant-opt -passes=revenant-unvecsearch,verify -S %s | %FileCheck %s
 
 define i32 @scan(ptr %0, ptr %1, i64 %2)  {
@@ -115,11 +118,6 @@ declare i32 @llvm.cttz.i32(i32, i1 immarg)
 !94 = !{i64 5368715094}
 
 ; CHECK-LABEL: define i32 @scan(
-; The dispatch folds straight to the scalar tail, including erasing the
-; latch-exit resume chain block.
-; CHECK: br label %bb_140001923
-; CHECK-NOT: call {{.*}} @llvm.cttz
-; CHECK-NOT: icmp eq <16 x i8>
-; CHECK-NOT: bitcast <16 x i1>
-; The scalar tail compares one byte pair per pass.
-; CHECK: icmp eq i8 {{.*}}, {{.*}}
+; The chunk scan skeleton survives: the pass must not fold.
+; CHECK: icmp eq <16 x i8>
+; CHECK: call {{.*}} @llvm.cttz

@@ -195,9 +195,20 @@ leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
 **revenant-unvecsearch (owner: MuseUnvecSearchR).** Expects devectorize output.
-Folds vectorized early-exit scans over i8/i16/i32 lanes back into scalar
-search loops when the needle, tail bound and resume address are proven.
-Preserves `!revenant.va`; runs explicitly, outside the default pipeline.
+Folds vectorized early-exit scans (find/strchr/strlen/memchr-like chunk loops
+over i8/i16/i32 lanes, SSE2..AVX2: lane compare + mask fold + bit-scan index,
+with a scalar compare tail) back to the scalar search loop from element 0.
+The needle must prove a byte-symbolic splat of one root (or a second-buffer
+load). Identity rules, never arithmetic: the tail resume incoming must be
+exactly the latch step or the chunk bound SSA value; chunk and tail must
+address the same base SSA value with the same index expression (the chunk
+and tail index phis); the chunk bound must have an and-mask or sub-urem
+multiple form so the exit edge provably fires. Disjoint from unloopvec by
+shape (no counted trip-bound loops touched, no mask+bit-scan skeleton
+accepted there). Preserves `!revenant.va`; bails leaving the CFG untouched
+when unsure. Runs explicitly, not in the default pipeline; the strchr
+two-way taken edge without a bit-scan and arithmetic tail resumes (e.g.
+dual-buffer compare with a recomputed resume) stay for later.
 
 **revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural clone folding is disabled: no body comparison can prove two entry points came from one source function (distinct declarations linked to different behavior, opaque observers, distinct exit codes, volatile loads from different objects), and identical bodies are not proof of shared source identity either. The pass keeps signature restoration (returns, dead formals, named clones, the narrow GCC constprop `this` formal), which requires source-signature evidence and rebinds only the same constant object. Uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 

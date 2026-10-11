@@ -625,6 +625,13 @@ struct ScanInfo {
   LoadInst *SecondLoad = nullptr;
   // strchr two-way form: second compare + or.
   ICmpInst *LaneCmp2 = nullptr;
+  // Resume identity: the latch step value (vector final index) and the
+  // latch-exit bound (chunk coverage endpoint). A tail resume incoming
+  // must be one of these two SSA values, never arithmetic on them.
+  Value *FinalIdx = nullptr;
+  Value *ChunkBound = nullptr;
+  // Tail IV phi captured by matchTailLoop; tail addresses index by it.
+  PHINode *TailIdx = nullptr;
 };
 
 bool isCttzCall(Value *V, CallInst *&Out) {
@@ -714,12 +721,46 @@ bool matchScanExit(BasicBlock *Exit, ScanInfo &S) {
   return true;
 }
 
-// Match one chunk-scan loop. Two CFG forms:
-//   (a) single-block self-loop: H branches to {H, ScanExit} with the
-//       mask test as its latch condition;
-//   (b) header+latch: H holds the load/compare/fold and branches on
-//       the mask test to {Latch, ScanExit}; Latch steps the chunk IV
-//       and the pointer, tests chunk-done, and branches to {H, Tail}.
+// The chunk bound must be reachable from 0 by stride steps: otherwise the
+// vector loop never takes its exit edge (it hangs without a mask hit) and
+// folding would turn a hang into a result. Accept only exact multiple
+// shapes keyed off the stride itself, never reasoning about values:
+// and-mask with the low log2(stride) bits cleared, or N minus N urem
+// stride. Stride is always a power of two here (lanes are 4/8/16/32).
+bool boundReachable(Value *Bound, uint64_t Stride) {
+  if (Stride == 0 || (Stride & (Stride - 1)) != 0)
+    return false;
+  if (auto *BO = dyn_cast<BinaryOperator>(Bound)) {
+    if (BO->getOpcode() == Instruction::And) {
+      for (unsigned K = 0; K < 2; ++K) {
+        if (auto *M = dyn_cast<ConstantInt>(BO->getOperand(K))) {
+          if (M->isZero())
+            return false;
+          if ((M->getZExtValue() & (Stride - 1)) == 0)
+            return true;
+          return false;
+        }
+      }
+      return false;
+    }
+    if (BO->getOpcode() == Instruction::Sub) {
+      if (auto *Rem = dyn_cast<Instruction>(BO->getOperand(1))) {
+        if (Rem->getOpcode() == Instruction::URem) {
+          if (auto *K = dyn_cast<ConstantInt>(Rem->getOperand(1)))
+            if (K->getZExtValue() == Stride)
+              return true;
+        }
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+// Match one chunk-scan loop (header+latch form only; see the latch
+// detection below). H holds the load/compare/fold and branches on the
+// mask test to {Latch, ScanExit}; Latch steps the chunk IV and the
+// pointer, tests chunk-done, and branches to {H, Tail}.
 // The latch condition compares the folded mask against 0 (find form)
 // or -1 (compare form). Returns true with S filled.
 bool matchScanLoop(BasicBlock *H, Function &F, ScanInfo &S) {
@@ -873,25 +914,28 @@ bool matchScanLoop(BasicBlock *H, Function &F, ScanInfo &S) {
   PHINode *PtrPhi = nullptr;
   BasicBlock *Latch = nullptr;
   // Detect the latch: the continue successor of H that branches back
-  // to H. In single-block form the continue edge is H itself.
-  // Successor 0 is the continue edge in both forms (mask==0 true, or
-  // mask==-1 true both mean keep scanning).
+  // to H. Only the header+latch form is accepted: a single-block
+  // self-loop has no latch exit edge, hence no vector-exit resume value
+  // to tie the tail start to, and erasing it could turn a no-hit hang
+  // into a result.
+  // Successor 0 is the continue edge (mask==0 true, or mask==-1 true
+  // both mean keep scanning).
   {
     BasicBlock *Cont = Term->getSuccessor(0);
     if (Cont == H) {
-      Latch = H;
-    } else {
-      auto *LT = dyn_cast<BranchInst>(Cont->getTerminator());
-      if (!LT)
-        return false;
-      bool BackToH = false;
-      for (BasicBlock *SS : successors(Cont))
-        if (SS == H)
-          BackToH = true;
-      if (!BackToH)
-        return false;
-      Latch = Cont;
+      UVS_BAIL("single-block " << H->getName());
+      return false;
     }
+    auto *LT = dyn_cast<BranchInst>(Cont->getTerminator());
+    if (!LT)
+      return false;
+    bool BackToH = false;
+    for (BasicBlock *SS : successors(Cont))
+      if (SS == H)
+        BackToH = true;
+    if (!BackToH)
+      return false;
+    Latch = Cont;
   }
   BasicBlock *Taken = Term->getSuccessor(1);
   for (PHINode &Phi : H->phis()) {
@@ -931,6 +975,7 @@ bool matchScanLoop(BasicBlock *H, Function &F, ScanInfo &S) {
     if (!ZeroStart)
       return false;
     IdxPhi = &Phi;
+    S.FinalIdx = Back;
     break;
   }
   for (PHINode &Phi : H->phis()) {
@@ -964,8 +1009,74 @@ bool matchScanLoop(BasicBlock *H, Function &F, ScanInfo &S) {
       PtrPhi = &Phi;
     }
   }
-  if (!IdxPhi && !PtrPhi)
+  // The index phi is required: the taken edge and the resume gate both
+  // key off its latch step value (the vector final index). A
+  // pointer-only loop cannot tie the tail start to vector coverage.
+  if (!IdxPhi)
     return false;
+  // Capture the latch exit bound: the latch must test step == bound
+  // with the step being exactly the index phi's backedge value, and
+  // exit to the tail side. The tail resume must be this bound (or the
+  // step itself); anything computed from them is unsound arithmetic.
+  {
+    auto *LT = cast<BranchInst>(Latch->getTerminator());
+    if (!LT->isConditional())
+      return false;
+    // Exactly one non-H, non-self successor: the vector exit edge.
+    BasicBlock *ExitBB = nullptr;
+    for (BasicBlock *SU : successors(Latch)) {
+      if (SU == H || SU == Latch)
+        continue;
+      if (ExitBB)
+        return false;
+      ExitBB = SU;
+    }
+    if (!ExitBB)
+      return false;
+    bool OtherIsH = false;
+    for (BasicBlock *SU : successors(Latch))
+      if (SU == H)
+        OtherIsH = true;
+    if (!OtherIsH)
+      return false;
+    auto *EC = dyn_cast<ICmpInst>(LT->getCondition());
+    if (!EC || EC->getParent() != Latch)
+      return false;
+    Value *Bound = nullptr;
+    if (EC->getPredicate() == ICmpInst::ICMP_EQ) {
+      // step == bound exits; the exit edge is the true edge.
+      if (ExitBB != LT->getSuccessor(0))
+        return false;
+      if (EC->getOperand(0) == S.FinalIdx)
+        Bound = EC->getOperand(1);
+      else if (EC->getOperand(1) == S.FinalIdx)
+        Bound = EC->getOperand(0);
+      else
+        return false;
+    } else if (EC->getPredicate() == ICmpInst::ICMP_NE) {
+      // step != bound continues; the exit edge is the false edge.
+      if (ExitBB != LT->getSuccessor(1))
+        return false;
+      if (EC->getOperand(0) == S.FinalIdx)
+        Bound = EC->getOperand(1);
+      else if (EC->getOperand(1) == S.FinalIdx)
+        Bound = EC->getOperand(0);
+      else
+        return false;
+    } else {
+      return false;
+    }
+    S.ChunkBound = Bound;
+    // The bound must be reachable from 0 by stride steps, else the
+    // original hangs in the vector loop and the fold would turn a hang
+    // into a result. Accept only the exact multiple forms (and-mask
+    // with cleared low bits, or N minus N urem stride): identity of
+    // shape, no arithmetic reasoning about values.
+    if (!boundReachable(Bound, Lanes)) {
+      UVS_BAIL("bound-shape " << Latch->getName());
+      return false;
+    }
+  }
   S.Latch = Latch;
   // The chunk load address must derive from the base + IV.
   // (Checked loosely: load pointer operand is the ptr phi or a GEP of
@@ -1113,136 +1224,22 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
     if (EltBits != S.LaneBytes * 8)
       return false;
   }
-  // Address identity must hold with exact constant offsets, not just
-  // equal roots: the chunk stream (base + c0 + k*stride) and the tail
-  // stream (base + c1 + i*elt) are the same array walk only when
-  // c0 == c1. A chunk pointer starting at base+1 with a tail at base
-  // would otherwise fold a hit at chunk index 0 into tail index 1.
-  // Phis resolve through their single non-chunk-region incoming (the
-  // base); anything ambiguous bails.
-  DenseSet<BasicBlock *> ChunkBlocks{S.H, S.ScanExit};
-  if (S.Latch)
-    ChunkBlocks.insert(S.Latch);
-  const DataLayout &DL = Hdr->getModule()->getDataLayout();
-  struct AddrInfo {
-    Value *Root = nullptr;
-    int64_t Off = 0;
-    bool OK = false;
-  };
-  auto Decomp = [&](Value *Ptr) -> AddrInfo {
-    int64_t Off = 0;
-    SmallVector<Value *, 4> WL{Ptr};
-    DenseSet<Value *> Seen;
-    Value *Root = nullptr;
-    while (!WL.empty()) {
-      Value *V = WL.pop_back_val();
-      if (!Seen.insert(V).second)
-        continue;
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
-        // Fold constant indices into the offset; a non-constant index
-        // ends offset folding for this chain (the symbolic stride is
-        // proven separately by the IV/step checks).
-        bool AllConst = true;
-        int64_t Step = 0;
-        for (unsigned K = 1; K < GEP->getNumOperands(); ++K) {
-          auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(K));
-          if (!CI) {
-            AllConst = false;
-            break;
-          }
-        }
-        if (AllConst) {
-          APInt Total(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
-          if (!GEP->accumulateConstantOffset(DL, Total))
-            return AddrInfo{};
-          if (Total.getActiveBits() > 63)
-            return AddrInfo{};
-          Step = Total.getSExtValue();
-          if ((Off > 0 && Step > INT64_MAX - Off) ||
-              (Off < 0 && Step < INT64_MIN - Off))
-            return AddrInfo{};
-          Off += Step;
-        }
-        WL.push_back(GEP->getPointerOperand());
-        continue;
-      }
-      if (auto *BC = dyn_cast<BitCastInst>(V)) {
-        WL.push_back(BC->getOperand(0));
-        continue;
-      }
-      if (auto *Phi = dyn_cast<PHINode>(V)) {
-        Value *Outside = nullptr;
-        bool Ambiguous = false;
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-          if (ChunkBlocks.count(Phi->getIncomingBlock(I)))
-            continue;
-          if (Outside) {
-            Ambiguous = true;
-            break;
-          }
-          Outside = Phi->getIncomingValue(I);
-        }
-        if (Ambiguous || !Outside)
-          return AddrInfo{};
-        WL.push_back(Outside);
-        continue;
-      }
-      if (Root && Root != V)
-        return AddrInfo{};
-      Root = V;
-    }
-    if (!Root)
-      return AddrInfo{};
-    return AddrInfo{Root, Off, true};
-  };
-  auto SameAddr = [&](Value *A, Value *B) -> bool {
-    AddrInfo X = Decomp(A);
-    AddrInfo Y = Decomp(B);
-    return X.OK && Y.OK && X.Root == Y.Root && X.Off == Y.Off;
-  };
-  if (S.SecondLoad) {
-    // Dual-buffer: two tail loads from the two chunk bases, in either
-    // order, and the element compare must be their equality (each
-    // side one of the loads).
-    if (EltLoads.size() != 2)
-      return false;
-    Value *CP0 = S.ChunkLoad->getPointerOperand();
-    Value *CP1 = S.SecondLoad->getPointerOperand();
-    Value *TP0 = EltLoads[0]->getPointerOperand();
-    Value *TP1 = EltLoads[1]->getPointerOperand();
-    bool Same = (SameAddr(TP0, CP0) && SameAddr(TP1, CP1)) ||
-                (SameAddr(TP0, CP1) && SameAddr(TP1, CP0));
-    if (!Same)
-      return false;
-    Value *C0 = EltCmp->getOperand(0);
-    Value *C1 = EltCmp->getOperand(1);
-    bool UsesBoth =
-        (C0 == EltLoads[0] && C1 == EltLoads[1]) ||
-        (C0 == EltLoads[1] && C1 == EltLoads[0]);
-    if (!UsesBoth)
-      return false;
-  } else {
-    // Find form: one tail load from the chunk base, and the element
-    // compare must use the same needle value (through casts).
-    if (EltLoads.size() != 1)
-      return false;
-    if (!SameAddr(EltLoads[0]->getPointerOperand(),
-                  S.ChunkLoad->getPointerOperand()))
-      return false;
-    bool NeedleUse = false;
-    for (unsigned K = 0; K < 2; ++K) {
-      Value *V = EltCmp->getOperand(K);
-      while (auto *C = dyn_cast<CastInst>(V))
-        V = C->getOperand(0);
-      if (S.Needle && V == S.Needle)
-        NeedleUse = true;
-    }
-    if (!NeedleUse)
-      return false;
-  }
+  // Address identity, not arithmetic. The chunk stream and the tail
+  // stream are the same array walk only when they address the same base
+  // SSA value with the same index expression. No offset is ever
+  // stripped or folded: constant GEP offsets, dynamic GEP indices, and
+  // phi detours each break identity and bail. (Bitcasts preserve
+  // addresses and are transparent.)
+  //   Chunk side: the chunk load pointer, bitcasts aside, is either the
+  //   chunk pointer phi (whose single pre-region incoming is the base,
+  //   used as-is) or a single-index GEP indexed by exactly the chunk
+  //   index phi.
+  //   Tail side (checked at the use sites below): each tail load is a
+  //   single-index GEP over the same base, indexed by exactly the tail
+  //   IV phi captured at the end of this function.
   // Tail IV must be a step-1 walk: backedge value is add(phi, 1) in
-  // Hdr (single-block) or in Latch (header+latch).
-  bool FoundIV = false;
+  // Hdr (single-block) or in Latch (header+latch). Captured first so
+  // the address checks below can demand the exact same SSA value.
   for (PHINode &Phi : Hdr->phis()) {
     Value *Back = nullptr;
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
@@ -1258,10 +1255,104 @@ bool matchTailLoop(BasicBlock *Hdr, BasicBlock *Latch, ScanInfo &S) {
       continue;
     if (Add->getParent() != Hdr && Add->getParent() != Latch)
       continue;
-    FoundIV = true;
+    S.TailIdx = &Phi;
+    break;
   }
-  if (!FoundIV)
+  if (!S.TailIdx)
     return false;
+  // Bitcasts preserve addresses; everything else is significant.
+  auto StripBC = [](Value *V) -> Value * {
+    while (auto *BC = dyn_cast<BitCastInst>(V))
+      V = BC->getOperand(0);
+    return V;
+  };
+  // Chunk base identity: the value the chunk stream starts from.
+  // Phi form: the single pre-region incoming, used as-is (a GEP with
+  // any offset, constant or dynamic, is a different start and bails at
+  // the comparison). GEP form: the GEP's pointer operand, used as-is
+  // (its index must be exactly the chunk index phi).
+  auto ChunkBaseOf = [&](LoadInst *L, Value *&BaseOut) -> bool {
+    BaseOut = nullptr;
+    Value *P = StripBC(L->getPointerOperand());
+    if (S.ChunkPtr && P == S.ChunkPtr) {
+      Value *Outside = nullptr;
+      for (unsigned I = 0; I < S.ChunkPtr->getNumIncomingValues(); ++I) {
+        if (S.ChunkPtr->getIncomingBlock(I) == S.H ||
+            S.ChunkPtr->getIncomingBlock(I) == S.Latch)
+          continue;
+        if (Outside)
+          return false;
+        Outside = S.ChunkPtr->getIncomingValue(I);
+      }
+      if (!Outside)
+        return false;
+      BaseOut = StripBC(Outside);
+      return true;
+    }
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(P)) {
+      if (GEP->getNumOperands() != 2)
+        return false;
+      if (GEP->getOperand(1) != S.ChunkIdx)
+        return false;
+      BaseOut = StripBC(GEP->getPointerOperand());
+      return true;
+    }
+    return false;
+  };
+  // Tail address identity: single-index GEP over exactly Base, indexed
+  // by exactly the tail IV phi. No other form is accepted.
+  auto TailAddrOK = [&](LoadInst *L, Value *Base) -> bool {
+    auto *GEP = dyn_cast<GetElementPtrInst>(StripBC(L->getPointerOperand()));
+    if (!GEP || GEP->getNumOperands() != 2)
+      return false;
+    if (StripBC(GEP->getPointerOperand()) != Base)
+      return false;
+    return GEP->getOperand(1) == S.TailIdx;
+  };
+  if (S.SecondLoad) {
+    // Dual-buffer: two chunk bases, two tail loads pairing with them in
+    // either order, and the element compare must be their equality
+    // (each side one of the loads).
+    if (EltLoads.size() != 2)
+      return false;
+    Value *B0 = nullptr, *B1 = nullptr;
+    if (!ChunkBaseOf(S.ChunkLoad, B0))
+      return false;
+    if (!ChunkBaseOf(S.SecondLoad, B1))
+      return false;
+    Value *C0 = EltCmp->getOperand(0);
+    Value *C1 = EltCmp->getOperand(1);
+    bool UsesBoth =
+        (C0 == EltLoads[0] && C1 == EltLoads[1]) ||
+        (C0 == EltLoads[1] && C1 == EltLoads[0]);
+    if (!UsesBoth)
+      return false;
+    bool Same = (TailAddrOK(EltLoads[0], B0) && TailAddrOK(EltLoads[1], B1)) ||
+                (TailAddrOK(EltLoads[0], B1) && TailAddrOK(EltLoads[1], B0));
+    if (!Same)
+      return false;
+  } else {
+    // Find form: one chunk base, one tail load over it indexed by the
+    // tail IV, and the element compare must use the same needle value
+    // (through casts).
+    if (EltLoads.size() != 1)
+      return false;
+    Value *B0 = nullptr;
+    if (!ChunkBaseOf(S.ChunkLoad, B0))
+      return false;
+    if (!TailAddrOK(EltLoads[0], B0))
+      return false;
+    bool NeedleUse = false;
+    for (unsigned K = 0; K < 2; ++K) {
+      Value *V = EltCmp->getOperand(K);
+      while (auto *C = dyn_cast<CastInst>(V))
+        V = C->getOperand(0);
+      if (S.Needle && V == S.Needle)
+        NeedleUse = true;
+    }
+    if (!NeedleUse)
+      return false;
+  }
   return true;
 }
 
@@ -1577,29 +1668,53 @@ bool runOnFunction(Function &F) {
       UVS_BAIL("escape " << S.H->getName() << " in " << F.getName());
       continue;
     }
-    // The tail entry must restart at 0: it needs a constant-0 incoming
-    // from the dispatch (kept) while the resume incoming comes from
-    // the dead region (dropped). When the entry IS the loop header,
-    // the header phi check inside matchTailLoop covers the IV; still
-    // require the zero edge here.
+    // Resume identity gate. After the fold the tail restarts wherever
+    // the kept TailEntry incomings say, so every TailEntry phi incoming
+    // is classified by identity, never arithmetic:
+    //   dispatch edge -> must be constant 0 (the restart);
+    //   self edge (TailEntry is the loop header) -> own recurrence,
+    //     preserved verbatim, ignored;
+    //   dead-region edge -> must be exactly the vector final index
+    //     (latch step) or the chunk coverage bound (same Value*);
+    //     anything computed from them (+4, zext-of-add, ...) bails;
+    //   any other live edge -> bail.
+    // The FinalIdx/ChunkBound pair plus the bound-reachability proof in
+    // matchScanLoop establish the vector covered exactly [0, resume):
+    // resume == step == bound on the exit edge, and the bound is
+    // stride-reachable from 0, so the exit edge provably fires there.
     {
-      bool ZeroFromDispatch = false;
       for (PHINode &Phi : TailEntry->phis()) {
-        int Idx = Phi.getBasicBlockIndex(Dispatch);
-        if (Idx < 0)
-          continue;
-        if (auto *CZ =
-                dyn_cast<ConstantInt>(Phi.getIncomingValue((unsigned)Idx)))
-          if (CZ->isZero())
-            ZeroFromDispatch = true;
+        for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+          BasicBlock *IB = Phi.getIncomingBlock(I);
+          Value *Inc = Phi.getIncomingValue(I);
+          if (IB == Dispatch) {
+            auto *CZ = dyn_cast<ConstantInt>(Inc);
+            if (!CZ || !CZ->isZero()) {
+              UVS_BAIL("resume-dispatch " << TailEntry->getName() << " in "
+                                          << F.getName());
+              OK = false;
+            }
+            continue;
+          }
+          if (IB == TailEntry)
+            continue;
+          if (Skip.count(IB)) {
+            if (Inc != S.FinalIdx && Inc != S.ChunkBound) {
+              UVS_BAIL("resume-identity " << TailEntry->getName() << " in "
+                                          << F.getName());
+              OK = false;
+            }
+            continue;
+          }
+          UVS_BAIL("resume-live " << TailEntry->getName() << " in "
+                                  << F.getName());
+          OK = false;
+        }
+        if (!OK)
+          break;
       }
-      // No phis at all (straight entry block): trivially restarts.
-      bool HasPhis = TailEntry->phis().begin() != TailEntry->phis().end();
-      if (HasPhis && !ZeroFromDispatch) {
-        UVS_BAIL("zerostart " << TailEntry->getName() << " in "
-                              << F.getName());
+      if (!OK)
         continue;
-      }
     }
     Work.push_back({S, TailEntry, Dispatch, Skip});
   }
