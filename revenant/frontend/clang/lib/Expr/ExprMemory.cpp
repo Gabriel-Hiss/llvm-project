@@ -277,6 +277,28 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
 
 Expr *ExprBuilderImpl::buildGEPValue(llvm::GetElementPtrInst &I, ExprScope &Scope) {
   llvm::SmallVector<llvm::Value *, 4> Idxs(I.indices());
+  llvm::Type *ElemTy = I.getSourceElementType();
+  if (Idxs.size() == 1 && I.hasOneUse() &&
+      !ElemTy->isAggregateType() && !ElemTy->isVectorTy()) {
+    llvm::Value *Use = *I.user_begin();
+    bool IsLoad = false;
+    if (auto *L = llvm::dyn_cast<llvm::LoadInst>(Use))
+      IsLoad = L->getPointerOperand() == &I;
+    else if (auto *S = llvm::dyn_cast<llvm::StoreInst>(Use))
+      IsLoad = S->getPointerOperand() == &I;
+    auto *IndexConstant = llvm::dyn_cast<llvm::ConstantInt>(Idxs[0]);
+    if (IsLoad && !(IndexConstant && IndexConstant->isZero())) {
+      Expr *Base = value(I.getPointerOperand(), Scope);
+      QualType ElemQT =
+          Types.typeOf(ElemTy, debugTypeOf(I.getPointerOperand()));
+      Expr *TypedBase = decayToPointer(Base, ElemQT);
+      Expr *Index = value(Idxs[0], Scope);
+      return new (*AST) clang::ArraySubscriptExpr(
+          parenIfNeeded(TypedBase, Prec::Postfix),
+          parenIfNeeded(Index, Prec::Ternary), ElemQT, VK_LValue, OK_Ordinary,
+          SourceLocation());
+    }
+  }
   return buildGEPFrom(value(I.getPointerOperand(), Scope),
                       I.getSourceElementType(), I.getPointerOperand(), Idxs,
                       Scope);

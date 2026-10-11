@@ -428,6 +428,28 @@ TEST_F(ExprTest, GepArraySubscript) {
   EXPECT_TRUE(S.find("[a]") != std::string::npos);
 }
 
+TEST_F(ExprTest, PointerGepLoadsUseSubscripts) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I32 = Type::getInt32Ty(LLCtx);
+  llvm::PointerType *I32Ptr = llvm::PointerType::getUnqual(I32);
+  AllocaInst *PtrSlot = B.CreateAlloca(I32Ptr, nullptr, "p.slot");
+  clang::QualType PtrQT = ACtx->getPointerType(ACtx->IntTy);
+  clang::VarDecl *PtrDecl = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("p"), PtrQT, ACtx->getTrivialTypeSourceInfo(PtrQT),
+      clang::SC_None);
+  FCtx->bindDecl(PtrSlot, PtrDecl);
+
+  llvm::Value *P = B.CreateLoad(I32Ptr, PtrSlot, "p.value");
+  llvm::Value *Element =
+      B.CreateGEP(I32, P, {H.A}, "element");
+  llvm::Value *Loaded = B.CreateLoad(I32, Element, "loaded");
+  EXPECT_EQ(print(Exprs->value(Loaded, Scope)), "p[a]");
+}
+
 TEST_F(ExprTest, DirectCallByName) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
