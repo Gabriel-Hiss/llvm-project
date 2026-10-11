@@ -29,6 +29,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -1023,10 +1024,80 @@ void rollbackEmitted(SmallVectorImpl<Instruction *> &Emitted) {
   }
 }
 
+// A straight-line AVX2 reduction may carry a 256-bit vector through an
+// i128 pair solely to extract one 128-bit half and bitcast it back to the
+// original lane width. Promote that exact half round-trip to a lane shuffle
+// before the scalar lane map is built, so unsupported <2 x i128> carriers do
+// not veto the entire block.
+unsigned promoteI128ExtractHalves(Function &F) {
+  if (!F.getParent()->getDataLayout().isLittleEndian())
+    return 0;
+  unsigned Changed = 0;
+  for (BasicBlock &BB : F) {
+    SmallVector<BitCastInst *, 8> BackCasts;
+    for (Instruction &I : BB)
+      if (auto *BC = dyn_cast<BitCastInst>(&I))
+        if (BC->getSrcTy()->isIntegerTy(128) &&
+            isa<FixedVectorType>(BC->getDestTy()))
+          BackCasts.push_back(BC);
+
+    for (BitCastInst *Back : BackCasts) {
+      if (Back->getParent() != &BB)
+        continue;
+      auto *TargetTy = dyn_cast<FixedVectorType>(Back->getDestTy());
+      auto *Extract = dyn_cast<ExtractElementInst>(Back->getOperand(0));
+      auto *Index = Extract
+                        ? dyn_cast<ConstantInt>(Extract->getIndexOperand())
+                        : nullptr;
+      auto *HalfView =
+          Extract ? dyn_cast<BitCastInst>(Extract->getVectorOperand()) : nullptr;
+      auto *HalfTy =
+          HalfView ? dyn_cast<FixedVectorType>(HalfView->getDestTy()) : nullptr;
+      auto *SourceTy =
+          HalfView ? dyn_cast<FixedVectorType>(HalfView->getSrcTy()) : nullptr;
+      if (!TargetTy || !Extract || Extract->getParent() != &BB || !Index ||
+          Index->getZExtValue() > 1 || !HalfView ||
+          HalfView->getParent() != &BB || !HalfTy || !SourceTy ||
+          HalfTy->getNumElements() != 2 ||
+          !HalfTy->getElementType()->isIntegerTy(128) ||
+          HalfTy->getPrimitiveSizeInBits() != 256 ||
+          SourceTy->getPrimitiveSizeInBits() != 256 ||
+          TargetTy->getPrimitiveSizeInBits() != 128 ||
+          !SourceTy->getElementType()->isIntegerTy() ||
+          SourceTy->getElementType()->getScalarSizeInBits() < 8 ||
+          SourceTy->getElementType()->getScalarSizeInBits() > 64 ||
+          SourceTy->getElementType() != TargetTy->getElementType() ||
+          TargetTy->getNumElements() * 2 != SourceTy->getNumElements() ||
+          !HalfView->hasOneUse() || *HalfView->user_begin() != Extract ||
+          !Extract->hasOneUse() || *Extract->user_begin() != Back)
+        continue;
+
+      auto *Source = dyn_cast<Instruction>(HalfView->getOperand(0));
+      if (!Source || Source->getParent() != &BB)
+        continue;
+      SmallVector<int, 8> Mask;
+      unsigned BaseLane =
+          static_cast<unsigned>(Index->getZExtValue()) * TargetTy->getNumElements();
+      for (unsigned Lane = 0; Lane < TargetTy->getNumElements(); ++Lane)
+        Mask.push_back(static_cast<int>(BaseLane + Lane));
+      auto *Shuffle = new ShuffleVectorInst(
+          HalfView->getOperand(0), PoisonValue::get(SourceTy), Mask,
+          Back->getName() + ".half", Back->getIterator());
+      inheritMeta(Back, Shuffle);
+      Back->replaceAllUsesWith(Shuffle);
+      Back->eraseFromParent();
+      Extract->eraseFromParent();
+      HalfView->eraseFromParent();
+      ++Changed;
+    }
+  }
+  return Changed;
+}
+
 } // namespace
 
 unsigned explodeStraight(Function &F) {
-  unsigned Changed = 0;
+  unsigned Changed = promoteI128ExtractHalves(F);
   // Pin vector defs used outside their home block: their home block must
   // never erase them, because a later-processed block may read their lanes
   // through extracts (see lanesOf). Computed on entry; explosion never
