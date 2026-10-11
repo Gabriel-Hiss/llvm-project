@@ -137,12 +137,55 @@ Value *splatInit(Value *Init, Type *Elem, unsigned Lanes) {
   return L0;
 }
 
+// Per-lane init values for scalar seeding. Constants fold per lane via
+// laneConst; an insertelement seed (AVX2 epilogue: scalar in lane 0, zero
+// constants elsewhere) yields the scalar for lane 0 and zero constants
+// after. Returns false for anything else.
+bool initLanes(Value *Init, Type *Elem, unsigned Lanes,
+               SmallVector<Value *, 4> &Out) {
+  if (auto *C = dyn_cast<Constant>(Init)) {
+    for (unsigned j = 0; j < Lanes; ++j) {
+      Value *Lj = laneConst(C, Elem, j);
+      if (!Lj)
+        return false;
+      Out.push_back(Lj);
+    }
+    return true;
+  }
+  if (auto *IE = dyn_cast<InsertElementInst>(Init)) {
+    auto *Idx = dyn_cast<ConstantInt>(IE->getOperand(2));
+    if (!Idx || !Idx->isZero())
+      return false;
+    auto *CV = dyn_cast<Constant>(IE->getOperand(0));
+    if (!CV)
+      return false;
+    // Lanes 1..N must be zero constants (undef accepted as zero; poison
+    // bails: it would poison a defined sum).
+    for (unsigned j = 1; j < Lanes; ++j) {
+      Value *Lj = laneConst(CV, Elem, j);
+      if (!isa<UndefValue>(Lj)) {
+        auto *CI = dyn_cast<ConstantInt>(Lj);
+        if (!CI || !CI->isZero())
+          return false;
+      }
+    }
+    Value *Lane0 = IE->getOperand(1);
+    if (!Lane0->getType()->isIntegerTy(Elem->getScalarSizeInBits()))
+      return false;
+    Out.push_back(Lane0);
+    for (unsigned j = 1; j < Lanes; ++j)
+      Out.push_back(ConstantInt::get(Elem, 0));
+    return true;
+  }
+  return false;
+}
+
 struct AccPhi {
   PHINode *Phi = nullptr;
   Value *Init = nullptr;
   BasicBlock *InitBB = nullptr;
   Instruction *Back = nullptr; // update binop in H
-  Value *Stream = nullptr;     // other operand of Back
+  Value *Stream = nullptr; // other operand of Back
 };
 
 // Manual horizontal-fold prover. A fold tree reduces accumulator lanes to one
@@ -411,22 +454,23 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
       return 0;
   }
 
-  // Per-acc splat init check: every acc init must fold to one Elem lane
-  // value. The emit stage seeds each scalar phi from its own acc's init
-  // (no cross-acc merging: independent reductions keep independent sums).
-  // Lane-varying induction bail: a vector PHI stepping by a splat constant
-  // from a ramp-constant init is an index vector, not a reduction
-  // accumulator. Such a loop is not a pure reduction over source values
-  // (c-gcc-o3 sub_1400017B0: acc over <0,1,2,3>+splat4), so the whole loop
-  // bails rather than threading the induction through scalar chains.
+  // Per-acc init check: every acc init must yield per-lane values (constants
+  // via laneConst, or an insertelement scalar seed with zero rest for AVX2
+  // epilogue loops). The emit stage seeds each scalar phi with the LANE SUM
+  // of its own acc's init lanes (for zero seeds identical to the old lane-0
+  // seed; for [seed,0,0,0] epilogues the seed itself). Lane-varying
+  // induction bail: a vector PHI stepping by a splat constant from a
+  // ramp-constant init is an index vector, not a reduction accumulator, so
+  // the whole loop bails rather than threading it through scalar chains.
   for (auto &A : Accs) {
-    if (splatInit(A.Init, Elem, Lanes))
+    SmallVector<Value *, 4> Lanes0;
+    if (initLanes(A.Init, Elem, Lanes, Lanes0))
       continue;
     auto *InitC = dyn_cast<Constant>(A.Init);
     auto *StreamC = dyn_cast<Constant>(A.Stream);
     if (InitC && StreamC && StreamC->getSplatValue())
       return 0; // induction PHI: not a pure reduction
-    return 0; // non-splat init, non-induction: today's bail
+    return 0; // unknown init form: bail
   }
   // Outside-use precheck: every outside use of an acc phi, backedge, or
   // other vector def in H must feed a matching reduce (directly or
@@ -842,10 +886,31 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   unsigned Esz = Elem->getScalarSizeInBits() / 8;
   SmallVector<Value *, 4> Inits;
   for (auto &A : Accs) {
-    Value *L0 = splatInit(A.Init, Elem, Lanes);
-    if (!L0)
+    // Seed = lane sum of the init lanes: the scalar image of the vector
+    // reduce of the entry value. Zero seeds (all observed cases) behave as
+    // before; [seed,0,0,0] epilogue inits seed with the scalar itself.
+    SmallVector<Value *, 4> IL;
+    if (!initLanes(A.Init, Elem, Lanes, IL))
       return 0; // pre-mutation: no scalar PHI created yet, nothing to clean
-    Inits.push_back(L0);
+    Value *Seed = IL[0];
+    for (unsigned j = 1; j < Lanes; ++j) {
+      // Zero lanes are neutral: skip them so zero seeds emit no seed
+      // arithmetic (existing fixtures keep byte-identical output). Seed
+      // arithmetic, when needed, goes before the InitBB terminator: it is
+      // loop-invariant.
+      if (auto *CI = dyn_cast<ConstantInt>(IL[j])) {
+        if (CI->isZero())
+          continue;
+      } else if (isa<UndefValue>(IL[j])) {
+        continue;
+      }
+      auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode, Seed,
+                                       IL[j], "s.unopt.seed",
+                                       InitBB->getTerminator());
+      inheritMeta(A.Phi, N);
+      Seed = N;
+    }
+    Inits.push_back(Seed);
   }
   SmallVector<PHINode *, 4> SS;
   for (unsigned a = 0; a < Accs.size(); ++a) {
