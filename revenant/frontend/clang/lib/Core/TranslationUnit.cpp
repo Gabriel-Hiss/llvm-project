@@ -161,10 +161,17 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
     } else if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
       SmallVector<c::Expr *, 64> Elems;
       c::QualType ElemTy = Types.typeOf(CDA->getElementType(), nullptr);
+      // A literal typed narrower than `int` prints with the Ui8/Ui16 numeric
+      // literal suffix, which gcc and clang-cl do not understand
+      // ("operator\"\"Ui8\"" not found). Spell the same value with the
+      // promoted literal type; the InitListExpr and the global keep ElemTy.
+      c::QualType LitTy = ElemTy;
+      if (LitTy->isIntegerType() && AST.getIntWidth(LitTy) < 32)
+        LitTy = AST.IntTy;
       for (unsigned I = 0, E = CDA->getNumElements(); I != E; ++I)
         Elems.push_back(c::IntegerLiteral::Create(
-            AST, APInt(AST.getIntWidth(ElemTy), CDA->getElementAsInteger(I)),
-            ElemTy, L));
+            AST, APInt(AST.getIntWidth(LitTy), CDA->getElementAsInteger(I)),
+            LitTy, L));
       c::Expr *ILE = new (AST) c::InitListExpr(AST, L, Elems, L);
       ILE->setType(VD->getType());
       VD->setInit(ILE);

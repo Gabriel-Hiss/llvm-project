@@ -214,3 +214,38 @@ TEST(TranslationUnitTest, EmitsInfinityWithoutNonportableInfToken) {
   printTranslationUnit(TU->tu(), OS, {});
   EXPECT_EQ(StringRef(OS.str()).find("Inf"), StringRef::npos);
 }
+
+TEST(TranslationUnitTest, ArrayElementLiteralsAvoidNarrowTypeSuffixes) {
+  LLVMContext Context;
+  Module M("byte-table", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  // The gcc/clang targets hold their tables as narrow arrays; a literal
+  // carrying the element type prints as `229Ui8`, which no target compiler
+  // understands ("operator\"Ui8\" not found").
+  Constant *Elems =
+      ConstantDataArray::get(Context, ArrayRef<uint8_t>{229, 1, 0, 255});
+  new GlobalVariable(M, ArrayType::get(Type::getInt8Ty(Context), 4), true,
+                     GlobalValue::ExternalLinkage, Elems, "table");
+
+  ClangFrontendOptions Options;
+  // The element list path is what the C++ emitter uses: C mode spells a
+  // fully narrow array as a string literal instead.
+  Options.Lang = "cpp";
+  auto TUOrErr = createASTContext(M, Options);
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  SmallString<256> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  StringRef Src = OS.str();
+  EXPECT_EQ(Src.find("Ui8"), StringRef::npos);
+  EXPECT_NE(Src.find("229"), StringRef::npos);
+}
