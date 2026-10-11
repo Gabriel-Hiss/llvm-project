@@ -282,8 +282,7 @@ c::QualType crtClangType(llvm::Type *T, c::ASTContext &AST) {
 /// declares, carrying the header's prototype instead of the lifted guess.
 /// Nullptr when no override applies and the caller uses the lifted type.
 static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
-                                               FrontendContext &FCtx,
-                                               TypeBuilder &Types) {
+                                               FrontendContext &FCtx) {
   if (!F.hasFnAttribute("revenant.lib"))
     return nullptr;
   std::optional<CrtPrototype> Proto = crtPrototypeFor(F.getName(),
@@ -307,17 +306,21 @@ static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
 }
 
 /// The FunctionDecl for `F` plus its ParmVarDecls: the declaration half of
-/// `buildFunction`, which every caller needs (bodies included).
+/// the emission, which every caller needs (bodies included).
+/// `LibraryDeclaration` asks for the declaration-only shape: no body will
+/// follow, so the storage class says the body comes from elsewhere at link
+/// time and a CRT/SDK name takes its header's prototype.
 static c::FunctionDecl *declareFunction(llvm::Function &F,
                                         FrontendContext &FCtx,
-                                        TypeBuilder &Types) {
+                                        TypeBuilder &Types,
+                                        bool LibraryDeclaration) {
   c::ASTContext &AST = FCtx.ast();
-  c::FunctionDecl *FD = headerPrototypeDeclFor(F, FCtx, Types);
+  c::FunctionDecl *FD = LibraryDeclaration
+                            ? headerPrototypeDeclFor(F, FCtx)
+                            : nullptr;
   if (!FD) {
     FD = FCtx.functionDecl(F, Types);
-    // A library body reads from the real CRT/SDK at link time, so its
-    // declaration says so instead of leaving the linker to guess.
-    if (F.hasFnAttribute("revenant.lib") && FD->getStorageClass() == c::SC_None)
+    if (LibraryDeclaration && FD->getStorageClass() == c::SC_None)
       FD->setStorageClass(c::SC_Extern);
   }
 
@@ -367,11 +370,12 @@ static c::FunctionDecl *declareFunction(llvm::Function &F,
 static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
                           TypeBuilder &Types, StmtBuilder &Stmts,
                           ExprBuilder &Exprs) {
-  c::ASTContext &AST = FCtx.ast();
-  c::FunctionDecl *FD = declareFunction(F, FCtx, Types);
+  c::FunctionDecl *FD = declareFunction(F, FCtx, Types,
+                                        /*LibraryDeclaration=*/false);
 
   if (F.isDeclaration())
     return;
+  c::ASTContext &AST = FCtx.ast();
   // Locals: one VarDecl per alloca, DI names/types when available.
   SmallVector<c::Stmt *, 16> LocalDecls;
   for (llvm::BasicBlock &BB : F)
@@ -437,8 +441,10 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
     // redefines the header's function (MSVC C2371/C2556) and duplicates the
     // definition at link. The declaration stays so calls still resolve, and
     // its prototype follows the header when one declares the name.
-    if (UserBodiesOnly && F.hasFnAttribute("revenant.lib"))
-      declareFunction(F, *T.FCtx, Types);
+    bool LibraryDeclaration =
+        UserBodiesOnly && F.hasFnAttribute("revenant.lib");
+    if (LibraryDeclaration)
+      declareFunction(F, *T.FCtx, Types, /*LibraryDeclaration=*/true);
     else
       buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
   }
