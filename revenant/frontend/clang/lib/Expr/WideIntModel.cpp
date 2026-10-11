@@ -464,6 +464,7 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
       LHS = wideIntConvert(A, SignedTy, LHS, clang::CK_IntegralCast);
   }
   llvm::SmallString<64> Name(recordName(WideIntBits, IsArithmeticShift ? true : Signed));
+  Name += "_";
   Name += Suffix;
   clang::FunctionDecl *FD =
       wrapperProto(A, IsArithmeticShift ? SignedTy : ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
