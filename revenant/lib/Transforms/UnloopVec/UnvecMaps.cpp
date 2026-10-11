@@ -68,22 +68,8 @@ struct InnerCascade {
   ScalarLoopInfo TailLoop;
   DenseSet<BasicBlock *> R;
 };
-// Drain-tail fusion: S routes to a countdown drain L (remainder
-// (N-resume)&(K-1)) and a counted tail T (bound N) whose start is
-// the drain end. When every tail lane group provably equals the
-// drain's scalar body (shared TailCmp valEq per lane group, same
-// bases), the drain is redundant: widen the tail start to the S
-// resume and erase the drain. The tail then covers [resume, N)
-// alone: exactly one loop, step 1 per element per lane group.
-struct DrainTail {
-  BasicBlock *S = nullptr;
-  BasicBlock *L = nullptr; // countdown drain
-  ScalarLoopInfo DrainLoop;
-  BasicBlock *T = nullptr; // counted tail
-  ScalarLoopInfo TailLoop;
-  Value *Resume = nullptr; // S resume value (drain start)
-  Value *N = nullptr;      // trip count root
-};
+// True when V is a cast chain rooted at one of the resume phis: the
+// value restarts at 0 on the folded path exactly like the phi.
 static bool isResumeDerived(Value *V,
                             const DenseSet<const PHINode *> &Resume,
                             unsigned Depth = 6) {
@@ -427,104 +413,12 @@ static bool midLanesEqualMidVsDrain(BasicBlock *Mid, BasicBlock *Drain) {
   return true;
 }
 
-// Collect scalar (non-vector) loads/adds/stores of a loop body.
-static void scalarMemOps(BasicBlock *B, SmallVectorImpl<LoadInst *> &Loads,
-                         SmallVectorImpl<BinaryOperator *> &Adds,
-                         SmallVectorImpl<StoreInst *> &Stores) {
-  for (Instruction &I : *B) {
-    if (auto *LI = dyn_cast<LoadInst>(&I)) {
-      if (!isa<FixedVectorType>(LI->getType()))
-        Loads.push_back(LI);
-    } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-      if (!isa<FixedVectorType>(BO->getType()) &&
-          BO->getOpcode() == Instruction::Add)
-        Adds.push_back(BO);
-    } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-      if (!isa<FixedVectorType>(SI->getValueOperand()->getType()))
-        Stores.push_back(SI);
-    }
-  }
-}
-
-// Lane proof between two scalar loops (drain vs tail): every tail
-// lane group (each scalar load/add/store triple, unrolled K times)
-// must equal the drain's scalar computation through the shared
-// TailCmp valEq, with identical memory bases. The drain IV maps to
-// the tail IV (both count the same element sequence).
-static bool tailLanesEqualDrain(BasicBlock *Tail, BasicBlock *Drain,
-                                ScalarLoopInfo &TailLoop,
-                                ScalarLoopInfo &DrainLoop) {
-  SmallVector<LoadInst *, 4> TL, DL;
-  SmallVector<BinaryOperator *, 4> TA, DA;
-  SmallVector<StoreInst *, 4> TS, DS;
-  scalarMemOps(Tail, TL, TA, TS);
-  scalarMemOps(Drain, DL, DA, DS);
-  if (TL.empty() || TS.empty() || DL.empty() || DS.empty())
-    return false;
-  // Same bases on every memory op.
-  for (LoadInst *L : TL)
-    if (ptrBase(L->getPointerOperand()) != ptrBase(DL[0]->getPointerOperand()))
-      return false;
-  for (StoreInst *S : TS)
-    if (ptrBase(S->getPointerOperand()) != ptrBase(DS[0]->getPointerOperand()))
-      return false;
-  // The drain add must consume the drain load; every tail add must
-  // consume one tail load.
-  if (!DA.empty() &&
-      DA[0]->getOperand(0) != DL[0] && DA[0]->getOperand(1) != DL[0])
-    return false;
-  for (BinaryOperator *A : TA) {
-    bool UsesLoad = false;
-    for (LoadInst *L : TL)
-      UsesLoad = UsesLoad || A->getOperand(0) == L || A->getOperand(1) == L;
-    if (!UsesLoad)
-      return false;
-  }
-  // Every tail store value must equal the drain's stored value
-  // (or the drain add result) under IV mapping.
-  Value *DrainStored = !DA.empty() ? cast<Value>(DA[0])
-                                   : cast<Value>(DS[0]->getValueOperand());
-  for (StoreInst *S : TS) {
-    TailCmp TC;
-    TC.A = Drain;
-    TC.B = Tail;
-    TC.MapAB[DrainLoop.IV] = TailLoop.IV;
-    for (LoadInst *L : DL)
-      TC.MapAB[L] = nullptr; // filled per-store below
-    // Map each drain load to the tail load feeding this store.
-    bool Mapped = false;
-    for (LoadInst *L : TL) {
-      // The tail load feeding store S (through its add, if any).
-      Value *V = S->getValueOperand();
-      if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-        if (BO->getOperand(0) == L || BO->getOperand(1) == L) {
-          for (LoadInst *D : DL)
-            TC.MapAB[D] = L;
-          Mapped = true;
-          break;
-        }
-      } else if (V == L) {
-        for (LoadInst *D : DL)
-          TC.MapAB[D] = L;
-        Mapped = true;
-        break;
-      }
-    }
-    if (!Mapped)
-      return false;
-    if (!TC.valEq(DrainStored, S->getValueOperand(), TailCmp::MaxDepth))
-      return false;
-  }
-  return true;
-}
-
 // Match the inner cascade around dispatch D with scalar entry S:
 // S routes to a countdown drain L and a counted tail T; the other
 // arm reaches a middle vector tier Mid (single-block self-loop with
 // a preheader) whose bound the countdown check accepts against the
 // drain. Region R covers the middle preheader, tier, and exit plus
 // any dispatch blocks between D and the preheader. Returns true with
-// C filled on a full structural match; no mutation.
 static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
                               InnerCascade &C) {
   // S must route to exactly the drain and the tail entries.
@@ -548,7 +442,6 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
     if (!Zero || !Zero->isZero())
       continue;
     // The tail entry is either the counted tail itself or a block
-    // leading to it; find the single-block counted self-loop below.
     ScalarLoopInfo Tail;
     BasicBlock *TailBB = nullptr;
     if (matchScalarLoop(MaybeTailEntry, Tail)) {
