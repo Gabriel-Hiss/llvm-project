@@ -443,6 +443,15 @@ TEST(TranslationUnitTest, UserBodiesOnlySkipsLibraryDefinitions) {
   Builder.CreateRet(ConstantInt::get(I32, 2));
   User->addFnAttr("revenant.user", "true");
   Lib->addFnAttr("revenant.lib", "lib_body");
+  // ICF folding can put a CRT body on the user-reachable set; that body is
+  // the program's own code and must survive as a definition.
+  Function *Both = Function::Create(FnTy, Function::ExternalLinkage,
+                                   "both_lib_and_user", M);
+  BasicBlock *BothEntry = BasicBlock::Create(Context, "entry", Both);
+  Builder.SetInsertPoint(BothEntry);
+  Builder.CreateRet(ConstantInt::get(I32, 3));
+  Both->addFnAttr("revenant.lib", "both_lib_and_user");
+  Both->addFnAttr("revenant.user", "true");
 
   ClangFrontendOptions Options;
   Options.Lang = "c";

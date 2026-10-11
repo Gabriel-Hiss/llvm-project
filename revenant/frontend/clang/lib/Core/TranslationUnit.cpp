@@ -441,8 +441,13 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
     // redefines the header's function (MSVC C2371/C2556) and duplicates the
     // definition at link. The declaration stays so calls still resolve, and
     // its prototype follows the header when one declares the name.
-    bool LibraryDeclaration =
-        UserBodiesOnly && F.hasFnAttribute("revenant.lib");
+    // A user-reachable function keeps its body even when it also matches a
+    // database record: the classifier reached it from the user entry, so it
+    // is the program's own code. ICF folding can land a CRT body on the
+    // traced entry, and a body-less entry does not link at all.
+    bool LibraryDeclaration = UserBodiesOnly &&
+                              F.hasFnAttribute("revenant.lib") &&
+                              !F.hasFnAttribute("revenant.user");
     if (LibraryDeclaration)
       declareFunction(F, *T.FCtx, Types, /*LibraryDeclaration=*/true);
     else

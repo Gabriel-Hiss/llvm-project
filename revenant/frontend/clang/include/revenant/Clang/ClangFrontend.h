@@ -88,7 +88,8 @@ createASTContext(llvm::Module &M, const ClangFrontendOptions &Opts);
 /// Populate `T`: globals (incl. `@str_*` string constants and `@g_*` data),
 /// external FunctionDecls for imports, FunctionDecls with ParmVarDecls and
 /// local VarDecls for every `define`, bodies via `Stmts`/`Exprs`, types via
-/// `Types`. With `UserBodiesOnly`, a definition carrying `revenant.lib`
+/// `Types`. With `UserBodiesOnly`, a definition the module classifies as
+/// library (`revenant.lib`) and not as user-reachable (`revenant.user`)
 /// becomes a declaration only.
 void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
                          TypeBuilder &Types, StmtBuilder &Stmts,
