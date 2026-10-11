@@ -84,9 +84,6 @@ struct DrainTail {
   Value *Resume = nullptr; // S resume value (drain start)
   Value *N = nullptr;      // trip count root
 };
-static bool tailLanesEqualDrain(BasicBlock *Tail, BasicBlock *Drain,
-                                ScalarLoopInfo &TailLoop,
-                                ScalarLoopInfo &DrainLoop);
 static bool isResumeDerived(Value *V,
                             const DenseSet<const PHINode *> &Resume,
                             unsigned Depth = 6) {
@@ -244,127 +241,6 @@ static bool partitionCoverageOK(Value *MidBound, ScalarLoopInfo &Drain,
   if (!Zero || !Zero->isZero())
     return false;
   return true;
-}
-
-// Match S routing to a countdown drain L and (through a drain-exit
-// block E) a counted tail T: S -> {L, E-chain}, L self-loop with a
-// countdown latch (bound 0), E leading to T self-loop with bound N,
-// T start fed from the drain end. Proofs: drain countdown remainder
-// shape, tail bound strips to the same N as the drain count init,
-// drain start is the S resume, and every tail lane group equals the
-// drain body (tailLanesEqualDrain over the shared TailCmp).
-static bool matchDrainTail(BasicBlock *S, Function &F, DrainTail &C) {
-  auto *SBr = dyn_cast<BranchInst>(S->getTerminator());
-  if (!SBr || !SBr->isConditional())
-    return false;
-  BasicBlock *S0 = SBr->getSuccessor(0);
-  BasicBlock *S1 = SBr->getSuccessor(1);
-  for (int Pick = 0; Pick < 2; ++Pick) {
-    BasicBlock *MaybeDrain = Pick == 0 ? S0 : S1;
-    BasicBlock *MaybeExit = Pick == 0 ? S1 : S0;
-    ScalarLoopInfo Drain;
-    if (!matchScalarLoop(MaybeDrain, Drain))
-      continue;
-    // Drain latch must compare against constant 0 (countdown).
-    Value *DrainBound = loopBound(Drain);
-    auto *Zero = dyn_cast_or_null<ConstantInt>(DrainBound);
-    if (!Zero || !Zero->isZero())
-      continue;
-    // Drain start: the non-latch incoming of the drain IV must be
-    // the S resume (a value available at S: S phi, S instruction,
-    // constant, or argument).
-    Value *Resume = nullptr;
-    for (unsigned I = 0; I < Drain.IV->getNumIncomingValues(); ++I) {
-      if (Drain.IV->getIncomingBlock(I) == MaybeDrain)
-        continue;
-      if (Drain.IV->getIncomingBlock(I) != S)
-        Resume = nullptr;
-      else
-        Resume = Drain.IV->getIncomingValue(I);
-    }
-    if (!Resume)
-      continue;
-    // The other arm reaches the counted tail through a drain-exit
-    // block: BFS for the first counted self-loop below it.
-    ScalarLoopInfo Tail;
-    BasicBlock *TailBB = nullptr;
-    {
-      SmallVector<BasicBlock *, 8> Work{MaybeExit};
-      DenseSet<BasicBlock *> Seen{MaybeExit};
-      for (unsigned Steps = 0; !Work.empty() && !TailBB && Steps < 32;
-           ++Steps) {
-        BasicBlock *BB = Work.pop_back_val();
-        if (BB != MaybeExit && BB != MaybeDrain && matchScalarLoop(BB, Tail)) {
-          TailBB = BB;
-          break;
-        }
-        for (BasicBlock *Su : successors(BB))
-          if (Seen.insert(Su).second)
-            Work.push_back(Su);
-      }
-    }
-    if (!TailBB || TailBB == MaybeDrain)
-      continue;
-    // Tail bound must strip to the same N as the drain count init.
-    Value *TailBound = loopBound(Tail);
-    if (!TailBound)
-      continue;
-    // Tail start: the non-latch incoming of the tail IV must come
-    // from the drain end (defined in the drain, its exit block, or
-    // the S resume chain), not from an unrelated value.
-    Value *TailStart = nullptr;
-    for (unsigned I = 0; I < Tail.IV->getNumIncomingValues(); ++I) {
-      if (Tail.IV->getIncomingBlock(I) == TailBB)
-        continue;
-      TailStart = Tail.IV->getIncomingValue(I);
-    }
-    if (!TailStart)
-      continue;
-    auto *StartInst = dyn_cast<Instruction>(TailStart);
-    bool StartOK = isa<Constant>(TailStart) || isa<Argument>(TailStart);
-    if (!StartOK && StartInst) {
-      BasicBlock *PB = StartInst->getParent();
-      StartOK = PB == MaybeDrain || PB == TailBB;
-      if (!StartOK) {
-        // Defined in the drain-exit region between drain and tail.
-        for (BasicBlock *Su : successors(MaybeDrain)) {
-          if (Su == MaybeDrain || Su == TailBB)
-            continue;
-          SmallVector<BasicBlock *, 8> W{Su};
-          DenseSet<BasicBlock *> Sn{Su};
-          for (unsigned K = 0; K < 16 && !W.empty() && !StartOK; ++K) {
-            BasicBlock *X = W.pop_back_val();
-            if (X == PB)
-              StartOK = true;
-            for (BasicBlock *Y : successors(X))
-              if (Sn.insert(Y).second)
-                W.push_back(Y);
-          }
-        }
-      }
-    }
-    if (!StartOK)
-      continue;
-    if (stripCountDerivation(TailBound, F) !=
-        stripCountDerivation(TailStart, F)) {
-      // Tail bound and tail start must share the trip root with the
-      // drain count init; otherwise the fused loop may cover a
-      // different range.
-      continue;
-    }
-    // Per-lane body proof over the shared TailCmp.
-    if (!tailLanesEqualDrain(TailBB, MaybeDrain, Tail, Drain))
-      continue;
-    C.S = S;
-    C.L = MaybeDrain;
-    C.DrainLoop = Drain;
-    C.T = TailBB;
-    C.TailLoop = Tail;
-    C.Resume = Resume;
-    C.N = stripCountDerivation(TailBound, F);
-    return true;
-  }
-  return false;
 }
 static bool secondaryStartOK(Value *Start, const BasicBlock *B,
                              const DenseSet<BasicBlock *> &R,
