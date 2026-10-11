@@ -583,6 +583,31 @@ TEST(LiftFunction, VariadicCallPassesLiveRegs) {
             << "variadic call dropped live arg " << A;
     }
   EXPECT_TRUE(FoundCall) << "no printf call in main";
+
+  // Whole-module shape: the wrapper itself is lifted, so its definition
+  // (not just the callee decl) must keep the variadic tail. A non-variadic
+  // def would force coerceArgs to truncate the call back to one argument.
+  auto WrapIt = P.Functions.find(Va(0x140003630));
+  ASSERT_NE(WrapIt, P.Functions.end()) << "printf wrapper not recovered";
+  // Mirror what libdb matching does in the real pipeline: name the record
+  // so the definition merges with main's callee decl instead of minting a
+  // second symbol.
+  WrapIt->second.Name = "printf";
+  if (!P.Names)
+    P.Names = std::make_shared<std::map<Va, std::string>>();
+  (*P.Names)[Va(0x140003630)] = "printf";
+  auto WrapLifted =
+      lift::liftFunction(M, P, WrapIt->second, *Fx->Dis, &Sigs, nullptr,
+                         /*RunPasses=*/false);
+  ASSERT_FALSE(!WrapLifted) << toString(WrapLifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+  EXPECT_EQ(M.getFunction("printf.decl"), nullptr)
+      << "wrapper def disagreed with the callee decl type";
+  const llvm::Function *Def = M.getFunction("printf");
+  ASSERT_NE(Def, nullptr) << "printf definition missing";
+  EXPECT_FALSE(Def->empty()) << "printf has a decl but no body";
+  EXPECT_TRUE(Def->getFunctionType()->isVarArg())
+      << "printf definition lost its variadic tail";
 }
 
 } // end anonymous namespace

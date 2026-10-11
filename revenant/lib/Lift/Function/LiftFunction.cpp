@@ -76,7 +76,7 @@ static llvm::FunctionType *functionType(llvm::LLVMContext &C,
     Ret = S->Ret->Float ? (S->Ret->Bits == 32 ? llvm::Type::getFloatTy(C)
                                               : llvm::Type::getDoubleTy(C))
                         : llvm::Type::getIntNTy(C, std::max(1u, S->Ret->Bits));
-  return llvm::FunctionType::get(Ret, Params, false);
+  return llvm::FunctionType::get(Ret, Params, S && S->Variadic);
 }
 
 static const Signature *signatureFor(const Signatures *Sigs, Va Addr) {
