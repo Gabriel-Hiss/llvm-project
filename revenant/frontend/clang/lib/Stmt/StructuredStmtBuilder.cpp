@@ -66,6 +66,10 @@ struct Region {
   Stmt *ForInit = nullptr;
   Expr *ForStep = nullptr;
   bool ForPiecesAttempted = false;
+  /// Pure loop-exit ifs can be emitted at each predecessor; keep the body
+  /// after the first emission so ExprBuilder's one-shot temp assignments
+  /// are reused as AST nodes, not silently omitted.
+  Stmt *InlineLoopFollowBody = nullptr;
   /// Members: for if/switch, blocks dominated by Header and post-dominated
   /// by Follow; for loops, dominated by Header and able to reach Latch
   /// without passing through Follow. Header itself is always a member for
@@ -734,6 +738,8 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
     if (!Nested || Nested->Kind != RegionKind::If || Nested->Degraded ||
         Nested->Follow != Loop->Follow || !BI || !BI->isConditional())
       return nullptr;
+    if (Nested->InlineLoopFollowBody)
+      return Nested->InlineLoopFollowBody;
     if (Emitted.contains(Target))
       return gotoTo(Target);
 
@@ -748,8 +754,11 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       BasicBlock *Current = Start;
       SmallPtrSet<BasicBlock *, 8> Seen;
       while (Current && Seen.insert(Current).second) {
-        if (Stmt *S = loopTransfer(Current))
+        if (Stmt *S = loopTransfer(Current)) {
+          if (Current != Loop->Follow)
+            Consumed.insert(Current);
           return S;
+        }
         if (pred_size(Current) != 1)
           return nullptr;
         auto *Edge = dyn_cast<BranchInst>(Current->getTerminator());
@@ -785,6 +794,7 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       Emitted.insert(Member);
     CompoundStmt *Inline = CompoundStmt::Create(
         *AST, Body, FPOptionsOverride(), SourceLocation(), SourceLocation());
+    Nested->InlineLoopFollowBody = Inline;
     if (NeededLabels.contains(Target))
       return new (*AST) LabelStmt(SourceLocation(), labelFor(Target), Inline);
     return Inline;

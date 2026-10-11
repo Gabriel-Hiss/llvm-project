@@ -620,6 +620,13 @@ TEST(StructuredStmtBuilderTest, EarlyReturnRegionUsesStructuredIf) {
   llvm::BasicBlock *Return = BasicBlock::Create(C, "bb_b010", F);
   llvm::BasicBlock *Continue = BasicBlock::Create(C, "bb_b020", F);
   llvm::IRBuilder<> B(Entry);
+  for (unsigned I = 0; I != 33; ++I) {
+    std::string Name = "header_call" + std::to_string(I);
+    auto *SideEffect = llvm::Function::Create(
+        llvm::FunctionType::get(I32, false),
+        llvm::GlobalValue::ExternalLinkage, Name, M);
+    B.CreateCall(SideEffect);
+  }
   B.CreateCondBr(B.CreateICmpEQ(X, llvm::ConstantInt::get(I32, 0)), Return,
                  Continue);
   B.SetInsertPoint(Return);
@@ -634,6 +641,9 @@ TEST(StructuredStmtBuilderTest, EarlyReturnRegionUsesStructuredIf) {
   Entry->getTerminator()->setMetadata("revenant.region", MDNode::get(C, Ops));
 
   std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("header_call0();"), std::string::npos) << S;
+  EXPECT_NE(S.find("header_call32();"), std::string::npos) << S;
+  EXPECT_LT(S.find("header_call32();"), S.find("if"));
   EXPECT_NE(S.find("if"), std::string::npos);
   EXPECT_NE(S.find("return 7"), std::string::npos);
   EXPECT_NE(S.find("return"), std::string::npos);
@@ -783,6 +793,61 @@ TEST(StructuredStmtBuilderTest, ForContinueEdgesEnterTheLatch) {
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("for"), std::string::npos);
   EXPECT_NE(S.find("continue"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, SharedLoopExitIfIsDuplicatedWithoutGoto) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_shared_loop_exit_if", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32, I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_shared_loop_exit_if", M);
+  llvm::Argument *N = F->getArg(0);
+  llvm::Argument *Skip = F->getArg(1);
+  llvm::BasicBlock *Pre = BasicBlock::Create(C, "bb_f200", F);
+  llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_f210", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_f220", F);
+  llvm::BasicBlock *Work = BasicBlock::Create(C, "bb_f230", F);
+  llvm::BasicBlock *SkipEdge = BasicBlock::Create(C, "bb_f225", F);
+  llvm::BasicBlock *ExitTest = BasicBlock::Create(C, "bb_f240", F);
+  llvm::BasicBlock *Latch = BasicBlock::Create(C, "bb_f250", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_f260", F);
+  llvm::IRBuilder<> B(Pre);
+  llvm::AllocaInst *IV = B.CreateAlloca(I32, nullptr, "i");
+  llvm::AllocaInst *Sum = B.CreateAlloca(I32, nullptr, "sum");
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), IV);
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), Sum);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Header);
+  B.CreateCondBr(B.CreateICmpSLT(B.CreateLoad(I32, IV), N), Dispatch, Exit);
+  B.SetInsertPoint(Dispatch);
+  B.CreateCondBr(B.CreateICmpEQ(Skip, llvm::ConstantInt::get(I32, 0)),
+                 SkipEdge, Work);
+  B.SetInsertPoint(SkipEdge);
+  B.CreateBr(ExitTest);
+  B.SetInsertPoint(Work);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, Sum), B.CreateLoad(I32, IV)),
+                Sum);
+  B.CreateBr(ExitTest);
+  B.SetInsertPoint(ExitTest);
+  llvm::Value *Next =
+      B.CreateAdd(B.CreateLoad(I32, IV), llvm::ConstantInt::get(I32, 1));
+  B.CreateCondBr(B.CreateICmpEQ(Next, N), Exit, Latch);
+  B.SetInsertPoint(Latch);
+  B.CreateStore(Next, IV);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(B.CreateLoad(I32, Sum));
+  tagRegion(Header->getTerminator(), "loop",
+            {indexOf(*F, Header), indexOf(*F, Latch), indexOf(*F, Exit)});
+  tagRegion(ExitTest->getTerminator(), "if", {indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_EQ(S.find("goto f_shared_loop_exit_if_L_bb_f240"), std::string::npos)
+      << S;
+  size_t FirstNext = S.find("v0 = i + 1U");
+  ASSERT_NE(FirstNext, std::string::npos) << S;
+  EXPECT_NE(S.find("v0 = i + 1U", FirstNext + 1), std::string::npos) << S;
 }
 
 TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
