@@ -1215,12 +1215,21 @@ static bool callerReads(const CallSites &Sites, FnCache &Fns,
     if (!B)
       continue;
     size_t End = std::min(B->InstrsEnd, G->Instrs.size());
-    for (size_t J = std::min<size_t>(Ii + 1, End); J < End; ++J) {
+    bool Killed = false;
+    for (size_t J = std::min<size_t>(Ii + 1, End); J < End && !Killed; ++J) {
       const Instr &Nx = G->Instrs[J];
       InsnInfo II = insnInfo(Nx.Inst, T);
-      for (const RegUse &U : II.Regs)
+      for (const RegUse &U : II.Regs) {
         if (grp(U.Reg) == grp(Reg) && U.Read)
           return true;
+        // An overwriting write kills the call result: a later read
+        // observes the new value, not the return (mirrors
+        // callerReadWidth). Without this, vector setup code after a
+        // scalar call misattributes float returns (c-clang-o2avx main
+        // clobbers xmm0 five bytes after calling break_continue).
+        if (grp(U.Reg) == grp(Reg) && U.Write)
+          Killed = true;
+      }
       // A later call clobbers the integer return (rax) but not the
       // vector return (xmm0): gcc -O2 `main` calls `sum_vec_d` then
       // `cmp_vec` before `cvttsd2si r10d, xmm0` consumes the double.

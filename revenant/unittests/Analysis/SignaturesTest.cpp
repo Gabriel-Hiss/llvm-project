@@ -620,3 +620,49 @@ TEST(SignaturesTest, ShortTailPrefixDoesNotVetoDirectPrefix) {
   // prefix abstains instead of vetoing.
   ASSERT_EQ(Sig->Params.size(), 2u);
 }
+
+TEST(SignaturesTest, OverwrittenXmm0ReadDoesNotInferFloatReturn) {
+  // A caller that clobbers xmm0 after the call, then reads the new value,
+  // must not attribute a float return: the read observes the overwrite.
+  constexpr uint64_t Base = 0x14000C000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x30;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // callee @ 0: mov eax, ecx; ret (scalar int function, no xmm use)
+  Text.Data[0] = 0x8B;
+  Text.Data[1] = 0xC1;
+  Text.Data[2] = 0xC3;
+  // caller @ 0x20: call callee; xorps xmm0, xmm0; movaps xmm1, xmm0; ret
+  Text.Data[0x20] = 0xE8;
+  Text.Data[0x21] = 0xDB;
+  Text.Data[0x22] = 0xFF;
+  Text.Data[0x23] = 0xFF;
+  Text.Data[0x24] = 0xFF;
+  Text.Data[0x25] = 0x0F;
+  Text.Data[0x26] = 0x57;
+  Text.Data[0x27] = 0xC0;
+  Text.Data[0x28] = 0x0F;
+  Text.Data[0x29] = 0x28;
+  Text.Data[0x2A] = 0xC8;
+  Text.Data[0x2B] = 0xC3;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va Callee(Base), Caller(Base + 0x20);
+  P.Functions.emplace(Callee, record(Callee, 0, 3, {0, 2}));
+  P.Functions.emplace(Caller,
+                       record(Caller, 0x20, 0xC, {0x20, 0x25, 0x28, 0x2B}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(Callee);
+  ASSERT_NE(Sig, nullptr);
+  ASSERT_TRUE(Sig->HasRet);
+  EXPECT_FALSE(Sig->Ret.Float);
+}
