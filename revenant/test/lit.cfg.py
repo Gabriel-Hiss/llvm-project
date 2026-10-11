@@ -81,6 +81,8 @@ def _tool_in(build_dir, name):
         # <build>/frontend/clang (revenant-clang lives there).
         _join(build_dir, "frontend", "clang"),
     ]
+    if name == "revenant-clang":
+        bases.append(_join(build_dir, "frontend", "clang"))
     bases.extend(sorted(_join(build_dir, "lib", area, "tool")
                         for area in _lib_areas(build_dir)))
     for base in bases:
@@ -115,7 +117,7 @@ opt = _tool("opt", ("RV_OPT",))
 filecheck = _tool("FileCheck", ("RV_FILECHECK", "FILECHECK"))
 revenant_opt = _tool("revenant-opt", ("REVENANT_OPT", "RV_REVENANT_OPT"))
 revenant_decompile = _tool("revenant-decompile", ("REVENANT_DECOMPILE",))
-revenant_clang = _tool("revenant-clang", ("REVENANT_CLANG",))
+revenant_clang = _tool("revenant-clang", ("REVENANT_CLANG", "RV_REVENANT_CLANG"))
 revenant_detect = _tool("revenant-detect", ("REVENANT_DETECT",))
 
 # Parity corpus for the tests that need a real PE (producer detection).
@@ -125,6 +127,13 @@ corpus = _first_env("REVENANT_CORPUS", "RV_CORPUS")
 if corpus and os.path.isdir(corpus):
     config.substitutions.append(("%revenant-corpus", corpus.replace("\\", "/")))
     config.available_features.add("revenant-corpus")
+lli = _tool("lli", ("RV_LLI", "LLVM_LLI"))
+clang_cl = _tool("clang-cl", ("RV_CLANG_CL", "CLANG_CL"))
+if revenant_clang and lli and clang_cl:
+    config.available_features.add("structured-source-run")
+    config.environment["REVENANT_CLANG"] = revenant_clang
+    config.environment["RV_LLI"] = lli
+    config.environment["RV_CLANG_CL"] = clang_cl
 
 # rv-structure-tool ships with the Structure slice build.
 rv_tool_dir = _first_env("RV_STRUCTURE_TOOL_DIR")

@@ -1185,6 +1185,23 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
     return CompoundStmt::Create(*AST, Head, FPOptionsOverride(),
                                 SourceLocation(), SourceLocation());
   };
+  auto activeLoopTransfer = [&](BasicBlock *Target) -> Stmt * {
+    if (ActiveLoops.empty())
+      return nullptr;
+    Region *Loop = ActiveLoops.back();
+    if (Target == Loop->Follow)
+      return new (*AST) BreakStmt(SourceLocation());
+    if (Target == Loop->Header)
+      return new (*AST) ContinueStmt(SourceLocation());
+    if (Target != Loop->Latch)
+      return nullptr;
+    for (Instruction &I : *Loop->Latch)
+      if (!I.isTerminator() && !isa<PHINode>(I) &&
+          !isa<DbgInfoIntrinsic>(I) && !ForClaimed.contains(&I)) {
+        return gotoTo(Target);
+      }
+    return new (*AST) ContinueStmt(SourceLocation());
+  };
   auto emitArm = [&](BasicBlock *Arm,
                      const SmallPtrSetImpl<BasicBlock *> &Mem) -> Stmt * {
     if (!ActiveLoops.empty() && Arm != R.Follow && pred_size(Arm) == 1) {
@@ -1196,29 +1213,14 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
           break;
         }
       auto *Edge = dyn_cast<BranchInst>(Arm->getTerminator());
-      Region *Loop = ActiveLoops.back();
-      if (Empty && Edge && Edge->isUnconditional() &&
-          Edge->getSuccessor(0) == Loop->Follow) {
-        Emitted.insert(Arm);
-        return new (*AST) BreakStmt(SourceLocation());
-      }
+      if (Empty && Edge && Edge->isUnconditional())
+        if (Stmt *Transfer = activeLoopTransfer(Edge->getSuccessor(0))) {
+          Emitted.insert(Arm);
+          return Transfer;
+        }
     }
-    if (Outer && isLoopKind(Outer->Kind) && R.Follow == Outer->Follow) {
-      if (Arm == R.Follow)
-        return new (*AST) BreakStmt(SourceLocation());
-      if (Arm == Outer->Latch) {
-        bool Claimed = true;
-        for (Instruction &I : *Outer->Latch)
-          if (!I.isTerminator() && !isa<PHINode>(I) &&
-              !isa<DbgInfoIntrinsic>(I) && !ForClaimed.contains(&I)) {
-            Claimed = false;
-            break;
-          }
-        if (Claimed)
-          return new (*AST) ContinueStmt(SourceLocation());
-        return gotoTo(Arm);
-      }
-    }
+    if (Stmt *Transfer = activeLoopTransfer(Arm))
+      return Transfer;
     if (Arm == R.Follow || Mem.empty())
       return nullptr;
     SmallVector<Stmt *, 8> SS;
