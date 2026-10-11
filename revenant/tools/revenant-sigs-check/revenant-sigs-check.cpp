@@ -218,6 +218,7 @@ int main(int Argc, char **Argv) {
       return 1;
     }
     std::vector<LibraryMatch> Matches = matchLibraryFunctions(P, *DB);
+    extendLibraryMatchesByCalleeEvidence(P, *DB, Matches);
     applyLibraryMatches(P, Sigs, Matches, *DB);
   }
 

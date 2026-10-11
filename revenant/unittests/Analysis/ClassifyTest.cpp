@@ -12,6 +12,8 @@
 
 #include "llvm/Support/Error.h"
 
+#include <optional>
+
 using namespace llvm;
 using namespace revenant;
 
@@ -23,7 +25,11 @@ TEST(ClassifyTest, CallsIntoMatchedLibraryStayLibrary) {
   ASSERT_TRUE(!!S) << "cannot open " REVENANT_TEST_C_O2;
   auto C = (*S)->classifyFunctions(
       Lang::C, "C:/Users/User/RustroverProjects/rv-scratch/LunaLibMatch3/libdb.json");
-  ASSERT_TRUE(!!C) << toString(C.takeError());
+  if (!C) {
+    consumeError(C.takeError());
+    FAIL() << "classify failed";
+    return;
+  }
   ASSERT_TRUE(C->UserEntry);
   auto MallocBase = (*S)->functionByName("_malloc_base");
   if (!MallocBase)
@@ -35,6 +41,32 @@ TEST(ClassifyTest, CallsIntoMatchedLibraryStayLibrary) {
       << "_malloc_base lost its library mark";
   EXPECT_FALSE(C->UserReachable.count(*MallocBase))
       << "_malloc_base marked user";
+#else
+  GTEST_SKIP() << "REVENANT_TEST_C_O2 not defined";
+#endif
+}
+
+TEST(ClassifyTest, CalleeEvidenceKeepsKnownMatch) {
+#ifdef REVENANT_TEST_C_O2
+  // The evidence extension runs inside classify. It must keep known
+  // byte matches library and must not drop them from the library set.
+  auto S = Session::open(REVENANT_TEST_C_O2);
+  ASSERT_TRUE(!!S) << "cannot open " REVENANT_TEST_C_O2;
+  auto C = (*S)->classifyFunctions(
+      Lang::C, "C:/Users/User/RustroverProjects/rv-scratch/LunaLibMatch3/libdb.json");
+  if (!C) {
+    consumeError(C.takeError());
+    FAIL() << "classify failed";
+    return;
+  }
+  ASSERT_TRUE(C->UserEntry);
+  auto MallocBase = (*S)->functionByName("_malloc_base");
+  if (!MallocBase)
+    for (const auto &[At, Name] : C->LibraryNames)
+      if (Name == "_malloc_base")
+        MallocBase = At;
+  ASSERT_TRUE(MallocBase);
+  EXPECT_TRUE(C->LibraryStarts.count(*MallocBase));
 #else
   GTEST_SKIP() << "REVENANT_TEST_C_O2 not defined";
 #endif

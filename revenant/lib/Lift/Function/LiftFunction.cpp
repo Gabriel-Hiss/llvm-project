@@ -95,6 +95,23 @@ static llvm::BasicBlock *edgeBlock(LiftState &LS, const FuncRecord &F,
   return It == LS.Blocks.end() ? nullptr : It->second;
 }
 
+/// Traced index location for a switch dispatch block: the guard jcc's fused
+/// producer operand when provenance matches, else the recorded CmpOperand.
+/// The value holds at dispatch-block entry, before this block's own stores.
+static std::pair<CmpOperand, int64_t> switchLoc(const FuncRecord &F,
+                                                const BlockRec &BR) {
+  CmpOperand Loc;
+  int64_t Off = 0;
+  if (auto Meta = F.blockSwitchIndex(BR)) {
+    Loc = Meta->first;
+    Off = Meta->second;
+  } else {
+    Loc.Tag = CmpOperand::Kind::Reg;
+    Loc.Reg = (unsigned)llvm::X86::RAX;
+  }
+  return {Loc, Off};
+}
+
 static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
                                   const BlockRec &BR, const Instr &I,
                                   const Image &Img) {
@@ -213,20 +230,16 @@ static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
 /// the guard block end.
 static llvm::Error emitSwitch(LiftState &LS, const FuncRecord &F,
                               const BlockRec &BR, const Instr &Last,
-                              const Image &Img) {
+                              const Image &Img,
+                              llvm::Value *EntryBase = nullptr) {
   Va Start = BR.startVa(Img);
   llvm::BasicBlock *Cur = LS.Blocks.find(Start)->second;
-  auto Meta = F.blockSwitchIndex(BR);
-  CmpOperand Loc;
-  int64_t Off = 0;
-  if (Meta) {
-    Loc = Meta->first;
-    Off = Meta->second;
-  } else {
-    Loc.Tag = CmpOperand::Kind::Reg;
-    Loc.Reg = (unsigned)llvm::X86::RAX;
-  }
-  llvm::Value *Base = LS.evalCmpOperand(Loc, Start);
+  auto [Loc, Off] = switchLoc(F, BR);
+  // Prefer the index read at dispatch-block entry (stashed before the body
+  // lifted): later stores in this block, like Win64 arg shuffles, must not
+  // leak into the dispatch operand. Fall back to a read at the end.
+  llvm::Value *Base =
+      EntryBase ? EntryBase : LS.evalCmpOperand(Loc, Start);
   int64_t MinCase = 0;
   bool HaveMin = false;
   for (size_t E = BR.EdgesBegin; E < BR.EdgesEnd; ++E) {
@@ -381,11 +394,16 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     llvm::NamedMDNode *Types = M.getOrInsertNamedMetadata("rev.types");
     if (Types->getNumOperands() == 0) {
       for (const EmbeddedTypeMetadata &Type : P.EmbeddedTypes) {
+        // Row layout: name, decorated name, vftable (null when the class has
+        // none), base class names, then virtual function addresses.
         std::vector<llvm::Metadata *> Fields{
             llvm::MDString::get(M.getContext(), Type.Name),
-            llvm::MDString::get(M.getContext(), Type.DecoratedName),
-            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-                llvm::Type::getInt64Ty(M.getContext()), Type.VTable.Value))};
+            llvm::MDString::get(M.getContext(), Type.DecoratedName)};
+        if (Type.VTable.Value)
+          Fields.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt64Ty(M.getContext()), Type.VTable.Value)));
+        else
+          Fields.push_back(llvm::MDNode::get(M.getContext(), {}));
         for (const std::string &Base : Type.BaseClasses)
           Fields.push_back(llvm::MDString::get(M.getContext(), Base));
         for (Va Target : Type.VirtualFunctions)
@@ -555,6 +573,16 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
       attachVa(UI, Start.Value);
       continue;
     }
+    // Switch dispatch blocks: read the traced index now, at block entry.
+    // The block body can shuffle the index register afterwards (Win64 arg
+    // moves), and a read at the end would dispatch on the wrong value.
+    llvm::Value *SwitchEntry = nullptr;
+    if (Instrs[BR.InstrsEnd - 1].Flow == FlowKind::IndirectBranch &&
+        BR.SwitchIndex != UINT32_MAX) {
+      auto [SLoc, SOff] = switchLoc(F, BR);
+      (void)SOff;
+      SwitchEntry = LS.evalCmpOperand(SLoc, Start);
+    }
     for (size_t N = BR.InstrsBegin; N + 1 < BR.InstrsEnd; ++N) {
       const Instr &I = Instrs[N];
       if (llvm::Error E = LS.liftInstr(I)) {
@@ -585,7 +613,7 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
                Last.Flow == FlowKind::IndirectBranch) {
       if (Last.Flow == FlowKind::IndirectBranch &&
           BR.SwitchIndex != UINT32_MAX) {
-        if (llvm::Error E = emitSwitch(LS, F, BR, Last, *P.Img)) {
+        if (llvm::Error E = emitSwitch(LS, F, BR, Last, *P.Img, SwitchEntry)) {
           Fn->deleteBody();
           return std::move(E);
         }

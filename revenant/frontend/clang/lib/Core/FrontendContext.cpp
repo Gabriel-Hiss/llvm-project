@@ -112,14 +112,16 @@ FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
     return D;
   clang::QualType FT = Types.functionType(F);
   // Normalize main/wmain signature for MSVC/clang-cl compatibility.
+  // Keep the lifted arity (argc/argv, plus envp when recovered): only the
+  // spellings are normalized, so the decl always matches the definition.
   if (F.getName() == "main" || F.getName() == "wmain") {
     clang::ASTContext &A = AST;
     clang::QualType IntTy = A.IntTy;
     clang::QualType CharPtrTy = A.getPointerType(A.CharTy);
     clang::QualType CharPtrPtrTy = A.getPointerType(CharPtrTy);
-    llvm::SmallVector<clang::QualType, 2> Params;
-    Params.push_back(IntTy);
-    Params.push_back(CharPtrPtrTy);
+    llvm::SmallVector<clang::QualType, 4> Params;
+    for (size_t I = 0; I < F.arg_size(); ++I)
+      Params.push_back(I == 0 ? IntTy : CharPtrPtrTy);
     FT = A.getFunctionType(IntTy, Params, clang::FunctionProtoType::ExtProtoInfo());
   }
   auto *FD = clang::FunctionDecl::Create(

@@ -229,8 +229,9 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
     auto DBOrErr = LibraryDatabase::load(LibraryDBPath);
     if (!DBOrErr)
       return DBOrErr.takeError();
-    Result.HasLibraryDB = true;
-    for (const LibraryMatch &Match : matchLibraryFunctions(Prog, *DBOrErr)) {
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DBOrErr);
+    extendLibraryMatchesByCalleeEvidence(Prog, *DBOrErr, Matches);
+    for (const LibraryMatch &Match : Matches) {
       Result.LibraryStarts.insert(Match.Start);
       if (Match.FunctionIndex < DBOrErr->Functions.size())
         Result.LibraryNames[Match.Start] =
@@ -255,7 +256,8 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   }
   if (!Result.UserEntry && Out != Lang::Rust) {
     for (const auto &[At, Name] : Result.LibraryNames) {
-      if (Name != "invoke_main" &&
+      bool Wide = Name == "invoke_wmain";
+      if (Name != "invoke_main" && !Wide &&
           Name.find("__tmainCRTStartup") == std::string::npos)
         continue;
       auto Invoke = materialize(At);
@@ -268,6 +270,13 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
             Prog.Functions.count(I.Target) &&
             !Result.LibraryStarts.count(I.Target)) {
           Result.UserEntry = I.Target;
+          // The startup path tells narrow from wide: record the entry
+          // spelling so the C emitter's main normalization fires.
+          // mainCRTStartup/wmainCRTStartup disambiguate the same way.
+          if (Wide || Name.find("wmain") != std::string::npos)
+            Result.UserEntryName = "wmain";
+          else
+            Result.UserEntryName = "main";
           break;
         }
       if (Result.UserEntry)
@@ -468,13 +477,36 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   if (!Result.UserEntry)
     return Result;
 
+  // Compiler-runtime memory helpers: the CRT ships them (libvcruntime's
+  // memset.obj defines memset_repstos), so a recompile that also emits the
+  // lifted body collides with the runtime library at link time. User code
+  // reaches them through conditional branches into the helper (clang's
+  // inlined memset pattern), which the call guard below does not cover, so
+  // they are filtered by name at pop time and stay library-classified.
+  auto isRuntimeProvidedName = [](StringRef Name) {
+    return Name == "memset_repstos" || Name == "memset_repstos_amd";
+  };
+  auto isRuntimeProvided = [&](Va Start) {
+    if (isRuntimeProvidedName(functionName(Start, Prog.Functions.at(Start))))
+      return true;
+    auto Lib = Result.LibraryNames.find(Start);
+    return Lib != Result.LibraryNames.end() &&
+           isRuntimeProvidedName(Lib->second);
+  };
+
   std::queue<Va> UserPending;
   UserPending.push(*Result.UserEntry);
   while (!UserPending.empty()) {
     Va At = UserPending.front();
     UserPending.pop();
-    if (MinGWRuntimeHooks.count(At) ||
-        !Result.UserReachable.insert(At).second)
+    if (MinGWRuntimeHooks.count(At))
+      continue;
+    if (isRuntimeProvided(At)) {
+      Result.LibraryStarts.insert(At);
+      Result.LibraryNames.emplace(At, functionName(At, Prog.Functions.at(At)).str());
+      continue;
+    }
+    if (!Result.UserReachable.insert(At).second)
       continue;
     auto FOrErr = materialize(At);
     if (!FOrErr) {

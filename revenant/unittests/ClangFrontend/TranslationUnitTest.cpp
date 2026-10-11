@@ -53,6 +53,52 @@ TEST(TranslationUnitTest, EmitsPointerReturnFallbackWithPointerType) {
   EXPECT_NE(StringRef(OS.str()).find("return"), StringRef::npos);
 }
 
+// A recovered main keeps its lifted arity: the hosted spelling must not add
+// parameters the definition lacks (FunctionDecl::setParams asserts on that).
+TEST(TranslationUnitTest, MainKeepsLiftedArity) {
+  for (unsigned Arity : {0u, 1u, 2u}) {
+    LLVMContext Context;
+    Module M("main-arity", Context);
+    M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+    Type *I32 = Type::getInt32Ty(Context);
+    SmallVector<Type *, 2> Params(Arity, I32);
+    if (Arity == 2)
+      Params[1] = PointerType::get(Context, 0);
+    Function *F = Function::Create(FunctionType::get(I32, Params, false),
+                                   Function::ExternalLinkage, "main", M);
+    IRBuilder<> Builder(BasicBlock::Create(Context, "entry", F));
+    Builder.CreateRet(Arity ? static_cast<Value *>(F->getArg(0))
+                            : ConstantInt::get(I32, 7));
+
+    ClangFrontendOptions Options;
+    Options.Lang = "c";
+    auto TUOrErr = createASTContext(M, Options);
+    if (!TUOrErr) {
+      ADD_FAILURE() << toString(TUOrErr.takeError());
+      return;
+    }
+    std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+    std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+    std::unique_ptr<StmtBuilder> Stmts =
+        createStmtBuilder(TU->frontend(), *Types);
+    std::unique_ptr<ExprBuilder> Exprs =
+        createExprBuilder(TU->frontend(), *Types);
+    fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+    SmallString<256> Text;
+    raw_svector_ostream OS(Text);
+    printTranslationUnit(TU->tu(), OS, {});
+    StringRef Out = OS.str();
+    size_t At = Out.find("int main(");
+    ASSERT_NE(At, StringRef::npos) << Out;
+    StringRef Sig = Out.substr(At + 9);
+    Sig = Sig.take_until([](char C) { return C == ')'; });
+    unsigned Printed =
+        (Sig.empty() || Sig == "void") ? 0 : 1 + Sig.count(',');
+    EXPECT_EQ(Printed, Arity) << Out;
+  }
+}
+
 TEST(TranslationUnitTest, DeclaresCalleesBeforeWholeUnitDefinitions) {
   LLVMContext Context;
   Module M("forward-call", Context);

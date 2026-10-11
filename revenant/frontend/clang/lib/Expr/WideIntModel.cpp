@@ -115,21 +115,13 @@ clang::Expr *cStyleCast(ASTContext &A, QualType T, CastKind K, Expr *Op) {
 }
 
 clang::IntegerLiteral *intLiteral(ASTContext &A, uint64_t V, QualType T) {
-  return clang::IntegerLiteral::Create(A, llvm::APInt(64, V), T,
+  // The APInt width must match the type width exactly (Expr.cpp:968);
+  // callers pass u64 fields and 32-bit counts through this helper.
+  const unsigned W = (unsigned)A.getIntWidth(T);
+  return clang::IntegerLiteral::Create(A, llvm::APInt(W, V), T,
                                        SourceLocation());
 }
 
-/// `(Record){lo, hi}`, the only spelling that builds a wide value from
-/// parts in MSVC C mode.
-clang::Expr *compoundLiteral(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
-  llvm::SmallVector<Expr *, 2> Inits{Lo, Hi};
-  clang::InitListExpr *Init = new (A)
-      clang::InitListExpr(A, SourceLocation(), Inits, SourceLocation());
-  clang::TypeSourceInfo *TSI = A.getTrivialTypeSourceInfo(T);
-  return new (A) clang::CompoundLiteralExpr(
-      SourceLocation(), TSI, T, clang::VK_PRValue, Init,
-      /*fileScope=*/false);
-}
 
 /// Low half read as a member access: `.lo` on the value the frontend
 /// already built for the wide operand.
@@ -176,8 +168,10 @@ clang::Expr *wrapperCall(ASTContext &A, clang::FunctionDecl *FD, Expr *A0,
 }
 
 /// Build (once) the prototype for a wrapper named `Name` on record `Rec`.
+/// Shift wrappers take a narrow `unsigned` count, matching the preamble.
 clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
-                                  bool Binary, bool Predicate) {
+                                  bool Binary, bool Predicate,
+                                  bool ShiftCount = false) {
   QualType Param = Rec;
   llvm::SmallVector<QualType, 2> Params;
   if (Predicate) {
@@ -186,10 +180,10 @@ clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
   } else {
     Params.push_back(Param);
     if (Binary)
-      Params.push_back(Param);
+      Params.push_back(ShiftCount ? A.UnsignedIntTy : Param);
   }
-  QualType Ret = Predicate ? A.IntTy : Rec;
   clang::FunctionProtoType::ExtProtoInfo EPI;
+  QualType Ret = Predicate ? A.IntTy : Rec;
   clang::QualType FT = A.getFunctionType(Ret, Params, EPI);
   clang::IdentifierInfo &II = A.Idents.get(Name);
   clang::TranslationUnitDecl *TU = A.getTranslationUnitDecl();
@@ -199,6 +193,28 @@ clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
   FD->setImplicit(true);
   TU->addDecl(FD);
   return FD;
+}
+
+/// Build a wide value from two u64 halves. In C, the only spelling is a
+/// compound literal `(Record){lo, hi}`. In C++ (including MSVC C++), compound
+/// literals are not valid (C4576), so call a preamble wrapper instead.
+clang::Expr *makeWideValue(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
+  if (A.getLangOpts().CPlusPlus) {
+    const bool Signed = isSigned(T);
+    llvm::SmallString<64> Name(Signed ? "revenant_i128_s_make"
+                                     : "revenant_i128_u_make");
+    clang::FunctionDecl *FD =
+        wrapperProto(A, T, Name, /*Binary=*/true, /*Predicate=*/false);
+    return wrapperCall(A, FD, Lo, Hi);
+  }
+  // C path: compound literal.
+  llvm::SmallVector<Expr *, 2> Inits{Lo, Hi};
+  clang::InitListExpr *Init = new (A)
+      clang::InitListExpr(A, SourceLocation(), Inits, SourceLocation());
+  clang::TypeSourceInfo *TSI = A.getTrivialTypeSourceInfo(T);
+  return new (A) clang::CompoundLiteralExpr(
+      SourceLocation(), TSI, T, clang::VK_PRValue, Init,
+      /*fileScope=*/false);
 }
 
 } // namespace
@@ -259,15 +275,19 @@ clang::Expr *wideIntConvert(ASTContext &A, clang::QualType Dst, Expr *Op,
 
   // wide -> wide of the other signedness: copy the halves across.
   if (DstWide && SrcWide)
-    return compoundLiteral(A, Dst, lowHalf(A, Src, Op),
+    return makeWideValue(A, Dst, lowHalf(A, Src, Op),
                            clang::MemberExpr::CreateImplicit(
                                A, Op, false, halfField(A, Src, 1), Src,
                                clang::VK_LValue, clang::OK_Ordinary));
 
-  // wide -> narrow: the low half carries the truncated value.
+  // wide -> narrow: the low half carries the truncated value. Cast the
+  // u64 field to the destination width so the literal bit width matches
+  // the cast type (Expr.cpp:968 asserts exact width match).
   if (SrcWide) {
     Expr *Lo = lowHalf(A, Src, Op);
-    return cStyleCast(A, Dst, K, Lo);
+    if (Lo->getType() != Dst)
+      Lo = cStyleCast(A, Dst, K, Lo);
+    return Lo;
   }
 
   // narrow -> wide: the operand is the low half and the high half is the
@@ -275,7 +295,7 @@ clang::Expr *wideIntConvert(ASTContext &A, clang::QualType Dst, Expr *Op,
   Expr *Lo = srcUnsignedHalf(A, Op);
   Expr *Hi = isSigned(Dst) ? signFill(A, Op)
                            : intLiteral(A, 0, A.UnsignedLongLongTy);
-  return compoundLiteral(A, Dst, Lo, Hi);
+  return makeWideValue(A, Dst, Lo, Hi);
 }
 
 clang::Expr *wideIntLiteral(ASTContext &A, clang::QualType T,
@@ -284,11 +304,11 @@ clang::Expr *wideIntLiteral(ASTContext &A, clang::QualType T,
     return nullptr;
   if (V.isZero()) {
     Expr *Zero = intLiteral(A, 0, A.UnsignedLongLongTy);
-    return compoundLiteral(A, T, Zero, Zero);
+    return makeWideValue(A, T, Zero, Zero);
   }
   const uint64_t Lo = V.trunc(64).getZExtValue();
   const uint64_t Hi = V.lshr(64).trunc(64).getZExtValue();
-  return compoundLiteral(A, T, intLiteral(A, Lo, A.UnsignedLongLongTy),
+  return makeWideValue(A, T, intLiteral(A, Lo, A.UnsignedLongLongTy),
                          intLiteral(A, Hi, A.UnsignedLongLongTy));
 }
 
@@ -379,12 +399,22 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
       LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
     else if (!isWideIntRecord(RHS->getType()))
       RHS = wideIntConvert(A, ResTy, RHS, clang::CK_IntegralCast);
+  } else {
+    // Shift counts in the IR have the operand's width, so they arrive as a
+    // wide record (often a (record){n, 0} literal). The helper wants
+    // `unsigned`; the low half carries the count, and the helpers return
+    // zero when n >= 128, which covers any high-half contribution.
+    if (isWideIntRecord(RHS->getType()))
+      RHS = wideIntConvert(A, A.UnsignedIntTy, RHS, clang::CK_IntegralCast);
+    if (!isWideIntRecord(LHS->getType()))
+      LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
   }
   llvm::SmallString<64> Name(recordName(WideIntBits, Signed));
   Name += "_";
   Name += Suffix;
   clang::FunctionDecl *FD =
-      wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false);
+      wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
+                   /*ShiftCount=*/IsShift);
   return wrapperCall(A, FD, LHS, RHS);
 }
 
@@ -489,6 +519,10 @@ static int revenant_i128_u_cmplt(struct revenant_i128_u a, struct revenant_i128_
 static int revenant_i128_u_cmple(struct revenant_i128_u a, struct revenant_i128_u b) { return revenant_i128_u_cmpge(b, a) != 0; }
 static int revenant_i128_u_cmpeq(struct revenant_i128_u a, struct revenant_i128_u b) { return a.hi == b.hi && a.lo == b.lo; }
 static int revenant_i128_u_cmpne(struct revenant_i128_u a, struct revenant_i128_u b) { return !(a.hi == b.hi && a.lo == b.lo); }
+
+static struct revenant_i128_u revenant_i128_u_make(unsigned long long lo, unsigned long long hi) {
+  struct revenant_i128_u r; r.lo = lo; r.hi = hi; return r;
+}
 )CWRAP";
 
   static const char *Signed = R"CWRAP(
@@ -551,7 +585,7 @@ static struct revenant_i128_s revenant_i128_s_neg(struct revenant_i128_s a) {
 static struct revenant_i128_s revenant_i128_s_shr(struct revenant_i128_s a, unsigned n) {
   struct revenant_i128_s r;
   if (n == 0) return a;
-  if (n >= 128) { r.lo = 0; r.hi = a.hi < 0 ? -1 : 0; return r; }
+  if (n >= 128) { long long fill = a.hi < 0 ? -1 : 0; r.lo = fill; r.hi = fill; return r; }
   if (n >= 64) {
     unsigned k = n - 64;
     long long fill = a.hi < 0 ? -1 : 0;
@@ -617,6 +651,9 @@ static int revenant_i128_s_cmplt(struct revenant_i128_s a, struct revenant_i128_
 static int revenant_i128_s_cmple(struct revenant_i128_s a, struct revenant_i128_s b) { return revenant_i128_s_cmpge(b, a) != 0; }
 static int revenant_i128_s_cmpeq(struct revenant_i128_s a, struct revenant_i128_s b) { return a.hi == b.hi && a.lo == b.lo; }
 static int revenant_i128_s_cmpne(struct revenant_i128_s a, struct revenant_i128_s b) { return !(a.hi == b.hi && a.lo == b.lo); }
+static struct revenant_i128_s revenant_i128_s_make(long long lo, long long hi) {
+  struct revenant_i128_s r; r.lo = lo; r.hi = hi; return r;
+}
 )CWRAP";
 
   OS << "struct revenant_i128_u { unsigned long long lo, hi; };\n";

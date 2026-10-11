@@ -517,3 +517,152 @@ TEST(SignaturesTest, LookupUsesFunctionStart) {
   ASSERT_NE(S.of(Va(0x140001000)), nullptr);
   EXPECT_EQ(S.of(Va(0x140001001)), nullptr);
 }
+
+TEST(SignaturesTest, TailJumpSetupBackfillsUnreadPrefix) {
+  // The CRT hands argc/argv/envp to main through a tail jump. The setup
+  // prefix at the jump backfills parameters the body never reads.
+  constexpr uint64_t Base = 0x14000A000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x30;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  const uint8_t Code[] = {
+      0x4C, 0x8B, 0xC7, // jumper: mov r8, rdi
+      0x48, 0x8B, 0xD3, // mov rdx, rbx
+      0x8B, 0x08,       // mov ecx, dword ptr [rax]
+      0xE9, 0x13, 0x00, 0x00, 0x00, // jmp callee
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+      0xCC, 0xCC, 0xCC,
+      0x8B, 0xC1, // callee: mov eax, ecx (reads ecx only)
+      0xC3,       // ret
+  };
+  std::copy(std::begin(Code), std::end(Code), Text.Data.begin());
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va Jumper(Base), Callee(Base + 0x20);
+  P.Functions.emplace(Jumper, record(Jumper, 0, 0xD, {0, 3, 6, 8}));
+  P.Functions.emplace(Callee, record(Callee, 0x20, 3, {0x20, 0x22}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(Callee);
+  ASSERT_NE(Sig, nullptr);
+  // Body reads ecx (32 bits); the tail-jump prefix adds rdx and r8.
+  ASSERT_EQ(Sig->Params.size(), 3u);
+  EXPECT_EQ(Sig->Params[0].Bits, 32u);
+  EXPECT_EQ(Sig->Params[1].Bits, 64u);
+  EXPECT_EQ(Sig->Params[2].Bits, 64u);
+}
+
+TEST(SignaturesTest, ShortTailPrefixDoesNotVetoDirectPrefix) {
+  // A tail path that leaves registers unset must not veto a unanimous
+  // direct-call prefix: the tail path may simply ignore those registers.
+  constexpr uint64_t Base = 0x14000B000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x50;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // callee @ 0: mov eax, ecx; ret (reads ecx only)
+  Text.Data[0] = 0x8B;
+  Text.Data[1] = 0xC1;
+  Text.Data[2] = 0xC3;
+  // direct caller @ 0x20: mov edx, 5; mov ecx, 7; call callee; ret
+  Text.Data[0x20] = 0xBA;
+  Text.Data[0x21] = 0x05;
+  Text.Data[0x22] = 0x00;
+  Text.Data[0x23] = 0x00;
+  Text.Data[0x24] = 0x00;
+  Text.Data[0x25] = 0xB9;
+  Text.Data[0x26] = 0x07;
+  Text.Data[0x27] = 0x00;
+  Text.Data[0x28] = 0x00;
+  Text.Data[0x29] = 0x00;
+  Text.Data[0x2A] = 0xE8;
+  Text.Data[0x2B] = 0xD1;
+  Text.Data[0x2C] = 0xFF;
+  Text.Data[0x2D] = 0xFF;
+  Text.Data[0x2E] = 0xFF;
+  Text.Data[0x2F] = 0xC3;
+  // tail jumper @ 0x40: xor ecx, ecx; jmp callee
+  Text.Data[0x40] = 0x31;
+  Text.Data[0x41] = 0xC9;
+  Text.Data[0x42] = 0xE9;
+  Text.Data[0x43] = 0xB9;
+  Text.Data[0x44] = 0xFF;
+  Text.Data[0x45] = 0xFF;
+  Text.Data[0x46] = 0xFF;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va Callee(Base), Caller(Base + 0x20), Jumper(Base + 0x40);
+  P.Functions.emplace(Callee, record(Callee, 0, 3, {0, 2}));
+  P.Functions.emplace(Caller,
+                       record(Caller, 0x20, 0x10, {0x20, 0x25, 0x2A, 0x2F}));
+  P.Functions.emplace(Jumper, record(Jumper, 0x40, 7, {0x40, 0x42}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(Callee);
+  ASSERT_NE(Sig, nullptr);
+  // Direct callers unanimously set up two registers; the short tail
+  // prefix abstains instead of vetoing.
+  ASSERT_EQ(Sig->Params.size(), 2u);
+}
+
+TEST(SignaturesTest, OverwrittenXmm0ReadDoesNotInferFloatReturn) {
+  // A caller that clobbers xmm0 after the call, then reads the new value,
+  // must not attribute a float return: the read observes the overwrite.
+  constexpr uint64_t Base = 0x14000C000;
+  Program P;
+  P.Img = std::make_shared<Image>();
+  P.Img->Base = Va(Base);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Va(Base);
+  Text.Vsize = 0x30;
+  Text.Flags = SectionFlags::rx();
+  Text.Data.resize(Text.Vsize, 0xCC);
+  // callee @ 0: mov eax, ecx; ret (scalar int function, no xmm use)
+  Text.Data[0] = 0x8B;
+  Text.Data[1] = 0xC1;
+  Text.Data[2] = 0xC3;
+  // caller @ 0x20: call callee; xorps xmm0, xmm0; movaps xmm1, xmm0; ret
+  Text.Data[0x20] = 0xE8;
+  Text.Data[0x21] = 0xDB;
+  Text.Data[0x22] = 0xFF;
+  Text.Data[0x23] = 0xFF;
+  Text.Data[0x24] = 0xFF;
+  Text.Data[0x25] = 0x0F;
+  Text.Data[0x26] = 0x57;
+  Text.Data[0x27] = 0xC0;
+  Text.Data[0x28] = 0x0F;
+  Text.Data[0x29] = 0x28;
+  Text.Data[0x2A] = 0xC8;
+  Text.Data[0x2B] = 0xC3;
+  P.Img->Sections.push_back(std::move(Text));
+
+  Va Callee(Base), Caller(Base + 0x20);
+  P.Functions.emplace(Callee, record(Callee, 0, 3, {0, 2}));
+  P.Functions.emplace(Caller,
+                       record(Caller, 0x20, 0xC, {0x20, 0x25, 0x28, 0x2B}));
+  auto D = Disasm::create(*P.Img);
+  ASSERT_TRUE(static_cast<bool>(D));
+
+  Signatures S = analyzeSignatures(P, *D);
+  const Signature *Sig = S.of(Callee);
+  ASSERT_NE(Sig, nullptr);
+  ASSERT_TRUE(Sig->HasRet);
+  EXPECT_FALSE(Sig->Ret.Float);
+}
