@@ -585,7 +585,7 @@ static struct revenant_i128_s revenant_i128_s_neg(struct revenant_i128_s a) {
 static struct revenant_i128_s revenant_i128_s_shr(struct revenant_i128_s a, unsigned n) {
   struct revenant_i128_s r;
   if (n == 0) return a;
-  if (n >= 128) { r.lo = 0; r.hi = a.hi < 0 ? -1 : 0; return r; }
+  if (n >= 128) { long long fill = a.hi < 0 ? -1 : 0; r.lo = fill; r.hi = fill; return r; }
   if (n >= 64) {
     unsigned k = n - 64;
     long long fill = a.hi < 0 ? -1 : 0;
