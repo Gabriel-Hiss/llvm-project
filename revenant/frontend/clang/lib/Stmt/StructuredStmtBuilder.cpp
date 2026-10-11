@@ -184,6 +184,11 @@ private:
   /// Does the member list end in a statement that already transfers
   /// control (return/break/continue/goto)?
   static bool endsTerminal(ArrayRef<Stmt *> SS);
+  /// Instructions of BB whose value the already-emitted condition
+  /// expression reads by name. Emitting those again would run them
+  /// after the test, so callers skip exactly this set — not the whole
+  /// dataflow cone, most of which has no inline spelling in Cond.
+  SmallPtrSet<Instruction *, 8> condFeeds(Expr *Cond, BasicBlock *BB);
 
   FrontendContext &Ctx;
   TypeBuilder &Types;
@@ -1042,6 +1047,43 @@ void StructuredStmtBuilder::emitMembers(
 }
 
 
+/// Instructions of BB whose value the already-emitted condition
+/// expression reads by name. Emitting those again would run them after
+/// the test, so callers skip exactly this set — not the whole dataflow
+/// cone, most of which has no inline spelling in Cond.
+SmallPtrSet<Instruction *, 8>
+StructuredStmtBuilder::condFeeds(Expr *Cond, BasicBlock *BB) {
+  SmallPtrSet<Instruction *, 8> Feeds;
+  if (!Cond || !BB)
+    return Feeds;
+  // Names of locals bound to instructions of BB.
+  DenseMap<const IdentifierInfo *, Instruction *> ByName;
+  for (Instruction &I : *BB) {
+    if (auto *VD = dyn_cast_or_null<VarDecl>(Ctx.lookupDecl(&I)))
+      if (const IdentifierInfo *II = VD->getIdentifier())
+        ByName[II] = &I;
+  }
+  if (ByName.empty())
+    return Feeds;
+  // Walk the emitted expression for DeclRefExprs naming those locals.
+  SmallVector<Stmt *, 32> Work{Cond};
+  SmallPtrSet<const Stmt *, 32> Seen;
+  while (!Work.empty()) {
+    Stmt *S = Work.pop_back_val();
+    if (!S || !Seen.insert(S).second)
+      continue;
+    if (auto *DR = dyn_cast<DeclRefExpr>(S)) {
+      auto It = ByName.find(DR->getDecl()->getIdentifier());
+      if (It != ByName.end())
+        Feeds.insert(It->second);
+      continue;
+    }
+    for (Stmt *C : S->children())
+      Work.push_back(C);
+  }
+  return Feeds;
+}
+
 Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
   auto *BI = dyn_cast<BranchInst>(R.Header->getTerminator());
   if (!BI || !BI->isConditional()) {
@@ -1053,6 +1095,19 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
       BS.push_back(T);
     return CompoundStmt::Create(*AST, BS, FPOptionsOverride(),
                                 SourceLocation(), SourceLocation());
+  }
+  // An if-region header still carries straight-line work: the allocas and
+  // definitions the frontend's SsaOut pass put there (the entry block in
+  // particular), plus the temporaries the test itself names. The
+  // condition folds into the test through ExprBuilder, but a multi-use
+  // operand becomes a `v<N>` local whose assignment has to run before the
+  // test, so the whole block's leaf code goes above the if.
+  SmallVector<Stmt *, 8> HeaderWork;
+  for (Instruction &I : *R.Header) {
+    if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(&I))
+      continue;
+    if (Stmt *S = Exprs->instr(I, *Scope))
+      HeaderWork.push_back(S);
   }
   BasicBlock *TS = BI->getSuccessor(0), *FS = BI->getSuccessor(1);
   auto armMembers = [&](BasicBlock *Arm) {
