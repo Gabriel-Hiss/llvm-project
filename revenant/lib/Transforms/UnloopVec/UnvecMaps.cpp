@@ -354,6 +354,99 @@ static bool midLanesEqualMidVsDrain(BasicBlock *Mid, BasicBlock *Drain) {
 // drain. Region R covers the middle preheader, tier, and exit plus
 // any dispatch blocks between D and the preheader. Returns true with
 // C filled on a full structural match; no mutation.
+
+// The counted tail must sit behind the corpus remainder guard. The
+// tail-feed block G (the tail IV's non-latch predecessor) computes
+//   %left = sub <start>, <N>
+//   %c = icmp ugt %left, -T        (T >= the tail stride K)
+//   br i1 %c, label <not-tail>, label <tail>
+// where <start> is the tail-feed phi's outside-G incoming (the S
+// chain value the drain restarts from). On the middle-tier path the
+// drain ends exactly at N (middle bound N&~(K-1) plus the remainder
+// N&(K-1)), so %left is 0 and the guard always skips the tail: the
+// middle tier plus drain already covered [0, N). Without the guard
+// the tail enters at N and writes [N, N+K) before its latch exits,
+// and the fold (drain [0, rem) plus tail [rem, N)) would drop that
+// range. On the zero-restart path the guard skips iff N < T, and
+// the fold keeps the same instructions over the same inputs, so the
+// decision is unchanged there.
+static bool tailGuardOK(BasicBlock *Tail, BasicBlock *Drain, BasicBlock *S,
+                        ScalarLoopInfo &L, Function &F) {
+  Value *TailBound = loopBound(L);
+  if (!TailBound)
+    return false;
+  Value *NRoot = stripCountDerivation(TailBound, F);
+  uint64_t K = L.Step ? L.Step->getZExtValue() : 0;
+  // Single tail-feed block G holding the tail IV's start.
+  BasicBlock *G = nullptr;
+  Value *Feed = nullptr;
+  for (unsigned I = 0; I < L.IV->getNumIncomingValues(); ++I) {
+    if (L.IV->getIncomingBlock(I) == Tail)
+      continue;
+    if (G && L.IV->getIncomingBlock(I) != G)
+      return false;
+    G = L.IV->getIncomingBlock(I);
+    Feed = L.IV->getIncomingValue(I);
+  }
+  if (!G || G == Tail)
+    return false;
+  // The start value: the feed phi's S-chain incoming (the value the
+  // drain restarts from on the zero path); the drain end is the
+  // other incoming.
+  Value *Start = Feed;
+  if (auto *P = dyn_cast<PHINode>(Feed)) {
+    if (P->getParent() != G)
+      return false;
+    Value *FromS = nullptr;
+    for (unsigned I = 0; I < P->getNumIncomingValues(); ++I) {
+      if (P->getIncomingBlock(I) != S)
+        continue;
+      if (FromS)
+        return false; // ambiguous start
+      FromS = P->getIncomingValue(I);
+    }
+    if (!FromS)
+      return false;
+    Start = FromS;
+  }
+  auto *Br = dyn_cast<BranchInst>(G->getTerminator());
+  if (!Br || !Br->isConditional())
+    return false;
+  bool TailArm = false;
+  for (unsigned I = 0; I < 2; ++I)
+    if (Br->getSuccessor(I) == Tail)
+      TailArm = true;
+  if (!TailArm)
+    return false;
+  for (Instruction &I : *G) {
+    auto *Sub = dyn_cast<BinaryOperator>(&I);
+    if (!Sub || Sub->getOpcode() != Instruction::Sub)
+      continue;
+    if (Sub->getOperand(0) != Start && Sub->getOperand(0) != Feed)
+      continue;
+    if (stripCountDerivation(Sub->getOperand(1), F) != NRoot)
+      continue;
+    for (User *U : Sub->users()) {
+      auto *Cmp = dyn_cast<ICmpInst>(U);
+      if (!Cmp || Cmp->getParent() != G)
+        continue;
+      if (Cmp->getPredicate() != CmpInst::ICMP_UGT)
+        continue;
+      if (Cmp->getOperand(0) != Sub || Br->getCondition() != Cmp)
+        continue;
+      auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+      if (!C || !C->isNegative())
+        continue;
+      // -T with T >= K: the skip region covers every possible
+      // remainder, so the middle-tier path always skips.
+      if (C->getSExtValue() > -(int64_t)K)
+        continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
                               InnerCascade &C) {
   // S must route to exactly the drain and the tail entries.
@@ -475,6 +568,12 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
       if (!TripOK)
         continue;
     }
+    // The counted tail must sit behind the corpus remainder guard
+    // (see tailGuardOK). Without it the middle-tier path enters the
+    // tail at N and writes [N, N+K) before the latch exits, a range
+    // the folded graph never writes.
+    if (!tailGuardOK(TailBB, MaybeDrain, S, Tail, F))
+      continue;
     // Lane equivalence (board bug 25, shared TailCmp gate): every
     // middle lane must equal the drain's scalar. The +100-vs-+1
     // mismatch fails here and bails.
