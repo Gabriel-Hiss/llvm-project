@@ -864,5 +864,84 @@ TEST_F(ExprTest, WideShiftCountIsNarrowed) {
   EXPECT_TRUE(S.find(".lo") != std::string::npos) << S;
 }
 
+TEST_F(ExprTest, DirectCallCastsToDeclParams) {
+  // IR call-site types are often opaque (i8*); the callee declaration
+  // carries recovered struct* params. Args must cast to the declaration
+  // (C++ rejects implicit void* -> struct*).
+  llvm::FunctionType *FT = FunctionType::get(
+      Type::getInt32Ty(LLCtx), {Type::getInt8Ty(LLCtx)->getPointerTo()}, false);
+  llvm::Function *Callee =
+      Function::Create(FT, GlobalValue::ExternalLinkage, "taker", M.get());
+  clang::IdentifierInfo *Id = FCtx->ident("taker");
+  clang::QualType FQT = ACtx->getFunctionType(
+      ACtx->IntTy, {ACtx->UnsignedLongLongTy},
+      clang::FunctionProtoType::ExtProtoInfo());
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      *ACtx, ACtx->getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FQT, ACtx->getTrivialTypeSourceInfo(FQT),
+      clang::SC_Extern);
+  FCtx->bindDecl(Callee, FD);
+  llvm::Value *PtrArg =
+      B.CreateIntToPtr(H.A, Type::getInt8Ty(LLCtx)->getPointerTo(), "p");
+  llvm::Value *C = B.CreateCall(FT, Callee, {PtrArg}, "c");
+  std::string S = print(Exprs->value(C, Scope));
+  EXPECT_TRUE(S.find("unsigned long long") != std::string::npos) << S;
+}
+
+TEST_F(ExprTest, PtrCompareCastsToU64) {
+  // `icmp ugt ptr` with differently-typed struct* operands does not
+  // compile in C++ (C2446); the addresses compare as integers.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *S0 = llvm::StructType::create(LLCtx, "rv_s0");
+  llvm::Type *S1 = llvm::StructType::create(LLCtx, "rv_s1");
+  llvm::cast<llvm::StructType>(S0)->setBody(Type::getInt8Ty(LLCtx));
+  llvm::cast<llvm::StructType>(S1)->setBody(Type::getInt32Ty(LLCtx));
+  llvm::AllocaInst *A0 = B.CreateAlloca(S0, nullptr, "p0");
+  llvm::AllocaInst *A1 = B.CreateAlloca(S1, nullptr, "p1");
+  clang::VarDecl *V0 = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("p0"), ACtx->getPointerType(ACtx->UnsignedCharTy),
+      ACtx->getTrivialTypeSourceInfo(
+          ACtx->getPointerType(ACtx->UnsignedCharTy)),
+      clang::SC_None);
+  clang::VarDecl *V1 = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("p1"), ACtx->getPointerType(ACtx->UnsignedIntTy),
+      ACtx->getTrivialTypeSourceInfo(
+          ACtx->getPointerType(ACtx->UnsignedIntTy)),
+      clang::SC_None);
+  FCtx->bindDecl(A0, V0);
+  FCtx->bindDecl(A1, V1);
+  llvm::Value *C = B.CreateICmpUGT(A0, A1, "c");
+  std::string S = print(Exprs->value(C, Scope));
+  EXPECT_TRUE(S.find("unsigned long long") != std::string::npos) << S;
+}
+
+TEST_F(ExprTest, FastfailCallDeclaresPrototype) {
+  // __fastfail lowering must leave a TU-visible prototype behind, or
+  // every use is C3861.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT = FunctionType::get(
+      Type::getVoidTy(LLCtx), {Type::getInt32Ty(LLCtx)}, false);
+  llvm::Function *Trap =
+      Function::Create(FT, GlobalValue::ExternalLinkage, "llvm.x86.int",
+                       M.get());
+  llvm::Value *C = B.CreateCall(
+      FT, Trap, {llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0x29)});
+  clang::Expr *E = Exprs->value(C, Scope);
+  EXPECT_TRUE(print(E).find("__fastfail") != std::string::npos);
+  clang::IdentifierInfo *Id = FCtx->ident("__fastfail");
+  bool Found = false;
+  for (clang::NamedDecl *D : ACtx->getTranslationUnitDecl()->lookup(Id))
+    if (llvm::isa<clang::FunctionDecl>(D))
+      Found = true;
+  EXPECT_TRUE(Found);
+}
 
 } // namespace

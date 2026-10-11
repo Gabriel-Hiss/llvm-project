@@ -27,7 +27,42 @@
 
 namespace revenant::clangx {
 using namespace clang;
-using namespace llvm::dwarf;
+namespace {
+
+// Shared extern declaration for a runtime intrinsic the emitter calls
+// directly (__fastfail, __debugbreak): created once per translation unit
+// and reused, so the prototype printer emits exactly one declaration and
+// no call site references an undeclared identifier (C3861).
+clang::FunctionDecl *intrinsicDecl(clang::ASTContext &AST,
+                                   FrontendContext &Ctx, const char *Name,
+                                   clang::QualType FT) {
+  clang::IdentifierInfo *Id = Ctx.ident(Name);
+  for (clang::NamedDecl *D : AST.getTranslationUnitDecl()->lookup(Id))
+    if (auto *FD = llvm::dyn_cast<clang::FunctionDecl>(D))
+      if (FD->getType() == FT && !FD->doesThisDeclarationHaveABody())
+        return FD;
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      AST, AST.getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FT, AST.getTrivialTypeSourceInfo(FT),
+      clang::SC_Extern);
+  // The TU printer walks declared parameters alongside the function
+  // type; a bare decl with none overruns into garbage (AV in
+  // Type::getAs<ParenType> during Decl::print).
+  if (auto *FPT = FT->getAs<clang::FunctionProtoType>()) {
+    llvm::SmallVector<clang::ParmVarDecl *, 2> Params;
+    for (unsigned I = 0, N = FPT->getNumParams(); I != N; ++I) {
+      clang::QualType PT = FPT->getParamType(I);
+      Params.push_back(clang::ParmVarDecl::Create(
+          AST, FD, clang::SourceLocation(), clang::SourceLocation(), nullptr,
+          PT, AST.getTrivialTypeSourceInfo(PT), clang::SC_None, nullptr));
+    }
+    FD->setParams(Params);
+  }
+  AST.getTranslationUnitDecl()->addDecl(FD);
+  return FD;
+}
+
+} // namespace
 
 // ---- select / phi / extractvalue -------------------------------------------
 
@@ -212,54 +247,66 @@ Expr *ExprBuilderImpl::tryVirtualCall(llvm::CallInst &I, ExprScope &Scope) {
   return ensureTemp(&I, Scope, Call);
 }
 
-/// The callee's own prototype when `Callee` names a function directly.
-/// The printed declaration is the contract the compiler checks a call
-/// against; the IR call signature can be less specific (the lifter
-/// bitcasts calls to opaque byte-pointer signatures), so the cast for
-/// each argument comes from the declaration, not from the IR type.
-static const clang::FunctionProtoType *
-namedFunctionType(clang::Expr *Callee) {
-  clang::Expr *E = Callee;
-  while (auto *Cast = llvm::dyn_cast<clang::ImplicitCastExpr>(E))
-    E = Cast->getSubExpr();
-  auto *DRE = llvm::dyn_cast_or_null<clang::DeclRefExpr>(E);
-  if (!DRE)
-    return nullptr;
-  auto *FD = llvm::dyn_cast_or_null<clang::FunctionDecl>(DRE->getFoundDecl());
+
+Expr *ExprBuilderImpl::castCallArg(Expr *E, QualType Want) {
+  if (Want.isNull())
+    return E;
+  QualType Have = E->getType();
+  if (Have == Want)
+    return E;
+  if (Have->isArrayType() && Want->isPointerType())
+    return makeCStyleCast(Want, CK_BitCast, E);
+  if (Have->isPointerType() && Want->isPointerType())
+    return makeCStyleCast(Want, CK_BitCast, E);
+  if (Have->isPointerType() && Want->isIntegerType())
+    return makeCStyleCast(Want, CK_PointerToIntegral, E);
+  if (Have->isIntegerType() && Want->isPointerType())
+    return makeCStyleCast(Want, CK_IntegralToPointer, E);
+  if (Have->isIntegerType() && Want->isIntegerType())
+    return makeCStyleCast(Want, CK_IntegralCast, E);
+  if (Have->isFloatingType() && Want->isFloatingType())
+    return makeCStyleCast(Want, CK_FloatingCast, E);
+  return E;
+}
+
+// Prototype parameter types for a direct callee: the FunctionDecl behind
+// a DeclRef (through the function-to-pointer decay) carries recovered
+// struct* params while IR call-site types are often opaque void*.
+static void protoParamsOf(Expr *Callee,
+                          llvm::SmallVectorImpl<QualType> &Out) {
+  Expr *E = Callee;
+  if (auto *IC = llvm::dyn_cast<clang::ImplicitCastExpr>(E))
+    if (IC->getCastKind() == clang::CK_FunctionToPointerDecay)
+      E = IC->getSubExpr();
+  auto *DR = llvm::dyn_cast<clang::DeclRefExpr>(E);
+  if (!DR)
+    return;
+  auto *FD = llvm::dyn_cast<clang::FunctionDecl>(DR->getDecl());
   if (!FD)
-    return nullptr;
-  return FD->getType()->getAs<clang::FunctionProtoType>();
+    return;
+  // Parameter types come from the function type, not the ParmVarDecl
+  // array (test/shim decls may not populate it).
+  auto *FPT = FD->getType()->getAs<clang::FunctionProtoType>();
+  if (!FPT)
+    return;
+  for (unsigned I = 0, N = FPT->getNumParams(); I != N; ++I)
+    Out.push_back(FPT->getParamType(I));
 }
 
 Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
                                      Expr *Callee, QualType RetTy) {
   llvm::SmallVector<Expr *, 8> Args;
+  llvm::SmallVector<QualType, 8> Proto;
+  protoParamsOf(Callee, Proto);
   llvm::FunctionType *FTy = I.getFunctionType();
-  const clang::FunctionProtoType *DeclTy = namedFunctionType(Callee);
-  unsigned DeclParams = DeclTy ? DeclTy->getNumParams() : 0;
   for (unsigned A = 0; A < I.arg_size(); ++A) {
     Expr *E = value(I.getArgOperand(A), Scope);
     QualType Want;
-    if (A < FTy->getNumParams())
+    if (A < Proto.size())
+      Want = Proto[A];
+    else if (A < FTy->getNumParams())
       Want = Types.typeOf(FTy->getParamType(A), nullptr);
-    if (A < DeclParams)
-      Want = DeclTy->getParamType(A);
-    QualType Have = E->getType();
-    if (!Want.isNull() && Have != Want) {
-      if (Have->isArrayType() && Want->isPointerType())
-        E = makeCStyleCast(Want, CK_BitCast, E);
-      else if (Have->isPointerType() && Want->isPointerType())
-        E = makeCStyleCast(Want, CK_BitCast, E);
-      else if (Have->isPointerType() && Want->isIntegerType())
-        E = makeCStyleCast(Want, CK_PointerToIntegral, E);
-      else if (Have->isIntegerType() && Want->isPointerType())
-        E = makeCStyleCast(Want, CK_IntegralToPointer, E);
-      else if (Have->isIntegerType() && Want->isIntegerType())
-        E = makeCStyleCast(Want, CK_IntegralCast, E);
-      else if (Have->isFloatingType() && Want->isFloatingType())
-        E = makeCStyleCast(Want, CK_FloatingCast, E);
-    }
-    Args.push_back(E);
+    Args.push_back(castCallArg(E, Want));
   }
   clang::CallExpr *Call =
       CallExpr::Create(*AST, Callee, Args, RetTy, VK_PRValue,
@@ -293,14 +340,9 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
     if (N == "llvm.x86.int" && I.arg_size() == 1) {
       auto *Vector = llvm::dyn_cast<llvm::ConstantInt>(I.getArgOperand(0));
       if (Vector && Vector->getZExtValue() == 0x29) {
-        IdentifierInfo *Id = Ctx.ident("__fastfail");
-        QualType FT =
+        clang::QualType FT =
             AST->getFunctionType(AST->VoidTy, {AST->UnsignedIntTy}, {});
-        FunctionDecl *FD = FunctionDecl::Create(
-            *AST, AST->getTranslationUnitDecl(), SourceLocation(),
-            SourceLocation(), Id, FT, AST->getTrivialTypeSourceInfo(FT),
-            SC_Extern);
-        Expr *Ref = declRef(FD);
+        Expr *Ref = declRef(intrinsicDecl(*AST, Ctx, "__fastfail", FT));
         Expr *Arg = value(I.getArgOperand(0), Scope);
         if (Arg->getType() != AST->UnsignedIntTy)
           Arg = makeCStyleCast(AST->UnsignedIntTy, CK_IntegralCast, Arg);
@@ -312,13 +354,8 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
     }
     if (N == "llvm.trap") {
       // `__debugbreak()` in MSVC terms; call it so the output compiles.
-      IdentifierInfo *Id = Ctx.ident("__debugbreak");
-      QualType FT = AST->getFunctionType(AST->VoidTy, {}, {});
-      FunctionDecl *FD = FunctionDecl::Create(
-          *AST, AST->getTranslationUnitDecl(), SourceLocation(),
-          SourceLocation(), Id, FT, AST->getTrivialTypeSourceInfo(FT),
-          SC_Extern);
-      Expr *Ref = declRef(FD);
+      clang::QualType FT = AST->getFunctionType(AST->VoidTy, {}, {});
+      Expr *Ref = declRef(intrinsicDecl(*AST, Ctx, "__debugbreak", FT));
       clang::CallExpr *Call =
           CallExpr::Create(*AST, Ref, {}, AST->VoidTy, VK_PRValue,
                            SourceLocation(), FPOptionsOverride());

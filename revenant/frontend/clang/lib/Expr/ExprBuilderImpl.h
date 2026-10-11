@@ -138,6 +138,8 @@ private:
   clang::Expr *tryVirtualCall(llvm::CallInst &I, ExprScope &Scope);
   clang::Expr *buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
                              clang::Expr *Callee, clang::QualType RetTy);
+  // Cast one call argument to the callee prototype's parameter type.
+  clang::Expr *castCallArg(clang::Expr *E, clang::QualType Want);
   const llvm::DICompositeType *compositeBehindPointer(const llvm::DIType *DI);
   clang::FieldDecl *fieldAtOffset(clang::RecordDecl *Rec, uint64_t BitOff);
 };

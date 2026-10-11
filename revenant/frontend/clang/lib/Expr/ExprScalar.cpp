@@ -294,6 +294,20 @@ Expr *ExprBuilderImpl::buildCmp(llvm::CmpInst &I, ExprScope &Scope) {
   Prec P = Prec::Eq;
   bool NonAssocRight = true;
   bool Signed = isSignedIntValue(I.getOperand(0));
+  // The lifter can leave `icmp <pred> ptr` (invalid LLVM IR); printing two
+  // struct* operands of different types does not compile in C++ (C2446).
+  // Compare the addresses as integers instead.
+  if (llvm::isa<llvm::ICmpInst>(&I) &&
+      (I.getOperand(0)->getType()->isPointerTy() ||
+       I.getOperand(1)->getType()->isPointerTy()) &&
+      L->getType() != R->getType()) {
+    bool Unsigned =
+        !llvm::cast<llvm::ICmpInst>(&I)->isSigned();
+    clang::QualType IntTy =
+        Unsigned ? AST->UnsignedLongLongTy : AST->LongLongTy;
+    L = makeCStyleCast(IntTy, clang::CK_PointerToIntegral, L);
+    R = makeCStyleCast(IntTy, clang::CK_PointerToIntegral, R);
+  }
   if (auto *IC = llvm::dyn_cast<llvm::ICmpInst>(&I)) {
     switch (IC->getPredicate()) {
     case llvm::CmpInst::ICMP_EQ:
