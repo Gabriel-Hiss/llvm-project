@@ -116,6 +116,15 @@ filecheck = _tool("FileCheck", ("RV_FILECHECK", "FILECHECK"))
 revenant_opt = _tool("revenant-opt", ("REVENANT_OPT", "RV_REVENANT_OPT"))
 revenant_decompile = _tool("revenant-decompile", ("REVENANT_DECOMPILE",))
 revenant_clang = _tool("revenant-clang", ("REVENANT_CLANG",))
+revenant_detect = _tool("revenant-detect", ("REVENANT_DETECT",))
+
+# Parity corpus for the tests that need a real PE (producer detection).
+# Opt-in: set REVENANT_CORPUS to the corpus root; tests requiring it are
+# skipped (REQUIRES) when it is unset or absent.
+corpus = _first_env("REVENANT_CORPUS", "RV_CORPUS")
+if corpus and os.path.isdir(corpus):
+    config.substitutions.append(("%revenant-corpus", corpus.replace("\\", "/")))
+    config.available_features.add("revenant-corpus")
 
 # rv-structure-tool ships with the Structure slice build.
 rv_tool_dir = _first_env("RV_STRUCTURE_TOOL_DIR")
@@ -143,6 +152,10 @@ if revenant_opt:
 if revenant_decompile:
     config.substitutions.append(("%revenant-decompile", revenant_decompile))
     config.substitutions.append(("%{revenant-decompile}", revenant_decompile))
+if revenant_detect:
+    config.substitutions.append(("%revenant-detect", revenant_detect))
+    config.substitutions.append(("%{revenant-detect}", revenant_detect))
+    config.available_features.add("revenant-detect")
 if revenant_clang:
     config.substitutions.append(("%revenant-clang", revenant_clang))
     config.substitutions.append(("%{revenant-clang}", revenant_clang))

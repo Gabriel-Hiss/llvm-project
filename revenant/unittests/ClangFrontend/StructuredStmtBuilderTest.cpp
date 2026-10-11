@@ -12,6 +12,7 @@
 #include "revenant/Clang/ExprBuilder.h"
 #include "revenant/Clang/StmtBuilder.h"
 #include "revenant/Clang/TypeBuilder.h"
+#include "revenant/IR/Contract.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -570,6 +571,96 @@ TEST(StructuredStmtBuilderTest, SehTryExcept) {
   EXPECT_NE(S.find("__except"), std::string::npos);
   EXPECT_NE(S.find("__except (1)"), std::string::npos);
 }
+TEST(StructuredStmtBuilderTest, SehSuppressedOnGnuTriple) {
+  // Board line 347: MinGW CRT startup lifts to __C_specific_handler
+  // catchpads, but the module is C on an x86_64-w64-windows-gnu triple, so
+  // the emitter must spell neither __try/__except (MSVC extension, gcc
+  // rejects it) nor try/catch (C++). It keeps the protected body.
+  LLVMContext &C = ctx();
+  llvm::Module M("t_seh_gnu", C);
+  M.setTargetTriple(Triple("x86_64-w64-windows-gnu"));
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  auto *Ptr = llvm::PointerType::getUnqual(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "may_throw_seh", M);
+  llvm::Function *Pers = llvm::Function::Create(
+      llvm::FunctionType::get(I32, true), llvm::GlobalValue::ExternalLinkage,
+      "__C_specific_handler", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_seh_gnu", M);
+  F->setPersonalityFn(Pers);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_9000", F);
+  llvm::BasicBlock *Normal = BasicBlock::Create(C, "bb_9010", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_9020", F);
+  llvm::BasicBlock *Except = BasicBlock::Create(C, "bb_9030", F);
+  llvm::BasicBlock *Ret = BasicBlock::Create(C, "bb_9040", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateInvoke(Callee->getFunctionType(), Callee, Normal, Dispatch, {});
+  B.SetInsertPoint(Normal);
+  B.CreateBr(Ret);
+  B.SetInsertPoint(Dispatch);
+  auto *SW = B.CreateCatchSwitch(llvm::ConstantTokenNone::get(C), nullptr, 1);
+  SW->addHandler(Except);
+  B.SetInsertPoint(Except);
+  llvm::Value *NullPtr = llvm::ConstantPointerNull::get(Ptr);
+  auto *Pad = B.CreateCatchPad(SW, {NullPtr});
+  B.CreateCatchRet(Pad, Ret);
+  B.SetInsertPoint(Ret);
+  B.CreateRet(llvm::ConstantInt::get(I32, 0));
+  std::string S = printFunction(M, *F);
+  EXPECT_EQ(S.find("__try"), std::string::npos);
+  EXPECT_EQ(S.find("__except"), std::string::npos);
+  EXPECT_EQ(S.find("try"), std::string::npos);
+  EXPECT_EQ(S.find("catch"), std::string::npos);
+  EXPECT_NE(S.find("may_throw_seh()"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, SehTryCatchKeptOnGnuCppTriple) {
+  // Same SEH shape on a gnu triple, but the module is C++ (cpp-gcc-*
+  // targets): g++ accepts try/catch, so the handler is still spelled.
+  LLVMContext &C = ctx();
+  llvm::Module M("t_seh_gnu_cpp", C);
+  M.setTargetTriple(Triple("x86_64-w64-windows-gnu"));
+  revenant::ir::setModuleLang(M, revenant::ir::Lang::CPP);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  auto *Ptr = llvm::PointerType::getUnqual(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "may_throw_seh", M);
+  llvm::Function *Pers = llvm::Function::Create(
+      llvm::FunctionType::get(I32, true), llvm::GlobalValue::ExternalLinkage,
+      "__C_specific_handler", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_seh_gnu_cpp", M);
+  F->setPersonalityFn(Pers);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_9100", F);
+  llvm::BasicBlock *Normal = BasicBlock::Create(C, "bb_9110", F);
+  llvm::BasicBlock *Dispatch = BasicBlock::Create(C, "bb_9120", F);
+  llvm::BasicBlock *Except = BasicBlock::Create(C, "bb_9130", F);
+  llvm::BasicBlock *Ret = BasicBlock::Create(C, "bb_9140", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateInvoke(Callee->getFunctionType(), Callee, Normal, Dispatch, {});
+  B.SetInsertPoint(Normal);
+  B.CreateBr(Ret);
+  B.SetInsertPoint(Dispatch);
+  auto *SW = B.CreateCatchSwitch(llvm::ConstantTokenNone::get(C), nullptr, 1);
+  SW->addHandler(Except);
+  B.SetInsertPoint(Except);
+  llvm::Value *NullPtr = llvm::ConstantPointerNull::get(Ptr);
+  auto *Pad = B.CreateCatchPad(SW, {NullPtr});
+  B.CreateCatchRet(Pad, Ret);
+  B.SetInsertPoint(Ret);
+  B.CreateRet(llvm::ConstantInt::get(I32, 0));
+  std::string S = printFunction(M, *F);
+  EXPECT_EQ(S.find("__try"), std::string::npos);
+  EXPECT_EQ(S.find("__except"), std::string::npos);
+  EXPECT_NE(S.find("try {"), std::string::npos);
+  EXPECT_NE(S.find("catch ("), std::string::npos);
+}
+
 TEST(StructuredStmtBuilderTest, SehTryFinally) {
   LLVMContext &C = ctx();
   llvm::Module M("t_seh_finally", C);

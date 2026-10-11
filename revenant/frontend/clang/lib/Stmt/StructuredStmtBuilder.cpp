@@ -1703,6 +1703,8 @@ VarDecl *StructuredStmtBuilder::catchVariable(MDNode *TypeMD) {
 ///   the filter expression stays opaque (constant 1).
 /// - Cleanup-only (cleanuppad/cleanupret, landingpad cleanup): one
 ///   catch-all handler spelling the unwind-only semantics.
+/// An SEH shape in a C module on a non-MSVC triple emits the protected body
+/// alone (see the gate below): neither __try nor try/catch is valid C there.
 Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
   auto *II = dyn_cast<InvokeInst>(BB->getTerminator());
   if (!II)
@@ -1741,13 +1743,14 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
   // Personality decides the spelling: __C_specific_handler -> SEH.
   // For non-MSVC targets (gcc/MinGW), never emit SEH.
   bool IsSEH = false;
+  bool IsSehShape = false;
   if (Fn && Fn->hasPersonalityFn()) {
     llvm::StringRef Triple = Fn->getParent()->getTargetTriple().str();
-    if (Triple.contains("msvc")) {
-      if (const auto *GV = dyn_cast<GlobalValue>(
-              Fn->getPersonalityFn()->stripPointerCasts()))
-        IsSEH = GV->getName() == "__C_specific_handler";
-    }
+    if (const auto *GV = dyn_cast<GlobalValue>(
+            Fn->getPersonalityFn()->stripPointerCasts()))
+      IsSehShape = GV->getName() == "__C_specific_handler";
+    if (Triple.contains("msvc") && IsSehShape)
+      IsSEH = true;
   }
 
   // A decoded try-table entry can protect several invoke sites. Gather the
@@ -1791,6 +1794,16 @@ Stmt *StructuredStmtBuilder::tryTry(BasicBlock *BB) {
         for (BasicBlock *H : ProtectedSwitch->handlers())
           EHClaimed.insert(H);
   }
+
+  // A C translation unit has no spelling for an SEH handler off an MSVC
+  // target: `__try/__except` is an MSVC extension and try/catch is C++.
+  // MinGW gcc images unwind through __C_specific_handler as well, so their
+  // CRT startup reaches this shape on a gnu triple. Keep the protected
+  // body: the handler only runs on the exceptional path, so the normal
+  // path stays exact and the TU stays compilable.
+  if (IsSehShape && !IsSEH && !Ctx.isCPlusPlus())
+    return CompoundStmt::Create(*AST, TryBody, FPOptionsOverride(),
+                                SourceLocation(), SourceLocation());
 
   if (IsSEH && CP && CP->getMetadata("revenant.finally")) {
     SmallVector<Stmt *, 4> FinallyBody;
