@@ -99,4 +99,33 @@ TEST(ClassifyTest, DetectRecognizesStrippedStaticMinGW) {
 #endif
 }
 
+// clang-cl inlines a memset and jumps into the CRT helper for the rep-stos
+// path, so a conditional branch (not a call) reaches memset_repstos. The
+// runtime library defines that symbol: a user marking makes the emission
+// collide with it at link time.
+TEST(ClassifyTest, BranchIntoRuntimeHelperStaysLibrary) {
+#ifdef REVENANT_TEST_C_CLANG_O2AVX
+  auto S = Session::open(REVENANT_TEST_C_CLANG_O2AVX);
+  ASSERT_TRUE(!!S) << "cannot open " REVENANT_TEST_C_CLANG_O2AVX;
+  auto C = (*S)->classifyFunctions(
+      Lang::C, "C:/Users/User/RustroverProjects/rv-scratch/LunaLibMatch3/libdb.json");
+  ASSERT_TRUE(!!C) << toString(C.takeError());
+  ASSERT_TRUE(C->UserEntry);
+  auto Repstos = (*S)->functionByName("memset_repstos");
+  if (!Repstos)
+    for (const auto &[At, Name] : C->LibraryNames)
+      if (Name == "memset_repstos")
+        Repstos = At;
+  ASSERT_TRUE(Repstos) << "memset_repstos not found by name";
+  EXPECT_TRUE(C->LibraryStarts.count(*Repstos))
+      << "memset_repstos lost its library mark";
+  EXPECT_FALSE(C->UserReachable.count(*Repstos))
+      << "memset_repstos marked user (branch target pulled it in)";
+  EXPECT_EQ(C->LibraryNames.count(*Repstos), 1u)
+      << "memset_repstos has no library name for the emitter";
+#else
+  GTEST_SKIP() << "REVENANT_TEST_C_CLANG_O2AVX not defined";
+#endif
+}
+
 } // namespace
