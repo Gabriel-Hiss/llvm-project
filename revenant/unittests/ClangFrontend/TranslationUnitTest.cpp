@@ -424,3 +424,117 @@ TEST(TranslationUnitTest, FallsBackWhenRecoveredArrayStrideConflicts) {
   EXPECT_EQ(Recovered->getSize().getZExtValue(), 4u);
   EXPECT_EQ(TU->frontend().ast().getTypeSize(Recovered->getElementType()), 32u);
 }
+
+TEST(TranslationUnitTest, UserBodiesOnlySkipsLibraryDefinitions) {
+  LLVMContext Context;
+  Module M("user-filter", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Type *I32 = Type::getInt32Ty(Context);
+  FunctionType *FnTy = FunctionType::get(I32, false);
+  Function *User = Function::Create(FnTy, Function::ExternalLinkage,
+                                    "user_body", M);
+  BasicBlock *UserEntry = BasicBlock::Create(Context, "entry", User);
+  IRBuilder<> Builder(UserEntry);
+  Builder.CreateRet(ConstantInt::get(I32, 1));
+  Function *Lib = Function::Create(FnTy, Function::ExternalLinkage,
+                                   "lib_body", M);
+  BasicBlock *LibEntry = BasicBlock::Create(Context, "entry", Lib);
+  Builder.SetInsertPoint(LibEntry);
+  Builder.CreateRet(ConstantInt::get(I32, 2));
+  User->addFnAttr("revenant.user", "true");
+  Lib->addFnAttr("revenant.lib", "lib_body");
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs,
+                      /*UserBodiesOnly=*/true);
+
+  SmallString<512> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  StringRef Source = OS.str();
+  // The user body is emitted; the library body becomes a declaration.
+  EXPECT_NE(Source.find("user_body"), StringRef::npos);
+  EXPECT_NE(Source.find("return 1"), StringRef::npos);
+  EXPECT_NE(Source.find("lib_body"), StringRef::npos);
+  EXPECT_EQ(Source.find("return 2"), StringRef::npos);
+}
+
+TEST(TranslationUnitTest, LibraryDeclarationUsesCrtHeaderPrototype) {
+  LLVMContext Context;
+  Module M("crt-shape", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Function *Cookie =
+      Function::Create(FunctionType::get(Type::getInt64Ty(Context), false),
+                       Function::ExternalLinkage, "__security_init_cookie", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", Cookie);
+  IRBuilder<> Builder(Entry);
+  Builder.CreateRet(ConstantInt::get(Type::getInt64Ty(Context), 0));
+  Cookie->addFnAttr("revenant.lib", "__security_init_cookie");
+
+  // The header prototype is the truth for this name; the lifted i64 return
+  // would redefine vcruntime.h's void function (MSVC C2371/C2556).
+  auto Proto = crtPrototypeFor("__security_init_cookie", Context);
+  ASSERT_TRUE(Proto.has_value());
+  EXPECT_TRUE(Proto->Ret->isVoidTy());
+  EXPECT_EQ(Proto->Params.size(), 0u);
+  EXPECT_FALSE(crtPrototypeFor("user_body", Context).has_value());
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  ASSERT_TRUE(!!TUOrErr) << toString(TUOrErr.takeError());
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs,
+                      /*UserBodiesOnly=*/true);
+
+  SmallString<512> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  StringRef Source = OS.str();
+  EXPECT_NE(Source.find("void __security_init_cookie(void)"),
+            StringRef::npos);
+  EXPECT_EQ(Source.find("__int64 __security_init_cookie"),
+            StringRef::npos);
+}
+
+TEST(TranslationUnitTest, FullEmitKeepsLibraryBodies) {
+  LLVMContext Context;
+  Module M("full-emit", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Type *I32 = Type::getInt32Ty(Context);
+  Function *Lib = Function::Create(FunctionType::get(I32, false),
+                                   Function::ExternalLinkage, "lib_body", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", Lib);
+  IRBuilder<> Builder(Entry);
+  Builder.CreateRet(ConstantInt::get(I32, 2));
+  Lib->addFnAttr("revenant.lib", "lib_body");
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  ASSERT_TRUE(!!TUOrErr) << toString(TUOrErr.takeError());
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs,
+                      /*UserBodiesOnly=*/false);
+
+  SmallString<512> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  EXPECT_NE(StringRef(OS.str()).find("return 2"), StringRef::npos);
+}

@@ -733,9 +733,10 @@ struct EmitResult {
 /// Contract IR -> C/C++ through the Clang frontend: Core builds the
 /// TranslationUnit and prints it with `printTranslationUnit`. The frontend
 /// does not attribute output lines to VAs, so `LineVas` stays empty.
-Expected<EmitResult> emitClangSource(Module &M, bool Cpp) {
+Expected<EmitResult> emitClangSource(Module &M, bool Cpp, bool UserBodiesOnly) {
   clangx::ClangFrontendOptions Opts;
   Opts.Lang = Cpp ? "cpp" : "c";
+  Opts.UserBodiesOnly = UserBodiesOnly;
   auto TOrErr = clangx::createASTContext(M, Opts);
   if (!TOrErr)
     return TOrErr.takeError();
@@ -743,7 +744,8 @@ Expected<EmitResult> emitClangSource(Module &M, bool Cpp) {
   auto Types = clangx::createTypeBuilder(T->frontend());
   auto Stmts = clangx::createStmtBuilder(T->frontend(), *Types);
   auto Exprs = clangx::createExprBuilder(T->frontend(), *Types);
-  clangx::fillTranslationUnit(*T, M, *Types, *Stmts, *Exprs);
+  clangx::fillTranslationUnit(*T, M, *Types, *Stmts, *Exprs,
+                              Opts.UserBodiesOnly);
   EmitResult R;
   raw_string_ostream OS(R.Text);
   SmallVector<StringRef, 4> Inc = {"stdint.h", "stddef.h", "stdbool.h"};
@@ -2397,7 +2399,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                "module");
       Expected<EmitResult> Em = Out == Lang::Rust
                                     ? emitRustcSource(FinalText)
-                                    : emitClangSource(*M, Out == Lang::Cpp);
+                                    : emitClangSource(*M, Out == Lang::Cpp,
+                                                      Opts.UserBodiesOnly);
       if (!Em)
         return Em.takeError();
       record(R.Stages, "source", "ok",

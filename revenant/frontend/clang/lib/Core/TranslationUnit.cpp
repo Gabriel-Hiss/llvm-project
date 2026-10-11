@@ -215,12 +215,99 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
 }
 
 
-static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
-                          TypeBuilder &Types, StmtBuilder &Stmts,
-                          ExprBuilder &Exprs) {
+namespace {
+/// Prototype shape for a CRT/SDK function name, spelled with the one-letter
+/// types `crtPrim` maps to Clang types.
+struct CrtShape {
+  llvm::StringRef Name;
+  char Ret;
+  llvm::StringRef Params;
+};
+
+/// One entry per CRT/SDK function name the headers this translation unit
+/// already includes declare (MSVC `<stdint.h>` reaches vcruntime.h and
+/// corecrt.h). `V` void, `I` int, `U` unsigned long long. Each shape is
+/// checked against those headers: declaring the lifted guess instead
+/// redefines the header's function and the recompile dies on C2371/C2556.
+const CrtShape CrtShapes[] = {
+    {"_invalid_parameter_noinfo", 'V', ""},
+    {"__security_init_cookie", 'V', ""},
+    {"_purecall", 'I', ""},
+    {"__security_check_cookie", 'V', "U"},
+    {"__report_gsfailure", 'V', ""},
+    {"_amsg_exit", 'V', "I"},
+};
+
+
+llvm::Type *crtPrim(llvm::LLVMContext &Ctx, char Kind) {
+  switch (Kind) {
+  case 'V':
+    return llvm::Type::getVoidTy(Ctx);
+  case 'I':
+    return llvm::Type::getInt32Ty(Ctx);
+  case 'U':
+    return llvm::Type::getInt64Ty(Ctx);
+  }
+  return llvm::Type::getVoidTy(Ctx);
+}
+} // namespace
+
+std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name,
+                                            llvm::LLVMContext &Ctx) {
+  for (const CrtShape &Shape : CrtShapes) {
+    if (Name != Shape.Name)
+      continue;
+    CrtPrototype Proto;
+    Proto.Ret = crtPrim(Ctx, Shape.Ret);
+    for (char Kind : Shape.Params)
+      Proto.Params.push_back(crtPrim(Ctx, Kind));
+    return Proto;
+  }
+  return std::nullopt;
+}
+
+/// Declaration for a library function whose name a CRT/SDK header already
+/// declares, carrying the header's prototype instead of the lifted guess.
+/// Nullptr when no override applies and the caller uses the lifted type.
+static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
+                                               FrontendContext &FCtx,
+                                               TypeBuilder &Types) {
+  if (!F.hasFnAttribute("revenant.lib"))
+    return nullptr;
+  std::optional<CrtPrototype> Proto = crtPrototypeFor(F.getName(),
+                                                      F.getContext());
+  if (!Proto || Proto->Params.size() != F.arg_size())
+    return nullptr;
   c::ASTContext &AST = FCtx.ast();
-  c::FunctionDecl *FD = FCtx.functionDecl(F, Types);
-  // Declarations still need ParmVarDecls for Clang's printer, but have no body.
+  SmallVector<c::QualType, 4> ParamTypes;
+  for (llvm::Type *T : Proto->Params)
+    ParamTypes.push_back(Types.typeOf(T, nullptr));
+  c::QualType FT = AST.getFunctionType(Types.typeOf(Proto->Ret, nullptr),
+                                       ParamTypes,
+                                       c::FunctionProtoType::ExtProtoInfo());
+  auto *FD = c::FunctionDecl::Create(
+      AST, AST.getTranslationUnitDecl(), c::SourceLocation(),
+      c::SourceLocation(), c::DeclarationName(FCtx.ident(F.getName())), FT,
+      nullptr, c::SC_Extern);
+  AST.getTranslationUnitDecl()->addDecl(FD);
+  FCtx.bindDecl(&F, FD);
+  return FD;
+}
+
+/// The FunctionDecl for `F` plus its ParmVarDecls: the declaration half of
+/// `buildFunction`, which every caller needs (bodies included).
+static c::FunctionDecl *declareFunction(llvm::Function &F,
+                                        FrontendContext &FCtx,
+                                        TypeBuilder &Types) {
+  c::ASTContext &AST = FCtx.ast();
+  c::FunctionDecl *FD = headerPrototypeDeclFor(F, FCtx, Types);
+  if (!FD) {
+    FD = FCtx.functionDecl(F, Types);
+    // A library body reads from the real CRT/SDK at link time, so its
+    // declaration says so instead of leaving the linker to guess.
+    if (F.hasFnAttribute("revenant.lib") && FD->getStorageClass() == c::SC_None)
+      FD->setStorageClass(c::SC_Extern);
+  }
 
   // Parameters: DI arg names when present, else a1..aN.
   DenseMap<unsigned, const llvm::DILocalVariable *> PV;
@@ -262,6 +349,14 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
     }
   }
   FD->setParams(Params);
+  return FD;
+}
+
+static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
+                          TypeBuilder &Types, StmtBuilder &Stmts,
+                          ExprBuilder &Exprs) {
+  c::ASTContext &AST = FCtx.ast();
+  c::FunctionDecl *FD = declareFunction(F, FCtx, Types);
 
   if (F.isDeclaration())
     return;
@@ -323,10 +418,18 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
 
 void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
                          TypeBuilder &Types, StmtBuilder &Stmts,
-                         ExprBuilder &Exprs) {
+                         ExprBuilder &Exprs, bool UserBodiesOnly) {
   buildGlobals(M, *T.FCtx, Types);
-  for (llvm::Function &F : M)
-    buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
+  for (llvm::Function &F : M) {
+    // A library body is code the real CRT/SDK ships: emitting ours as well
+    // redefines the header's function (MSVC C2371/C2556) and duplicates the
+    // definition at link. The declaration stays so calls still resolve, and
+    // its prototype follows the header when one declares the name.
+    if (UserBodiesOnly && F.hasFnAttribute("revenant.lib"))
+      declareFunction(F, *T.FCtx, Types);
+    else
+      buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
+  }
 }
 
 

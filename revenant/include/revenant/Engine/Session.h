@@ -85,6 +85,11 @@ struct DecompileOpts {
   bool Patterns = false;
   /// Optional static-library database used to recover function names/types.
   std::string LibraryDBPath;
+  /// Whole-module source declares functions the module classifies as library
+  /// (`revenant.lib`) instead of emitting their bodies: the real CRT/SDK
+  /// provides them at link time, and emitting ours redefines the header's
+  /// function. Default on. Opt out with `--full-emit`.
+  bool UserBodiesOnly = true;
 };
 
 /// Per-function decompile result plus stage outputs.

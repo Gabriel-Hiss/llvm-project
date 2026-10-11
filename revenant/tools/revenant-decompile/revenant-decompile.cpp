@@ -65,6 +65,10 @@ static cl::opt<bool> Patterns("patterns",
 static cl::opt<bool> NoArtifacts("no-artifacts",
                                  cl::desc("do not write stage artifact files"));
 static cl::opt<bool> ShowTime("time", cl::desc("print elapsed time per stage"));
+static cl::opt<bool> FullEmit(
+    "full-emit",
+    cl::desc("emit bodies for every lifted function, including library "
+             "bodies the CRT/SDK already provides"));
 static cl::opt<std::string>
     MetaOpt("meta", cl::desc("metadata: none|embedded|pdb (default: embedded)"),
             cl::value_desc("mode"), cl::init("embedded"));
@@ -253,6 +257,7 @@ int main(int Argc, char **Argv) {
   Opts.Emit = Emit;
   Opts.Patterns = Patterns;
   Opts.LibraryDBPath = LibraryDBPath.str().str();
+  Opts.UserBodiesOnly = !FullEmit;
   if (!NoArtifacts) {
     // Artifact base: the output path if given, else <pe>.decompiled.
     std::string Base =
