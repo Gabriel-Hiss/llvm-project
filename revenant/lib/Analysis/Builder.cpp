@@ -127,15 +127,20 @@ struct Builder {
            foreign(Address);
   }
 
-  // A branch target that opens a 16-byte-aligned code region right after an
-  // int3 padding run starts its own function: MSVC x64 pads between
-  // functions with int3 and aligns every function start, while loops and
-  // cold blocks inside a function are aligned with nop padding. Treating
-  // such a target as an intra-function block leader absorbs the callee's
-  // bytes into this function, and a leaf function reached only by that
-  // tail jump is then never discovered (an LTCG-specialized caller that
-  // lost its function-pointer table leaves no other reference). The
+  // An unconditional `jmp` whose target opens a 16-byte-aligned code region
+  // right after an int3 padding run starts its own function: MSVC x64 pads
+  // between functions with int3 and aligns every function start, while loops
+  // and cold blocks inside a function are aligned with nop padding.
+  // Treating such a target as an intra-function block leader absorbs the
+  // callee's bytes into this function, and a leaf function reached only by
+  // that tail jump is then never discovered (an LTCG-specialized caller
+  // that lost its function-pointer table leaves no other reference). The
   // function's own start is excluded: a `jmp` to the entry is a loop.
+  //
+  // Only the unconditional form uses this rule. `liftTerminator` skips
+  // TailCall edges when it emits a conditional branch, so turning a jcc
+  // target into one silently drops the taken edge; a conditional target
+  // must stay an inline block leader.
   bool startsAfterPadding(Va Address) const {
     return Address != Start && startsAfterInt3(Dis, Img, Address);
   }
@@ -184,7 +189,7 @@ struct Builder {
 
   bool isForeignTarget(Va Target) const {
     return (Target != Start && FunctionStarts.count(Target)) ||
-           foreign(Target) || startsAfterPadding(Target);
+           foreign(Target);
   }
 
   void resolveFixpoint() {
@@ -461,10 +466,8 @@ struct Builder {
         EndKind = BlockEnd::Branch;
         if (I.HasTarget) {
           const Va Target = I.Target;
-          if (foreignTarget(Target) || !inBound(Target) ||
-              startsAfterPadding(Target)) {
+          if (foreignTarget(Target) || !inBound(Target)) {
             ForeignTargets.push_back(Target);
-            F.CallTargets.push_back(Target);
             Edges.push_back(makeEdge(Target, EdgeKind::TailCall));
           } else {
             Edges.push_back(makeEdge(Target, EdgeKind::CondTaken));
@@ -618,7 +621,7 @@ struct Builder {
         }
         auto Veto = [&](Va Address) {
           return foreign(Address) || inData(Address) ||
-                 Img.inInlineData(Address) || startsAfterPadding(Address);
+                 Img.inInlineData(Address);
         };
         analysis_detail::OverlapEnv Env{WeakIps, Bound.has_value(),
                                         &DeadStarts, Veto};
@@ -682,8 +685,7 @@ struct Builder {
       WeakIps.push_back(Ip);
     }
     auto Veto = [&](Va Address) {
-      return foreign(Address) || inData(Address) || Img.inInlineData(Address) ||
-             startsAfterPadding(Address);
+      return foreign(Address) || inData(Address) || Img.inInlineData(Address);
     };
     analysis_detail::OverlapEnv Env{WeakIps, Bound.has_value(), &DeadStarts,
                                     Veto};
