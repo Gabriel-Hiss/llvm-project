@@ -122,27 +122,6 @@ clang::IntegerLiteral *intLiteral(ASTContext &A, uint64_t V, QualType T) {
                                        SourceLocation());
 }
 
-/// Build a wide value from two u64 halves. In C, the only spelling is a
-/// compound literal `(Record){lo, hi}`. In C++ (including MSVC C++), compound
-/// literals are not valid (C4576), so call a preamble wrapper instead.
-clang::Expr *makeWideValue(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
-  if (A.getLangOpts().CPlusPlus) {
-    const bool Signed = isSigned(T);
-    llvm::SmallString<64> Name(Signed ? "revenant_i128_s_make"
-                                     : "revenant_i128_u_make");
-    clang::FunctionDecl *FD =
-        wrapperProto(A, T, Name, /*Binary=*/true, /*Predicate=*/false);
-    return wrapperCall(A, FD, Lo, Hi);
-  }
-  // C path: compound literal.
-  llvm::SmallVector<Expr *, 2> Inits{Lo, Hi};
-  clang::InitListExpr *Init = new (A)
-      clang::InitListExpr(A, SourceLocation(), Inits, SourceLocation());
-  clang::TypeSourceInfo *TSI = A.getTrivialTypeSourceInfo(T);
-  return new (A) clang::CompoundLiteralExpr(
-      SourceLocation(), TSI, T, clang::VK_PRValue, Init,
-      /*fileScope=*/false);
-}
 
 /// Low half read as a member access: `.lo` on the value the frontend
 /// already built for the wide operand.
@@ -214,6 +193,28 @@ clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
   FD->setImplicit(true);
   TU->addDecl(FD);
   return FD;
+}
+
+/// Build a wide value from two u64 halves. In C, the only spelling is a
+/// compound literal `(Record){lo, hi}`. In C++ (including MSVC C++), compound
+/// literals are not valid (C4576), so call a preamble wrapper instead.
+clang::Expr *makeWideValue(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
+  if (A.getLangOpts().CPlusPlus) {
+    const bool Signed = isSigned(T);
+    llvm::SmallString<64> Name(Signed ? "revenant_i128_s_make"
+                                     : "revenant_i128_u_make");
+    clang::FunctionDecl *FD =
+        wrapperProto(A, T, Name, /*Binary=*/true, /*Predicate=*/false);
+    return wrapperCall(A, FD, Lo, Hi);
+  }
+  // C path: compound literal.
+  llvm::SmallVector<Expr *, 2> Inits{Lo, Hi};
+  clang::InitListExpr *Init = new (A)
+      clang::InitListExpr(A, SourceLocation(), Inits, SourceLocation());
+  clang::TypeSourceInfo *TSI = A.getTrivialTypeSourceInfo(T);
+  return new (A) clang::CompoundLiteralExpr(
+      SourceLocation(), TSI, T, clang::VK_PRValue, Init,
+      /*fileScope=*/false);
 }
 
 } // namespace
