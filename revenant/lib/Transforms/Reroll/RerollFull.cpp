@@ -51,6 +51,7 @@
 #include "revenant/Evidence/Evidence.h"
 #endif
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
@@ -62,6 +63,7 @@
 #include "llvm/IR/Metadata.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 using namespace llvm;
 
@@ -223,6 +225,295 @@ std::optional<LaneValue> anchorValue(StoreInst *S,
   return laneValueOf(V, Def);
 }
 
+struct IndexedScalarLoad {
+  LoadInst *Load;
+  Value *Base;
+  int64_t Index;
+};
+
+struct ScalarPointerInfo {
+  Value *Base = nullptr;
+  int64_t Index = 0;
+  SmallVector<GetElementPtrInst *, 8> GEPs;
+};
+
+// Reduce a scalar load address to a byte offset from one in-block GEP base.
+// The byte GEP chains emitted by StraightDevec and ordinary typed GEPs both
+// use this form; struct and dynamic-index GEPs conservatively veto the match.
+bool scalarPointerInfo(LoadInst *L, BasicBlock &B, ScalarPointerInfo &Info) {
+  Type *LoadTy = L->getType();
+  if (!LoadTy->isIntegerTy())
+    return false;
+  unsigned LoadBits = LoadTy->getIntegerBitWidth();
+  if (LoadBits < 8 || LoadBits % 8 != 0)
+    return false;
+  uint64_t ElemBytes = LoadBits / 8;
+
+  int64_t ByteOffset = 0;
+  Value *Ptr = L->getPointerOperand();
+  while (auto *G = dyn_cast<GetElementPtrInst>(Ptr)) {
+    if (G->getParent() != &B || G->getNumIndices() != 1)
+      return false;
+    Type *SourceTy = G->getSourceElementType();
+    if (!SourceTy->isIntegerTy() && !isa<FixedVectorType>(SourceTy))
+      return false;
+    TypeSize Bits = SourceTy->getPrimitiveSizeInBits();
+    if (Bits.isScalable() || Bits.getFixedValue() % 8 != 0)
+      return false;
+    uint64_t Scale = Bits.getFixedValue() / 8;
+    if (Scale == 0 || Scale > static_cast<uint64_t>(INT64_MAX))
+      return false;
+    auto *C = dyn_cast<ConstantInt>(G->getOperand(1));
+    auto Index = C ? signedConst(C) : std::nullopt;
+    if (!Index || *Index < 0 ||
+        static_cast<uint64_t>(*Index) >
+            static_cast<uint64_t>(INT64_MAX) / Scale)
+      return false;
+    int64_t Delta = *Index * static_cast<int64_t>(Scale);
+    if (Delta > INT64_MAX - ByteOffset)
+      return false;
+    ByteOffset += Delta;
+    Info.GEPs.push_back(G);
+    Ptr = G->getPointerOperand();
+  }
+  if (!Ptr->getType()->isPointerTy() ||
+      ByteOffset % static_cast<int64_t>(ElemBytes) != 0)
+    return false;
+  Info.Base = Ptr;
+  Info.Index = ByteOffset / static_cast<int64_t>(ElemBytes);
+  return true;
+}
+
+// Rebuild a fixed-trip scalar sum as one source-style loop. The proof is
+// deliberately narrow: one block, contiguous nonvolatile scalar loads,
+// a single-use add tree, and monotonic !revenant.va evidence. No operation
+// outside the load/address/add tree may be present.
+unsigned tryRerollScalarSum(Function &F, BasicBlock &B,
+                            ArrayRef<Instruction *> Insns) {
+  if (F.size() != 1 || &B != &F.getEntryBlock())
+    return 0;
+  auto *Ret = dyn_cast<ReturnInst>(B.getTerminator());
+  if (!Ret || !Ret->getReturnValue())
+    return 0;
+
+  SmallVector<Value *, 4> CandidateBases;
+  for (Instruction *I : Insns) {
+    auto *L = dyn_cast<LoadInst>(I);
+    if (!L || L->isVolatile() || L->isAtomic())
+      continue;
+    ScalarPointerInfo PI;
+    if (!scalarPointerInfo(L, B, PI) ||
+        llvm::is_contained(CandidateBases, PI.Base))
+      continue;
+    CandidateBases.push_back(PI.Base);
+  }
+
+  for (Value *CandidateBase : CandidateBases) {
+    SmallVector<IndexedScalarLoad, 32> Loads;
+    SmallPtrSet<GetElementPtrInst *, 32> GEPs;
+    for (Instruction *I : Insns) {
+      auto *L = dyn_cast<LoadInst>(I);
+      if (!L || L->isVolatile() || L->isAtomic())
+        continue;
+      ScalarPointerInfo PI;
+      if (!scalarPointerInfo(L, B, PI) || PI.Base != CandidateBase)
+        continue;
+      Loads.push_back({L, PI.Base, PI.Index});
+      for (GetElementPtrInst *G : PI.GEPs)
+        GEPs.insert(G);
+    }
+    if (Loads.size() < 4 || Loads.size() > 64)
+      continue;
+    Type *LoadTy = Loads.front().Load->getType();
+    Align LoadAlign = Loads.front().Load->getAlign();
+    if (!llvm::all_of(Loads, [&](const auto &L) {
+          return L.Load->getType() == LoadTy;
+        }))
+      continue;
+    for (const IndexedScalarLoad &L : Loads)
+      if (L.Load->getAlign().value() < LoadAlign.value())
+        LoadAlign = L.Load->getAlign();
+    llvm::sort(Loads, [](const auto &A, const auto &C) {
+      return A.Index < C.Index;
+    });
+    bool Contiguous = true;
+    for (size_t K = 0; K < Loads.size(); ++K)
+      Contiguous &= Loads[K].Index == static_cast<int64_t>(K);
+    if (!Contiguous)
+      continue;
+
+    SmallVector<BinaryOperator *, 32> Adds;
+    bool InvalidAdd = false;
+    for (Instruction *I : Insns) {
+      auto *BO = dyn_cast<BinaryOperator>(I);
+      if (!BO || BO->getOpcode() != Instruction::Add)
+        continue;
+      if (BO->getType() != LoadTy || BO->hasNoSignedWrap() ||
+          BO->hasNoUnsignedWrap()) {
+        InvalidAdd = true;
+        break;
+      }
+      Adds.push_back(BO);
+    }
+    if (InvalidAdd || Adds.size() != Loads.size() - 1)
+      continue;
+    auto *Root = dyn_cast<BinaryOperator>(Ret->getReturnValue());
+    if (!Root || !llvm::is_contained(Adds, Root))
+      continue;
+
+    SmallPtrSet<LoadInst *, 32> LoadSet;
+    SmallPtrSet<BinaryOperator *, 32> AddSet;
+    for (const IndexedScalarLoad &L : Loads)
+      LoadSet.insert(L.Load);
+    for (BinaryOperator *BO : Adds)
+      AddSet.insert(BO);
+
+    SmallPtrSet<Instruction *, 32> Allowed;
+    for (const IndexedScalarLoad &L : Loads)
+      Allowed.insert(L.Load);
+    for (GetElementPtrInst *G : GEPs)
+      Allowed.insert(G);
+    for (BinaryOperator *BO : Adds)
+      Allowed.insert(BO);
+    if (llvm::any_of(Insns, [&](Instruction *I) {
+          return !Allowed.count(I);
+        }))
+      continue;
+
+    bool UsesOK = true;
+    for (const IndexedScalarLoad &L : Loads) {
+      if (!L.Load->hasOneUse()) {
+        UsesOK = false;
+        break;
+      }
+      auto *U = dyn_cast<BinaryOperator>(*L.Load->user_begin());
+      if (!U || !AddSet.count(U))
+        UsesOK = false;
+    }
+    for (GetElementPtrInst *G : GEPs) {
+      for (User *U : G->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || (!LoadSet.count(dyn_cast<LoadInst>(UI)) &&
+                    !GEPs.count(dyn_cast<GetElementPtrInst>(UI))))
+          UsesOK = false;
+      }
+    }
+    for (BinaryOperator *BO : Adds) {
+      if (!BO->hasOneUse()) {
+        UsesOK = false;
+        break;
+      }
+      User *U = *BO->user_begin();
+      if (BO == Root ? U != Ret : !AddSet.count(dyn_cast<BinaryOperator>(U)))
+        UsesOK = false;
+    }
+    if (!UsesOK)
+      continue;
+
+    SmallPtrSet<LoadInst *, 32> SeenLoads;
+    SmallPtrSet<BinaryOperator *, 32> SeenAdds;
+    SmallVector<Value *, 64> Pending{Root};
+    bool TreeOK = true;
+    while (!Pending.empty() && TreeOK) {
+      Value *V = Pending.pop_back_val();
+      if (auto *L = dyn_cast<LoadInst>(V)) {
+        if (!LoadSet.count(L) || SeenLoads.count(L)) {
+          TreeOK = false;
+          break;
+        }
+        SeenLoads.insert(L);
+        continue;
+      }
+      auto *BO = dyn_cast<BinaryOperator>(V);
+      if (!BO || !AddSet.count(BO) || SeenAdds.count(BO)) {
+        TreeOK = false;
+        break;
+      }
+      SeenAdds.insert(BO);
+      Pending.push_back(BO->getOperand(0));
+      Pending.push_back(BO->getOperand(1));
+    }
+    if (!TreeOK || SeenLoads.size() != Loads.size() ||
+        SeenAdds.size() != Adds.size())
+      continue;
+
+    Type *IndexTy = nullptr;
+    bool IndexTypesOK = true;
+    for (GetElementPtrInst *G : GEPs) {
+      Type *Ty = G->getOperand(1)->getType();
+      if (!Ty->isIntegerTy() || (IndexTy && IndexTy != Ty)) {
+        IndexTypesOK = false;
+        break;
+      }
+      IndexTy = Ty;
+    }
+    if (!IndexTypesOK || !IndexTy)
+      continue;
+
+    std::optional<uint64_t> FirstVA, PreviousVA;
+    Instruction *VAAnchor = nullptr;
+    bool EvidenceOK = true;
+    for (BinaryOperator *BO : Adds) {
+      auto VA = vaOf(*BO);
+      if (!VA || (PreviousVA && *VA < *PreviousVA) ||
+          (FirstVA && *VA - *FirstVA > 512)) {
+        EvidenceOK = false;
+        break;
+      }
+      if (!FirstVA)
+        FirstVA = VA;
+      if (!VAAnchor)
+        VAAnchor = BO;
+      PreviousVA = VA;
+    }
+    if (!EvidenceOK || !VAAnchor)
+      continue;
+
+    BasicBlock *Preheader = &B;
+    BasicBlock *Exit =
+        Preheader->splitBasicBlock(Preheader->getTerminator(), "unroll.exit");
+    auto *PreheaderBranch = cast<BranchInst>(Preheader->getTerminator());
+    BasicBlock *Loop =
+        BasicBlock::Create(F.getContext(), "unroll", &F, Exit);
+    PreheaderBranch->setSuccessor(0, Loop);
+
+    IRBuilder<> PHBuilder(Loop, Loop->begin());
+    auto *Index = PHBuilder.CreatePHI(IndexTy, 2, "u0i");
+    Index->addIncoming(ConstantInt::get(IndexTy, 0), Preheader);
+    auto *Acc = PHBuilder.CreatePHI(LoadTy, 2, "u0acc");
+    Acc->addIncoming(ConstantInt::get(LoadTy, 0), Preheader);
+    IRBuilder<> BodyBuilder(Loop);
+    Value *Addr =
+        BodyBuilder.CreateGEP(LoadTy, CandidateBase, Index, "u0addr");
+    auto *Load = BodyBuilder.CreateLoad(LoadTy, Addr, "u0v");
+    Load->setAlignment(LoadAlign);
+    Value *Sum = BodyBuilder.CreateAdd(Acc, Load, "u0next");
+    Value *Next = BodyBuilder.CreateAdd(
+        Index, ConstantInt::get(IndexTy, 1), "u0inext");
+    Value *Cond = BodyBuilder.CreateICmpULT(
+        Next, ConstantInt::get(IndexTy, Loads.size()), "u0c");
+    BranchInst *Latch = BodyBuilder.CreateCondBr(Cond, Loop, Exit);
+    Index->addIncoming(Next, Loop);
+    Acc->addIncoming(Sum, Loop);
+
+    copyVA(VAAnchor, Index);
+    copyVA(VAAnchor, Acc);
+    copyVA(VAAnchor, cast<Instruction>(Addr));
+    copyVA(VAAnchor, Load);
+    copyVA(VAAnchor, cast<Instruction>(Sum));
+    copyVA(VAAnchor, cast<Instruction>(Next));
+    copyVA(VAAnchor, cast<Instruction>(Cond));
+    copyVA(VAAnchor, Latch);
+    Ret->setOperand(0, Sum);
+
+    for (auto It = Insns.rbegin(); It != Insns.rend(); ++It)
+      if ((*It)->getParent() == Preheader)
+        (*It)->eraseFromParent();
+    return 1;
+  }
+  return 0;
+}
+
 } // namespace
 
 unsigned tryRerollFull(Function &F, BasicBlock &B,
@@ -238,6 +529,10 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
   size_t N = Insns.size();
   // Four constant stores need only three address GEPs; other patterns
   // are filtered by their anchor and lane checks below.
+  if (tryRerollScalarSum(F, B, Insns)) {
+    Notes.push_back("fixed-trip scalar sum");
+    return 1;
+  }
   if (N < 7)
     return 0;
 
