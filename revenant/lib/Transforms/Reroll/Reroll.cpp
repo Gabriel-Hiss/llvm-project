@@ -255,8 +255,18 @@ std::optional<Affine> affineOfValue(Value *V, Value *IV, const DefLookup &DL,
     case Instruction::Trunc:
     case Instruction::BitCast:
     case Instruction::PtrToInt:
-    case Instruction::IntToPtr:
-      return affineOfInsn(*Def, IV, DL, Depth + 1);
+    case Instruction::IntToPtr: {
+      // Arithmetic the model cannot fold is ALSO an opaque leaf, not a
+      // failed match. `mul (load i), (load i)` carries no coefficient, so
+      // there is nothing to scale; but its operands still carry the
+      // element index, and a consumer that needs that index reaches it
+      // through the bare-var rule only if the mul reads as a leaf.
+      // Returning nullopt here hid the index from every consumer, which
+      // is why a multi-accumulator unroll's per-window accumulators never
+      // resolved to a slot and never folded.
+      auto A = affineOfInsn(*Def, IV, DL, Depth + 1);
+      return A ? *A : Affine{0, 0};
+    }
     default:
       return Affine{0, 0}; // Load/Phi/Call/... are opaque leaves.
     }
@@ -924,9 +934,20 @@ struct ExitSide {
 // `IV`/`StepInst` its induction and step, `Step` the ORIGINAL step
 // magnitude and `D` the window count. Returns false when the fold would
 // change the set of iterations the loop performs.
+//
+// When the exit tests a *coupled* counter rather than the induction
+// (`%trip = phi [%start], [%trip - 1]`, `icmp eq %trip.next, 0`), the fold
+// is still legal — but only if the caller also rescales the counter: the
+// rolled loop runs D times as many iterations, so a counter whose step is
+// a constant ±1 needs its entry multiplied by D. That is provable only
+// when every entry is a constant (the trip count is then exactly that
+// constant) and the counter has no user besides its step and the compare
+// (rescaling changes the values it walks). `CoupledTrip` reports such a
+// counter; it stays null when the compare already walks the induction.
 bool exitTripCompatible(BasicBlock *H, PHINode *IV, Instruction *StepInst,
                         int64_t Step, int64_t D, const DefLookup &DL,
-                        Instruction *Term) {
+                        Instruction *Term, PHINode *&CoupledTrip) {
+  CoupledTrip = nullptr;
   auto *Br = dyn_cast<BranchInst>(Term);
   if (!Br || !Br->isConditional())
     return false;
@@ -936,6 +957,66 @@ bool exitTripCompatible(BasicBlock *H, PHINode *IV, Instruction *StepInst,
 
   Value *A = Cmp->getOperand(0), *B = Cmp->getOperand(1);
   ExitSide Side;
+  // A coupled trip counter: the exit tests another PHI's backedge step
+  // against zero (`%trip = phi [%start], [%trip - 1]`, `icmp eq %trip.next,
+  // 0`). This is the shape lifted c-o2 `dot4` reaches the fold stage with:
+  // `%rax.0` is the element induction and `%r11.0.i32` the coupled
+  // countdown, exited on `%8 == 0`.
+  //
+  // Checked before the induction classifier, because neither operand walks
+  // the folded induction and the classifier would reject the compare as
+  // "not a trip count".
+  if (auto *AS = dyn_cast<BinaryOperator>(A)) {
+    if ((AS->getOpcode() == Instruction::Add ||
+         AS->getOpcode() == Instruction::Sub) &&
+        AS->getParent() == H) {
+      Value *Other = AS->getOperand(0) == AS->getOperand(1)
+                         ? nullptr
+                         : AS->getOperand(0);
+      auto *BP = dyn_cast_or_null<PHINode>(Other);
+      if (BP && BP != IV && BP->getType()->isIntegerTy() &&
+          isa<ConstantInt>(B) && cast<ConstantInt>(B)->isZero() &&
+          (Cmp->getPredicate() == ICmpInst::ICMP_EQ ||
+           Cmp->getPredicate() == ICmpInst::ICMP_NE)) {
+        // The counter's backedge must be exactly this add/sub, and it must
+        // step by 1 so its trip count is its entry value.
+        Value *CBack = nullptr;
+        for (unsigned K = 0, E = BP->getNumIncomingValues(); K != E; ++K)
+          if (BP->getIncomingBlock(K) == H)
+            CBack = BP->getIncomingValue(K);
+        if (CBack != AS)
+          return false;
+        auto *CO = dyn_cast<ConstantInt>(
+            AS->getOperand(0) == BP ? AS->getOperand(1)
+                                    : AS->getOperand(1) == BP
+                                          ? AS->getOperand(0)
+                                          : nullptr);
+        // `sub phi, 1` and `add phi, -1` are both unit countdown steps: the
+        // trip count is |entry| either way and the folded loop runs D times
+        // as many of them.
+        if (!CO || CO->getSExtValue() != 1 && CO->getSExtValue() != -1)
+          return false;
+        // Every entry must be a constant, and the counter may have no user
+        // but its own step: rescaling walks a different value sequence, so
+        // any other reader would observe it.
+        for (unsigned K = 0, E = BP->getNumIncomingValues(); K != E; ++K) {
+          if (BP->getIncomingBlock(K) == H)
+            continue;
+          if (!isa<ConstantInt>(BP->getIncomingValue(K)))
+            return false;
+        }
+        for (User *U : BP->users())
+          if (U != AS)
+            return false;
+        // The add/sub itself may only feed the counter and the compare.
+        for (User *U : AS->users())
+          if (U != BP && U != Cmp)
+            return false;
+        CoupledTrip = BP;
+        return true;
+      }
+    }
+  }
   auto classify = [&](Value *V) -> bool {
     Side = ExitSide();
     if (V == IV) {
@@ -1220,9 +1301,12 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     // the exit has to be proved reachable on the same lattice; see
     // exitTripCompatible. An unproved trip count means the folded loop
     // would run a different number of times, so the loop stays unrolled.
-    if (!exitTripCompatible(H, IV.Phi, IV.StepInst, IV.Step, D, DL, Term))
+    // A coupled countdown (`icmp eq %trip.next, 0`) is legal only when the
+    // counter's entry is a constant the fold rescales below.
+    PHINode *CoupledTrip = nullptr;
+    if (!exitTripCompatible(H, IV.Phi, IV.StepInst, IV.Step, D, DL, Term,
+                            CoupledTrip))
       continue;
-
     auto W0 = Effective(0);
     std::vector<std::vector<Instruction *>> WSets;
     for (int64_t w = 0; w < D; ++w) {
@@ -1469,6 +1553,21 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       BO->setOperand(1, ConstantInt::get(BO->getOperand(1)->getType(),
                                         Sign * NewStep));
     }
+    // Rescale the coupled countdown: the rolled loop runs D times as many
+    // iterations, so its entry (proved a constant by
+    // exitTripCompatible) becomes entry * D. Its step stays ±1, so the
+    // `icmp eq %trip.next, 0` exit still fires exactly at the end.
+    if (CoupledTrip)
+      for (unsigned K = 0, E = CoupledTrip->getNumIncomingValues(); K != E;
+           ++K) {
+        if (CoupledTrip->getIncomingBlock(K) == H)
+          continue;
+        auto *C = dyn_cast<ConstantInt>(CoupledTrip->getIncomingValue(K));
+        if (!C)
+          continue;
+        CoupledTrip->setIncomingValue(
+            K, ConstantInt::get(C->getType(), C->getSExtValue() * D));
+      }
     // Remap every use of a dropped effective value to its slot-0
     // counterpart (phi backedges, other blocks, terminators). Uses inside
     // dropped instructions are redirected too; those insns vanish below.
