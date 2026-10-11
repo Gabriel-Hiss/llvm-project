@@ -701,6 +701,7 @@ static int matchBinary() {
   Signatures Sigs = analyzeSignatures(P, *DisOrErr);
   std::vector<LibraryMatch> Matches =
       matchLibraryFunctions(P, *DBOrErr);
+  extendLibraryMatchesByCalleeEvidence(P, *DBOrErr, Matches);
   applyLibraryMatches(P, Sigs, Matches, *DBOrErr);
 
   outs() << "function_va,name,archive,member,param_count,pdb_name,correct\n";

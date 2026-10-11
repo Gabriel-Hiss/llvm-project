@@ -3,7 +3,8 @@
 // Ports crates/analysis/src/strings.rs behavior: ASCII >= 4 printable bytes
 // and UTF-16 >= 4 non-control chars, readable non-executable sections only,
 // with the Rust side's rejection cases (short, non-printable, executable,
-// lone surrogates, control chars).
+// lone surrogates, control chars). rustc merges string fragments, so the
+// narrow reader keeps the longest textual prefix of a merged constant.
 //
 //===----------------------------------------------------------------------===//
 
@@ -175,6 +176,77 @@ TEST(StringsTest, CollectKeepsOnlyStrings) {
   ASSERT_EQ(Got.size(), 1u);
   EXPECT_EQ(Got.begin()->first, Good);
   EXPECT_EQ(Got.begin()->second, "good!");
+}
+
+// rustc concatenates string fragments into one constant, so a merged panic
+// string mixes plain ASCII with UTF-8 text and the constant that follows it
+// holds `Arguments` template bytes. The longest textual prefix is the string:
+// the UTF-16 branch must not read the run, which turns "called" into
+// mojibake.
+TEST(StringsTest, MergedUtf8ConstantAccepted) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  const char *Prefix = "mainfatal runtime error: drop of the panic payload";
+  std::vector<uint8_t> Bytes(Prefix, Prefix + std::strlen(Prefix));
+  Bytes.push_back('\n');
+  Bytes.push_back('\t');
+  const char *Middle = "thread '";
+  Bytes.insert(Bytes.end(), Middle, Middle + std::strlen(Middle));
+  Bytes.push_back((uint8_t)0xCF); // U+03C0, as rustc emits it
+  Bytes.push_back((uint8_t)0x80);
+  const char *Suffix = "' failed";
+  Bytes.insert(Bytes.end(), Suffix, Suffix + std::strlen(Suffix));
+  Bytes.push_back(0);
+  poke(Img, At, Bytes);
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S,
+            "mainfatal runtime error: drop of the panic payload\n\tthread '\xCF"
+            "\x80' failed");
+}
+
+// The trailing template bytes of a merged constant are not text, so the run
+// stops at the message.
+TEST(StringsTest, MergedConstantStopsAtTemplateBytes) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  const char *Message = "assertion failed: src.len() == dst.len()";
+  std::vector<uint8_t> Bytes(Message, Message + std::strlen(Message));
+  Bytes.push_back((uint8_t)0xA8); // rustc `Arguments` template bytes
+  Bytes.push_back((uint8_t)0xD5);
+  Bytes.push_back('%');
+  Bytes.push_back('@');
+  Bytes.push_back((uint8_t)0x01);
+  Bytes.push_back(0);
+  poke(Img, At, Bytes);
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S, "assertion failed: src.len() == dst.len()");
+}
+
+// A run whose first four bytes are printable is narrow text even when the
+// rest of it would read as UTF-16: interleaving text bytes into units returns
+// mojibake, so the narrow reader keeps the bytes. Latin wide text still
+// reaches the UTF-16 reader, because its first unit is NUL.
+TEST(StringsTest, TextBeatsWideBranch) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  // U+4F60, U+597D, U+4E16, U+754C in UTF-16LE.
+  poke(Img, At, {0x60, 0x4F, 0x7D, 0x59, 0x16, 0x4E, 0x4C, 0x75, 0, 0});
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S, "`O}Y");
+}
+
+// A wide run whose first unit is NUL is not text at all, so the UTF-16
+// reader owns it.
+TEST(StringsTest, WideNulTerminatedAccepted) {
+  Image Img = testImage();
+  Va At(0x140002010ULL);
+  poke(Img, At, wide("WideText"));
+  auto S = stringAt(Img, At);
+  ASSERT_TRUE(S.has_value());
+  EXPECT_EQ(*S, "WideText");
 }
 
 } // end anonymous namespace
