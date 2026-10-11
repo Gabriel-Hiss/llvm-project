@@ -10,6 +10,7 @@
 
 #include "LiftTestUtil.h"
 #include "revenant/Analysis/Analysis.h"
+#include "revenant/Analysis/Signatures.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 #include "revenant/Lift/LiftFunction.h"
@@ -444,6 +445,75 @@ TEST(LiftFunction, WhileLoopKeepsDistinctSuccessors) {
       << "loop block branches to the same block twice";
   ASSERT_FALSE(llvm::isa<llvm::UndefValue>(BI->getCondition()))
       << "loop exit condition is undef";
+}
+
+/// Analysis signatures in the lifter's form, as the driver feeds them.
+static lift::Signatures toLiftSigs(const Signatures &Full) {
+  auto Convert = [](const auto &S) {
+    lift::Signature LS;
+    for (const Param &Pm : S.Params)
+      LS.Params.push_back({lift::ParamLoc::reg(Pm.Loc.Reg), Pm.Bits,
+                           Pm.Float, std::nullopt});
+    if (S.HasRet)
+      LS.Ret = lift::RetLoc{S.Ret.Float, S.Ret.Bits};
+    LS.Source = lift::SigSource::Inferred;
+    return LS;
+  };
+  lift::Signatures Sigs;
+  for (const auto &[At, S] : Full.Funcs)
+    Sigs.Funcs.emplace(At, Convert(S));
+  for (const auto &[At, S] : Full.Externs)
+    Sigs.Externs.emplace(At, Convert(S));
+  for (const auto &[At, N] : Full.CallsiteArgs)
+    Sigs.CallsiteArgs.emplace(At, N);
+  for (const auto &[At, N] : Full.IndirectArgs)
+    Sigs.IndirectArgs.emplace(At, N);
+  return Sigs;
+}
+
+TEST(LiftFunction, CondBranchToTailCallKeepsBothArms) {
+  // c-o2gl 0x14003fc90 is `cmp [rcx+0x28],0; je sub_14003FCA0; ret`:
+  // the taken edge is a TailCall edge to a foreign function start. The
+  // CondBranch handler used to skip TailCall edges, so only the
+  // fall-through arm survived and the lifted body always fell through
+  // (WRONG CODE). Both arms must be kept: a condbr whose taken side
+  // calls the tail-call target and returns.
+  auto Fx = open(REVENANT_TEST_PARITY "/c-o2gl/c-o2gl.exe");
+  ASSERT_TRUE(Fx.has_value()) << "c-o2gl binary missing";
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  auto It = P.Functions.find(Va(0x14003FC90));
+  ASSERT_NE(It, P.Functions.end()) << "0x14003fc90 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("cond_tailcall", C);
+  Signatures Full = analyzeSignatures(P, *Fx->Dis);
+  lift::Signatures Sigs = toLiftSigs(Full);
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                   nullptr, /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::BranchInst *Cond = nullptr;
+  const llvm::CallInst *Tail = nullptr;
+  for (const llvm::BasicBlock &BB : *Lifted->Fn) {
+    if (const auto *BI =
+            llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator()))
+      if (BI->isConditional())
+        Cond = BI;
+    for (const llvm::Instruction &Ins : BB)
+      if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(&Ins))
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "sub_14003FCA0")
+          Tail = CI;
+  }
+  ASSERT_NE(Cond, nullptr) << "jcc lowered to an unconditional branch";
+  ASSERT_NE(Tail, nullptr)
+      << "tail-call arm lost: je target never called";
+  EXPECT_TRUE(Tail->getParent()->getTerminator() &&
+              llvm::isa<llvm::ReturnInst>(
+                  Tail->getParent()->getTerminator()))
+      << "tail-call arm must return, not fall through";
 }
 
 } // end anonymous namespace
