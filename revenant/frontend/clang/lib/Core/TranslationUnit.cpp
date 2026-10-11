@@ -266,6 +266,18 @@ std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name,
   return std::nullopt;
 }
 
+/// The clang spelling for one of `crtPrim`'s shapes. Hand-written rather than
+/// routed through `Types.typeOf`, whose fallback for an unsigned-less integer
+/// is `unsigned int`: the header declares `int _purecall(void)` and a signed
+/// spelling that comes out unsigned still redefines it.
+c::QualType crtClangType(llvm::Type *T, c::ASTContext &AST) {
+  if (T->isVoidTy())
+    return AST.VoidTy;
+  if (T->isIntegerTy(32))
+    return AST.IntTy;
+  return AST.UnsignedLongLongTy;
+}
+
 /// Declaration for a library function whose name a CRT/SDK header already
 /// declares, carrying the header's prototype instead of the lifted guess.
 /// Nullptr when no override applies and the caller uses the lifted type.
@@ -281,8 +293,8 @@ static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
   c::ASTContext &AST = FCtx.ast();
   SmallVector<c::QualType, 4> ParamTypes;
   for (llvm::Type *T : Proto->Params)
-    ParamTypes.push_back(Types.typeOf(T, nullptr));
-  c::QualType FT = AST.getFunctionType(Types.typeOf(Proto->Ret, nullptr),
+    ParamTypes.push_back(crtClangType(T, AST));
+  c::QualType FT = AST.getFunctionType(crtClangType(Proto->Ret, AST),
                                        ParamTypes,
                                        c::FunctionProtoType::ExtProtoInfo());
   auto *FD = c::FunctionDecl::Create(
