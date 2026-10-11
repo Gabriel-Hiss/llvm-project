@@ -444,8 +444,10 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
     // `_invalid_parameter_noinfo` `void`) or come back `void` from a
     // recovered signature, while the lifted body still reads the return
     // register.  Read the result through the call's own function type so
-    // the value use compiles (C2296/C2069/C2561).
-    if (!I.getType()->isVoidTy() && DF->isDeclaration()) {
+    // the value use compiles (C2296/C2069/C2561).  Dead-result calls keep
+    // the plain spelling.
+    if (!I.getType()->isVoidTy() && !I.use_empty() &&
+        DF->isDeclaration()) {
       Callee = castCalleeToCallType(I, Callee);
       // Parenthesize the designator so the call reads
       // `((T (*)(args))f)(args)` and not `(T) f(args)`.
