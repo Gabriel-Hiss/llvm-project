@@ -1172,6 +1172,9 @@ static bool mustDefine(const Function &F, const McTables &T,
   return !MustIn[entryBlock(F)];
 }
 
+/// Direct call sites by callee: (caller start, index of the call in its
+/// instrs). Unconditional direct jumps to another function start (tail
+/// calls) vote too: their register setup is the callee's arguments.
 using CallSites = std::map<Va, SmallVector<std::pair<Va, uint32_t>, 2>>;
 
 static CallSites callSites(const Program &P, FnCache &Fns) {
@@ -1180,7 +1183,16 @@ static CallSites callSites(const Program &P, FnCache &Fns) {
     const Function *G = Fns.get(Start);
     for (size_t I = 0; G && I < G->Instrs.size(); ++I) {
       const Instr &Ins = G->Instrs[I];
-      if (Ins.Flow != FlowKind::Call)
+      // Direct calls vote with their register setup. Unconditional direct
+      // jumps to another function start are tail calls: the registers are
+      // the arguments, and the jump ends its block, so the setup prefix
+      // unambiguously belongs to this target (the CRT hands argc/argv/envp
+      // to main through such a jump). Conditional branches keep flowing to
+      // the fallthrough, so their setup may belong past the jump.
+      bool IsCall = Ins.Flow == FlowKind::Call;
+      bool IsTailJump = Ins.Flow == FlowKind::Branch && Ins.HasTarget &&
+                        Ins.Target != Start && P.Functions.count(Ins.Target);
+      if (!IsCall && !IsTailJump)
         continue;
       if (Ins.HasTarget)
         Out[Ins.Target].push_back({Start, (uint32_t)I});
@@ -1203,12 +1215,21 @@ static bool callerReads(const CallSites &Sites, FnCache &Fns,
     if (!B)
       continue;
     size_t End = std::min(B->InstrsEnd, G->Instrs.size());
-    for (size_t J = std::min<size_t>(Ii + 1, End); J < End; ++J) {
+    bool Killed = false;
+    for (size_t J = std::min<size_t>(Ii + 1, End); J < End && !Killed; ++J) {
       const Instr &Nx = G->Instrs[J];
       InsnInfo II = insnInfo(Nx.Inst, T);
-      for (const RegUse &U : II.Regs)
+      for (const RegUse &U : II.Regs) {
         if (grp(U.Reg) == grp(Reg) && U.Read)
           return true;
+        // An overwriting write kills the call result: a later read
+        // observes the new value, not the return (mirrors
+        // callerReadWidth). Without this, vector setup code after a
+        // scalar call misattributes float returns (c-clang-o2avx main
+        // clobbers xmm0 five bytes after calling break_continue).
+        if (grp(U.Reg) == grp(Reg) && U.Write)
+          Killed = true;
+      }
       // A later call clobbers the integer return (rax) but not the
       // vector return (xmm0): gcc -O2 `main` calls `sum_vec_d` then
       // `cmp_vec` before `cvttsd2si r10d, xmm0` consumes the double.
@@ -1612,15 +1633,18 @@ do {
 // (homed without reload, or folded). Only call sites that are the last
 // call of their block vote: otherwise the setup may belong to a later
 // call in the same block. Varargs callees are excluded: callers
-// legitimately pass more than the fixed parameters.
+// legitimately pass more than the fixed parameters. Tail-jump voters
+// only ever extend a unanimous direct prefix, never veto it: the jump
+// ends its block so its setup unambiguously targets this callee, but a
+// short tail prefix may leave registers the callee ignores unset.
 for (auto &[Start, Sig] : Out.Funcs) {
   if (Sig.VarArgs)
     continue;
   auto Sit = Sites.find(Start);
   if (Sit == Sites.end() || Sit->second.empty())
     continue;
-  unsigned Min = 4, Max = 0;
-  bool AnyVote = false;
+  unsigned MinDir = 4, MaxDir = 0, MinTail = 4, MaxTail = 0;
+  bool AnyDir = false, AnyTail = false;
   for (auto [CallerStart, Ii] : Sit->second) {
     const Function *G = Fns.get(CallerStart);
     if (!G || Ii >= G->Instrs.size())
@@ -1640,13 +1664,34 @@ for (auto &[Start, Sig] : Out.Funcs) {
     if (LaterCall)
       continue;
     unsigned N = callsiteArgs(*G, T, Site);
-    Min = std::min(Min, N);
-    Max = std::max(Max, N);
-    AnyVote = true;
+    if (G->Instrs[Ii].Flow == FlowKind::Branch) {
+      AnyTail = true;
+      MinTail = std::min(MinTail, N);
+      MaxTail = std::max(MaxTail, N);
+    } else {
+      AnyDir = true;
+      MinDir = std::min(MinDir, N);
+      MaxDir = std::max(MaxDir, N);
+    }
   }
-  if (!AnyVote || Min != Max)
+  if (AnyDir && MinDir != MaxDir)
     continue;
-  for (unsigned K = 0; K < Min; ++K) {
+  // Extension target: unanimous direct prefix, extended by a unanimous
+  // tail prefix. A disagreeing tail prefix abstains instead of vetoing.
+  unsigned Target = 0;
+  bool HaveTarget = false;
+  if (AnyDir) {
+    Target = MaxDir;
+    if (AnyTail && MinTail == MaxTail)
+      Target = std::max(Target, MaxTail);
+    HaveTarget = true;
+  } else if (AnyTail && MinTail == MaxTail) {
+    Target = MaxTail;
+    HaveTarget = true;
+  }
+  if (!HaveTarget)
+    continue;
+  for (unsigned K = 0; K < Target; ++K) {
     bool Have = false;
     for (const Param &Q : Sig.Params)
       if (Q.Loc.Tag == ParamLoc::Kind::Reg && Q.Loc.Reg == GRP[K])

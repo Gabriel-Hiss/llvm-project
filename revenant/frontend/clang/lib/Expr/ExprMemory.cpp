@@ -149,6 +149,8 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
       Val = makeCStyleCast(DestType, CK_FloatingCast, Val);
     else if (Val->getType()->isIntegerType() && DestType->isPointerType())
       Val = makeCStyleCast(DestType, CK_IntegralToPointer, Val);
+    else if (Val->getType()->isPointerType() && DestType->isIntegerType())
+      Val = makeCStyleCast(DestType, CK_PointerToIntegral, Val);
   }
   clang::BinaryOperator *Assign = BinaryOperator::Create(
       *AST, Dst, Val, BO_Assign, Dst->getType(), VK_PRValue, OK_Ordinary,
