@@ -289,22 +289,39 @@ Expr *ExprBuilderImpl::buildGEPValue(llvm::GetElementPtrInst &I, ExprScope &Scop
   if (Idxs.size() == 1 && I.hasOneUse() &&
       !ElemTy->isAggregateType() && !ElemTy->isVectorTy()) {
     llvm::Value *Use = *I.user_begin();
-    bool IsLoad = false;
+    llvm::LoadInst *Load = nullptr;
+    llvm::StoreInst *Store = nullptr;
     if (auto *L = llvm::dyn_cast<llvm::LoadInst>(Use))
-      IsLoad = L->getPointerOperand() == &I;
-    else if (auto *S = llvm::dyn_cast<llvm::StoreInst>(Use))
-      IsLoad = S->getPointerOperand() == &I;
+      if (L->getPointerOperand() == &I)
+        Load = L;
+    if (auto *S = llvm::dyn_cast<llvm::StoreInst>(Use))
+      if (S->getPointerOperand() == &I)
+        Store = S;
     auto *IndexConstant = llvm::dyn_cast<llvm::ConstantInt>(Idxs[0]);
-    if (IsLoad && !(IndexConstant && IndexConstant->isZero())) {
-      Expr *Base = value(I.getPointerOperand(), Scope);
-      QualType ElemQT =
-          Types.typeOf(ElemTy, debugTypeOf(I.getPointerOperand()));
-      Expr *TypedBase = decayToPointer(Base, ElemQT);
-      Expr *Index = value(Idxs[0], Scope);
-      return new (*AST) clang::ArraySubscriptExpr(
-          parenIfNeeded(TypedBase, Prec::Postfix),
-          parenIfNeeded(Index, Prec::Ternary), ElemQT, VK_LValue, OK_Ordinary,
-          SourceLocation());
+    if ((Load || Store) && !(IndexConstant && IndexConstant->isZero())) {
+      QualType AccessType =
+          Load ? Types.typeOf(Load->getType(), debugTypeOf(Load))
+               : Types.typeOf(Store->getValueOperand()->getType(),
+                              debugTypeOf(Store->getValueOperand()));
+      if (!AccessType.isNull() && !AccessType->isVoidType() &&
+          !AccessType->isAggregateType() && !AccessType->isVectorType()) {
+        unsigned long long ElementSize =
+            CurF->getParent()->getDataLayout().getTypeAllocSize(ElemTy);
+        unsigned long long AccessSize =
+            AST->getTypeSize(AccessType) / AST->getCharWidth();
+        if (ElementSize == AccessSize) {
+          Expr *Base = value(I.getPointerOperand(), Scope);
+          Expr *TypedBase = decayToPointer(Base, AccessType);
+          QualType WantPointer = AST->getPointerType(AccessType);
+          if (!AST->hasSameType(TypedBase->getType(), WantPointer))
+            TypedBase = makeCStyleCast(WantPointer, CK_BitCast, TypedBase);
+          Expr *Index = value(Idxs[0], Scope);
+          return new (*AST) clang::ArraySubscriptExpr(
+              parenIfNeeded(TypedBase, Prec::Postfix),
+              parenIfNeeded(Index, Prec::Ternary), AccessType, VK_LValue,
+              OK_Ordinary, SourceLocation());
+        }
+      }
     }
   }
   return buildGEPFrom(value(I.getPointerOperand(), Scope),

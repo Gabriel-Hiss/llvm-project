@@ -226,6 +226,15 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
   // operator as a call to one of its wrappers.
   if (clang::Expr *Wide = wideIntArithmetic(*AST, ResTy, Op, 0, L, R))
     return ensureTemp(llvm::cast<llvm::Instruction>(&I), Scope, Wide);
+  bool HasUsualIntegerResult =
+      Op == llvm::Instruction::Add || Op == llvm::Instruction::Sub ||
+      Op == llvm::Instruction::Mul || Op == llvm::Instruction::And ||
+      Op == llvm::Instruction::Or || Op == llvm::Instruction::Xor;
+  if (HasUsualIntegerResult && L->getType()->isIntegerType() &&
+      R->getType()->isIntegerType() &&
+      AST->hasSameType(L->getType(), R->getType()) &&
+      AST->getTypeSize(L->getType()) >= AST->getTypeSize(AST->IntTy))
+    ResTy = L->getType();
 
   bool SignedOp = Op == llvm::Instruction::SDiv ||
                   Op == llvm::Instruction::SRem ||
@@ -249,6 +258,18 @@ Expr *ExprBuilderImpl::buildBinary(llvm::Instruction &I, ExprScope &Scope) {
         (OperandTy->isSignedIntegerType() || OperandTy->isUnsignedIntegerType()))
       OperandTy = AST->getCorrespondingUnsignedType(OperandTy);
     if (!OperandTy.isNull()) {
+      if (Op == llvm::Instruction::SDiv ||
+          Op == llvm::Instruction::SRem) {
+        if (auto *RC = llvm::dyn_cast<llvm::ConstantInt>(RHS)) {
+          llvm::APInt Magnitude = -RC->getValue();
+          if (RC->getValue().isNegative() && !Magnitude.isNegative()) {
+            Expr *Positive = buildIntegerLiteral(Magnitude, OperandTy);
+            R = UnaryOperator::Create(*AST, Positive, UO_Minus, OperandTy,
+                                      VK_PRValue, OK_Ordinary, SourceLocation(),
+                                      false, FPOptionsOverride());
+          }
+        }
+      }
       if (L->getType() != OperandTy)
         L = makeCStyleCast(OperandTy, CK_IntegralCast, L);
       if (!IsShift && R->getType() != OperandTy)

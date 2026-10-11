@@ -269,6 +269,27 @@ TEST_F(ExprTest, AddNegativeBecomesSub) {
   EXPECT_EQ(print(E), "a - 5");
 }
 
+TEST_F(ExprTest, SignedDivisionNegativeConstantUsesNegativeLiteral) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Div = B.CreateSDiv(
+      H.A, ConstantInt::get(Type::getInt32Ty(LLCtx), (uint64_t)-3, true));
+  EXPECT_EQ(print(Exprs->value(Div, Scope)), "a / -3");
+}
+
+TEST_F(ExprTest, SignedDivisionDoesNotCastSignedBitwiseOperands) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Bits = B.CreateOr(H.A, H.B);
+  llvm::Value *Div = B.CreateSDiv(
+      Bits, ConstantInt::get(Type::getInt32Ty(LLCtx), (uint64_t)-3, true));
+  EXPECT_EQ(print(Exprs->value(Div, Scope)), "(a | b) / -3");
+}
+
 TEST_F(ExprTest, SelectBecomesTernary) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
@@ -477,6 +498,29 @@ TEST_F(ExprTest, PointerGepLoadsUseSubscripts) {
       B.CreateGEP(I32, P, {H.A}, "element");
   llvm::Value *Loaded = B.CreateLoad(I32, Element, "loaded");
   EXPECT_EQ(print(Exprs->value(Loaded, Scope)), "p[a]");
+}
+
+TEST_F(ExprTest, PointerGepLoadPreservesAccessType) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I8 = Type::getInt8Ty(LLCtx);
+  llvm::Type *I64 = Type::getInt64Ty(LLCtx);
+  AllocaInst *Bytes =
+      B.CreateAlloca(ArrayType::get(I8, 16), nullptr, "bytes");
+  clang::QualType BytesType = ACtx->getConstantArrayType(
+      ACtx->UnsignedCharTy, llvm::APInt(64, 16), nullptr,
+      clang::ArraySizeModifier::Normal, 0);
+  clang::VarDecl *BytesDecl = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("bytes"), BytesType, ACtx->getTrivialTypeSourceInfo(BytesType),
+      clang::SC_None);
+  FCtx->bindDecl(Bytes, BytesDecl);
+  llvm::Value *Element = B.CreateGEP(I64, Bytes, {H.A}, "element");
+  llvm::Value *Loaded =
+      B.CreateLoad(llvm::PointerType::get(LLCtx, 0), Element, "loaded");
+  EXPECT_EQ(print(Exprs->value(Loaded, Scope)), "((void **)bytes)[a]");
 }
 
 TEST_F(ExprTest, DirectCallByName) {
