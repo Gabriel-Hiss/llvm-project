@@ -1013,6 +1013,8 @@ unsigned tryRerollRegions(Function &F, SmallVectorImpl<StringRef> &Notes) {
     }
     Regions.push_back(R);
   }
+  if (Regions.size() < 3)
+    return 0;
   // Chain: the join fuses the next guard's latch compare (one block holds
   // PHIs + square store + next `cmp len, g`), so join_j must branch to
   // grow_{j+1}/join_{j+1}. The last join may instead fall to the tail
