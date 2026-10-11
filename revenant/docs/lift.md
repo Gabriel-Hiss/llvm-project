@@ -14,6 +14,9 @@ The lifter models packed `CVTDQ2PD`, `CVTDQ2PS`, `CVTPS2DQ`,
 `CVTPS2PD`, `ROUNDSD`, and `ROUNDSS` memory operands read only their
 architectural width.
 
+Packed float-to-integer conversions return the x86 indefinite value `INT_MIN`
+for NaN and out-of-range lanes.
+
 `ROUNDSD` and `ROUNDSS` use `llvm.nearbyint`, `llvm.floor`, `llvm.ceil`, or
 `llvm.trunc` according to the instruction's imm8 mode. The MXCSR-selected
 mode uses `llvm.nearbyint`, so the JIT does not need x86-specific helper
