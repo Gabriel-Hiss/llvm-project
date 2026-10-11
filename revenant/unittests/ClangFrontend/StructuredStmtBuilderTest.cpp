@@ -941,6 +941,155 @@ TEST(StructuredStmtBuilderTest, SharedLoopExitIfIsDuplicatedWithoutGoto) {
   EXPECT_NE(S.find("v0 = i + 1U", FirstNext + 1), std::string::npos) << S;
 }
 
+// Reduced from zlib-clang-o2 longest_match (0x140006300), where the emitted IR
+// carried a generic loop containing a concrete while with the same follow.
+// Without filtering, the C emitter wrapped that real loop in a second while.
+TEST(StructuredStmtBuilderTest, GenericLoopDoesNotWrapCoveredWhile) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_generic_loop_covered_by_while", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_generic_loop_covered_by_while",
+      M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_g100", F);
+  llvm::BasicBlock *GenericHeader = BasicBlock::Create(C, "bb_g110", F);
+  llvm::BasicBlock *InnerHeader = BasicBlock::Create(C, "bb_g120", F);
+  llvm::BasicBlock *InnerBody = BasicBlock::Create(C, "bb_g130", F);
+  llvm::BasicBlock *OuterBody = BasicBlock::Create(C, "bb_g140", F);
+  llvm::BasicBlock *OuterLatch = BasicBlock::Create(C, "bb_g150", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_g160", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateBr(GenericHeader);
+  B.SetInsertPoint(GenericHeader);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 0)),
+                 InnerHeader, OuterBody);
+  B.SetInsertPoint(InnerHeader);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 1)),
+                 InnerBody, Exit);
+  B.SetInsertPoint(InnerBody);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 2)),
+                 InnerHeader, OuterLatch);
+  B.SetInsertPoint(OuterBody);
+  B.CreateBr(OuterLatch);
+  B.SetInsertPoint(OuterLatch);
+  B.CreateBr(GenericHeader);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(X);
+  tagRegion(GenericHeader->getTerminator(), "loop",
+            {indexOf(*F, GenericHeader), indexOf(*F, OuterLatch),
+             indexOf(*F, Exit)});
+  tagRegion(InnerHeader->getTerminator(), "while",
+            {indexOf(*F, InnerHeader), indexOf(*F, InnerBody),
+             indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_EQ(StringRef(S).count("while ("), 1u) << S;
+}
+
+// Reduced same-exit nesting from zlib-clang-o2 gzgets (0x1400077E0): the
+// concrete for already contains the generic loop's block region.
+TEST(StructuredStmtBuilderTest, ConcreteLoopSuppressesCoveredGenericLoop) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_concrete_loop_covers_generic", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_concrete_loop_covers_generic", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_h100", F);
+  llvm::BasicBlock *ConcreteHeader = BasicBlock::Create(C, "bb_h110", F);
+  llvm::BasicBlock *GenericHeader = BasicBlock::Create(C, "bb_h120", F);
+  llvm::BasicBlock *GenericBody = BasicBlock::Create(C, "bb_h130", F);
+  llvm::BasicBlock *GenericLatch = BasicBlock::Create(C, "bb_h140", F);
+  llvm::BasicBlock *ConcreteLatch = BasicBlock::Create(C, "bb_h150", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_h160", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateBr(ConcreteHeader);
+  B.SetInsertPoint(ConcreteHeader);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 0)),
+                 GenericHeader, Exit);
+  B.SetInsertPoint(GenericHeader);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 1)),
+                 GenericBody, Exit);
+  B.SetInsertPoint(GenericBody);
+  B.CreateBr(GenericLatch);
+  B.SetInsertPoint(GenericLatch);
+  B.CreateCondBr(B.CreateICmpSGT(X, llvm::ConstantInt::get(I32, 2)),
+                 GenericHeader, ConcreteLatch);
+  B.SetInsertPoint(ConcreteLatch);
+  B.CreateBr(ConcreteHeader);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(X);
+  tagRegion(ConcreteHeader->getTerminator(), "for",
+            {indexOf(*F, ConcreteHeader), indexOf(*F, ConcreteLatch),
+             indexOf(*F, Exit)});
+  tagRegion(GenericHeader->getTerminator(), "loop",
+            {indexOf(*F, GenericHeader), indexOf(*F, GenericLatch),
+             indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_EQ(StringRef(S).count("for ("), 1u) << S;
+  EXPECT_EQ(S.find("while ("), std::string::npos) << S;
+}
+
+
+TEST(StructuredStmtBuilderTest, GenericLoopLatchWithStoresIsJumpedTo) {
+  LLVMContext &C = ctx();
+  llvm::Module M("t_generic_loop_latch_steps", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32, I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_generic_loop_latch_steps", M);
+  llvm::Argument *Limit = F->getArg(0);
+  llvm::Argument *Skip = F->getArg(1);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_s100", F);
+  llvm::BasicBlock *Header = BasicBlock::Create(C, "bb_s110", F);
+  llvm::BasicBlock *Gate = BasicBlock::Create(C, "bb_s120", F);
+  llvm::BasicBlock *Work = BasicBlock::Create(C, "bb_s130", F);
+  llvm::BasicBlock *Latch = BasicBlock::Create(C, "bb_s150", F);
+  llvm::BasicBlock *Exit = BasicBlock::Create(C, "bb_s160", F);
+  llvm::IRBuilder<> B(Entry);
+  llvm::AllocaInst *IV = B.CreateAlloca(I32, nullptr, "i");
+  llvm::AllocaInst *OtherIV = B.CreateAlloca(I32, nullptr, "j");
+  llvm::AllocaInst *Sum = B.CreateAlloca(I32, nullptr, "sum");
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), IV);
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), OtherIV);
+  B.CreateStore(llvm::ConstantInt::get(I32, 0), Sum);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Header);
+  B.CreateCondBr(B.CreateICmpSLT(B.CreateLoad(I32, IV), Limit), Gate, Exit);
+  B.SetInsertPoint(Gate);
+  B.CreateCondBr(B.CreateICmpEQ(Skip, llvm::ConstantInt::get(I32, 0)), Latch,
+                 Work);
+  B.SetInsertPoint(Work);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, Sum), B.CreateLoad(I32, IV)),
+                Sum);
+  B.CreateBr(Latch);
+  B.SetInsertPoint(Latch);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, IV),
+                            llvm::ConstantInt::get(I32, 1)),
+                IV);
+  B.CreateStore(B.CreateAdd(B.CreateLoad(I32, OtherIV),
+                            llvm::ConstantInt::get(I32, 2)),
+                OtherIV);
+  B.CreateBr(Header);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(B.CreateLoad(I32, Sum));
+  tagRegion(Header->getTerminator(), "loop",
+            {indexOf(*F, Header), indexOf(*F, Latch), indexOf(*F, Exit)});
+  tagRegion(Gate->getTerminator(), "if", {indexOf(*F, Exit)});
+
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("goto f_generic_loop_latch_steps_L_bb_s150"),
+            std::string::npos)
+      << S;
+  size_t LatchLabel = S.find("f_generic_loop_latch_steps_L_bb_s150:");
+  ASSERT_NE(LatchLabel, std::string::npos) << S;
+  EXPECT_NE(S.find("i =", LatchLabel), std::string::npos) << S;
+  EXPECT_NE(S.find("j =", LatchLabel), std::string::npos) << S;
+}
 TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
   LLVMContext &C = ctx();
   llvm::Module M("t_generic_loop", C);

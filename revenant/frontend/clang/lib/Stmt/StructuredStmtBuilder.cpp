@@ -450,6 +450,29 @@ void StructuredStmtBuilder::collectRegions() {
     }
     Regions[&BB] = std::make_unique<Region>(std::move(R));
   }
+  // Same-exit generic regions can appear either around a concrete loop or
+  // nested inside one. If either header belongs to the other's loop body,
+  // keep the concrete descriptor and leave the generic region as labels.
+  SmallVector<BasicBlock *, 8> RedundantGenericLoops;
+  for (const auto &Entry : Regions) {
+    Region &Generic = *Entry.second;
+    if (Generic.Kind != RegionKind::Loop || !Generic.Follow)
+      continue;
+    for (const auto &Other : Regions) {
+      Region &Concrete = *Other.second;
+      if (Concrete.Kind == RegionKind::Loop || !isLoopKind(Concrete.Kind) ||
+          Concrete.Follow != Generic.Follow)
+        continue;
+      if (Generic.Members.contains(Concrete.Header) ||
+          Concrete.Members.contains(Generic.Header)) {
+        RedundantGenericLoops.push_back(Generic.Header);
+        break;
+      }
+    }
+  }
+  for (BasicBlock *Header : RedundantGenericLoops)
+    Regions.erase(Header);
+
   for (BasicBlock *BB : Blocks)
     if (Region *R = regionOf(BB))
       RegionsInOrder.push_back(R);
@@ -725,6 +748,8 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
           ForClaimed.contains(&I))
         continue;
+      if (Loop->Kind == RegionKind::Loop)
+        return gotoTo(Target);
       return nullptr;
     }
     return new (*AST) ContinueStmt(SourceLocation());
@@ -1126,8 +1151,18 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
     if (Outer && isLoopKind(Outer->Kind) && R.Follow == Outer->Follow) {
       if (Arm == R.Follow)
         return new (*AST) BreakStmt(SourceLocation());
-      if (Outer->ForShape && Arm == Outer->Latch)
-        return new (*AST) ContinueStmt(SourceLocation());
+      if (Arm == Outer->Latch) {
+        bool Claimed = true;
+        for (Instruction &I : *Outer->Latch)
+          if (!I.isTerminator() && !isa<PHINode>(I) &&
+              !isa<DbgInfoIntrinsic>(I) && !ForClaimed.contains(&I)) {
+            Claimed = false;
+            break;
+          }
+        if (Claimed)
+          return new (*AST) ContinueStmt(SourceLocation());
+        return gotoTo(Arm);
+      }
     }
     if (Arm == R.Follow || Mem.empty())
       return nullptr;
@@ -1309,7 +1344,7 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   Expr *Step = nullptr;
   Stmt *Init = nullptr;
   SmallVector<Stmt *, 8> Body;
-  SmallVector<Stmt *, 8> Tail; // latch statements for do-while
+  SmallVector<Stmt *, 8> LatchBody;
 
   prepareForLoop(R);
   Init = R.ForInit;
@@ -1411,17 +1446,17 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   for (BasicBlock *BB : Blocks) {
     if (!R.Members.contains(BB) || BB == R.Header)
       continue;
-    // The latch's branch back to the header is implicit in the loop
-    // construct. Its leaf instructions remain in the body. If an external
-    // edge targets the latch, collectRegions requests a label here.
+    // Defer latch code to the loop-body epilogue. An edge to the latch must
+    // execute its updates before the implicit backedge, regardless of block
+    // layout.
     if (BB == R.Latch) {
       if (!Emitted.insert(BB).second)
         continue;
       if (NeededLabels.contains(BB))
-        Body.push_back(new (*AST)
-                           LabelStmt(SourceLocation(), labelFor(BB),
-                                     new (*AST) NullStmt(SourceLocation())));
-      emitBlockStmts(BB, Body);
+        LatchBody.push_back(new (*AST)
+                                LabelStmt(SourceLocation(), labelFor(BB),
+                                          new (*AST) NullStmt(SourceLocation())));
+      emitBlockStmts(BB, LatchBody);
       continue;
     }
     if (Region *Nested = regionOf(BB); Nested && !Nested->Degraded) {
@@ -1442,6 +1477,7 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
     if (Stmt *T = emitTerminator(BB, &R))
       Body.push_back(T);
   }
+  Body.append(LatchBody.begin(), LatchBody.end());
   Stmt *B = CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                  SourceLocation(), SourceLocation());
   Stmt *Loop = nullptr;
