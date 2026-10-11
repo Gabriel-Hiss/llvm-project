@@ -562,6 +562,17 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               *Classification.UserEntryName;
       }
     }
+    // The classifier's UserEntry is the hosted `main` on every path that
+    // finds it (narrow CRT handoff, MinGW argc/argv setup, PE-entry tail
+    // chain). Spell it `main` while the record still has a generic name so
+    // the C/C++ emitter applies the hosted argc/argv signature; Rust output
+    // has no hosted entry.
+    if (Classification.UserEntry && (Out == Lang::C || Out == Lang::Cpp)) {
+      auto It = Prog.Functions.find(*Classification.UserEntry);
+      if (It != Prog.Functions.end() &&
+          It->second.Name.rfind("sub_", 0) == 0)
+        It->second.Name = "main";
+    }
     record(R.Stages, "sigs", "ok",
            formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
                    Sigs->Externs.size())

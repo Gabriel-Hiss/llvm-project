@@ -477,13 +477,36 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   if (!Result.UserEntry)
     return Result;
 
+  // Compiler-runtime memory helpers: the CRT ships them (libvcruntime's
+  // memset.obj defines memset_repstos), so a recompile that also emits the
+  // lifted body collides with the runtime library at link time. User code
+  // reaches them through conditional branches into the helper (clang's
+  // inlined memset pattern), which the call guard below does not cover, so
+  // they are filtered by name at pop time and stay library-classified.
+  auto isRuntimeProvidedName = [](StringRef Name) {
+    return Name == "memset_repstos" || Name == "memset_repstos_amd";
+  };
+  auto isRuntimeProvided = [&](Va Start) {
+    if (isRuntimeProvidedName(functionName(Start, Prog.Functions.at(Start))))
+      return true;
+    auto Lib = Result.LibraryNames.find(Start);
+    return Lib != Result.LibraryNames.end() &&
+           isRuntimeProvidedName(Lib->second);
+  };
+
   std::queue<Va> UserPending;
   UserPending.push(*Result.UserEntry);
   while (!UserPending.empty()) {
     Va At = UserPending.front();
     UserPending.pop();
-    if (MinGWRuntimeHooks.count(At) ||
-        !Result.UserReachable.insert(At).second)
+    if (MinGWRuntimeHooks.count(At))
+      continue;
+    if (isRuntimeProvided(At)) {
+      Result.LibraryStarts.insert(At);
+      Result.LibraryNames.emplace(At, functionName(At, Prog.Functions.at(At)).str());
+      continue;
+    }
+    if (!Result.UserReachable.insert(At).second)
       continue;
     auto FOrErr = materialize(At);
     if (!FOrErr) {
