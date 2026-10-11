@@ -224,6 +224,15 @@ clang::Expr *makeWideValue(ASTContext &A, QualType T, Expr *Lo, Expr *Hi) {
       /*fileScope=*/false);
 }
 
+/// Return the signed variant of a wide record type. Used when dispatching
+/// AShr: the opcode carries arithmetic semantics regardless of the record's
+/// inferred signedness.
+QualType makeSignedRecord(ASTContext &A, QualType T) {
+  if (isSigned(T))
+    return T;
+  return wideIntType(A, WideIntBits, /*Signed=*/true);
+}
+
 } // namespace
 
 clang::QualType wideIntType(ASTContext &A, unsigned Bits, bool Signed) {
@@ -394,30 +403,31 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
   if (!Suffix)
     return nullptr;
   const bool Signed = isSigned(ResTy);
+  // AShr always uses the signed (arithmetic) helper. The opcode carries
+  // arithmetic semantics; the record's inferred signedness is only a
+  // spelling. Conform LHS to the signed record so the helper call
+  // type-checks — the wide→wide halves copy is bit-exact.
+  const bool IsArithmeticShift = Op == llvm::Instruction::AShr;
+  QualType SignedTy = Signed ? ResTy : makeSignedRecord(A, ResTy);
   // Shifts: the second operand is a narrow count (unsigned int), not a
   // wide record. Do not convert it; the wrapper signature expects unsigned.
   const bool IsShift = Op == llvm::Instruction::Shl ||
                        Op == llvm::Instruction::LShr ||
                        Op == llvm::Instruction::AShr;
   if (!IsShift) {
-    // If one operand is narrow (e.g. a u64 literal), convert it to the
-    // wide record so the wrapper call type-checks.
     if (!isWideIntRecord(LHS->getType()))
       LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
     else if (!isWideIntRecord(RHS->getType()))
       RHS = wideIntConvert(A, ResTy, RHS, clang::CK_IntegralCast);
   } else {
-    // Shift counts in the IR have the operand's width, so they arrive as a
-    // wide record (often a (record){n, 0} literal). The helper wants
-    // `unsigned`; the low half carries the count, and the helpers return
-    // zero when n >= 128, which covers any high-half contribution.
+    if (IsArithmeticShift && !Signed)
+      LHS = wideIntConvert(A, SignedTy, LHS, clang::CK_IntegralCast);
     if (isWideIntRecord(RHS->getType()))
       RHS = wideIntConvert(A, A.UnsignedIntTy, RHS, clang::CK_IntegralCast);
     if (!isWideIntRecord(LHS->getType()))
-      LHS = wideIntConvert(A, ResTy, LHS, clang::CK_IntegralCast);
+      LHS = wideIntConvert(A, SignedTy, LHS, clang::CK_IntegralCast);
   }
-  llvm::SmallString<64> Name(recordName(WideIntBits, Signed));
-  Name += "_";
+  llvm::SmallString<64> Name(recordName(WideIntBits, IsArithmeticShift ? true : Signed));
   Name += Suffix;
   clang::FunctionDecl *FD =
       wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
