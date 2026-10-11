@@ -49,6 +49,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "X86BaseInfo.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Transforms/Utils/Cloning.h"
