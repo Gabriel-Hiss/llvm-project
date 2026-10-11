@@ -120,9 +120,8 @@ FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
     clang::QualType CharPtrTy = A.getPointerType(A.CharTy);
     clang::QualType CharPtrPtrTy = A.getPointerType(CharPtrTy);
     llvm::SmallVector<clang::QualType, 4> Params;
-    Params.push_back(IntTy);
-    for (size_t I = 1; I < F.arg_size(); ++I)
-      Params.push_back(CharPtrPtrTy);
+    for (size_t I = 0; I < F.arg_size(); ++I)
+      Params.push_back(I == 0 ? IntTy : CharPtrPtrTy);
     FT = A.getFunctionType(IntTy, Params, clang::FunctionProtoType::ExtProtoInfo());
   }
   auto *FD = clang::FunctionDecl::Create(
