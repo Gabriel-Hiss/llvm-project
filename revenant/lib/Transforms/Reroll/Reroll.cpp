@@ -633,6 +633,114 @@ bool operandsPair(Value *A, Value *C, int64_t W, Value *IV,
 }
 
 // ---------------------------------------------------------------------------
+// Step-instruction discipline.
+//
+// The fold rewrites StepInst's constant in place (add/sub by the divided
+// step), so every user of StepInst that SURVIVES the fold observes the
+// divided step, which changes what it computes. The other users are legal
+// only when the fold erases them all.
+//
+// `Erased` is a dead-user closure: seeded with the dropped windows and the
+// accumulator-collapse adds the fold is about to perform, then closed under
+// "every user is already in the set". Window membership alone is not enough
+// — address math in a dropped window can feed a kept slot-0 instruction,
+// and the remap substitutes only dropped values, so that kept instruction
+// would silently read the divided step.
+//
+// The collapse is modelled, not run: collapse erases an `add Old,New`
+// outside the header whose operands are all the kept update (New) and the
+// dropped ones (Old, already in Remap) of the same window position, where
+// New itself reads a loop phi. Predicting it keeps this a pure pre-mutation
+// gate, so a bail leaves the IR exactly as found.
+// ---------------------------------------------------------------------------
+bool stepUsersFolded(BasicBlock *H, Instruction *StepInst, PHINode *Phi,
+                     const SmallPtrSetImpl<Instruction *> &Drop,
+                     const DenseMap<Value *, Value *> &Remap,
+                     const SmallPtrSetImpl<Value *> &Accs) {
+  SmallPtrSet<Instruction *, 32> Erased(Drop.begin(), Drop.end());
+  // Predicted collapse erasures: the add/fadd users of dropped values whose
+  // operands are all {New, Old} of the same remap entry, where New reads a
+  // loop phi. Mirrors the collapse loop below but only records the set.
+  for (auto &KV : Remap) {
+    Value *Old = KV.first, *New = KV.second;
+    auto *NewI = dyn_cast<Instruction>(New);
+    if (!NewI || Drop.count(NewI))
+      continue;
+    bool KeptReadsPhi = false;
+    for (const Use &U : NewI->operands())
+      if (isa<PHINode>(U.get())) {
+        KeptReadsPhi = true;
+        break;
+      }
+    if (!KeptReadsPhi)
+      continue;
+    for (User *U : Old->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() == H || UI->getType()->isVoidTy())
+        continue;
+      if (UI->getOpcode() != Instruction::Add &&
+          UI->getOpcode() != Instruction::FAdd)
+        continue;
+      bool AllSame = true;
+      for (const Use &O : UI->operands())
+        if (O.get() != New && O.get() != Old) {
+          AllSame = false;
+          break;
+        }
+      if (AllSame)
+        Erased.insert(UI);
+    }
+  }
+  // Close the set: an instruction is erased when every one of its users is
+  // already erased. Iterate to a fixed point over the header's
+  // instructions; the closure is small and terminates because each round
+  // only adds.
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (Instruction &I : *H) {
+      if (Erased.count(&I) || isa<PHINode>(&I) || &I == StepInst)
+        continue;
+      if (I.use_empty())
+        continue; // already dead for its own reasons; not our concern here
+      bool AllErased = true;
+      for (User *U : I.users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || !Erased.count(UI)) {
+          AllErased = false;
+          break;
+        }
+      }
+      if (AllErased) {
+        Erased.insert(&I);
+        Changed = true;
+      }
+    }
+  }
+  // Every user of the step must be erased, or be the induction phi, or be
+  // the exit compare's own use of the step (the branch that exitTrip-
+  // Compatible already proved). The compare itself is in LatchDefs and
+  // therefore pinned, and its condition reads the step, so that read is
+  // permitted and is exactly the trip count being preserved.
+  for (User *U : StepInst->users()) {
+    if (U == Phi)
+      continue;
+    if (auto *UI = dyn_cast<Instruction>(U))
+      if (Erased.count(UI))
+        continue;
+    // The latch terminator's condition may read the step through its own
+    // def chain; that is the proved exit, not a surviving consumer.
+    if (auto *UI = dyn_cast<Instruction>(U)) {
+      if (auto *Br = dyn_cast<BranchInst>(H->getTerminator()))
+        if (Br->isConditional() && Br->getCondition() == UI)
+          continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Exit legality for a fold.
 //
 // Folding divides the IV step from S to S/D and keeps the latch condition
@@ -1245,6 +1353,66 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
       for (Instruction *I : It->second)
         Drop.insert(I);
     }
+    // Extend the drop set with the dead-user closure: once the windows are
+    // gone, the address math that fed ONLY them is dead too, and it has to
+    // be erased rather than left behind reading the divided step.
+    //
+    // This is what a lifted dot4 needs. Its window-1 addresses run
+    // `shl (%iv + 2), 2` -> `gep i8` -> `gep i32 -1`, i.e. straight off the
+    // step instruction, and the step's constant is exactly what the fold
+    // divides. Without the closure the shl survives and computes
+    // `(%iv + 1) * 4` for an iteration that no longer exists.
+    //
+    // The closure never reaches the induction phi, the step instruction, or
+    // the latch-condition chain: each of those keeps a live user, so
+    // "every user is already dropped" fails for them.
+    {
+      SmallPtrSet<Instruction *, 32> ErasedChain;
+      for (Instruction *I : Drop)
+        ErasedChain.insert(I);
+      bool Grew = true;
+      while (Grew) {
+        Grew = false;
+        for (Instruction &I : *H) {
+          if (ErasedChain.count(&I) || isa<PHINode>(&I) ||
+              &I == IV.StepInst || LatchDefs.count(&I))
+            continue;
+          if (I.use_empty())
+            continue; // already dead for its own reasons
+          bool AllDropped = true;
+          for (User *U : I.users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI || !ErasedChain.count(UI)) {
+              AllDropped = false;
+              break;
+            }
+          }
+          if (AllDropped) {
+            ErasedChain.insert(&I);
+            Grew = true;
+          }
+        }
+      }
+      for (Instruction *I : ErasedChain)
+        Drop.insert(I);
+    }
+    // Step-instruction discipline. The fold rewrites the step's constant
+    // in place, so every user of the step that SURVIVES the fold observes
+    // the divided step, which is wrong. The other users are legal only
+    // when the fold erases them all.
+    //
+    // The erased set is a dead-user closure, not window membership. Seeded
+    // with the dropped windows plus the accumulator-collapse adds the fold
+    // is about to perform (modelled here, before any mutation, so a bail
+    // leaves the IR untouched), then closed under "every user is already
+    // in the set". Window membership alone would leak: address math in a
+    // dropped window can feed a kept slot-0 instruction, and remap only
+    // substitutes dropped values, so that kept instruction would silently
+    // read the divided step. Predict the collapse rather than running it:
+    // a post-collapse bail would leave the collapse's own mutations
+    // standing on a no-fire path.
+    if (!stepUsersFolded(H, IV.StepInst, IV.Phi, Drop, Remap, Accs))
+      continue;
     // Collapse the unroll's accumulator merge. A multi-accumulator unroll
     // sums its per-window accumulator values after the loop; rolled, they
     // are one accumulator, so the merge outside the header must drop its
@@ -1314,12 +1482,21 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     // Erase dropped windows in reverse program order so users vanish
     // before their operands (cycles only pass through kept phis, already
     // remapped above).
-    SmallVector<Instruction *, 16> Dead;
-    for (auto It = H->rbegin(); It != H->rend(); ++It)
-      if (Drop.count(&*It))
-        Dead.push_back(&*It);
-    for (Instruction *I : Dead)
-      I->eraseFromParent();
+    // Erase the dropped set in reverse DEPENDENCY order. Reverse program
+    // order is not the same thing once the dead closure is in the set: a
+    // window's address math (the GEP and the load) is defined before the
+    // dropped add that consumes it, so program order would try to erase
+    // the load while its user is still live. Erasing whatever has become
+    // use-empty, repeatedly, is the dependency order and needs no sort.
+    bool AnyLeft = true;
+    while (AnyLeft) {
+      AnyLeft = false;
+      for (Instruction &I : make_early_inc_range(*H))
+        if (Drop.count(&I) && I.use_empty()) {
+          I.eraseFromParent();
+          AnyLeft = true;
+        }
+    }
     // A dropped window's accumulator phi has no users left once its window
     // is gone; erase it so the header keeps only the rolled accumulator.
     for (Instruction &I : make_early_inc_range(*H)) {

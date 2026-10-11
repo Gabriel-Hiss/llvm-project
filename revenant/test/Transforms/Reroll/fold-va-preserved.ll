@@ -4,7 +4,13 @@
 
 define i32 @sum_va(ptr %p0, i32 %n) !revenant.va !0 {
 entry:
-  br label %L
+  ; Never reached with n == 0: with zero windows the unrolled body would run
+  ; once and read two elements while the folded body reads one.
+  %empty = icmp slt i32 %n, 1
+  ; Exit on the step value against a bound that is a multiple of the
+  ; 2-window step, so folding the step to 1 keeps the trip count.
+  %scaled = shl i32 %n, 1
+  br i1 %empty, label %X, label %L
 
 L:
   %i = phi i32 [ 0, %entry ], [ %inext, %L ], !revenant.va !1
@@ -16,20 +22,21 @@ L:
   %l1 = load i32, ptr %g1, align 4, !revenant.va !7
   %s2 = add i32 %s1, %l1, !revenant.va !8
   %inext = add i32 %i, 2, !revenant.va !9
-  ; Exit on the step value against a bound that is a multiple of the
-  ; 2-window step, so folding the step to 1 keeps the trip count.
-  %scaled = shl i32 %n, 1
   %c = icmp ult i32 %inext, %scaled, !revenant.va !10
   br i1 %c, label %L, label %X
 
 X:
-  ret i32 %s2
+  %r = phi i32 [ 0, %entry ], [ %s2, %L ]
+  ret i32 %r
 }
 
 
 ; CHECK: %s1 = add i32 %s, %l0, !revenant.va !{{[0-9]+}}
 ; CHECK: %inext = add i32 %i, 1, !revenant.va !{{[0-9]+}}
-; CHECK: ret i32 %s1
+; The dropped window's address math and merge are gone; the exit takes the
+; folded accumulator through its phi.
+; CHECK: %r = phi i32 [ 0, %entry ], [ %s1, %L ]
+; CHECK: ret i32 %r
 !0 = !{i64 4096}
 !1 = !{i64 4100}
 !2 = !{i64 4104}
