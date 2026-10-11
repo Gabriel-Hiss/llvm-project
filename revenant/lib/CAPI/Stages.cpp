@@ -197,6 +197,7 @@ recoverSignatures(Program &Prog, const Disasm &Dis, StringRef LibraryDBPath) {
     if (!DB)
       return DB.takeError();
     std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DB);
+    extendLibraryMatchesByCalleeEvidence(Prog, *DB, Matches);
     applyLibraryMatches(Prog, A, Matches, *DB);
   }
   auto Out = std::make_shared<lift::Signatures>();
@@ -549,6 +550,18 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       return ClassificationOrErr.takeError();
     FunctionClassification Classification =
         std::move(*ClassificationOrErr);
+    // Name the startup-traced entry so the C emitter's main normalization
+    // fires. A discovered real name always wins over the traced spelling.
+    if (Classification.UserEntry && Classification.UserEntryName) {
+      auto Rec = Prog.Functions.find(*Classification.UserEntry);
+      if (Rec != Prog.Functions.end() &&
+          StringRef(Rec->second.Name).starts_with("sub_")) {
+        Rec->second.Name = *Classification.UserEntryName;
+        if (Prog.Names)
+          (*Prog.Names)[*Classification.UserEntry] =
+              *Classification.UserEntryName;
+      }
+    }
     record(R.Stages, "sigs", "ok",
            formatv("{0} functions, {1} imports", Sigs->Funcs.size(),
                    Sigs->Externs.size())

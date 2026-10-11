@@ -331,6 +331,130 @@ std::vector<LibraryMatch> matchLibraryFunctions(const Program &P,
   return Matches;
 }
 
+void extendLibraryMatchesByCalleeEvidence(const Program &P,
+                                           const LibraryDatabase &DB,
+                                           std::vector<LibraryMatch> &Matches) {
+  std::map<std::string, std::vector<uint32_t>> ByName;
+  for (uint32_t I = 0; I < DB.Functions.size(); ++I)
+    ByName[DB.Functions[I].Name].push_back(I);
+  std::set<Va> Matched;
+  std::map<Va, std::string> MatchedName;
+  for (const LibraryMatch &M : Matches) {
+    Matched.insert(M.Start);
+    if (M.FunctionIndex < DB.Functions.size())
+      MatchedName[M.Start] = DB.Functions[M.FunctionIndex].Name;
+  }
+  auto calleeName = [&](Va Callee) -> std::string {
+    auto Known = MatchedName.find(Callee);
+    if (Known != MatchedName.end())
+      return Known->second;
+    if (P.Names)
+      if (auto It = P.Names->find(Callee); It != P.Names->end())
+        return It->second;
+    auto Rec = P.Functions.find(Callee);
+    if (Rec != P.Functions.end())
+      return Rec->second.Name;
+    return {};
+  };
+  bool Changed;
+  do {
+    Changed = false;
+    for (const auto &[Start, Record] : P.Functions) {
+      if (Matched.count(Start))
+        continue;
+      // Program name for the candidate: the name table carries import and
+      // discovered names; fall back to the record.
+      std::string Name;
+      if (P.Names)
+        if (auto It = P.Names->find(Start); It != P.Names->end())
+          Name = It->second;
+      if (Name.empty() || StringRef(Name).starts_with("sub_"))
+        Name = Record.Name;
+      bool Generic =
+          Name.empty() || StringRef(Name).starts_with("sub_");
+      const std::vector<uint32_t> *Candidates = nullptr;
+      if (!Generic) {
+        auto Found = ByName.find(Name);
+        if (Found == ByName.end())
+          continue;
+        Candidates = &Found->second;
+      }
+      if (Record.CallTargets.empty())
+        continue;
+      // Compiler-inserted instrumentation calls (stack cookies, probes)
+      // are transparent for library membership: they appear in user and
+      // library bodies alike and must neither gate nor score a match.
+      auto isInstrumentation = [&](Va Callee) {
+        std::string N = calleeName(Callee);
+        StringRef S(N);
+        // Imports arrive as `dll!name`; compare the bare name.
+        size_t Bang = S.rfind('!');
+        if (Bang != StringRef::npos)
+          S = S.drop_front(Bang + 1);
+        // Unnamed callees resolve through the callee's own record below.
+        if (S.empty() || S.starts_with("sub_")) {
+          auto Rec = P.Functions.find(Callee);
+          if (Rec == P.Functions.end() || Rec->second.Name.empty())
+            return false;
+          S = StringRef(Rec->second.Name);
+        }
+        return S == "__security_check_cookie" || S == "__report_gsfailure" ||
+               S == "_alloca_probe" || S == "__alloca_probe" ||
+               S == "_RTC_CheckStackVars" || S == "__RTC_CheckEsp";
+      };
+      std::set<std::string> Known;
+      bool AllMatched = true;
+      for (Va Callee : Record.CallTargets) {
+        if (Callee != Start && isInstrumentation(Callee))
+          continue;
+        if (Matched.count(Callee) || (P.Externs && P.Externs->count(Callee))) {
+          std::string CalleeName = calleeName(Callee);
+          if (!CalleeName.empty())
+            Known.insert(nameKey(CalleeName));
+          continue;
+        }
+        // Self-recursion says nothing about library membership.
+        if (Callee == Start)
+          continue;
+        AllMatched = false;
+        break;
+      }
+      if (!AllMatched || Known.empty() || Generic)
+        continue;
+      // Named candidates only: the program name plus at least one
+      // agreeing callee disambiguates same-named records. Generic
+      // sub_-named candidates are left unmatched: callee sets alone
+      // fire on user code that calls library helpers.
+      bool Hit = false;
+      uint32_t Best = 0;
+      int BestScore = 0;
+      bool Tie = false;
+      for (uint32_t Index : *Candidates) {
+        const LibraryFunction &F = DB.Functions[Index];
+        if (F.Callees.empty())
+          continue;
+        int Score = 0;
+        for (const std::string &Callee : F.Callees)
+          Score += Known.count(nameKey(Callee));
+        if (Score > BestScore) {
+          BestScore = Score;
+          Best = Index;
+          Hit = true;
+          Tie = false;
+        } else if (Score == BestScore && Score > 0) {
+          Tie = true;
+        }
+      }
+      if (Tie || !Hit || BestScore == 0)
+        continue;
+      Matches.push_back({Start, Best});
+      Matched.insert(Start);
+      MatchedName[Start] = DB.Functions[Best].Name;
+      Changed = true;
+    }
+  } while (Changed);
+}
+
 void applyLibraryMatches(Program &P, Signatures &Sigs,
                          ArrayRef<LibraryMatch> Matches,
                          const LibraryDatabase &DB) {

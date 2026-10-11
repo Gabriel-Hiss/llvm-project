@@ -60,6 +60,10 @@ enum class MetaMode { None, Embedded, Pdb };
 /// Reachability and static-library labels for an analyzed PE.
 struct FunctionClassification {
   std::optional<Va> UserEntry;
+  /// Spelling for the traced entry ("main"/"wmain") from the startup path.
+  /// Set only when the entry was traced via startup analysis; the pipeline
+  /// applies it to the program when no discovered real name exists.
+  std::optional<std::string> UserEntryName;
   std::set<Va> UserReachable;
   std::set<Va> Startup;
   std::set<Va> LibraryStarts;

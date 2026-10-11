@@ -704,5 +704,22 @@ TEST_F(ExprTest, WideConstantStoreKeepsBothHalves) {
   EXPECT_TRUE(Text.find("5369332432ULL") != std::string::npos) << Text;
   EXPECT_TRUE(Text.find("5369332880ULL") != std::string::npos) << Text;
 }
+TEST_F(ExprTest, WideShiftCountIsNarrowed) {
+  // IR shift counts carry the operand width, so a lshr i128 arrives with a
+  // wide-record literal as the count. The wrapper wants `unsigned`; the
+  // count must be narrowed to the record's low half (C2440 before the fix).
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I128 = llvm::Type::getInt128Ty(LLCtx);
+  llvm::Value *Wide = B.CreateZExt(H.A, I128, "w");
+  llvm::Value *V = B.CreateLShr(
+      Wide, llvm::ConstantInt::get(I128, 67), "v");
+  std::string S = print(Exprs->value(V, Scope));
+  EXPECT_TRUE(S.find("revenant_i128_s_shr") != std::string::npos) << S;
+  EXPECT_TRUE(S.find(".lo") != std::string::npos) << S;
+}
+
 
 } // namespace

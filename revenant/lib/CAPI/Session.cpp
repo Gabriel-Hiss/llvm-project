@@ -229,8 +229,9 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
     auto DBOrErr = LibraryDatabase::load(LibraryDBPath);
     if (!DBOrErr)
       return DBOrErr.takeError();
-    Result.HasLibraryDB = true;
-    for (const LibraryMatch &Match : matchLibraryFunctions(Prog, *DBOrErr)) {
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DBOrErr);
+    extendLibraryMatchesByCalleeEvidence(Prog, *DBOrErr, Matches);
+    for (const LibraryMatch &Match : Matches) {
       Result.LibraryStarts.insert(Match.Start);
       if (Match.FunctionIndex < DBOrErr->Functions.size())
         Result.LibraryNames[Match.Start] =
@@ -255,7 +256,8 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   }
   if (!Result.UserEntry && Out != Lang::Rust) {
     for (const auto &[At, Name] : Result.LibraryNames) {
-      if (Name != "invoke_main" &&
+      bool Wide = Name == "invoke_wmain";
+      if (Name != "invoke_main" && !Wide &&
           Name.find("__tmainCRTStartup") == std::string::npos)
         continue;
       auto Invoke = materialize(At);
@@ -268,6 +270,13 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
             Prog.Functions.count(I.Target) &&
             !Result.LibraryStarts.count(I.Target)) {
           Result.UserEntry = I.Target;
+          // The startup path tells narrow from wide: record the entry
+          // spelling so the C emitter's main normalization fires.
+          // mainCRTStartup/wmainCRTStartup disambiguate the same way.
+          if (Wide || Name.find("wmain") != std::string::npos)
+            Result.UserEntryName = "wmain";
+          else
+            Result.UserEntryName = "main";
           break;
         }
       if (Result.UserEntry)
