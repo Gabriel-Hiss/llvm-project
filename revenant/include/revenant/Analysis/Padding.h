@@ -61,6 +61,18 @@ uint64_t padLen(const Disasm &Dis, const Image &Img, Va Addr);
 /// `Addr` is already an instruction boundary.
 std::optional<Va> fillerHead(const Disasm &Dis, Va Addr);
 
+/// True when `Addr` opens a code region right after an int3 padding run
+/// that itself sits directly after a `ret` instruction, and `Addr` is on a
+/// 16-byte boundary: the MSVC x64 layout for the boundary between two
+/// functions. Int3 (never the nop family) is the discriminator because
+/// compilers align loops and cold blocks *inside* a function with nop
+/// padding. The preceding `ret` separates that from an unconditional `jmp`
+/// over int3 padding to an aligned continuation block inside one function.
+/// Callers use this to decide that a branch target starts its own function
+/// instead of being an intra-function block leader; a zero byte is not
+/// padding here (immediates end in zero bytes inside real code).
+bool startsAfterInt3(const Disasm &Dis, const Image &Img, Va Addr);
+
 /// Emit `[Start, End)` as one padding run when the whole piece decodes
 /// as contiguous filler ending exactly at `End`. Otherwise keep only a
 /// leading run that starts exactly at the chunk end and closes on a

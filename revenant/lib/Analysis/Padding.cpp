@@ -180,6 +180,33 @@ std::optional<Va> fillerHead(const Disasm &Dis, Va Addr) {
   return H;
 }
 
+bool startsAfterInt3(const Disasm &Dis, const Image &Img, Va Addr) {
+  // The 16-byte boundary plus an int3 run is the MSVC x64 inter-function
+  // layout: every function start is aligned and the alignment gap between
+  // two functions is int3, while loops and cold blocks *inside* a function
+  // are aligned with nop padding. The int3 run must also sit directly
+  // after a `ret`: a function that ends in `ret` is closed, so the next
+  // aligned address is a new function. An unconditional `jmp` over int3
+  // padding is the same shape inside one function (a jump to an aligned
+  // continuation block), and must not split the function.
+  if (Addr.Value & 15)
+    return false;
+  Va Cur = Addr;
+  bool Found = false;
+  for (unsigned Guard = 0; Guard < 64 && Cur.Value > 0; ++Guard) {
+    auto B = Img.read(Va(Cur.Value - 1), 1);
+    if (!B || B->empty() || (*B)[0] != 0xCC)
+      break;
+    Cur = Va(Cur.Value - 1);
+    Found = true;
+  }
+  if (!Found || Cur.Value == 0)
+    return false;
+  auto Before = Img.read(Va(Cur.Value - 1), 1);
+  (void)Dis;
+  return Before && !Before->empty() && (*Before)[0] == 0xC3;
+}
+
 void gapFillers(const Disasm &Dis, const Image &Img, Va Start, Va End,
                 std::vector<PaddingRun> &Out) {
   std::vector<Rva> Instrs;

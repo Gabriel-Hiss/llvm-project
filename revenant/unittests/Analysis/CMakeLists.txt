@@ -36,6 +36,7 @@ target_compile_definitions(RevenantClassifyTests PRIVATE
   REVENANT_TEST_C_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2/c-o2.exe")
 target_compile_definitions(RevenantAnalysisTests PRIVATE
   REVENANT_TEST_C_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2/c-o2.exe"
+  REVENANT_TEST_C_O2GL="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2gl/c-o2gl.exe"
   REVENANT_TEST_CPP_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-o2/cpp-o2.exe"
   REVENANT_TEST_CPP_CLANG_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-clang-o2/artifacts/cpp-clang-o2.exe"
   REVENANT_TEST_CPP_GCC_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-gcc-o2/cpp-gcc-o2.exe"
