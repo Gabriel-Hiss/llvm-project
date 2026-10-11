@@ -1,3 +1,4 @@
+; REQUIRES: revenant-clang
 ; RUN: %revenant-clang %s 2>&1 | %FileCheck %s
 ; Regression fixture for the emitter's if/loop header work.
 ;

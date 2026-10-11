@@ -168,7 +168,10 @@ if revenant_detect:
 if revenant_clang:
     config.substitutions.append(("%revenant-clang", revenant_clang))
     config.substitutions.append(("%{revenant-clang}", revenant_clang))
-    config.available_features.add("revenant-clang")
+    # Only a worktree that builds the frontend tool has it; the shared build
+    # does not, so tests that emit C are skipped there rather than failing.
+    if os.path.isfile(revenant_clang):
+        config.available_features.add("revenant-clang")
 config.substitutions.append(("%{rv-structure-tool}", rv_structure_tool))
 config.substitutions.append(("%{rv-structure-tool-exe}", rv_structure_tool))
 
