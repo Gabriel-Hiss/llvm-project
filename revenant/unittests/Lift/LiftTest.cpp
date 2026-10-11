@@ -610,4 +610,155 @@ TEST(LiftFunction, VariadicCallPassesLiveRegs) {
       << "printf definition lost its variadic tail";
 }
 
+TEST(LiftFunction, SharedDataGlobalHasOneDefinition) {
+  // Whole-module shape: two lifted functions that touch the same .bss
+  // object must share one global. Per-function caches minted a second
+  // global per referencing function (renamed `<name>.N`), and .bss globals
+  // had no initializer at all, so the emitted C declared extern symbols
+  // nothing defines and the link failed.
+  auto Fx = open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  llvm::LLVMContext C;
+  llvm::Module M("shared_data", C);
+  lift::Signatures Sigs = gccO2MainSigs(P, *Fx->Dis);
+  const Va Funcs[] = {Va(0x1400022f0), Va(0x140002a78)};
+  for (Va Start : Funcs) {
+    auto It = P.Functions.find(Start);
+    ASSERT_NE(It, P.Functions.end()) << "function not recovered";
+    auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                     nullptr, /*RunPasses=*/false);
+    ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  }
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+  const llvm::GlobalVariable *Bss = nullptr;
+  unsigned Count = 0;
+  for (const llvm::GlobalVariable &GV : M.globals())
+    if (GV.getName() == "g_14000a0f8" ||
+        GV.getName().starts_with("g_14000a0f8.")) {
+      ++Count;
+      Bss = &GV;
+    }
+  ASSERT_EQ(Count, 1u) << "the .bss object was minted once per user";
+  ASSERT_NE(Bss, nullptr);
+  EXPECT_FALSE(Bss->isDeclaration())
+      << "bss global emitted without a definition";
+  EXPECT_TRUE(Bss->hasInitializer());
+  EXPECT_EQ(Bss->getLinkage(), llvm::GlobalValue::InternalLinkage);
+  EXPECT_FALSE(Bss->isConstant())
+      << "stored-to data must not be a constant global";
+}
+
+// Ported from StepAuditFmt7's LiftFunction.SharedDataGlobalMaterializedOnce
+// (c-o0 fixture): the red/green proof for the aliasing case (the /GS cookie
+// slot materialized once per referencing function) and the writable-data
+// constness property. Complementary to the c-gcc-o2 test above, which pins
+// the defined-not-extern shape.
+TEST(LiftFunction, SharedDataGlobalMaterializedOnce) {
+  // A data VA referenced from two functions is one object in the image: the
+  // lifter must materialize one global for it, otherwise LLVM's per-name
+  // uniquing gives each referencing function its own copy (g_<va>.1, .2, ...)
+  // and a store through one copy is invisible to the loads through the others.
+  auto Fx = open(REVENANT_TEST_C_O0);
+  ASSERT_TRUE(Fx.has_value());
+  ASSERT_FALSE(Fx->Pe->Pdata.empty());
+
+  // Absolute VAs each function's linear prefix touches (lea of a data
+  // address, rip-relative memory, indirect call slots).
+  std::map<uint64_t, std::set<Va>> Refs;
+  for (const auto &Pe : Fx->Pe->Pdata) {
+    std::vector<Instr> Block = linearBlock(*Fx->Dis, Pe.Begin, 64);
+    for (const Instr &I : Block)
+      if (I.HasMemTarget)
+        Refs[I.MemTarget.Value].insert(Pe.Begin);
+  }
+  Va Shared;
+  for (const auto &[Va_, Fns] : Refs)
+    if (Fns.size() >= 2) {
+      Shared = Va(Va_);
+      break;
+    }
+  ASSERT_NE(Shared.Value, 0u)
+      << "fixture has no VA referenced by two functions";
+
+  Program P = emptyProgram(Fx->Pe->Img);
+  llvm::LLVMContext C;
+  llvm::Module M("lift_shared_global", C);
+  auto Materialized = [&]() -> llvm::GlobalVariable * {
+    for (llvm::GlobalVariable &G : M.globals())
+      if (auto VA = ir::getGlobalVA(G); VA && *VA == Shared.Value)
+        return &G;
+    return nullptr;
+  };
+  // Lift functions whose prefixes touch the VA until two of them actually
+  // materialize it (a reference can also be folded into the addressing of
+  // another operand and never reach a global).
+  std::vector<Va> Contributors;
+  for (Va Start : Refs[Shared.Value]) {
+    if (Contributors.size() == 2)
+      break;
+    std::vector<Instr> Block = linearBlock(*Fx->Dis, Start, 64);
+    FuncRecord R = singleBlockFunc(P, Block);
+    auto L = lift::liftFunction(M, P, R, *Fx->Dis, nullptr, nullptr,
+                                /*RunPasses=*/false);
+    if (!L) {
+      consumeError(L.takeError());
+      continue;
+    }
+    llvm::GlobalVariable *G = Materialized();
+    unsigned Uses = G ? G->getNumUses() : 0;
+    if (Uses > Contributors.size())
+      Contributors.push_back(Start);
+  }
+  ASSERT_EQ(Contributors.size(), 2u)
+      << "fixture: no VA materialized by two functions";
+
+  // Exactly one global carries the VA, and both functions read through it.
+  unsigned WithVa = 0;
+  llvm::GlobalVariable *Only = Materialized();
+  for (llvm::GlobalVariable &G : M.globals())
+    if (auto VA = ir::getGlobalVA(G); VA && *VA == Shared.Value)
+      ++WithVa;
+  ASSERT_EQ(WithVa, 1u) << "VA " << Shared.Value << " materialized more than "
+                        << "once (per-function global copies)";
+  EXPECT_EQ(M.getNamedValue(Only->getName()), Only);
+  EXPECT_GE(Only->getNumUses(), 2u)
+      << "the two functions do not share one global";
+  EXPECT_FALSE(verifyModule(M, &llvm::errs()));
+
+  // Writable image data (a stored-to slot such as the security cookie) keeps
+  // the file's bytes as its initializer but must not be `constant`.
+  Va Writable;
+  for (const auto &[Va_, Fns] : Refs)
+    if (!Fns.empty() && P.Img && P.Img->isWritable(Va(Va_))) {
+      Writable = Va(Va_);
+      break;
+    }
+  ASSERT_NE(Writable.Value, 0u)
+      << "fixture has no writable data VA referenced by a function";
+  if (Writable.Value != 0) {
+    llvm::LLVMContext C2;
+    llvm::Module M2("lift_writable_global", C2);
+    bool Checked = false;
+    for (Va Start : Refs[Writable.Value]) {
+      std::vector<Instr> Block = linearBlock(*Fx->Dis, Start, 64);
+      FuncRecord R = singleBlockFunc(P, Block);
+      auto L = lift::liftFunction(M2, P, R, *Fx->Dis, nullptr, nullptr,
+                                  /*RunPasses=*/false);
+      if (!L) {
+        consumeError(L.takeError());
+        continue;
+      }
+      Checked = true;
+      break;
+    }
+    ASSERT_TRUE(Checked);
+    for (llvm::GlobalVariable &G : M2.globals())
+      if (auto VA = ir::getGlobalVA(G); VA && *VA == Writable.Value)
+        EXPECT_FALSE(G.isConstant())
+            << "writable data global must not be constant";
+  }
+}
+
 } // end anonymous namespace

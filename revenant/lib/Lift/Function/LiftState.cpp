@@ -847,19 +847,65 @@ Value *LiftState::globalPtr(Va Addr) {
     return It->second;
   std::string Name = globalNameFor(P, Addr);
   std::optional<std::vector<uint8_t>> Init;
+  // True when Init came straight from the image (readAtMost), i.e. the bytes
+  // are the program's data, not an analyzer-recognized string.
+  bool FromImage = false;
+  if (P.Functions.count(Addr)) {
+    // A function-pointer table can sit at a function start (vtables): read
+    // its bytes so the object gets a definition instead of an extern that
+    // nothing defines at link time.
+    Init = P.Img->readAtMost(Addr, 16);
+    FromImage = true;
+  }
   if (P.Strings) {
     if (auto It = P.Strings->find(Addr); It != P.Strings->end())
       Init = std::vector<uint8_t>(It->second.begin(), It->second.end());
   }
   if (!Init && !P.Functions.count(Addr))
     Init = P.Img->readAtMost(Addr, 4096);
+  // The initializer came from the image unless the analyzer recognized a
+  // string: those keep the IR contract's constant shape.
+  if (!P.Strings || !P.Strings->count(Addr))
+    FromImage = true;
+  // The Globals cache is per-function, so a whole-module run lifts the same
+  // address once per referencing function and LLVM renames the extras to
+  // `<name>.N`. One image VA is one object: reuse the global an earlier lift
+  // already materialized. Separate copies break aliasing (a store through
+  // one copy is invisible to the loads through the others), duplicate the
+  // initializer once per user, and reprint as extern declarations nothing
+  // defines. The name lookup is the fast path; the scan catches an object
+  // another lift spelled differently.
+  if (auto *ByName = llvm::dyn_cast_or_null<llvm::GlobalVariable>(
+          Mod.getNamedValue(Name)))
+    if (auto ByNameVa = ir::getGlobalVA(*ByName))
+      if (*ByNameVa == Addr.Value) {
+        Globals[Addr] = ByName;
+        return ByName;
+      }
+  for (llvm::GlobalVariable &GV : Mod.globals())
+    if (ir::getGlobalVA(GV) == Addr.Value) {
+      Globals[Addr] = &GV;
+      return &GV;
+    }
+  // No file-backed bytes (pure .bss): the object still starts zero-filled,
+  // so define it rather than emit an extern nothing can resolve.
+  bool Bss = !Init.has_value();
+  if (Bss)
+    Init = std::vector<uint8_t>(16, 0);
+  // Writable image data (the security cookie, mutable tables) carries the
+  // file's bytes as its initializer but must not be `constant`: the program
+  // stores to it, and a constant global makes those stores undefined. The
+  // exception is scoped to image-read initializers so analyzer-recognized
+  // string globals keep the IR contract's constant shape. A .bss object is
+  // uninitialized data, so it is writable by definition (and sectionOf does
+  // not map it, so isWritable cannot answer for it).
+  bool Writable = Bss || (FromImage && P.Img && P.Img->isWritable(Addr));
   unsigned Sz = Init ? (unsigned)Init->size() : 16;
   if (Sz == 0)
     Sz = 16;
   auto *G = new GlobalVariable(
-      Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/!!Init,
-      Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
-      nullptr, Name);
+      Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/Init && !Writable,
+      GlobalValue::InternalLinkage, nullptr, Name);
   if (Init) {
     SmallVector<Constant *, 16> Vals;
     Vals.reserve(Init->size());
