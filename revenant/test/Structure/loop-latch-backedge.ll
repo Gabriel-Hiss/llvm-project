@@ -1,4 +1,4 @@
-; RUN: python %S/loop-latch-backedge-run.py %s
+; RUN: python %S/loop-latch-backedge-run.py %s sub_140001210 10 27
 ; REQUIRES: structured-source-run
 ;
 ; Real lifted c-o0 break_continue at 0x140001210. For n=10 it returns 27;

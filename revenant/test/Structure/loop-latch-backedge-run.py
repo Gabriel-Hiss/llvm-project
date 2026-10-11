@@ -12,19 +12,23 @@ from pathlib import Path
 if os.name == "nt":
     ctypes.windll.kernel32.SetErrorMode(0x8003)
 
-MAIN_IR = r"""
-define i32 @main() {
-entry:
-  %result = call i32 @sub_140001210(i32 10)
-  %good = icmp eq i32 %result, 27
-  %status = select i1 %good, i32 0, i32 1
-  ret i32 %status
-}
-"""
-MAIN_C = r"""
-int sub_140001210(int);
-int main(void) { return sub_140001210(10) == 27 ? 0 : 1; }
-"""
+def wrapper_ir(function: str, argument: int, expected: int) -> str:
+    return (
+        "define i32 @main() {\n"
+        "entry:\n"
+        f"  %result = call i32 @{function}(i32 {argument})\n"
+        f"  %good = icmp eq i32 %result, {expected}\n"
+        "  %status = select i1 %good, i32 0, i32 1\n"
+        "  ret i32 %status\n"
+        "}\n"
+    )
+
+
+def wrapper_c(function: str, argument: int, expected: int) -> str:
+    return (
+        f"int {function}(int);\n"
+        f"int main(void) {{ return {function}({argument}) == {expected} ? 0 : 1; }}\n"
+    )
 
 
 def run(command: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[bytes]:
@@ -36,9 +40,15 @@ def run(command: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: loop-latch-backedge-run.py input.ll")
+    if len(sys.argv) != 5:
+        raise SystemExit(
+            "usage: loop-latch-backedge-run.py input.ll function argument expected")
     ir = Path(sys.argv[1]).resolve()
+    function = sys.argv[2]
+    try:
+        argument, expected = map(int, sys.argv[3:])
+    except ValueError as exc:
+        raise SystemExit("argument and expected result must be integers") from exc
     revenant_clang = os.environ["REVENANT_CLANG"]
     clang_cl = os.environ["RV_CLANG_CL"]
     lli = os.environ["RV_LLI"]
@@ -52,9 +62,10 @@ def main() -> int:
         driver = root / "driver.c"
         binary = root / "emitted.exe"
         lli_input = root / "lli-input.ll"
-        lli_input.write_text(ir_text.replace(metadata, MAIN_IR + "\n" + metadata, 1),
+        main_ir = wrapper_ir(function, argument, expected)
+        lli_input.write_text(ir_text.replace(metadata, main_ir + "\n" + metadata, 1),
                              encoding="utf-8")
-        driver.write_text(MAIN_C, encoding="utf-8")
+        driver.write_text(wrapper_c(function, argument, expected), encoding="utf-8")
         emitted = run([revenant_clang, str(ir), "--lang=c", "-o", str(source)])
         if emitted.returncode:
             raise SystemExit(emitted.stderr.decode(errors="replace"))
