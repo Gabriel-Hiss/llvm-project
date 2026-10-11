@@ -753,6 +753,8 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
       if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
           ForClaimed.contains(&I))
         continue;
+      if (Loop->ForShape && !I.mayHaveSideEffects())
+        continue;
       if (Loop->Kind == RegionKind::Loop)
         return gotoTo(Target);
       return nullptr;
@@ -968,15 +970,23 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
 void StructuredStmtBuilder::emitMembers(
     const Region &R, const SmallPtrSetImpl<BasicBlock *> &Set,
     SmallVectorImpl<Stmt *> &Out) {
+  // A while annotation can still describe a canonical for loop after
+  // optimization. Discover its init/step before the preheader is emitted.
+  for (auto &KV : Regions) {
+    Region *Loop = KV.second.get();
+    if (Loop->Kind == RegionKind::While && !Loop->Degraded)
+      prepareForLoop(*Loop);
+  }
   for (BasicBlock *BB : Blocks) {
     if (!Set.contains(BB))
       continue;
     bool DeferIntoLoop = false;
     for (auto &KV : Regions) {
       Region *Loop = KV.second.get();
-      if (Loop->Kind != RegionKind::Loop || Loop->Degraded ||
-          !Loop->Preheader || !Set.contains(Loop->Preheader) ||
-          Emitted.contains(Loop->Preheader) || !Loop->Members.contains(BB))
+      if ((Loop->Kind != RegionKind::Loop && !Loop->ForShape) ||
+          Loop->Degraded || !Loop->Preheader ||
+          !Set.contains(Loop->Preheader) || Emitted.contains(Loop->Preheader) ||
+          !Loop->Members.contains(BB))
         continue;
       auto BlockIt = llvm::find(Blocks, BB);
       auto PreheaderIt = llvm::find(Blocks, Loop->Preheader);
@@ -991,7 +1001,7 @@ void StructuredStmtBuilder::emitMembers(
     Region *PreheaderLoop = nullptr;
     for (auto &KV : Regions) {
       Region *Candidate = KV.second.get();
-      if (Candidate->Kind == RegionKind::Loop &&
+      if ((Candidate->Kind == RegionKind::Loop || Candidate->ForShape) &&
           Candidate->Preheader == BB && !Candidate->Degraded &&
           Set.contains(Candidate->Header)) {
         PreheaderLoop = Candidate;
@@ -1195,11 +1205,14 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
       return new (*AST) ContinueStmt(SourceLocation());
     if (Target != Loop->Latch)
       return nullptr;
-    for (Instruction &I : *Loop->Latch)
-      if (!I.isTerminator() && !isa<PHINode>(I) &&
-          !isa<DbgInfoIntrinsic>(I) && !ForClaimed.contains(&I)) {
-        return gotoTo(Target);
-      }
+    for (Instruction &I : *Loop->Latch) {
+      if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
+          ForClaimed.contains(&I))
+        continue;
+      if (Loop->ForShape && !I.mayHaveSideEffects())
+        continue;
+      return gotoTo(Target);
+    }
     return new (*AST) ContinueStmt(SourceLocation());
   };
   auto emitArm = [&](BasicBlock *Arm,
@@ -1380,11 +1393,15 @@ Stmt *StructuredStmtBuilder::tryForPieces(Region &R, Expr *&Step) {
 }
 void StructuredStmtBuilder::prepareForLoop(Region &R) {
   if (R.ForPiecesAttempted ||
-      (R.Kind != RegionKind::For && R.Kind != RegionKind::Loop))
+      (R.Kind != RegionKind::For && R.Kind != RegionKind::Loop &&
+       R.Kind != RegionKind::While))
     return;
   R.ForInit = tryForPieces(R, R.ForStep);
   R.ForPiecesAttempted = true;
-  R.ForShape = R.Kind == RegionKind::Loop && R.ForInit && R.ForStep;
+  // A While descriptor can still have canonical for-loop pieces: the
+  // structured CFG shape, not the original spelling, determines this.
+  R.ForShape = (R.Kind == RegionKind::Loop || R.Kind == RegionKind::While) &&
+               R.ForInit && R.ForStep;
 }
 
 

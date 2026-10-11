@@ -1,7 +1,8 @@
 ; Real ir-final alloca-form c-clang-o0 break_continue at 0x140001240.
 ; For n=30 the IR returns 147; the emitted source must terminate with that value.
 ; RUN: python %S/loop-latch-backedge-run.py %s sub_140001240 30 147
-; REQUIRES: structured-source-run
+; RUN: %revenant-clang %s --lang=c | %FileCheck %s --check-prefix=SHAPE
+; REQUIRES: structured-source-run,revenant-clang
 
 source_filename = "c-clang-o0.exe"
 target datalayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
@@ -68,3 +69,9 @@ bb_14000129f147:                                  ; preds = %bb_14000127a, %bb_1
 bb_x0:                                            ; preds = %bb_14000126c
   br label %bb_14000128e
 }
+
+; Shape recovery: the while-tagged loop has a preheader IV init and latch step.
+; SHAPE-LABEL: sub_140001240(
+; SHAPE: for (
+; SHAPE: continue;
+; SHAPE: break;
