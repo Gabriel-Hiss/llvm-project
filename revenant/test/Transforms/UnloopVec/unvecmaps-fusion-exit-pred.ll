@@ -1,16 +1,15 @@
 ; Drain-tail fusion stray-pred counterexample.
 ; S dispatches to the countdown drain or straight into the tail through
 ; a drain-exit block bb_exit. bb_exit has a SECOND predecessor alt: when
-; %alt reaches it the tail must still start at t.start.alt. The fusion
-; fold rewires S->T and the tail IV start BEFORE checking stray preds,
-; so a dead-region bail leaves S unconditionally jumping to T (the
-; drain is orphaned, bb_exit unreachable on its normal path, and the
-; tail IV starts at the fused resume on every entry — wrong code when
-; the drain carried the first rem elements, and a second-path alt entry
-; now sees an IV incoming it never supplied).
-; The fold must bail cleanly (no mutation, verify-clean): the guard
-; block has a live second predecessor, so collapsing its tail-feed phi
-; would drop a live entry.
+; %alt reaches it the tail must still start at t.start.alt.
+; The drain-tail fusion that used to live here was removed outright:
+; erasing the drain while starting the tail at the drain end lost the
+; drain's [indexStart, indexStart+rem) range for every N not a multiple
+; of the tail stride (lli differential diverged), and no tail-start
+; choice covers both the drain range and N on the tail's lattice. This
+; file stays as the no-mutation witness for the shape: the drain, the
+; guard phi with its stray incoming, and the dispatch all survive the
+; pass untouched, verify-clean.
 ; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 ; CHECK-LABEL: define{{.*}}i32 @fuse_exitpred
 ; CHECK: br i1 %hazrem, label %bb_exit, label %bb_drain
