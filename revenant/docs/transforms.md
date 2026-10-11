@@ -128,6 +128,12 @@ same-value stores through one base into a counted store loop. It requires
 matching widths and alignment, no intervening operations, and monotonic
 `!revenant.va` anchors; the loop preserves the original store width.
 
+The full pass can also rebuild a scalar integer reduction that rustc fully
+unrolled into one basic block: contiguous indexed loads, a single-use add tree
+that consumes every load exactly once, and monotonic `!revenant.va` evidence
+are required. The loop visits all indices in order and preserves wrapping-add
+semantics; other operations or shapes veto the rewrite.
+
 **revenant-unrotate (owner: MuseTxUnrotate).** Expects rerolled loops.
 Rewrites `if (c) { do { body } while (c); }` to while shape when guard and
 latch conditions are provably equal, splitting the self-loop block into a
