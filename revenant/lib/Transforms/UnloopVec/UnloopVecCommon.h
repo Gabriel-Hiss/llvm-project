@@ -72,6 +72,11 @@ inline bool matchScalarLoop(BasicBlock *H, ScalarLoopInfo &Out) {
         (C = dyn_cast<ConstantInt>(Add->getOperand(1)))) {
       if (Add->getOpcode() == Instruction::Sub)
         continue; // iv - C is not a latch step
+      // Width guard: every Step consumer converts with
+      // getZExtValue/getSExtValue, which assert past 64 bits.
+      // Bail at capture so no matcher can see a wide step.
+      if (C->getValue().getActiveBits() > 63)
+        continue;
       Out.Header = H;
       Out.IV = &Phi;
       Out.Step = C;

@@ -201,7 +201,8 @@ static bool countdownSecondaryOK(BasicBlock *Mid, ScalarLoopInfo &V,
   if (!InitAnd || InitAnd->getOpcode() != Instruction::And)
     return false;
   auto *Mask = dyn_cast<ConstantInt>(InitAnd->getOperand(1));
-  if (!Mask || Mask->getZExtValue() != Found - 1)
+  if (!Mask || Mask->getValue().getActiveBits() > 63 ||
+      Mask->getZExtValue() != Found - 1)
     return false;
   return stripCountDerivation(InitAnd->getOperand(0), F) == N;
 }
@@ -524,6 +525,8 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
       if (!Feeds)
         continue;
     }
+    if (MidLoop.Step->getValue().getActiveBits() > 63)
+      continue;
     uint64_t Step = MidLoop.Step->getZExtValue();
     if (Step < 2)
       continue;
