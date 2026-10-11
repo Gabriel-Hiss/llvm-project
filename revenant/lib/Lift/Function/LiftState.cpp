@@ -850,12 +850,16 @@ Value *LiftState::globalPtr(Va Addr) {
   // True when Init came straight from the image (readAtMost), i.e. the bytes
   // are the program's data, not an analyzer-recognized string.
   bool FromImage = false;
+  // True for a data reference to a function start: the object is the
+  // function's address, so it stays an extern the harness resolves.
+  bool FuncRef = false;
   if (P.Functions.count(Addr)) {
-    // A function-pointer table can sit at a function start (vtables): read
-    // its bytes so the object gets a definition instead of an extern that
-    // nothing defines at link time.
-    Init = P.Img->readAtMost(Addr, 16);
-    FromImage = true;
+    // Keep the extern spelling here: a data reference to a function start
+    // is the function's address, which the semantic harness resolves by
+    // deleting these declarations and aliasing the uses to the function.
+    // Defining a byte array under the same name collides with the function
+    // after that rename.
+    FuncRef = true;
   }
   if (P.Strings) {
     if (auto It = P.Strings->find(Addr); It != P.Strings->end())
@@ -887,9 +891,10 @@ Value *LiftState::globalPtr(Va Addr) {
       Globals[Addr] = &GV;
       return &GV;
     }
-  // No file-backed bytes (pure .bss): the object still starts zero-filled,
-  // so define it rather than emit an extern nothing can resolve.
-  bool Bss = !Init.has_value();
+  // No file-backed bytes on a plain data address (pure .bss): the object
+  // still starts zero-filled, so define it rather than emit an extern
+  // nothing can resolve.
+  bool Bss = !Init.has_value() && !FuncRef;
   if (Bss)
     Init = std::vector<uint8_t>(16, 0);
   // Writable image data (the security cookie, mutable tables) carries the
@@ -905,7 +910,8 @@ Value *LiftState::globalPtr(Va Addr) {
     Sz = 16;
   auto *G = new GlobalVariable(
       Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/Init && !Writable,
-      GlobalValue::InternalLinkage, nullptr, Name);
+      Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
+      nullptr, Name);
   if (Init) {
     SmallVector<Constant *, 16> Vals;
     Vals.reserve(Init->size());
