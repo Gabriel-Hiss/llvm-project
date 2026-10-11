@@ -193,6 +193,7 @@ int main(int Argc, char **Argv) {
       if (Classification.UserEntry && Start == *Classification.UserEntry &&
           Classification.UserEntryName)
         Name = *Classification.UserEntryName;
+      outs() << format_hex(Start.Value, 0) << "\t" << Name << "\t";
       if (!ClassifyFuncs)
         outs() << Rec.InstrRvas.size() << " instrs\n";
       else if (Classification.UserReachable.count(Start))
