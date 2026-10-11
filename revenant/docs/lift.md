@@ -10,8 +10,9 @@ The generated footer reports the table census. The X86 target contains 21,973 in
 
 The lifter models packed `CVTDQ2PD`, `CVTDQ2PS`, `CVTPS2DQ`,
 `CVTTPS2DQ`, and `CVTTPD2DQ` operations with vector IR conversions.
-`CVTTPD2DQ` zeroes the upper 64 result bits. `CVTPS2PD` and `ROUNDSD`/`ROUNDSS`
-memory operands read only their architectural width.
+`CVTPD2PS` and `CVTTPD2DQ` zero the upper 64 result bits. `CVTDQ2PD`,
+`CVTPS2PD`, `ROUNDSD`, and `ROUNDSS` memory operands read only their
+architectural width.
 
 `ROUNDSD` and `ROUNDSS` use `llvm.nearbyint`, `llvm.floor`, `llvm.ceil`, or
 `llvm.trunc` according to the instruction's imm8 mode. The MXCSR-selected
