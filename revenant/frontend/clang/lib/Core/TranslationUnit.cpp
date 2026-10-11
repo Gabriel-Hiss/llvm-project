@@ -206,6 +206,20 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
     Params.push_back(PD);
     ++Idx;
   }
+  // The declared prototype can carry more parameters than the lifted IR
+  // (functionDecl normalizes main/wmain to (int, char**), and a libdb
+  // prototype may name parameters the lifted signature dropped). Pad with
+  // prototype-typed ParmVarDecls so setParams' count always matches.
+  if (Prototype) {
+    for (unsigned I = Params.size(); I < Prototype->getNumParams(); ++I) {
+      c::QualType PT = Prototype->getParamType(I);
+      c::IdentifierInfo *II = FCtx.ident(("a" + Twine(I + 1)).str());
+      c::ParmVarDecl *PD = c::ParmVarDecl::Create(
+          AST, FD, c::SourceLocation(), c::SourceLocation(), II, PT, nullptr,
+          c::SC_None, nullptr);
+      Params.push_back(PD);
+    }
+  }
   FD->setParams(Params);
 
   if (F.isDeclaration())

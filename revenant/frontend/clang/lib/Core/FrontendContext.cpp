@@ -114,6 +114,9 @@ FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
   // Normalize main/wmain signature for MSVC/clang-cl compatibility.
   // Keep the lifted arity (argc/argv, plus envp when recovered): only the
   // spellings are normalized, so the decl always matches the definition.
+  // Normalize main/wmain signature for MSVC/clang-cl compatibility. The
+  // lifted IR may carry fewer arguments (e.g. argc-only `i32 @main(i32)`);
+  // buildFunction pads ParmVarDecls to the declared arity below.
   if (F.getName() == "main" || F.getName() == "wmain") {
     clang::ASTContext &A = AST;
     clang::QualType IntTy = A.IntTy;
