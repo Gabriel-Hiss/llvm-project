@@ -123,6 +123,11 @@ Synthesizes loops for full straight-line unrolls, including strength-reduced
 affine lanes with uniform address strides and instruction-address evidence.
 Ambiguous copies and unproved short-trip loops stay put.
 
+The full pass also rerolls a constant-fill run of four or more contiguous,
+same-value stores through one base into a counted store loop. It requires
+matching widths and alignment, no intervening operations, and monotonic
+`!revenant.va` anchors; the loop preserves the original store width.
+
 **revenant-unrotate (owner: MuseTxUnrotate).** Expects rerolled loops.
 Rewrites `if (c) { do { body } while (c); }` to while shape when guard and
 latch conditions are provably equal, splitting the self-loop block into a

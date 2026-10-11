@@ -236,7 +236,9 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
     Insns.push_back(&I);
   }
   size_t N = Insns.size();
-  if (N < 9)
+  // Four constant stores need only three address GEPs; other patterns
+  // are filtered by their anchor and lane checks below.
+  if (N < 7)
     return 0;
 
   // In-window def lookup.
@@ -260,7 +262,14 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
       continue;
     Value *Addr = S->getPointerOperand();
     auto *G = dyn_cast<GetElementPtrInst>(Addr);
-    if (!G || G->getParent() != &B || G->getNumIndices() != 1)
+    if (!G) {
+      // A direct store through the shared base is the zero-offset lane.
+      if (Addr->getType()->isPointerTy() &&
+          !isa<Instruction>(Addr) && isa<Constant>(S->getValueOperand()))
+        Anchors.push_back({p, Addr, 0});
+      continue;
+    }
+    if (G->getParent() != &B || G->getNumIndices() != 1)
       continue;
     auto *C = dyn_cast<ConstantInt>(G->getOperand(1));
     if (!C)
@@ -291,6 +300,105 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
   DenseMap<Value *, SmallVector<size_t, 8>> ByBase;
   for (size_t i = 0; i < Anchors.size(); ++i)
     ByBase[Anchors[i].Base].push_back(i);
+  auto TryConstantFill = [&](const SmallVector<size_t, 8> &Idx, Value *Base,
+                             int64_t Stride) {
+    const size_t K = Idx.size();
+    if (K < 4 || !Base->getType()->isPointerTy())
+      return false;
+    auto *FirstStore =
+        dyn_cast<StoreInst>(Insns[Anchors[Idx.front()].Pos]);
+    auto *Fill = FirstStore
+                     ? dyn_cast<Constant>(FirstStore->getValueOperand())
+                     : nullptr;
+    if (!FirstStore || !Fill || Fill->getType()->isVectorTy() ||
+        !Fill->getType()->isSized() || FirstStore->isVolatile() ||
+        FirstStore->isAtomic())
+      return false;
+    int64_t StoreBytes =
+        (int64_t)Fill->getType()->getPrimitiveSizeInBits() / 8;
+    if (StoreBytes <= 0 || Stride < StoreBytes)
+      return false;
+
+    Align StoreAlign = FirstStore->getAlign();
+    SmallPtrSet<Instruction *, 16> Allowed;
+    SmallVector<StoreInst *, 8> Stores;
+    SmallVector<GetElementPtrInst *, 8> AddressGEPs;
+    uint64_t FirstVA = 0, PrevVA = 0;
+    for (size_t J = 0; J < K; ++J) {
+      auto *S = dyn_cast<StoreInst>(Insns[Anchors[Idx[J]].Pos]);
+      if (!S || S->getValueOperand() != Fill || S->isVolatile() ||
+          S->isAtomic() || S->getAlign() != StoreAlign)
+        return false;
+      auto VA = vaOf(*S);
+      if (!VA || (J && *VA <= PrevVA))
+        return false;
+      if (!J)
+        FirstVA = *VA;
+      PrevVA = *VA;
+
+      Stores.push_back(S);
+      Allowed.insert(S);
+      Value *Addr = S->getPointerOperand();
+      if (Addr == Base) {
+        if (Anchors[Idx[J]].Off != 0)
+          return false;
+        continue;
+      }
+      auto *G = dyn_cast<GetElementPtrInst>(Addr);
+      if (!G || G->getPointerOperand() != Base || G->getNumIndices() != 1 ||
+          !G->hasOneUse() || *G->user_begin() != S)
+        return false;
+      AddressGEPs.push_back(G);
+      Allowed.insert(G);
+    }
+    if (PrevVA - FirstVA > 512)
+      return false;
+
+    size_t Start = Anchors[Idx.front()].Pos;
+    size_t RunEnd = Anchors[Idx.back()].Pos + 1;
+    for (size_t I = Start; I < RunEnd; ++I)
+      if (!Allowed.count(Insns[I]))
+        return false;
+
+    BasicBlock *Pre = &B;
+    BasicBlock *Exit = RunEnd < N
+                           ? Pre->splitBasicBlock(Insns[RunEnd], "unroll.exit")
+                           : Pre->splitBasicBlock(Pre->getTerminator(),
+                                                  "unroll.exit");
+    BasicBlock *Loop = Pre->splitBasicBlock(Insns[Start], "unroll");
+    Instruction *OldTerm = Loop->getTerminator();
+    Type *I64 = Type::getInt64Ty(F.getContext());
+    IRBuilder<> PB(Loop, Loop->begin());
+    PHINode *Index = PB.CreatePHI(I64, 2, "u0i");
+    Index->addIncoming(ConstantInt::get(I64, 0), Pre);
+    copyVA(FirstStore, Index);
+
+    IRBuilder<> LB(OldTerm);
+    Value *Offset = LB.CreateMul(Index, ConstantInt::get(I64, Stride), "u0a");
+    if (Anchors[Idx.front()].Off != 0)
+      Offset = LB.CreateAdd(
+          Offset, ConstantInt::get(I64, Anchors[Idx.front()].Off), "u0a");
+    Value *Address =
+        LB.CreateGEP(Type::getInt8Ty(F.getContext()), Base, Offset, "u0addr");
+    StoreInst *LoopStore = LB.CreateStore(Fill, Address);
+    LoopStore->setAlignment(StoreAlign);
+    copyVA(FirstStore, LoopStore);
+    Value *Next = LB.CreateAdd(Index, ConstantInt::get(I64, 1), "u0inext");
+    Value *Cond =
+        LB.CreateICmpULT(Next, ConstantInt::get(I64, K), "u0c");
+    copyVA(FirstStore, cast<Instruction>(Next));
+    copyVA(FirstStore, cast<Instruction>(Cond));
+    Index->addIncoming(Next, Loop);
+    BranchInst *Latch = LB.CreateCondBr(Cond, Loop, Exit);
+    copyVA(Stores.back(), Latch);
+    OldTerm->eraseFromParent();
+
+    for (StoreInst *S : Stores)
+      S->eraseFromParent();
+    for (GetElementPtrInst *G : AddressGEPs)
+      G->eraseFromParent();
+    return true;
+  };
   for (auto &KV : ByBase) {
     auto &All = KV.second;
     if (All.size() < MinWindows)
@@ -317,6 +425,8 @@ unsigned tryRerollFull(Function &F, BasicBlock &B,
         AddrOK = false;
     if (!AddrOK)
       continue;
+    if (TryConstantFill(Idx, KV.first, Stride))
+      return 1;
     // Lane ranges must tile contiguously from the first lane's value-def
     // start: lane 0 starts at its value def (or its address GEP when the
     // value is a bare leaf/constant), later lanes start right after the
