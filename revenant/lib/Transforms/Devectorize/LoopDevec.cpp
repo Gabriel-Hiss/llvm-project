@@ -145,6 +145,186 @@ struct AccPhi {
   Value *Stream = nullptr;     // other operand of Back
 };
 
+// Manual horizontal-fold prover. A fold tree reduces accumulator lanes to one
+// scalar through lane-wise adds, shuffles, same-width bitcasts, i128 logical
+// shifts by whole lanes, and a final lane extract. Each lane of every tree
+// value carries a multiset of root-lane occurrences (root r = acc*Lanes+lane,
+// up to 64 roots). Adds sum the multisets; intermediate lanes may
+// double-count roots that later shuffles drop (clang's hadd lowering sums
+// [a+c b+d c+c d+d] then keeps only lane 1). The fold is valid iff the final
+// extracted lane holds every root exactly once. Integer wrapping add is
+// associative and commutative, so the final exact-once multiset is the whole
+// legality proof for Add.
+struct FoldProver {
+  const SmallVector<AccPhi, 4> *Accs = nullptr;
+  unsigned Lanes = 0;
+  unsigned Roots = 0;
+  // Memo: flattened lanes*Roots counts per value.
+  DenseMap<const Value *, SmallVector<unsigned, 16>> Memo;
+  const SmallVector<unsigned, 16> *lanes(const Value *V, unsigned Depth) {
+    if (Depth > 32)
+      return nullptr;
+    auto Hit = Memo.find(V);
+    if (Hit != Memo.end())
+      return &Hit->second;
+    SmallVector<unsigned, 16> M;
+    if (!build(const_cast<Value *>(V), M, Depth))
+      return nullptr;
+    Memo[V] = M;
+    return &Memo.find(V)->second;
+  }
+  bool build(Value *V, SmallVector<unsigned, 16> &M, unsigned Depth) {
+    unsigned R = Roots ? Roots : 1;
+    auto pushZero = [&]() {
+      for (unsigned k = 0; k < R; ++k)
+        M.push_back(0);
+    };
+    auto pushOneHot = [&](unsigned Root) {
+      for (unsigned k = 0; k < R; ++k)
+        M.push_back(k == Root ? 1 : 0);
+    };
+    for (unsigned a = 0; Accs && a < Accs->size(); ++a) {
+      if (V == (*Accs)[a].Phi || V == (*Accs)[a].Back) {
+        for (unsigned j = 0; j < Lanes; ++j)
+          pushOneHot(a * Lanes + j);
+        return true;
+      }
+    }
+    if (auto *C = dyn_cast<Constant>(V)) {
+      unsigned NL = 1;
+      if (auto *VT = dyn_cast<FixedVectorType>(C->getType()))
+        NL = VT->getNumElements();
+      for (unsigned j = 0; j < NL; ++j) {
+        const Constant *LaneC = nullptr;
+        if (auto *CV = dyn_cast<ConstantVector>(C)) {
+          if (Constant *S = CV->getSplatValue())
+            LaneC = S;
+          else
+            LaneC = dyn_cast<Constant>(CV->getOperand(j));
+        } else if (isa<ConstantAggregateZero>(C)) {
+          LaneC = nullptr;
+        } else {
+          LaneC = C;
+        }
+        if (LaneC && !isa<UndefValue>(LaneC)) {
+          auto *CI = dyn_cast<ConstantInt>(LaneC);
+          if (!CI || !CI->isZero())
+            return false;
+        }
+        pushZero();
+      }
+      return true;
+    }
+    if (isa<UndefValue>(V) || isa<PoisonValue>(V)) {
+      pushZero();
+      return true;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getOpcode() == Instruction::Add) {
+        auto *A = lanes(BO->getOperand(0), Depth + 1);
+        auto *B = lanes(BO->getOperand(1), Depth + 1);
+        if (!A || !B || A->size() != B->size())
+          return false;
+        for (unsigned j = 0; j < A->size(); ++j)
+          M.push_back((*A)[j] + (*B)[j]);
+        return true;
+      }
+      if (BO->getOpcode() == Instruction::LShr &&
+          BO->getType()->isIntegerTy(128)) {
+        auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (!CI)
+          return false;
+        uint64_t Shift = CI->getZExtValue();
+        if (Shift % 32 != 0 || R == 0)
+          return false;
+        unsigned K = (unsigned)(Shift / 32);
+        auto *A = lanes(BO->getOperand(0), Depth + 1);
+        if (!A || A->size() != 4 * R || K >= 4)
+          return false;
+        for (unsigned j = 0; j < 4; ++j)
+          for (unsigned k = 0; k < R; ++k)
+            M.push_back(j + K < 4 ? (*A)[(j + K) * R + k] : 0);
+        return true;
+      }
+      return false;
+    }
+    if (auto *SV = dyn_cast<ShuffleVectorInst>(V)) {
+      int NL = (int)SV->getShuffleMask().size();
+      auto *A = lanes(SV->getOperand(0), Depth + 1);
+      auto *B = lanes(SV->getOperand(1), Depth + 1);
+      if (!A || !B || R == 0)
+        return false;
+      unsigned AL = A->size() / R, BL = B->size() / R;
+      for (int j = 0; j < NL; ++j) {
+        int Idx = SV->getShuffleMask()[j];
+        if (Idx < 0) {
+          pushZero();
+          continue;
+        }
+        unsigned U = (unsigned)Idx;
+        const SmallVector<unsigned, 16> *S = nullptr;
+        unsigned Base = 0;
+        if (U < AL) {
+          S = A;
+          Base = U * R;
+        } else if (U - AL < BL) {
+          S = B;
+          Base = (U - AL) * R;
+        } else {
+          return false;
+        }
+        for (unsigned k = 0; k < R; ++k)
+          M.push_back((*S)[Base + k]);
+      }
+      return true;
+    }
+    if (auto *BI = dyn_cast<BitCastInst>(V)) {
+      auto *A = lanes(BI->getOperand(0), Depth + 1);
+      if (!A)
+        return false;
+      auto laneCount = [](Type *T) -> unsigned {
+        if (auto *VT = dyn_cast<FixedVectorType>(T))
+          return VT->getNumElements();
+        if (T->isIntegerTy(128))
+          return 4;
+        return 0;
+      };
+      unsigned SrcL = laneCount(BI->getSrcTy());
+      unsigned DstL = laneCount(BI->getDestTy());
+      if (!SrcL || SrcL != DstL || (R != 0 && A->size() != SrcL * R))
+        return false;
+      M.assign(A->begin(), A->end());
+      return true;
+    }
+    if (auto *EI = dyn_cast<ExtractElementInst>(V)) {
+      auto *Idx = dyn_cast<ConstantInt>(EI->getIndexOperand());
+      if (!Idx || R == 0)
+        return false;
+      auto *A = lanes(EI->getVectorOperand(), Depth + 1);
+      if (!A || (Idx->getZExtValue() + 1) * R > A->size())
+        return false;
+      unsigned Base = (unsigned)Idx->getZExtValue() * R;
+      for (unsigned k = 0; k < R; ++k)
+        M.push_back((*A)[Base + k]);
+      return true;
+    }
+    return false;
+  }
+};
+
+// Fold-step opcode test for the outside-use walk: lane-wise integer adds,
+// vector shuffles, bitcasts, and lane extracts. i128 shifts are
+// BinaryOperators (LShr) and pass here; width checking happens in the prover.
+bool isFoldStep(Instruction *I) {
+  if (isa<ShuffleVectorInst>(I) || isa<BitCastInst>(I) ||
+      isa<ExtractElementInst>(I))
+    return true;
+  if (auto *BO = dyn_cast<BinaryOperator>(I))
+    return BO->getOpcode() == Instruction::Add ||
+           BO->getOpcode() == Instruction::LShr;
+  return false;
+}
+
 } // namespace
 
 static unsigned tryLoop(Function &F, BasicBlock *H);
@@ -234,11 +414,20 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   // Per-acc splat init check: every acc init must fold to one Elem lane
   // value. The emit stage seeds each scalar phi from its own acc's init
   // (no cross-acc merging: independent reductions keep independent sums).
+  // Lane-varying induction bail: a vector PHI stepping by a splat constant
+  // from a ramp-constant init is an index vector, not a reduction
+  // accumulator. Such a loop is not a pure reduction over source values
+  // (c-gcc-o3 sub_1400017B0: acc over <0,1,2,3>+splat4), so the whole loop
+  // bails rather than threading the induction through scalar chains.
   for (auto &A : Accs) {
-    if (!splatInit(A.Init, Elem, Lanes))
-      return 0;
+    if (splatInit(A.Init, Elem, Lanes))
+      continue;
+    auto *InitC = dyn_cast<Constant>(A.Init);
+    auto *StreamC = dyn_cast<Constant>(A.Stream);
+    if (InitC && StreamC && StreamC->getSplatValue())
+      return 0; // induction PHI: not a pure reduction
+    return 0; // non-splat init, non-induction: today's bail
   }
-
   // Outside-use precheck: every outside use of an acc phi, backedge, or
   // other vector def in H must feed a matching reduce (directly or
   // through one lane-wise add combining acc backs).
@@ -298,18 +487,28 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
         Combines.push_back(BO);
         continue;
       }
+      // Fold-step candidate: lane-wise adds (other than the combine), vector
+      // shuffles, same-width bitcasts, whole-lane i128 shifts, and lane
+      // extracts outside H may belong to a manual horizontal-fold tree. They
+      // are proven (or rejected) by the fold discovery below; anything else
+      // bails here as before.
+      if (isFoldStep(const_cast<Instruction *>(UI)))
+        continue;
       return 0;
     }
   }
-  // Reduces over an exit-block combine: the combine lives outside H so the
-  // loop above never visits its users. Every combine must feed at least one
-  // matching reduce (else the scalar chains would not cover its value), and
-  // no other outside use is allowed. (devectorize-mixed-reduce-roots.ll: the
-  // second reduce over acc+acc was missed here, left on the severed vector
-  // PHI, and returned 16 instead of 24.)
+  // Reduces over an exit-block combine (only when a reduce intrinsic exists:
+  // with no reduces the combines feed manual fold trees, proven below). The
+  // combine lives outside H so the loop above never visits its users. Every
+  // combine must feed at least one matching reduce (else the scalar chains
+  // would not cover its value), and no other outside use is allowed.
+  // (devectorize-mixed-reduce-roots.ll: the second reduce over acc+acc was
+  // missed here, left on the severed vector PHI, and returned 16 instead
+  // of 24.)
   DenseSet<const Instruction *> SeenReduce;
   for (Instruction *R : Reduces)
     SeenReduce.insert(R);
+  if (!Reduces.empty())
   for (BinaryOperator *C : Combines) {
     bool FedReduce = false;
     for (User *U : C->users()) {
@@ -330,6 +529,135 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     if (!FedReduce)
       return 0;
   }
+  // Manual-fold exit discovery (no reduce intrinsic): when Reduces is empty
+  // and the opcode is Add, each exit-block combine may instead feed a fold
+  // tree (lane-wise adds, shuffles, same-width bitcasts, whole-lane i128
+  // shifts, final lane extract) that the prover shows sums every root lane
+  // exactly once. Fold-tree values and the extract are recorded for erasure
+  // after scalar aliasing. The extract may feed scalar tail-loop PHIs or a
+  struct FoldExit {
+    ExtractElementInst *Extract = nullptr;
+    SmallVector<Instruction *, 16> TreeVals;
+    unsigned Roots = 0;
+  };
+  SmallVector<FoldExit, 2> Folds;
+  // Fold roots: the exit-block combines when present, else the acc backedges
+  // directly (single-accumulator i128 folds have no combine).
+  SmallVector<Value *, 4> FoldRoots;
+  for (auto *C : Combines)
+    FoldRoots.push_back(C);
+  if (FoldRoots.empty())
+    for (auto &A : Accs)
+      FoldRoots.push_back(A.Back);
+  if (Reduces.empty() && Opcode == Instruction::Add && !FoldRoots.empty()) {
+    FoldProver FP;
+    FP.Accs = &Accs;
+    FP.Lanes = Lanes;
+    FP.Roots = Accs.size() * Lanes;
+    SmallVector<ExtractElementInst *, 4> Exts;
+    DenseSet<const Value *> SeenExt;
+    for (Value *FR : FoldRoots) {
+      SmallVector<Value *, 8> Work;
+      DenseSet<const Value *> Seen;
+      Work.push_back(FR);
+      Seen.insert(FR);
+      for (unsigned wi = 0; wi < Work.size() && wi < 64; ++wi) {
+        for (User *U : Work[wi]->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI || UI->getParent() == H || !isFoldStep(UI))
+            continue;
+          if (auto *EI = dyn_cast<ExtractElementInst>(UI)) {
+            if (SeenExt.insert(EI).second)
+              Exts.push_back(EI);
+            continue;
+          }
+          if (Seen.insert(UI).second)
+            Work.push_back(UI);
+        }
+      }
+    }
+    auto ExactOnce = [&](const SmallVector<unsigned, 16> *M) {
+      if (!M || M->size() != FP.Roots)
+        return false;
+      for (unsigned c : *M)
+        if (c != 1)
+          return false;
+      return true;
+    };
+    DenseSet<const Value *> FoldSeen;
+    for (ExtractElementInst *Ext : Exts) {
+      if (!ExactOnce(FP.lanes(Ext, 0)))
+        continue;
+      // Backward slice through fold steps to the acc roots.
+      SmallVector<Instruction *, 16> Slice;
+      DenseSet<const Value *> SSeen;
+      SmallVector<Value *, 8> Work;
+      Work.push_back(Ext);
+      SSeen.insert(Ext);
+      bool Bad = false;
+      for (unsigned wi = 0; wi < Work.size() && wi < 64 && !Bad; ++wi) {
+        auto *I = cast<Instruction>(Work[wi]);
+        Slice.push_back(I);
+        for (Value *Op : I->operands()) {
+          if (isa<Constant>(Op) || isa<UndefValue>(Op))
+            continue;
+          bool IsRoot = false;
+          for (unsigned a = 0; a < Accs.size(); ++a)
+            if (Op == Accs[a].Phi || Op == Accs[a].Back)
+              IsRoot = true;
+          if (IsRoot)
+            continue;
+          auto *OI = dyn_cast<Instruction>(Op);
+          if (!OI || OI->getParent() == H || !isFoldStep(OI)) {
+            Bad = true;
+            break;
+          }
+          if (SSeen.insert(OI).second)
+            Work.push_back(OI);
+        }
+      }
+      if (Bad)
+        continue;
+      FoldExit FE;
+      FE.Extract = Ext;
+      FE.Roots = FP.Roots;
+      FE.TreeVals = Slice;
+      for (auto *I : FE.TreeVals)
+        FoldSeen.insert(I);
+      Folds.push_back(FE);
+    }
+    // Every combine must be consumed by a proven fold; every fold value's
+    // users must stay inside the folds except the extracts, which feed
+    // scalar tail PHIs or a scalar return.
+    for (BinaryOperator *C : Combines) {
+      if (!FoldSeen.contains(C))
+        return 0;
+    }
+    for (auto &FE : Folds) {
+      for (Instruction *I : FE.TreeVals) {
+        if (I == FE.Extract)
+          continue;
+        for (User *U : I->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI || !FoldSeen.contains(UI))
+            return 0;
+        }
+      }
+      for (User *U : FE.Extract->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI)
+          return 0;
+        if (isa<PHINode>(UI) || isa<ReturnInst>(UI))
+          continue;
+        return 0;
+      }
+    }
+    if (Folds.empty())
+      return 0;
+  }
+  // exit consumers on severed vector PHIs (loop-manualfold-stays.ll).
+  if (Reduces.empty() && Folds.empty())
+    return 0;
   for (BasicBlock *S : Br->successors()) {
     if (S == H)
       continue;
@@ -776,14 +1104,52 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   for (BinaryOperator *C : Combines) {
     if (C->use_empty())
       continue;
-    // Uses were rewired to Chain above (the combine fed only reduces).
-    // Anything still using it blocks erasure; leave it.
+    // Uses were rewired to scalar images above (the combine fed only
+    // reduces). Anything still using it blocks erasure; leave it.
     if (C->use_empty()) {
       C->eraseFromParent();
       ++NReduce;
     }
   }
-
+  // Manual-fold exits: each fold's extract aliases to the scalar sum of the
+  // chain ends (one opcode op per combine side, distributed like reduces).
+  // The extract feeds scalar tail-loop PHIs (reseed: the tail now starts from
+  // the scalar sum) or a scalar return. Trip-bound defs are untouched; only
+  // users rewire. Fold-tree values die by erasure below.
+  for (auto &FE : Folds) {
+    // Scalar image of the fold: the tree provably sums every root lane
+    // exactly once, so the extract aliases to the opcode applied across all
+    // per-acc chain ends (each chain end is that acc's post-update lane sum;
+    // all acc inits are the shared splat seed by the precheck... each acc
+    // keeps its own seed: sum the chain ends directly).
+    Value *Sum = nullptr;
+    for (unsigned a = 0; a < Accs.size(); ++a) {
+      Value *Img = Subs.lookup(Accs[a].Back);
+      if (!Img)
+        return 0; // precheck promised per-acc chains; defensive
+      if (!Sum) {
+        Sum = Img;
+        continue;
+      }
+      auto *N = BinaryOperator::Create((Instruction::BinaryOps)Opcode, Sum,
+                                       Img, "s.unopt.m", FE.Extract);
+      inheritMeta(FE.Extract, N);
+      Sum = N;
+    }
+    if (!Sum)
+      return 0;
+    FE.Extract->replaceAllUsesWith(Sum);
+    for (Instruction *I : FE.TreeVals) {
+      if (I != FE.Extract && I->use_empty()) {
+        I->eraseFromParent();
+        ++NReduce;
+      }
+    }
+    if (FE.Extract->use_empty()) {
+      FE.Extract->eraseFromParent();
+      ++NReduce;
+    }
+  }
   // Rewrite kept scalar operands through Subs (type-guarded).
   for (Instruction &I : *H) {
     if (isa<FixedVectorType>(I.getType()))
