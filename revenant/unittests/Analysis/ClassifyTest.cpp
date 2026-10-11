@@ -72,4 +72,31 @@ TEST(ClassifyTest, CalleeEvidenceKeepsKnownMatch) {
 #endif
 }
 
+// Board line 347: stripped static-MinGW PEs (no mingw/libgcc import DLLs)
+// must still detect as MinGwGcc via .CRT/.tls sections + GCC comment +
+// Mingw-w64 runtime strings; MSVC c-o2 and clang-cl json-cl-o2 must stay
+// non-MinGW so the __try/__except gate keeps firing for them.
+TEST(ClassifyTest, DetectRecognizesStrippedStaticMinGW) {
+#if defined(REVENANT_TEST_C_GCC_O2) && defined(REVENANT_TEST_C_O2)
+  auto Gcc = Session::open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(!!Gcc) << "cannot open " REVENANT_TEST_C_GCC_O2;
+  EXPECT_EQ((*Gcc)->compiler().Producer, Compiler::MinGwGcc)
+      << "evidence: "
+      << ((*Gcc)->compiler().Evidence.empty()
+              ? std::string("<none>")
+              : (*Gcc)->compiler().Evidence.front());
+  auto Msvc = Session::open(REVENANT_TEST_C_O2);
+  ASSERT_TRUE(!!Msvc) << "cannot open " REVENANT_TEST_C_O2;
+  EXPECT_NE((*Msvc)->compiler().Producer, Compiler::MinGwGcc);
+#ifdef REVENANT_TEST_JSON_CL_O2
+  auto ClangCl = Session::open(REVENANT_TEST_JSON_CL_O2);
+  ASSERT_TRUE(!!ClangCl) << "cannot open " REVENANT_TEST_JSON_CL_O2;
+  EXPECT_NE((*ClangCl)->compiler().Producer, Compiler::MinGwGcc)
+      << "clang-cl image must not score as MinGW";
+#endif
+#else
+  GTEST_SKIP() << "REVENANT_TEST_C_GCC_O2/REVENANT_TEST_C_O2 not defined";
+#endif
+}
+
 } // namespace
