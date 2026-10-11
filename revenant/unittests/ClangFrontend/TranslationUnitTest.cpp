@@ -212,7 +212,53 @@ TEST(TranslationUnitTest, EmitsInfinityWithoutNonportableInfToken) {
   SmallString<256> Text;
   raw_svector_ostream OS(Text);
   printTranslationUnit(TU->tu(), OS, {});
-  EXPECT_EQ(StringRef(OS.str()).find("Inf"), StringRef::npos);
+  StringRef Src = OS.str();
+  // The value comes from a helper call, never from a literal spelling: no
+  // `Inf` token, no constant `1.0 / 0.0` (MSVC C2124), and the helper that
+  // carries the exact IEEE bits is declared before its first use.
+  EXPECT_EQ(Src.find("Inf"), StringRef::npos);
+  EXPECT_EQ(Src.find("1.0 / 0.0"), StringRef::npos);
+  EXPECT_NE(Src.find("return revenant_inf();"), StringRef::npos);
+  size_t Helper = Src.find("static double revenant_inf(void)");
+  EXPECT_NE(Helper, StringRef::npos);
+  EXPECT_LT(Helper, Src.find("return revenant_inf();"));
+}
+
+TEST(TranslationUnitTest, EmitsNanThroughPortableHelper) {
+  LLVMContext Context;
+  Module M("nan", Context);
+  M.setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  Function *F = Function::Create(
+      FunctionType::get(Type::getDoubleTy(Context), false),
+      Function::ExternalLinkage, "nan_value", M);
+  BasicBlock *Entry = BasicBlock::Create(Context, "entry", F);
+  IRBuilder<> Builder(Entry);
+  Builder.CreateRet(ConstantFP::getQNaN(Type::getDoubleTy(Context)));
+
+  ClangFrontendOptions Options;
+  Options.Lang = "c";
+  auto TUOrErr = createASTContext(M, Options);
+  if (!TUOrErr) {
+    ADD_FAILURE() << toString(TUOrErr.takeError());
+    return;
+  }
+  std::unique_ptr<TranslationUnit> TU = std::move(*TUOrErr);
+  std::unique_ptr<TypeBuilder> Types = createTypeBuilder(TU->frontend());
+  std::unique_ptr<StmtBuilder> Stmts = createStmtBuilder(TU->frontend(), *Types);
+  std::unique_ptr<ExprBuilder> Exprs = createExprBuilder(TU->frontend(), *Types);
+  fillTranslationUnit(*TU, M, *Types, *Stmts, *Exprs);
+
+  SmallString<256> Text;
+  raw_svector_ostream OS(Text);
+  printTranslationUnit(TU->tu(), OS, {});
+  StringRef Src = OS.str();
+  // `NaN` as a bare identifier is undeclared under gcc; the helper keeps
+  // the value and every compiler accepts it.
+  EXPECT_EQ(Src.find("NaN"), StringRef::npos);
+  EXPECT_NE(Src.find("return revenant_nan();"), StringRef::npos);
+  size_t Helper = Src.find("static double revenant_nan(void)");
+  EXPECT_NE(Helper, StringRef::npos);
+  EXPECT_LT(Helper, Src.find("return revenant_nan();"));
 }
 
 TEST(TranslationUnitTest, ArrayElementLiteralsAvoidNarrowTypeSuffixes) {
@@ -222,8 +268,8 @@ TEST(TranslationUnitTest, ArrayElementLiteralsAvoidNarrowTypeSuffixes) {
   // The gcc/clang targets hold their tables as narrow arrays; a literal
   // carrying the element type prints as `229Ui8`, which no target compiler
   // understands ("operator\"Ui8\" not found").
-  Constant *Elems =
-      ConstantDataArray::get(Context, ArrayRef<uint8_t>{229, 1, 0, 255});
+  Constant *Elems = ConstantDataArray::get(
+      Context, ArrayRef<uint8_t>{229, 1, 0, 255});
   new GlobalVariable(M, ArrayType::get(Type::getInt8Ty(Context), 4), true,
                      GlobalValue::ExternalLinkage, Elems, "table");
 

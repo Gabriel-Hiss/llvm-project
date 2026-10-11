@@ -392,23 +392,32 @@ Expr *ExprBuilderImpl::buildConstant(llvm::Constant *C, ExprScope &Scope) {
   if (auto *CF = llvm::dyn_cast<llvm::ConstantFP>(C)) {
     const llvm::APFloat &Value = CF->getValueAPF();
     clang::QualType Ty = exprTypeOf(C);
-    if (Value.isInfinity()) {
-      clang::SourceLocation L;
-      clang::Expr *Numerator = clang::FloatingLiteral::Create(
-          *AST, llvm::APFloat(1.0), true, AST->DoubleTy, L);
-      clang::Expr *Denominator = clang::FloatingLiteral::Create(
-          *AST, llvm::APFloat(0.0), true, AST->DoubleTy, L);
-      clang::Expr *Infinity = clang::BinaryOperator::Create(
-          *AST, Numerator, Denominator, clang::BO_Div, AST->DoubleTy,
-          clang::VK_PRValue, clang::OK_Ordinary, L, clang::FPOptionsOverride());
-      if (Value.isNegative())
-        Infinity = clang::UnaryOperator::Create(
-            *AST, Infinity, clang::UO_Minus, AST->DoubleTy, clang::VK_PRValue,
-            clang::OK_Ordinary, L, /*CanOverflow=*/false,
+    // Infinity and NaN have no portable C spelling (see the preamble in
+    // WideIntModel.cpp): call the helper that divides by a volatile zero,
+    // which keeps the exact value and every compiler accepts it.
+    if (Value.isInfinity() || Value.isNaN()) {
+      const char *Name;
+      if (Ty->isSpecificBuiltinType(clang::BuiltinType::Float)) {
+        Name = Value.isNaN() ? "revenant_nanf" : "revenant_inff";
+      } else {
+        Name = Value.isNaN() ? "revenant_nan" : "revenant_inf";
+      }
+      QualType FnTy = AST->getFunctionType(Ty, {}, {});
+      FunctionDecl *FD = FunctionDecl::Create(
+          *AST, AST->getTranslationUnitDecl(), SourceLocation(),
+          SourceLocation(), Ctx.ident(Name), FnTy,
+          AST->getTrivialTypeSourceInfo(FnTy), SC_Extern);
+      FD->setImplicit(true);
+      Expr *Ref = declRef(FD);
+      if (!Value.isNaN() && Value.isNegative())
+        Ref = clang::UnaryOperator::Create(
+            *AST, Ref, clang::UO_Minus, Ty, clang::VK_PRValue,
+            clang::OK_Ordinary, SourceLocation(), /*CanOverflow=*/false,
             clang::FPOptionsOverride());
-      return Ty == AST->DoubleTy
-                 ? Infinity
-                 : makeImplicit(Ty, clang::CK_FloatingCast, Infinity);
+      clang::CallExpr *Call = clang::CallExpr::Create(
+          *AST, Ref, {}, Ty, clang::VK_PRValue, SourceLocation(),
+          clang::FPOptionsOverride());
+      return Call;
     }
     return clang::FloatingLiteral::Create(*AST, Value, true, Ty,
                                           SourceLocation());

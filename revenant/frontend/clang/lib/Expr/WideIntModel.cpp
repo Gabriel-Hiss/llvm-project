@@ -589,6 +589,19 @@ static struct revenant_i128_u revenant_i128_u_make(unsigned long long lo, unsign
 }
 )CWRAP";
 
+  // Infinity and NaN have no portable C spelling: a printed `Inf` token is
+  // not C at all, gcc has no builtin spelling, and `1.0/0.0` is a
+  // compile-time constant division that MSVC rejects (C2124). Helper
+  // functions divide by a volatile zero so every compiler accepts the
+  // expression and the operand keeps the exact IEEE bit pattern.
+  static const char *FloatPreface = R"CWRAP(
+static double revenant_inf(void) { volatile double z = 0.0; return 1.0 / z; }
+static float revenant_inff(void) { volatile float z = 0.0f; return 1.0f / z; }
+static double revenant_nan(void) { volatile double z = 0.0; return z / z; }
+static float revenant_nanf(void) { volatile float z = 0.0f; return z / z; }
+
+)CWRAP";
+
   static const char *Signed = R"CWRAP(
 static unsigned long long revenant_hi64_s(unsigned long long a, unsigned long long b) {
   unsigned long long a0 = a & 0xffffffffULL, a1 = a >> 32;
@@ -722,6 +735,7 @@ static struct revenant_i128_s revenant_i128_s_make(long long lo, long long hi) {
 
   OS << "struct revenant_i128_u { unsigned long long lo, hi; };\n";
   OS << "struct revenant_i128_s { long long lo, hi; };\n\n";
+  OS << FloatPreface;
   OS << Unsigned;
   OS << Signed;
 }
