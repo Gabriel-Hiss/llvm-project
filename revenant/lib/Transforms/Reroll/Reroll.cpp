@@ -1379,44 +1379,6 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
     if (!ShapeOK)
       continue;
 
-    // Only the last window's values survive the fold (as their slot-0
-    // counterparts); a value of a *dropped* window read outside the
-    // windows blocks the fold. Window 0 is kept, so its values may be
-    // read outside freely — that is the ordinary accumulator case.
-    DenseMap<Instruction *, int64_t> Body;
-    for (auto &KV : Slots)
-      for (Instruction *I : KV.second)
-        Body[I] = KV.first;
-    auto ReadOutside = [&](Value *V) {
-      for (User *U : V->users()) {
-        auto *UI = dyn_cast<Instruction>(U);
-        if (!UI)
-          continue;
-        if (UI->getParent() != H)
-          return true;
-        if (!Body.count(UI))
-          return true;
-      }
-      // Terminator reads outside the windows (latch uses its own defs).
-      return false;
-    };
-    bool LiveBlock = false;
-    for (int64_t w = 1; w < D - 1 && !LiveBlock; ++w) {
-      auto It = Slots.find(w * G);
-      if (It == Slots.end())
-        continue;
-      for (Instruction *I : It->second) {
-        if (I->getType()->isVoidTy())
-          continue;
-        if (ReadOutside(I)) {
-          LiveBlock = true;
-          break;
-        }
-      }
-    }
-    if (LiveBlock)
-      continue;
-
     // Fold: drop windows 1.., remap last-window dsts to slot-0 dsts,
     // rewrite the step constant.
     DenseMap<Value *, Value *> Remap;
@@ -1428,6 +1390,103 @@ unsigned tryFoldLoop(BasicBlock *H, SmallVectorImpl<StringRef> &Notes) {
           Remap[C] = A;
       }
     }
+
+    // The escapes the fold can absorb. A dropped window's value may leave
+    // the loop only into the accumulator-collapse add: the merge that sums
+    // the per-window accumulators after the loop, whose operands are all
+    // the kept update and the dropped ones of one remap entry. Every other
+    // escape would survive the fold reading a value the fold rewrote, so
+    // it blocks the fold. Computed before any mutation so a bail leaves
+    // the IR exactly as found.
+    //
+    // This is the check that covers the LAST window, and therefore the
+    // D == 2 case: a two-window fold's only dropped window is the last
+    // one, and an escape it cannot absorb is exactly the shape that leaves
+    // two accumulators summing the same products after the remap.
+    SmallPtrSet<Instruction *, 8> CollapseTargets;
+    for (auto &KV : Remap) {
+      Value *Old = KV.first, *New = KV.second;
+      auto *NewI = dyn_cast<Instruction>(New);
+      if (!NewI || !NewI->getType()->isIntegerTy() &&
+                      !NewI->getType()->isFloatingPointTy())
+        continue;
+      bool KeptReadsPhi = false;
+      for (const Use &U : NewI->operands())
+        if (isa<PHINode>(U.get())) {
+          KeptReadsPhi = true;
+          break;
+        }
+      if (!KeptReadsPhi)
+        continue;
+      for (User *U : Old->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || UI->getParent() == H || UI->getType()->isVoidTy())
+          continue;
+        if (UI->getOpcode() != Instruction::Add &&
+            UI->getOpcode() != Instruction::FAdd)
+          continue;
+        bool AllSame = true;
+        for (const Use &O : UI->operands())
+          if (O.get() != New && O.get() != Old) {
+            AllSame = false;
+            break;
+          }
+        if (AllSame)
+          CollapseTargets.insert(UI);
+      }
+    }
+
+    // Only the last window's values survive the fold (as their slot-0
+    // counterparts); a value of a *dropped* window read outside the
+    // windows blocks the fold. Window 0 is kept, so its values may be
+    // read outside freely — that is the ordinary accumulator case.
+    DenseMap<Instruction *, int64_t> Body;
+    for (auto &KV : Slots)
+      for (Instruction *I : KV.second)
+        Body[I] = KV.first;
+    bool LiveBlock = false;
+    for (int64_t w = 1; w < D && !LiveBlock; ++w) {
+      auto It = Slots.find(w * G);
+      if (It == Slots.end())
+        continue;
+      bool LastWindow = (w == D - 1);
+      for (Instruction *I : It->second) {
+        if (I->getType()->isVoidTy())
+          continue;
+        for (User *U : I->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI)
+            continue;
+          if (UI->getParent() != H) {
+            // An escape out of the loop. An intermediate window has no
+            // post-loop equivalent for a mid-loop value, so any escape
+            // blocks the fold. The last window does have one — the rolled
+            // accumulator — and the fold supplies it two ways: the
+            // accumulator-collapse add, and any PHI whose incoming is the
+            // dropped value (the remap retargets it to the kept update).
+            if (!LastWindow ||
+                (!CollapseTargets.count(UI) && !isa<PHINode>(UI))) {
+              LiveBlock = true;
+              break;
+            }
+            continue;
+          }
+          // An in-header reader that is not part of the windows. A
+          // backedge phi reading the last window's accumulator is the
+          // ordinary merge shape and the remap retargets it; an
+          // intermediate window feeding a phi has no equivalent, so it
+          // still blocks the fold.
+          if (!Body.count(UI) && !(LastWindow && isa<PHINode>(UI))) {
+            LiveBlock = true;
+            break;
+          }
+        }
+        if (LiveBlock)
+          break;
+      }
+    }
+    if (LiveBlock)
+      continue;
     SmallPtrSet<Instruction *, 16> Drop;
     for (int64_t w = 1; w < D; ++w) {
       auto It = Slots.find(w * G);
