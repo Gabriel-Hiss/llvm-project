@@ -8,15 +8,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "LiftTestUtil.h"
-#include "revenant/Analysis/Analysis.h"
-#include "revenant/Disasm/Disasm.h"
-#include "revenant/IR/Contract.h"
-#include "revenant/Lift/LiftFunction.h"
-#include "revenant/Object/PeFile.h"
-#include "revenant/Target/TargetHooks.h"
+ #include "LiftTestUtil.h"
+ #include "revenant/Analysis/Analysis.h"
+ #include "revenant/Disasm/Disasm.h"
+ #include "revenant/IR/Contract.h"
+ #include "revenant/Lift/LiftFunction.h"
+ #include "revenant/Object/PeFile.h"
+ #include "revenant/Target/TargetHooks.h"
+ #include "X86MCTargetDesc.h"
 
-#include "gtest/gtest.h"
+ #include "gtest/gtest.h"
 
 #include <cstdlib>
 #include <map>
@@ -444,6 +445,82 @@ TEST(LiftFunction, WhileLoopKeepsDistinctSuccessors) {
       << "loop block branches to the same block twice";
   ASSERT_FALSE(llvm::isa<llvm::UndefValue>(BI->getCondition()))
       << "loop exit condition is undef";
+}
+
+TEST(LiftFunction, ThunkCallLowersToDirectImport) {
+  // c-gcc-o2 sub_140001A10 calls the single-`jmp [strcmp-slot]` XFG stub
+  // sub_140003968. The call must lower as a direct import call (the shared
+  // `call [mem]` path), not as an opaque stub reference: the stubs are
+  // library-named alike, so stub references collide at recompile.
+  auto Fx = open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Va Start(0x140001a10);
+  auto It = P.Functions.find(Start);
+  ASSERT_NE(It, P.Functions.end()) << "fn 0x140001a10 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("thunk_import", C);
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, nullptr,
+                                   nullptr, /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::Function *Strcmp = M.getFunction("strcmp");
+  ASSERT_NE(Strcmp, nullptr) << "no direct strcmp import call";
+  bool CallsStrcmp = false;
+  for (const llvm::User *U : Strcmp->users())
+    if (llvm::isa<llvm::CallInst>(U))
+      CallsStrcmp = true;
+  EXPECT_TRUE(CallsStrcmp) << "strcmp import declared but never called";
+  EXPECT_EQ(M.getFunction("sub_140003968"), nullptr)
+      << "opaque XFG stub still referenced";
+}
+
+TEST(LiftFunction, RecursiveLeafPreservesSiblingRegs) {
+  // c-gcc-o2 main calls fib (0x140001af0, directly recursive) then call_ptr
+  // (0x140001b40). gcc passes edx=9/r8d=4 through fib, which never writes
+  // them. The clobber scan must tolerate the self-call instead of
+  // undefining every volatile register, or call_ptr loses two arguments.
+  auto Fx = open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Va Start(0x140003b00);
+  auto It = P.Functions.find(Start);
+  ASSERT_NE(It, P.Functions.end()) << "main 0x140003b00 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("recursive_clobber", C);
+  // call_ptr's production signature (3x i32, i64 return): with null Sigs
+  // the decl comes back zero-param and coerceArgs truncates every argument
+  // away, which would make the loop below vacuous.
+  lift::Signatures Sigs;
+  lift::Signature B40;
+  B40.Params = {{lift::ParamLoc::reg(llvm::X86::RCX), 32, false, std::nullopt},
+                {lift::ParamLoc::reg(llvm::X86::RDX), 32, false, std::nullopt},
+                {lift::ParamLoc::reg(llvm::X86::R8), 32, false, std::nullopt}};
+  B40.Ret = lift::RetLoc{false, 64};
+  Sigs.Funcs.emplace(Va(0x140001b40), B40);
+  // Cleanup (mem2reg) must run: without it clobbered registers read back
+  // as loads of undef stores, and the undef below is invisible.
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                   nullptr, /*RunPasses=*/true);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::Function *CallPtr = M.getFunction("sub_140001B40");
+  ASSERT_NE(CallPtr, nullptr) << "no call_ptr declaration";
+  bool FoundCall = false;
+  for (const llvm::User *U : CallPtr->users())
+    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U)) {
+      FoundCall = true;
+      for (const llvm::Value *A : CI->args())
+        EXPECT_FALSE(llvm::isa<llvm::UndefValue>(A))
+            << "call_ptr lost a live-through-fib register argument";
+    }
+  EXPECT_TRUE(FoundCall) << "no call_ptr call in main";
 }
 
 } // end anonymous namespace
