@@ -345,13 +345,34 @@ static bool matchDrainTail(BasicBlock *S, Function &F, DrainTail &C) {
     }
     if (!StartOK)
       continue;
-    if (stripCountDerivation(TailBound, F) !=
-        stripCountDerivation(TailStart, F)) {
-      // Tail bound and tail start must share the trip root with the
-      // drain count init; otherwise the fused loop may cover a
-      // different range.
-      continue;
+    // Tail bound must share the trip root with the drain count
+    // init (the (N-S)&(K-1) remainder): otherwise the fused loop
+    // may cover a different range than the drain did.
+    Value *DrainCountInit = nullptr;
+    for (unsigned I = 0; I < Drain.IV->getNumIncomingValues(); ++I) {
+      if (Drain.IV->getIncomingBlock(I) == MaybeDrain)
+        continue;
+      // The count phi's start is the remainder; use the index IV's
+      // start when the latch counts a sibling phi (corpus drain
+      // latches on the countdown while indexing with the main IV).
+      DrainCountInit = Drain.IV->getIncomingValue(I);
     }
+    // Prefer the remainder init feeding the countdown: search the
+    // drain block for an And feeding any drain phi start.
+    for (PHINode &Phi : MaybeDrain->phis()) {
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+        if (Phi.getIncomingBlock(I) == MaybeDrain)
+          continue;
+        if (auto *BO = dyn_cast<BinaryOperator>(Phi.getIncomingValue(I)))
+          if (BO->getOpcode() == Instruction::And)
+            DrainCountInit = Phi.getIncomingValue(I);
+      }
+    }
+    if (!DrainCountInit)
+      continue;
+    if (stripCountDerivation(TailBound, F) !=
+        stripCountDerivation(DrainCountInit, F))
+      continue;
     // Per-lane body proof over the shared TailCmp.
     if (!tailLanesEqualDrain(TailBB, MaybeDrain, Tail, Drain))
       continue;
@@ -592,12 +613,37 @@ static bool tailLanesEqualDrain(BasicBlock *Tail, BasicBlock *Drain,
   for (StoreInst *S : TS)
     if (ptrBase(S->getPointerOperand()) != ptrBase(DS[0]->getPointerOperand()))
       return false;
-  // The drain add must consume the drain load; every tail add must
-  // consume one tail load.
-  if (!DA.empty() &&
-      DA[0]->getOperand(0) != DL[0] && DA[0]->getOperand(1) != DL[0])
+  // The drain add must consume the drain load; every tail value add
+  // must consume one tail load. IV steps and countdown decrements
+  // (feeding phis and latch compares, not stores) are not value
+  // adds and are skipped: collect only adds feeding a store.
+  auto feedsStore = [](BinaryOperator *BO, ArrayRef<StoreInst *> Stores) {
+    SmallVector<Value *, 4> Work{BO};
+    DenseSet<Value *> Seen{BO};
+    for (unsigned K = 0; K < 16 && !Work.empty(); ++K) {
+      Value *V = Work.pop_back_val();
+      for (User *U : V->users()) {
+        if (isa<StoreInst>(U))
+          return true;
+        if (auto *N = dyn_cast<BinaryOperator>(U)) {
+          if (N->getOpcode() == Instruction::Add && Seen.insert(N).second)
+            Work.push_back(N);
+        }
+      }
+    }
+    return false;
+  };
+  BinaryOperator *DAdd = nullptr;
+  for (BinaryOperator *A : DA)
+    if (!DAdd && feedsStore(A, DS))
+      DAdd = A;
+  if (!DA.empty() && !DAdd)
+    return false;
+  if (DAdd && DAdd->getOperand(0) != DL[0] && DAdd->getOperand(1) != DL[0])
     return false;
   for (BinaryOperator *A : TA) {
+    if (!feedsStore(A, TS))
+      continue;
     bool UsesLoad = false;
     for (LoadInst *L : TL)
       UsesLoad = UsesLoad || A->getOperand(0) == L || A->getOperand(1) == L;
@@ -606,8 +652,8 @@ static bool tailLanesEqualDrain(BasicBlock *Tail, BasicBlock *Drain,
   }
   // Every tail store value must equal the drain's stored value
   // (or the drain add result) under IV mapping.
-  Value *DrainStored = !DA.empty() ? cast<Value>(DA[0])
-                                   : cast<Value>(DS[0]->getValueOperand());
+  Value *DrainStored = DAdd ? cast<Value>(DAdd)
+                            : cast<Value>(DS[0]->getValueOperand());
   for (StoreInst *S : TS) {
     TailCmp TC;
     TC.A = Drain;
@@ -957,6 +1003,119 @@ static bool foldInnerCascade(Function &F, const InnerCascade &C) {
     BB->eraseFromParent();
   return true;
 }
+
+// Fold drain+tail into the tail alone: S jumps directly to T with
+// the tail IV starting at the S resume, and the drain plus the
+// drain-exit blocks are erased. Only branch targets and the tail
+// start change; kept instructions are untouched.
+static bool foldDrainTail(Function &F, const DrainTail &C) {
+  // Drain-exit blocks: on a path from L to T (forward reachable
+  // from L without passing S/T, and able to reach T). The function
+  // exit is never included even when reachable from L.
+  DenseSet<BasicBlock *> Exit;
+  {
+    DenseSet<BasicBlock *> Fwd;
+    SmallVector<BasicBlock *, 8> Work;
+    for (BasicBlock *Su : successors(C.L))
+      if (Su != C.L)
+        Work.push_back(Su);
+    for (unsigned K = 0; K < 32 && !Work.empty(); ++K) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (BB == C.T || BB == C.S || !Fwd.insert(BB).second)
+        continue;
+      if (isa<ReturnInst>(BB->getTerminator()) ||
+          isa<UnreachableInst>(BB->getTerminator()))
+        continue;
+      for (BasicBlock *Su : successors(BB))
+        Work.push_back(Su);
+    }
+    DenseSet<BasicBlock *> Back{C.T};
+    SmallVector<BasicBlock *, 8> W2{C.T};
+    for (unsigned K = 0; K < 32 && !W2.empty(); ++K) {
+      BasicBlock *BB = W2.pop_back_val();
+      for (BasicBlock *P : predecessors(BB)) {
+        if (P == C.S || P == C.L)
+          continue;
+        if (Back.insert(P).second)
+          W2.push_back(P);
+      }
+    }
+    for (BasicBlock *BB : Fwd)
+      if (Back.count(BB))
+        Exit.insert(BB);
+  }
+  // Every exit block must be dead after the fold except for feeding
+  // T's start: pure routing/arithmetic only (phis, branches,
+  // compares, casts, GEPs, scalar ALU). No calls, loads, or stores:
+  // anything touching memory could carry a live value.
+  for (BasicBlock *BB : Exit) {
+    for (Instruction &I : *BB) {
+      if (isa<PHINode>(&I) || isa<BranchInst>(&I) || isa<ICmpInst>(&I) ||
+          isa<CastInst>(&I) || isa<GetElementPtrInst>(&I))
+        continue;
+      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+        if (!isa<FixedVectorType>(BO->getType()))
+          continue;
+      }
+      return false;
+    }
+  }
+  // Rewire the tail start to the S resume.
+  for (unsigned I = 0; I < C.TailLoop.IV->getNumIncomingValues(); ++I) {
+    if (C.TailLoop.IV->getIncomingBlock(I) == C.T)
+      continue;
+    C.TailLoop.IV->setIncomingValue(I, C.Resume);
+    C.TailLoop.IV->setIncomingBlock(I, C.S);
+  }
+  // S jumps directly to T.
+  auto *SBr = cast<BranchInst>(C.S->getTerminator());
+  BranchInst *NewBr = BranchInst::Create(C.T, SBr);
+  if (MDNode *MD = SBr->getMetadata("revenant.va"))
+    NewBr->setMetadata("revenant.va", MD);
+  NewBr->setDebugLoc(SBr->getDebugLoc());
+  SBr->eraseFromParent();
+  // Erase drain + exit blocks with the standard protocol.
+  SmallVector<BasicBlock *, 8> Dead;
+  Dead.push_back(C.L);
+  for (BasicBlock *BB : Exit)
+    Dead.push_back(BB);
+  DenseSet<BasicBlock *> DeadSet(Dead.begin(), Dead.end());
+  // No kept pred may target dead blocks now (S was the only entry;
+  // S is repointed). Verify before erasing.
+  for (BasicBlock *BB : Dead)
+    for (BasicBlock *P : predecessors(BB))
+      if (!DeadSet.count(P) && P != C.S)
+        return false;
+  for (BasicBlock *BB : Dead)
+    BB->getTerminator()->setMetadata(LLVMContext::MD_loop, nullptr);
+  for (BasicBlock *BB : Dead) {
+    Instruction *OldT = BB->getTerminator();
+    auto *Unr = new UnreachableInst(BB->getContext());
+    Unr->insertInto(BB, BB->end());
+    OldT->eraseFromParent();
+  }
+  for (BasicBlock &BB : F) {
+    if (DeadSet.count(&BB))
+      continue;
+    for (PHINode &Phi : BB.phis()) {
+      SmallVector<BasicBlock *, 4> Kill;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
+        if (DeadSet.count(Phi.getIncomingBlock(I)))
+          Kill.push_back(Phi.getIncomingBlock(I));
+      if (Kill.size() == Phi.getNumIncomingValues())
+        continue;
+      for (BasicBlock *KB : Kill)
+        Phi.removeIncomingValue(KB);
+    }
+  }
+  for (BasicBlock *BB : Dead)
+    BB->dropAllReferences();
+  for (BasicBlock *BB : Dead)
+    BB->eraseFromParent();
+  (void)F;
+  return true;
+}
+
 // Runs after UnloopVec in the same library: folds inner-cascade map
 // dispatches UnloopVec leaves behind.
 bool runUnvecMaps(llvm::Function &F) {
@@ -1020,12 +1179,30 @@ bool runUnvecMaps(llvm::Function &F) {
       // proved candidates reach this fold.
       RoundChanged |= foldInnerCascade(F, C);
     }
+    // Drain-tail fusion runs after the cascade folds in each round:
+    // with the middle tiers gone, S routes to drain+tail directly.
+    {
+      SmallVector<DrainTail, 4> FCands;
+      for (BasicBlock &BB : F) {
+        auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+        if (!Br || !Br->isConditional())
+          continue;
+        DrainTail C;
+        if (matchDrainTail(&BB, F, C))
+          FCands.push_back(C);
+      }
+      for (DrainTail &C : FCands) {
+        if (!C.S || !C.L || !C.T || C.S->getParent() != &F ||
+            C.L->getParent() != &F || C.T->getParent() != &F)
+          continue;
+        RoundChanged |= foldDrainTail(F, C);
+      }
+    }
     Changed |= RoundChanged;
     if (!RoundChanged)
       break;
   }
   return Changed;
 }
-
 } // namespace unvecmaps
 } // namespace revenant
