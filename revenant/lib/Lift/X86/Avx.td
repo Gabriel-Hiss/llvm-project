@@ -322,6 +322,78 @@ def : RVMatch {
   dag Body = (rv_setz $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
 }
 
+// VEX-128 PS bitwise ops: same lane-wise semantics as the PD forms; the
+// packed-single encodings stayed opaque (vxorps xmm,xmm,xmm is the
+// canonical zero idiom, ~2.3k census hits on c-clang-o2avx*). The ymm PS
+// forms are already lifted by the generic twin rule.
+def : RVMatch {
+  string Glob = "VANDPSrr";
+  dag Body = (rv_setz $dst, (rv_and (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VANDPSrm";
+  dag Body = (rv_setz $dst, (rv_and (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VORPSrr";
+  dag Body = (rv_setz $dst, (rv_or (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VORPSrm";
+  dag Body = (rv_setz $dst, (rv_or (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VXORPSrr";
+  dag Body = (rv_setz $dst, (rv_xor (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VXORPSrm";
+  dag Body = (rv_setz $dst, (rv_xor (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VANDNPSrr";
+  dag Body = (rv_setz $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VANDNPSrm";
+  dag Body = (rv_setz $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
+}
+
+// VEX-256 PD bitwise ops: the ymm twins of the xmm VANDPD/VORPD/VXORPD/
+// VANDNPD rules above (ymm PS forms are lifted; ymm PD was not).
+def : RVMatch {
+  string Glob = "VANDPDYrr";
+  dag Body = (rv_setz $dst, (rv_and (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VANDPDYrm";
+  dag Body = (rv_setz $dst, (rv_and (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VORPDYrr";
+  dag Body = (rv_setz $dst, (rv_or (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VORPDYrm";
+  dag Body = (rv_setz $dst, (rv_or (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VXORPDYrr";
+  dag Body = (rv_setz $dst, (rv_xor (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VXORPDYrm";
+  dag Body = (rv_setz $dst, (rv_xor (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VANDNPDYrr";
+  dag Body = (rv_setz $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VANDNPDYrm";
+  dag Body = (rv_setz $dst, (rv_and (rv_not (rv_op 0)), (rv_op 1)));
+}
+
 // ---- VEX-128 packed integer ops ----------------------------------------------------------
 // Lane-wise integer arithmetic, bitwise ops and compares: typed pattern
 // inversion (X86LiftVector.cpp).

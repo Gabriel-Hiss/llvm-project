@@ -359,6 +359,19 @@ std::vector<Case> cases() {
   add(Case("vpxor xmm zeroes upper", "vpxor xmm0, xmm0, xmm1")
           .ymm(0, A0, A1, B0, B1).ymm(1, 1, 2, 3, 4));
 
+  // VEX-128 PS bitwise ops (vxorps xmm,xmm,xmm is the canonical zero idiom
+  // that used to lift opaque) plus their ymm PD twins.
+  for (const char *Op : {"vxorps", "vandps", "vorps", "vandnps"}) {
+    add(Case(std::string(Op) + " xmm", std::string(Op) + " xmm2, xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1).xmm(2, 1, 2));
+  }
+  for (const char *Op : {"vxorpd", "vandpd", "vorpd", "vandnpd"}) {
+    add(Case(std::string(Op) + " ymm", std::string(Op) + " ymm2, ymm0, ymm1")
+            .ymm(0, A0, A1, B0, B1).ymm(1, B0, B1, A0, A1).ymm(2, 1, 2, 3, 4));
+  }
+  add(Case("vxorps xmm self-zero", "vxorps xmm0, xmm0, xmm0")
+          .ymm(0, A0, A1, B0, B1));
+
   // Scalar and packed float.
   add(Case("xorps self", "xorps xmm0, xmm0").xmm(0, A0, A1));
   add(Case("addps", "addps xmm0, xmm1")
