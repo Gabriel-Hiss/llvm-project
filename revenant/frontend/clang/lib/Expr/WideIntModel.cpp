@@ -474,7 +474,12 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
   // (IsShift comes from the narrow-preserving block above).
   LHS = conformWideOperand(A, ResTy, LHS);
   RHS = conformWideOperand(A, IsShift ? A.UnsignedIntTy : ResTy, RHS);
-  return wrapperCall(A, FD, LHS, RHS);
+  Expr *Call = wrapperCall(A, FD, LHS, RHS);
+  // When the record is unsigned but AShr dispatched to the signed helper,
+  // conform the result back to ResTy (wide→wide halves copy, bit-exact).
+  if (IsArithmeticShift && !Signed)
+    return wideIntConvert(A, ResTy, Call, clang::CK_IntegralCast);
+  return Call;
 }
 
 void emitWideIntPreamble(llvm::raw_ostream &OS, clang::ASTContext &A) {
