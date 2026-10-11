@@ -603,16 +603,20 @@ unsigned tryPromoteHalfVectors(BasicBlock *H) {
       Halves.push_back(Hl);
   }
   unsigned Promoted = 0;
+  // promoteHalfPair erases consumed half phis (eraseFromParent frees them),
+  // so consumed pairs are tracked here instead of testing the phi's parent.
+  SmallVector<bool, 4> Consumed(Halves.size(), false);
   for (unsigned i = 0; i < Halves.size(); ++i) {
-    if (Halves[i].Phi->getParent() == nullptr)
+    if (Consumed[i])
       continue; // consumed by an earlier pair
     for (unsigned j = i + 1; j < Halves.size(); ++j) {
-      if (Halves[j].Phi->getParent() == nullptr ||
-          Halves[j].InitBB != Halves[i].InitBB)
+      if (Consumed[j] || Halves[j].InitBB != Halves[i].InitBB)
         continue;
       // The low half is the phi whose backedge value is extract 0.
       if (promoteHalfPair(H, Halves[i], Halves[j]) ||
           promoteHalfPair(H, Halves[j], Halves[i])) {
+        Consumed[i] = true;
+        Consumed[j] = true;
         ++Promoted;
         break;
       }
@@ -1448,6 +1452,18 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   // The extract feeds scalar tail-loop PHIs (reseed: the tail now starts from
   // the scalar sum) or a scalar return. Trip-bound defs are untouched; only
   // users rewire. Fold-tree values die by erasure below.
+  // eraseFromParent() frees the instruction, so every later sweep consults
+  // this set instead of re-reading a dangling pointer (getParent() on a
+  // freed node is a use-after-free, not an "already erased" test).
+  DenseSet<const Value *> Gone;
+  auto EraseIfDead = [&](Value *V) {
+    auto *I = dyn_cast_or_null<Instruction>(V);
+    if (!I || Gone.contains(V) || !I->getParent() || !I->use_empty())
+      return false;
+    I->eraseFromParent();
+    Gone.insert(V);
+    return true;
+  };
   for (auto &FE : Folds) {
     // Scalar image of the fold: the tree provably sums every root lane
     // exactly once, so the extract aliases to the opcode applied across all
@@ -1480,9 +1496,8 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
     while (TreeProgress) {
       TreeProgress = false;
       for (Instruction *&I : FE.TreeVals) {
-        if (I == nullptr || !I->use_empty())
+        if (!EraseIfDead(I))
           continue;
-        I->eraseFromParent();
         I = nullptr;
         TreeProgress = true;
       }
@@ -1504,6 +1519,8 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   }
   for (auto &KV : Subs) {
     Value *Old = const_cast<Value *>(KV.first);
+    if (Gone.contains(Old))
+      continue; // a fold-tree value erased above (its uses went to Sum)
     if (Old == KV.second || Old->getType() != KV.second->getType())
       continue;
     Old->replaceAllUsesWith(KV.second);
@@ -1517,16 +1534,13 @@ static unsigned tryLoop(Function &F, BasicBlock *H) {
   while (Progress) {
     Progress = false;
     for (auto It = Kill.rbegin(); It != Kill.rend(); ++It) {
-      Instruction *K = *It;
-      if (K->getParent() == nullptr || !K->use_empty())
-        continue;
-      K->eraseFromParent();
-      Progress = true;
+      if (EraseIfDead(*It))
+        Progress = true;
     }
   }
   for (auto &A : Accs) {
-    if (A.Phi->getParent() != nullptr && A.Phi->use_empty())
-      A.Phi->eraseFromParent();
+    if (EraseIfDead(A.Phi))
+      continue;
   }
 
   return 1 + NReduce;
