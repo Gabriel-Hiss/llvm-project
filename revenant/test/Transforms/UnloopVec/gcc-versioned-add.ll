@@ -85,16 +85,12 @@ exit:
 }
 
 ; CHECK-LABEL: define{{.*}}void @add_vec
-; CHECK-NOT: <4 x i32>
+; The standalone-tail fold stays disabled (bug board 25): the dispatch
+; keeps both arms, the vector loop and its epilogue survive.
 ; CHECK: entry:
-; CHECK: br label %scalar.pre
-; CHECK: scalar.pre:
-; CHECK: br label %scalar.loop
+; CHECK: dispatch:
 ; CHECK: scalar.loop:
-; CHECK: phi i32 [ 0, %scalar.pre ]
-; CHECK: load i32
-; CHECK: add i32
-; CHECK: store i32
-; CHECK: br i1
+; CHECK: vector.loop:
+; CHECK: tail.check:
 ; CHECK: ret void
 ; CHECK: }

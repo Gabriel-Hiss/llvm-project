@@ -100,12 +100,15 @@ define i32 @middle_caller(i32 %x, i32 %y) {
 ; GCC .isra shape: pooled string globals have equal bytes but distinct lifted
 ; names, and the noreturn trap tail is emitted as two VA-specific stubs.
 ; Identical data does not make addresses interchangeable when code compares
-; them. Both the specialized target and its caller must remain unchanged.
+; them, and distinct declarations never prove the same behavior: the two
+; stub calls return to live code, so their effects are observable. Both
+; the specialized target and its caller must remain unchanged.
 ; CHECK: define i32 @sub_8000(i32 %x)
 ; CHECK: call i32 @sub_8000(i32 %x)
-; CHECK-NOT: define i32 @sub_5000
+; CHECK: define i32 @sub_4000(i32 %x)
+; CHECK: define i32 @sub_5000(i32 %x)
 ; CHECK: define i32 @global_caller
-; CHECK: call i32 @sub_4000(i32 %x)
+; CHECK: call i32 @sub_5000(i32 %x)
 ; CHECK: define i32 @sub_9000(i32 %tag)
 ; CHECK: define i32 @sub_a000()
 ; CHECK: define void @part_cold.cold

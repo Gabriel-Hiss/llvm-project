@@ -34,7 +34,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
 endif()
 
-set(DEVEC_SOURCES Devectorize.cpp Lane0.cpp Propagate.cpp LoopDevec.cpp StraightDevec.cpp)
+set(DEVEC_SOURCES Devectorize.cpp Lane0.cpp Propagate.cpp LoopDevec.cpp StraightDevec.cpp PairSplit.cpp)
 
 if(COMMAND add_llvm_library)
   add_llvm_library(RevenantTransformDevectorize STATIC ${DEVEC_SOURCES}

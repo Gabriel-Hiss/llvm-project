@@ -98,12 +98,18 @@ every use reads lane 0 and all layouts agree; anything else keeps 128
 bits. Runs first inside devectorize so the later phases see plain scalar
 loops.
 
-**revenant-devectorize, phases 2-3.** Expects lane-0 output.
+**revenant-devectorize, phases 2-4.** Expects lane-0 output.
 Explodes auto-vectorized `i128`/`__v*` work into per-lane scalar ops:
 vector streams become per-element scalars in loops, reduction accumulators
 collapse to one scalar phi; straight-line slices scalarize for reroll.
-Guarantees conservative bail-outs: ymm/zmm upper lanes, cross-lane ops,
-unrecognized vector phis stay vector.
+The straight-line phase also explodes cross-width lane splits (`<2 x i64>`
+to `<4 x i32>`), lane-0 broadcasts (insertelement / zext+bitcast + shuffle),
+and manual i128 shift/bitcast/add horizontal folds, with per-lane alignment
+(common alignment of vector alignment and lane offset) and exact float lane
+constants. A final pair-split phase turns scalar-i128 copy webs (constant /
+load / phi webs feeding only stores) into i64 halves. Guarantees
+conservative bail-outs: ymm/zmm upper lanes, cross-lane ops, unrecognized
+vector phis, i128 arithmetic webs, and shared copy webs stay vector.
 
 **revenant-reroll (owner: MuseTxReroll).** Expects scalarized loops.
 Folds unrolled iteration copies back into one induction-variable step
@@ -135,21 +141,31 @@ the plugin loads under stock `opt`, the pass also reads
 Guarantees tolerance of commuted operands and extra code, and no change
 when the pattern set is missing or empty or confidence is low.
 
-**revenant-structure (owner: Swe2Structure).** Expects unopt (or patterns)
-output. Regions become `if`/`while`/`dowhile`/`for`/`switch` with
-`!revenant.region` on header terminators (block-list indices, `-1` none);
-irreducible edges get `!revenant.region !{!"goto", target}`. Guarantees a
-frontend ignoring annotations still emits correct code via labels + `goto`.
+**revenant-types (owner: MuseTypeRecovery, after unopt).** Expects deoptimized
+IR. Recovers locals/parameters and struct/class/vtable/enum shapes, expressed
+as DI (`DILocalVariable`, `DIBasicType`, `DIDerivedType`, `DICompositeType`)
+via RevenantIR helpers. It does not require region annotations.
 
+**revenant-ssaout (owner: MuseSsaOut, after types).** Expects typed SSA. Undoes
+mem2reg/sroa into named `alloca`s with DI for the frontends. It may add
+critical-edge blocks for phi copies.
 **revenant-types (owner: MuseTypeRecovery, post-structure).** Expects
-structured IR with region annotations. Recovers locals/parameters and
-struct/class/vtable/enum shapes, expressed as DI (`DILocalVariable`,
-`DIBasicType`, `DIDerivedType`, `DICompositeType`) via RevenantIR helpers.
-Guarantees region annotations and provenance survive; types only refine.
+structured IR with region annotations. Recovers locals, fixed-size array
+extents, parameter and return types, plus struct/class/vtable/enum shapes,
+expressed as DI (`DILocalVariable`, `DISubroutineType`, `DIBasicType`,
+`DIDerivedType`, `DICompositeType`) via RevenantIR helpers. Integer parameters
+used only through explicit truncations can recover the narrower width. Field
+types come from the widest access at each constant offset. Guarantees region
+annotations and provenance survive; types only refine.
+The Clang emitter uses recovered parameter-variable types and names when a
+lifted `DISubroutineType` still carries placeholder parameter types.
 
-**revenant-ssaout (owner: MuseSsaOut, post-structure).** Expects typed
-structured IR. Undoes mem2reg/sroa into named `alloca`s with DI for the
-frontends. Guarantees stable `bb_<va>` names and intact annotations.
+**revenant-structure (owner: LunaShapeCtrlR, terminal).** Expects typed SSA-out
+IR and runs after critical-edge splitting so descriptors use indices into the
+final block list. Regions become `if`/`while`/`dowhile`/`for`/`switch` with
+`!revenant.region` on header terminators (block-list indices, `-1` means none);
+irreducible edges get `!revenant.region !{!"goto", target}`. A frontend that
+ignores annotations still emits correct code with labels and `goto`.
 
 **revenant-unabi (owner: MuseDeoptAbi).** Module pass (not function): rewrites
 function signatures, snapshotting the function list first so erasure is safe.
@@ -163,7 +179,7 @@ runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
 leaving the CFG untouched when unsure. Runs explicitly, not in the default
 pipeline.
 
-**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural matching folds only equal-signature bodies, and requires matching operands except for equivalent constant data and trap-only stubs. It does not infer a missing formal from constants found near call sites. Identical bodies or one constant-specialized body are not proof of shared source identity. Function folds and signature restoration require source-signature evidence; uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
+**revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural clone folding is disabled: no body comparison can prove two entry points came from one source function (distinct declarations linked to different behavior, opaque observers, distinct exit codes, volatile loads from different objects), and identical bodies are not proof of shared source identity either. The pass keeps signature restoration (returns, dead formals, named clones, the narrow GCC constprop `this` formal), which requires source-signature evidence and rebinds only the same constant object. Uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
 **revenant-locals-to-slots (owner: LunaLocalsToSlots).** Expects structured,
 type-recovered SSA. Restores the `-O0` storage shape: every parameter gets an
@@ -232,26 +248,19 @@ stale. Named-clone recovery requires a clone suffix. Folded constant-global
 recovery is limited to one global passed only as the first call argument, the
 GCC constprop `this` shape.
 
-New calls preserve instruction metadata and VA provenance. Structural matching
-rejects opaque instructions, region annotations, and outlined `.part.N` or
-`.cold` bodies rather than rewriting those paths.
+New calls preserve instruction metadata and VA provenance. Signature
+restoration rejects opaque instructions, region annotations, and outlined
+`.part.N` or `.cold` bodies rather than rewriting those paths.
 
 
-Measured with the standalone plugin and `revenant-unipo,verify` on fresh
-normalized GCC lifts:
-
-| Target | Oracle clone entries | Recovered / 9 | Named clone entries merged/restored | Cold partitions |
-| --- | ---: | ---: | --- | --- |
-| cpp-gcc-o2 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
-| cpp-gcc-o3 | 9 | 3 | pool free and allocate signatures restored; `_S_construct.isra` merged | both unchanged |
-
-The pool constprop clones regain their folded pool-object formal by rebinding
-the equivalent internal constant global. Their remaining arguments stay
-site-specific, so callers retain distinct allocation sizes rather than
-requiring a unanimous constant. The `_S_construct.isra` pair folds only when
-the body match proves equivalent initialized string data and equivalent
-trap-only `sub_0x` callees; pooled data is treated as equal only when constant
-initializers match and its address is not compared. Four named entries remain:
+Structural folding previously recovered the `_S_construct.isra` pair on
+fresh normalized GCC lifts by matching equivalent string data with
+equivalent trap tails; that fold is removed with the rest of structural
+matching (see above). The pool constprop clones keep their folded
+pool-object formal by rebinding the same constant object. Their
+remaining arguments stay site-specific, so callers retain distinct
+allocation sizes rather than requiring a unanimous constant. Four named
+entries remain:
 `_M_construct.isra` at VA `0x14001bca0` (O2) / `0x14001bf40` (O3), whose body
 CFG/opcode shapes differ from unspecialized `_M_construct` at `0x14001bbf0` /
 `0x14001be90`; `d_demangle_callback.constprop` at `0x14000aa20` / `0x14000ac30`
@@ -290,10 +299,9 @@ changes; `revenant-unipo,verify` succeeds. The map and PDB remain scoring-only.
 The new FileCheck fixtures derive their bodies from `c-clang-o2lto`
 `cmp_unsigned` and scalar add/sub shapes, plus the observed `c-gcc-o2`
 `sub_140001017` call sequence that stores 2 in RCX before calling
-`sub_140003A10`. They cover same-signature structural matches, constant
-specialization rejection, DI-backed return recovery, address-taking, and
-outlined cold partitions. They do not claim controlled fixture clones existed
-in the measured binaries.
+`sub_140003A10`. They cover constant specialization rejection, DI-backed
+return recovery, address-taking, and outlined cold partitions. They do
+not claim controlled fixture clones existed in the measured binaries.
 
 Raw clang LTO emission succeeds with the current driver. Its `ir-final` path
 currently aborts in RerollPass on `sub_140001930` because an APInt exceeds the
