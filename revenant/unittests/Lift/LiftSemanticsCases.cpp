@@ -304,6 +304,16 @@ std::vector<Case> cases() {
                                               " xmm0, xmmword ptr [rsp+0x20]")
             .xmm(0, A0, A1).stack({B0, B1}));
   }
+  for (const char *Op : {"phaddd", "phaddw"}) {
+    add(Case(std::string(Op) + " xmm,xmm", std::string(Op) + " xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1));
+  }
+  for (const char *Op : {"vphaddd", "vphaddw"}) {
+    add(Case(std::string(Op) + " xmm", std::string(Op) + " xmm2, xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1).xmm(2, 1, 2));
+    add(Case(std::string(Op) + " ymm", std::string(Op) + " ymm2, ymm0, ymm1")
+            .ymm(0, A0, A1, B0, B1).ymm(1, B0, B1, A0, A1).ymm(2, 1, 2, 3, 4));
+  }
   for (const char *Op : {"psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq",
                          "psraw", "psrad"}) {
     add(Case(std::string(Op) + " xmm,imm", std::string(Op) + " xmm0, 3")

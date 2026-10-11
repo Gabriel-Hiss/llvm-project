@@ -1105,6 +1105,37 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     }
     return Shuf(M, A, Bv, EB);
   }
+  if (Name == "phadd") {
+    // Horizontal packed add: dst lane K gets src1[2K]+src1[2K+1] then
+    // src2[2K]+src2[2K+1], independently per 128-bit lane. Works on the
+    // operand's own width (i128 xmm forms, i256 VEX-256 Y forms); the
+    // mask concatenates even lanes (a,b pairs interleaved) and odd
+    // lanes the same way, then adds pairwise.
+    unsigned EB = static_cast<unsigned>(Imm);
+    unsigned W = A->getType()->getPrimitiveSizeInBits();
+    Type *IT = iN(W);
+    Type *VT = vecTyOf(B, IT, EB);
+    unsigned NL = llvm::cast<llvm::FixedVectorType>(VT)->getNumElements();
+    Value *X = As(toInt(A, W), VT);
+    Value *Y = As(toInt(Bv, W), VT);
+    unsigned Per = 128 / EB;    // elements per 128-bit lane
+    SmallVector<int, 32> ME, MO;
+    for (unsigned Lane = 0; Lane < W / 128; ++Lane) {
+      unsigned Base = Lane * Per; // first element of this 128-bit lane
+      for (unsigned i = 0; i < Per; ++i) {
+        // First Per/2 results come from A's pairs in this lane, the
+        // rest from B's pairs in the same lane.
+        bool Second = i >= Per / 2;
+        unsigned Pair = Second ? i - Per / 2 : i;
+        int Idx = int((Second ? NL : 0) + Base + 2 * Pair);
+        ME.push_back(Idx);
+        MO.push_back(Idx + 1);
+      }
+    }
+    Value *E = B.CreateShuffleVector(X, Y, ME);
+    Value *O = B.CreateShuffleVector(X, Y, MO);
+    return B.CreateBitCast(B.CreateAdd(E, O), IT);
+  }
   if (Name == "pshufb") {
     // Select each byte with a dynamic lane index. A control byte with its high
     // bit set produces zero.

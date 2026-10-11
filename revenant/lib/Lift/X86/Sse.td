@@ -37,6 +37,7 @@ def rv_pshufhw      : RVOp; // (rv_pshufhw x, imm)
 def rv_pshuflw      : RVOp; // (rv_pshuflw x, imm)
 def rv_shufps       : RVOp; // (rv_shufps a, b, imm)
 def rv_shufpd       : RVOp; // (rv_shufpd a, b, imm)
+def rv_phadd        : RVOp; // (rv_phadd ebits, a, b): per-128-lane pairwise add
 def rv_punpckl      : RVOp; // (rv_punpckl ebits, a, b): interleave low half
 def rv_punpckh      : RVOp; // (rv_punpckh ebits, a, b): interleave high half
 def rv_pshufb       : RVOp; // (rv_pshufb a, b): SSSE3 byte shuffle
@@ -744,6 +745,34 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "PUNPCKHQDQr*";
   dag Body = (rv_set $dst, (rv_punpckh 64, (rv_op 0), (rv_op 1)));
+}
+
+// ---- horizontal adds ----------------------------------------------------------
+// dst pairs (a0+a1, a2+a3, b0+b1, b2+b3) per 128-bit lane; rv_set keeps
+// the merge-destination semantics, rv_setz the VEX zeroing form.
+def : RVMatch {
+  string Glob = "PHADDDr*";
+  dag Body = (rv_set $dst, (rv_phadd 32, (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "PHADDWr*";
+  dag Body = (rv_set $dst, (rv_phadd 16, (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VPHADDDr*";
+  dag Body = (rv_setz $dst, (rv_phadd 32, (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VPHADDWr*";
+  dag Body = (rv_setz $dst, (rv_phadd 16, (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VPHADDDYr*";
+  dag Body = (rv_setz $dst, (rv_phadd 32, (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VPHADDWYr*";
+  dag Body = (rv_setz $dst, (rv_phadd 16, (rv_op 0), (rv_op 1)));
 }
 
 // ---- shuffles ------------------------------------------------------------------

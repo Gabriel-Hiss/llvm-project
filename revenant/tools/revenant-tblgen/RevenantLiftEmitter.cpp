@@ -533,6 +533,20 @@ class RevenantLiftEmitter {
                       ", " + B + ", " + Twine(Bits->getValue()) + ")")
                          .str();
       }
+      // (rv_phadd ebits, a, b): operand width is the instruction's
+      // (i128 for xmm forms, i256 for the VEX-256 Y variants).
+      if (Name == "rv_phadd" && D->getNumArgs() == 3) {
+        const auto *Bits = dyn_cast<IntInit>(D->getArg(0));
+        std::string A =
+            expression(D->getArg(1), Inst, Width, D->getArgNameStr(1));
+        std::string B =
+            expression(D->getArg(2), Inst, Width, D->getArgNameStr(2));
+        return !Bits || A.empty() || B.empty()
+                   ? std::string()
+                   : (Twine("LC.vop(\"phadd\", ") + A + ", " + B + ", " +
+                      Twine(Bits->getValue()) + ")")
+                         .str();
+      }
       if (Name == "rv_pinsrw" && D->getNumArgs() == 3) {
         std::string A =
             expression(D->getArg(0), Inst, 128, D->getArgNameStr(0));
