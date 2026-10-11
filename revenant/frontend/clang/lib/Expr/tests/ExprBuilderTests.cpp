@@ -453,6 +453,36 @@ TEST_F(ExprTest, LoadStoreDeref) {
             "v += 2");
 }
 
+TEST_F(ExprTest, CompoundStoreKeepsSideEffectingRhsSequenced) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I32 = Type::getInt32Ty(LLCtx);
+  AllocaInst *All = B.CreateAlloca(I32, nullptr, "v");
+  clang::VarDecl *VD = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("v"), ACtx->IntTy, ACtx->getTrivialTypeSourceInfo(ACtx->IntTy),
+      clang::SC_None);
+  FCtx->bindDecl(All, VD);
+  llvm::Function *SideEffect = llvm::Function::Create(
+      llvm::FunctionType::get(I32, false), llvm::GlobalValue::ExternalLinkage,
+      "side_effect", M.get());
+  llvm::Value *OldValue = B.CreateLoad(I32, All, "old");
+  llvm::Value *RHS = B.CreateCall(SideEffect, {}, "rhs");
+  llvm::Value *Sum = B.CreateAdd(OldValue, RHS, "sum");
+  StoreInst *Update = B.CreateStore(Sum, All);
+  clang::Stmt *St = Exprs->instr(*Update, Scope);
+  ASSERT_NE(St, nullptr);
+  llvm::SmallString<256> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  clang::PrintingPolicy Policy(LangOpts);
+  St->printPretty(OS, nullptr, Policy);
+  std::string Printed = OS.str().str();
+  EXPECT_EQ(Printed.find("v +="), std::string::npos);
+  EXPECT_NE(Printed.find("v ="), std::string::npos);
+}
+
 
 TEST_F(ExprTest, GepArraySubscript) {
   FuncHost H = makeFunc();

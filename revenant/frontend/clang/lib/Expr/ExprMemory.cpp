@@ -13,6 +13,8 @@
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -30,6 +32,30 @@ using namespace clang;
 using namespace llvm::dwarf;
 
 // ---- memory: loads, stores, GEPs ------------------------------------------
+
+static bool isOrderIndependentCompoundRHS(llvm::Value *Root) {
+  llvm::SmallVector<llvm::Value *, 16> Worklist{Root};
+  llvm::SmallPtrSet<llvm::Value *, 16> Visited;
+  while (!Worklist.empty()) {
+    llvm::Value *V = Worklist.pop_back_val();
+    if (!Visited.insert(V).second)
+      continue;
+    auto *I = llvm::dyn_cast<llvm::Instruction>(V);
+    if (!I)
+      continue;
+    if (llvm::isa<llvm::CallBase>(I))
+      return false;
+    if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(I)) {
+      if (Load->isVolatile() || Load->isAtomic())
+        return false;
+    } else if (I->mayHaveSideEffects()) {
+      return false;
+    }
+    for (llvm::Use &Operand : I->operands())
+      Worklist.push_back(Operand.get());
+  }
+  return true;
+}
 
 Expr *ExprBuilderImpl::decayToPointer(Expr *E, QualType Pointee) {
   QualType T = E->getType();
@@ -169,15 +195,15 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
     SameDestinationType =
         AST->getTypeSize(DestType) == AST->getTypeSize(Pointee) &&
         DestType->isSignedIntegerType() == Pointee->isSignedIntegerType();
-  bool CanCompound = OldValue &&
-                     OldValue->getPointerOperand() == I.getPointerOperand() &&
-                     !I.getValueOperand()->getType()->isAggregateType() &&
-                     !I.getValueOperand()->getType()->isVectorTy() &&
-                     Update->getOperand(0)->getType() ==
-                         I.getValueOperand()->getType() &&
-                     Update->getOperand(1)->getType() ==
-                         I.getValueOperand()->getType() &&
-                     SameDestinationType;
+  bool CanCompound =
+      OldValue && OldValue->getPointerOperand() == I.getPointerOperand() &&
+      !OldValue->isVolatile() && !OldValue->isAtomic() && !I.isVolatile() &&
+      !I.isAtomic() && !I.getValueOperand()->getType()->isAggregateType() &&
+      !I.getValueOperand()->getType()->isVectorTy() &&
+      Update->getOperand(0)->getType() == I.getValueOperand()->getType() &&
+      Update->getOperand(1)->getType() == I.getValueOperand()->getType() &&
+      SameDestinationType && !Dst->HasSideEffects(*AST) &&
+      isOrderIndependentCompoundRHS(UpdateRHS);
   if (CanCompound) {
     switch (Update->getOpcode()) {
     case llvm::Instruction::Add:
