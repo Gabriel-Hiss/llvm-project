@@ -178,21 +178,29 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
     auto *CDS = llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(Init);
     if (!CDS)
       continue;
-    // C allows a string literal that exactly fills the array; C++ always
-    // counts the terminator, so there only a NUL-terminated array prints as a
-    // literal (without its last byte) and the rest as a byte list.
-    if (CDS->isString() && (!FCtx.isCPlusPlus() || CDS->isCString())) {
+    // A string literal carries an implicit NUL, so it only fits an array of
+    // N bytes when its stored data leaves room for it (C++) or exactly fills
+    // the array without it (C). Drop a redundant trailing NUL from the data
+    // and otherwise fall back to a braced initializer.
+    if (CDS->isString()) {
       StringRef S = CDS->getRawDataValues();
-      c::QualType ArrTy = AST.getConstantArrayType(
-          AST.CharTy, APInt(64, S.size()), nullptr,
-          c::ArraySizeModifier::Normal, 0);
-      if (FCtx.isCPlusPlus())
-        S = S.drop_back();
-      VD->setType(ArrTy);
-      VD->setInit(c::StringLiteral::Create(
-          AST, S, c::StringLiteralKind::Ordinary, false, ArrTy, L));
-      VD->setInitStyle(c::VarDecl::CInit);
-    } else if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
+      const bool DropsNul = !S.empty() && S.back() == '\0';
+      StringRef Lit = DropsNul ? S.drop_back() : S;
+      const bool Fits = FCtx.isCPlusPlus()
+                            ? Lit.size() + 1 <= CDS->getNumElements()
+                            : Lit.size() <= CDS->getNumElements();
+      if (Fits) {
+        c::QualType ArrTy = AST.getConstantArrayType(
+            AST.CharTy, APInt(64, CDS->getNumElements()), nullptr,
+            c::ArraySizeModifier::Normal, 0);
+        VD->setType(ArrTy);
+        VD->setInit(c::StringLiteral::Create(
+            AST, Lit, c::StringLiteralKind::Ordinary, false, ArrTy, L));
+        VD->setInitStyle(c::VarDecl::CInit);
+        continue;
+      }
+    }
+    if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
       SmallVector<c::Expr *, 64> Elems;
       c::QualType ElemTy = Types.typeOf(CDA->getElementType(), nullptr);
       // A literal typed narrower than `int` prints with the Ui8/Ui16 numeric

@@ -182,6 +182,7 @@ missing = [
         ("%FileCheck", filecheck),
         ("%revenant-opt", revenant_opt),
         ("%revenant-decompile", revenant_decompile),
+        ("%revenant-clang", revenant_clang),
     )
     if not path
 ]
