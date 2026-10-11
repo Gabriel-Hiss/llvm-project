@@ -268,8 +268,6 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
             Prog.Functions.count(I.Target) &&
             !Result.LibraryStarts.count(I.Target)) {
           Result.UserEntry = I.Target;
-          // Traced through the narrow handoff: the entry is hosted `main`.
-          Result.UserEntryIsNarrowMain = (Name == "invoke_main");
           break;
         }
       if (Result.UserEntry)

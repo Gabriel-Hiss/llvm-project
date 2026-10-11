@@ -60,9 +60,6 @@ enum class MetaMode { None, Embedded, Pdb };
 /// Reachability and static-library labels for an analyzed PE.
 struct FunctionClassification {
   std::optional<Va> UserEntry;
-  /// The entry was traced through the narrow CRT handoff (`invoke_main`):
-  /// it is the hosted `main`, so the emitter spells argc/argv accordingly.
-  bool UserEntryIsNarrowMain = false;
   std::set<Va> UserReachable;
   std::set<Va> Startup;
   std::set<Va> LibraryStarts;
