@@ -466,7 +466,7 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
   llvm::SmallString<64> Name(recordName(WideIntBits, IsArithmeticShift ? true : Signed));
   Name += Suffix;
   clang::FunctionDecl *FD =
-      wrapperProto(A, ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
+      wrapperProto(A, IsArithmeticShift ? SignedTy : ResTy, Name, /*Binary=*/true, /*Predicate=*/false,
                    /*ShiftCount=*/IsShift);
   // Constants and narrow operands conform to the declared parameter
   // types: the record for value operands, `unsigned` for shift counts
