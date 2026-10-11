@@ -79,6 +79,13 @@ using namespace llvm::PatternMatch;
 
 namespace {
 
+// Provenance for instructions that replace an opaque call: the VA moves
+// over, the opacity does not (the rewrite is no longer opaque).
+void copyVA(Instruction *New, Instruction *Old) {
+  if (MDNode *VA = Old->getMetadata("revenant.va"))
+    New->setMetadata("revenant.va", VA);
+}
+
 void copyProvenance(Instruction *New, Instruction *Old) {
   if (MDNode *VA = Old->getMetadata("revenant.va"))
     New->setMetadata("revenant.va", VA);
@@ -1785,11 +1792,87 @@ Value *resolveInBlock(BasicBlock &BB, Value *V, unsigned Depth = 6) {
   return V;
 }
 
-/// ConstantRange of `V` for the shapes a table index takes (masks, shifts,
-/// multiplies and extends of a possibly-unknown value). Nullopt when an
-/// operation is unsupported, which vetoes the rewrite.
+/// Resolve lane `Lane` of `V` to the constant that lands there when every
+/// step is a constant operation or a register/xmm slot read. GCC builds its
+/// function-pointer table with a vector store (`punpcklqdq` + `movaps`), so
+/// the entry constant only appears after folding those slot loads, the
+/// bitcasts around them and the shuffle that interleaves the two halves.
+/// Width-changing casts are transparent here: the entry is used as a pointer
+/// identity, never as bits.
+Constant *constLane(Value *V, unsigned Lane, BasicBlock &BB,
+                    const DataLayout &DL, unsigned Depth = 14) {
+  (void)DL;
+  if (!V || Depth == 0)
+    return nullptr;
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    // `ptrtoint (@f, i64)` is an entry; a cast expression keeps the layout
+    // of its operand.
+    if (CE->isCast())
+      return constLane(CE->getOperand(0), Lane, BB, DL, Depth - 1);
+    return Lane == 0 ? CE : nullptr;
+  }
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    if (Lane == 0)
+      return CI;
+    // The lanes above a zext are zero.
+    return CI->isZero() ? CI : nullptr;
+  }
+  if (auto *CV = dyn_cast<ConstantVector>(V))
+    return Lane < CV->getNumOperands() ? CV->getOperand(Lane) : nullptr;
+  if (isa<Constant>(V))
+    return Lane == 0 ? cast<Constant>(V) : nullptr;
+  if (auto *Ld = dyn_cast<LoadInst>(V)) {
+    if (Ld->getParent() != &BB)
+      return nullptr;
+    Value *Ptr = Ld->getPointerOperand()->stripPointerCasts();
+    if (!isa<AllocaInst>(Ptr))
+      return nullptr;
+    Value *Stored = nullptr;
+    for (Instruction &I2 : BB) {
+      if (&I2 == Ld)
+        break;
+      auto *St = dyn_cast<StoreInst>(&I2);
+      if (!St)
+        continue;
+      if (St->getPointerOperand()->stripPointerCasts() == Ptr)
+        Stored = St->getValueOperand();
+    }
+    return constLane(Stored, Lane, BB, DL, Depth - 1);
+  }
+  if (auto *Cast = dyn_cast<CastInst>(V)) {
+    if (isa<TruncInst>(Cast) || isa<ZExtInst>(Cast) || isa<SExtInst>(Cast) ||
+        isa<BitCastInst>(Cast))
+      return constLane(Cast->getOperand(0), Lane, BB, DL, Depth - 1);
+    return nullptr;
+  }
+  if (auto *SV = dyn_cast<ShuffleVectorInst>(V)) {
+    if (isa<ScalableVectorType>(SV->getType()))
+      return nullptr;
+    unsigned MaskN = SV->getShuffleMask().size();
+    if (Lane >= MaskN)
+      return nullptr;
+    int m = SV->getShuffleMask()[Lane];
+    if (m < 0)
+      return nullptr;
+    auto *ATy = dyn_cast<FixedVectorType>(SV->getOperand(0)->getType());
+    if (!ATy)
+      return nullptr;
+    int AElts = (int)ATy->getNumElements();
+    if (m < AElts)
+      return constLane(SV->getOperand(0), (unsigned)m, BB, DL, Depth - 1);
+    return constLane(SV->getOperand(1), (unsigned)(m - AElts), BB, DL, Depth - 1);
+  }
+  return nullptr;
+}
+
+/// ConstantRange of `V` for the shapes a table index takes. Reads through
+/// the lifter's register slots (a load re-substitutes the last store to that
+/// slot) and uses LLVM's ConstantRange arithmetic, so a mask such as
+/// `and (shl x, 3), 8` really narrows to {0, 8}. Nullopt when an operation is
+/// unsupported, which vetoes the rewrite.
 std::optional<ConstantRange>
-rangeOf(Value *V, DenseMap<Value *, ConstantRange> &Memo, unsigned Depth = 8) {
+rangeOf(Value *V, BasicBlock &BB, DenseMap<Value *, ConstantRange> &Memo,
+        unsigned Depth = 10) {
   if (!V || !V->getType()->isIntegerTy())
     return std::nullopt;
   auto It = Memo.find(V);
@@ -1803,48 +1886,73 @@ rangeOf(Value *V, DenseMap<Value *, ConstantRange> &Memo, unsigned Depth = 8) {
   if (auto *C = dyn_cast<ConstantInt>(V)) {
     Res = ConstantRange(C->getValue(), C->getValue() + 1);
   } else if (isa<Argument>(V)) {
+    // A parameter: an unknown but bounded-by-type value.
     Res = Full;
-  } else if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    auto L = rangeOf(BO->getOperand(0), Memo, Depth - 1);
-    auto Rr = rangeOf(BO->getOperand(1), Memo, Depth - 1);
-    if (!L || !Rr)
+  } else if (isa<LoadInst>(V)) {
+    // A register/xmm slot read: substitute the last store to that slot.
+    auto *Ld = cast<LoadInst>(V);
+    if (Ld->getParent() != &BB)
       return std::nullopt;
+    Value *Ptr = Ld->getPointerOperand()->stripPointerCasts();
+    if (!isa<AllocaInst>(Ptr))
+      return std::nullopt;
+    Value *Stored = nullptr;
+    for (Instruction &I2 : BB) {
+      if (&I2 == Ld)
+        break;
+      auto *St = dyn_cast<StoreInst>(&I2);
+      if (!St)
+        continue;
+      if (St->getPointerOperand()->stripPointerCasts() == Ptr)
+        Stored = St->getValueOperand();
+    }
+    if (!Stored)
+      return std::nullopt;
+    Res = rangeOf(Stored, BB, Memo, Depth - 1).value_or(Full);
+  } else if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    auto L = rangeOf(BO->getOperand(0), BB, Memo, Depth - 1);
+    auto Rr = rangeOf(BO->getOperand(1), BB, Memo, Depth - 1);
+    if (!L)
+      return std::nullopt;
+    ConstantRange RHS = Rr ? *Rr : Full;
+    // Every binary op on a bounded range stays bounded; the arithmetic is
+    // exact for the wrapping operation the IR performs.
     switch (BO->getOpcode()) {
     case Instruction::And:
-      // A mask with a constant bounds the result hard; otherwise keep the
-      // full set (an `and` can only clear bits).
-      if (BO->getOperand(1) == BO->getOperand(0)) {
-        Res = ConstantRange(APInt(W, 0), APInt(W, 0) + 1);
-        break;
-      }
-      if (auto *K = dyn_cast<ConstantInt>(BO->getOperand(1)))
-        Res = L->binaryAnd(ConstantRange(K->getValue(), K->getValue() + 1));
-      else if (auto *K = dyn_cast<ConstantInt>(BO->getOperand(0)))
-        Res = Rr->binaryAnd(ConstantRange(K->getValue(), K->getValue() + 1));
-      else
-        Res = Full;
-      break;
-    case Instruction::Shl:
-    case Instruction::LShr:
-    case Instruction::AShr:
-    case Instruction::Mul:
-      if (isa<ConstantInt>(BO->getOperand(1)))
-        Res = Full;
-      else
-        Res = Full;
-      break;
-    case Instruction::Add:
-      if (isa<ConstantInt>(BO->getOperand(1)) || isa<ConstantInt>(BO->getOperand(0)))
-        Res = Full;
-      else
-        Res = Full;
-      break;
-    case Instruction::Sub:
-      Res = Full;
+      Res = L->binaryAnd(RHS);
       break;
     case Instruction::Or:
+      Res = L->binaryOr(RHS);
+      break;
     case Instruction::Xor:
-      Res = Full;
+      Res = L->binaryXor(RHS);
+      break;
+    case Instruction::Shl:
+      Res = L->shl(RHS);
+      break;
+    case Instruction::LShr:
+      Res = L->lshr(RHS);
+      break;
+    case Instruction::AShr:
+      Res = L->ashr(RHS);
+      break;
+    case Instruction::Mul: {
+      // ConstantRange has no multiplication: widen to the full set unless
+      // one side is a known constant, which is the shape a table index
+      // takes (`mul i, 8`). A bounded times-constant keeps the bound.
+      if (auto *K = dyn_cast<ConstantInt>(BO->getOperand(1)))
+        Res = L->multiply(K->getValue().zextOrTrunc(W));
+      else if (auto *K = dyn_cast<ConstantInt>(BO->getOperand(0)))
+        Res = RHS.multiply(K->getValue().zextOrTrunc(W));
+      else
+        Res = Full;
+      break;
+    }
+    case Instruction::Add:
+      Res = L->add(RHS);
+      break;
+    case Instruction::Sub:
+      Res = L->sub(RHS);
       break;
     default:
       return std::nullopt;
@@ -1853,10 +1961,9 @@ rangeOf(Value *V, DenseMap<Value *, ConstantRange> &Memo, unsigned Depth = 8) {
     auto Src = CI->getOperand(0)->getType();
     if (!Src->isIntegerTy())
       return std::nullopt;
-    auto S = rangeOf(CI->getOperand(0), Memo, Depth - 1);
+    auto S = rangeOf(CI->getOperand(0), BB, Memo, Depth - 1);
     if (!S)
       return std::nullopt;
-    unsigned SW = Src->getIntegerBitWidth();
     switch (CI->getOpcode()) {
     case Instruction::ZExt:
       Res = S->zextOrTrunc(W);
@@ -1865,17 +1972,12 @@ rangeOf(Value *V, DenseMap<Value *, ConstantRange> &Memo, unsigned Depth = 8) {
       Res = S->sextOrTrunc(W);
       break;
     case Instruction::Trunc:
-      Res = S->zextOrTrunc(W).intersectWith(ConstantRange::getFull(W));
+      Res = S->truncate(W);
       break;
     default:
       return std::nullopt;
     }
-  } else if (isa<PHINode>(V) || isa<SelectInst>(V)) {
-    return std::nullopt;
   } else {
-    // Anything else (load, call, ...) is unknown but could still be in
-    // range only if the table covered every possible value, which we do
-    // not accept.
     return std::nullopt;
   }
   Memo.try_emplace(V, Res);
@@ -1885,17 +1987,24 @@ rangeOf(Value *V, DenseMap<Value *, ConstantRange> &Memo, unsigned Depth = 8) {
 /// Resolve a `ptrtoint` constant to the function it names. The lifter renders
 /// a code address as `@f_<va>`; the function itself is `sub_<va>`.
 Function *functionFromPtr(Constant *C, Module &M) {
-  auto *CE = dyn_cast<ConstantExpr>(C);
-  if (!CE || CE->getOpcode() != Instruction::PtrToInt)
-    return nullptr;
-  auto *GV = dyn_cast<GlobalValue>(CE->getOperand(0));
+  // The entry arrives either as the address itself (`@f_<va>`, the lifter's
+  // view of a code address) or as a `ptrtoint` of it.
+  GlobalValue *GV = nullptr;
+  if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+    if (CE->getOpcode() != Instruction::PtrToInt)
+      return nullptr;
+    GV = dyn_cast<GlobalValue>(CE->getOperand(0));
+  } else {
+    GV = dyn_cast<GlobalValue>(C);
+  }
   if (!GV)
     return nullptr;
   if (auto *Fn = dyn_cast<Function>(GV))
     return Fn;
   StringRef Name = GV->getName();
-  if (Name.starts_with("f_") && M.getFunction(Name.drop_front(2)))
-    return M.getFunction(Name.drop_front(2));
+  if (Name.starts_with("f_"))
+    if (Function *F = M.getFunction(Name.drop_front(2)))
+      return F;
   return nullptr;
 }
 
@@ -1915,25 +2024,29 @@ bool tryPtrTable(Function &F, BasicBlock &BB) {
     Opaque = CI;
     break;
   }
-  if (!Opaque || Opaque->arg_size() < 1)
+  if (!Opaque || Opaque->arg_size() < 1) {
     return false;
+  }
   Value *Tgt = resolveInBlock(BB, Opaque->getArgOperand(0));
   auto *Ld = dyn_cast<LoadInst>(Tgt);
-  if (!Ld || Ld->getParent() != &BB)
+  if (!Ld || Ld->getParent() != &BB) {
     return false;
-  if (!Ld->getType()->isIntegerTy(64))
+  }
+  if (!Ld->getType()->isIntegerTy(64)) {
     return false;
+  }
   auto *GEP = dyn_cast<GetElementPtrInst>(Ld->getPointerOperand());
-  if (!GEP || GEP->getNumIndices() != 1)
+  if (!GEP || GEP->getNumIndices() != 1) {
     return false;
-  if (GEP->getSourceElementType() != Type::getInt8Ty(Ctx))
+  }
+  if (GEP->getSourceElementType() != Type::getInt8Ty(Ctx)) {
     return false;
+  }
   Value *IdxVal = GEP->getOperand(1);
-  if (!IdxVal->getType()->isIntegerTy(64))
+  if (!IdxVal->getType()->isIntegerTy(64)) {
     return false;
-  Value *SlotBase = resolveInBlock(BB, GEP->getPointerOperand());
-  if (!SlotBase)
-    return false;
+  }
+  Value *GepBase = GEP->getPointerOperand()->stripPointerCasts();
   // The entry offset inside the table. `gep %slot, (idx + K)` shifts the
   // table base by K; only a constant K keeps the slot store comparable.
   int64_t SlotOff = 0;
@@ -1947,111 +2060,192 @@ bool tryPtrTable(Function &F, BasicBlock &BB) {
     SlotOff = -cast<ConstantInt>(AddI->getOperand(1))->getSExtValue();
     IdxVal = AddI->getOperand(0);
   }
-  if (SlotOff < 0)
-    return false;
+  // A frame table sits below the frame pointer (GCC's `sub rsp, 2*8`
+  // address), so a negative base offset is normal.
 
-  // 2. The constant table: exactly the stores that fill this slot, and no
-  // other access to it.
+  // Static byte offset of `P` from `GepBase`, or nullopt when `P` is not a
+  // constant-offset view of the same base (another local, or a dynamic
+  // offset we cannot compare).
+  auto staticOff = [&](Value *P) -> std::optional<int64_t> {
+    Value *Cur = P->stripPointerCasts();
+    if (Cur == GepBase)
+      return 0;
+    auto *G = dyn_cast<GEPOperator>(Cur);
+    if (!G || G->getPointerOperand()->stripPointerCasts() != GepBase)
+      return std::nullopt;
+    const DataLayout &GDL = F.getDataLayout();
+    int64_t Off = 0;
+    Type *Src = G->getSourceElementType();
+    unsigned NumIdx = G->getNumIndices();
+    if (NumIdx == 0)
+      return std::nullopt;
+    // The last index must be a constant: it is the table offset, not the
+    // table index (which lives in the load's own GEP).
+    for (unsigned I = 0; I + 1 < NumIdx; ++I) {
+      auto *C = dyn_cast<ConstantInt>(G->getOperand(I + 1));
+      if (!C)
+        return std::nullopt;
+      uint64_t Idx = C->getZExtValue();
+      if (auto *AT = dyn_cast<ArrayType>(Src))
+        Src = AT->getElementType();
+      else
+        return std::nullopt;
+      Off += (int64_t)(Idx * GDL.getTypeAllocSize(Src));
+    }
+    auto *K = dyn_cast<ConstantInt>(G->getOperand(NumIdx));
+    if (!K)
+      return std::nullopt;
+    if (!Src->isSized())
+      return std::nullopt;
+    Off += K->getSExtValue() * (int64_t)GDL.getTypeAllocSize(Src);
+    return Off;
+  };
+
+  // 2. The constant table: exactly one writer at the table's offset, and no
+  // other reader of the bytes it covers.
   StoreInst *TblStore = nullptr;
   for (Instruction &I : BB) {
     auto *St = dyn_cast<StoreInst>(&I);
-    if (St && St->getPointerOperand()->stripPointerCasts() == SlotBase) {
-      if (TblStore)
-        return false; // more than one writer: not a constant table
-      TblStore = St;
+    if (St) {
+      auto Off = staticOff(St->getPointerOperand());
+      if (!Off)
+        continue;
+      if (*Off == SlotOff) {
+        if (TblStore) {
+                return false; // more than one writer: not a constant table
+        }
+        TblStore = St;
+      }
       continue;
     }
     auto *Ld2 = dyn_cast<LoadInst>(&I);
-    if (Ld2 && Ld2 != Ld &&
-        Ld2->getPointerOperand()->stripPointerCasts() == SlotBase)
-      return false; // another reader: the table escapes this switch
+    if (Ld2 && Ld2 != Ld) {
+      // A read of the same base through a GEP, or of the base itself, could
+      // see the table (or a sibling slot): let the caller's rewrite stand
+      // only when nothing else reads it.
+      Value *P = Ld2->getPointerOperand()->stripPointerCasts();
+      if (isa<GetElementPtrInst>(P) || P == GepBase) {
+            return false;
+      }
+    }
   }
-  if (!TblStore || !isa<Constant>(TblStore->getValueOperand()))
+  if (!TblStore) {
     return false;
-  auto *TblConst = dyn_cast<Constant>(TblStore->getValueOperand());
-  uint64_t TblBytes = DL.getTypeStoreSize(TblConst->getType());
-  if (TblBytes % 8 != 0 || TblBytes == 0 || TblBytes > 64 * 8)
+  }
+  // The stored value is the table: an i128 / vector / array constant, or a
+  // chain of slot loads that only looks non-constant. Entries are its lanes
+  // in order.
+  Value *TblVal = TblStore->getValueOperand();
+  if (!TblVal->getType()->isSized())
     return false;
+  uint64_t TblBytes = DL.getTypeStoreSize(TblVal->getType());
+  if (TblBytes % 8 != 0 || TblBytes == 0 || TblBytes > 64 * 8) {
+    return false;
+  }
   unsigned Entries = (unsigned)(TblBytes / 8);
 
   // 3. The index range must land inside the table.
   DenseMap<Value *, ConstantRange> Memo;
-  auto Range = rangeOf(IdxVal, Memo);
-  if (!Range)
+  auto Range = rangeOf(IdxVal, BB, Memo);
+  if (!Range) {
     return false;
+  }
   APInt Lo = Range->getLower();
   APInt Hi = Range->getUpper();
-  if (Lo.getBitWidth() != 64)
+  if (Lo.getBitWidth() != 64) {
     return false;
+  }
   // The range must be a subset of {0, 8, ..., (Entries-1)*8}.
   APInt MaxOff = APInt(64, (Entries - 1) * 8);
-  if (Lo.uge(MaxOff + 1) || Hi.ugt(MaxOff + 1))
+  if (Lo.uge(MaxOff + 1) || Hi.ugt(MaxOff + 1)) {
     return false;
+  }
 
-  // 4. Resolve every entry to a real function in this module.
+  // 4. Resolve every entry to a real function in this module. Entries are
+  // relative to the table object, not to the frame pointer.
   SmallVector<Function *, 8> Callees;
   for (unsigned I = 0; I < Entries; ++I) {
-    Constant *E = ConstantFoldLoadFromConst(
-        TblConst, Type::getInt64Ty(Ctx),
-        APInt(64, I * 8 + (uint64_t)SlotOff), DL);
-    if (!E)
+    Constant *E = constLane(TblVal, I, BB, DL);
+    if (!E) {
       return false;
+    }
     Function *Callee = functionFromPtr(E, *F.getParent());
-    if (!Callee)
+    if (!Callee) {
       return false;
+    }
     if (Callee->arg_size() > 4)
       return false;
-    for (Argument &A : Callee->args())
-      if (!A.getType()->isIntegerTy() || A.getType()->getIntegerBitWidth() > 64)
-        return false;
-    if (Callee->getReturnType() != F.getReturnType())
+    {
+      bool IntArgs = true;
+      for (Argument &A : Callee->args())
+        if (!A.getType()->isIntegerTy() || A.getType()->getIntegerBitWidth() > 64)
+          IntArgs = false;
+      if (!IntArgs) {
+            return false;
+      }
+    }
+    if (Callee->getReturnType() != F.getReturnType()) {
       return false;
+    }
     if (Callee->isVarArg())
       return false;
     Callees.push_back(Callee);
   }
-  if (Callees.empty())
+  if (Callees.empty()) {
     return false;
+  }
 
   // 5. Rewrite: switch on the element index, one direct tail call per entry.
   // The argument register slots are read here, before the opaque jump, so
   // they still hold the values the tail call passes.
-  Instruction *SplitAt = Opaque;
-  BasicBlock *Tail = BB.splitBasicBlock(SplitAt, "sw.ptr.tail");
-  // The tail holds only the opaque jump plus dead register clobbers; drop it
-  // so the emitted source never mentions the opaque callee.
-  bool TailIsDead = true;
-  for (Instruction &I : *Tail) {
-    if (I.isTerminator())
-      continue;
-    if (!I.mayHaveSideEffects() && I.use_empty())
-      continue;
-    TailIsDead = false;
-    break;
-  }
-  if (TailIsDead) {
-    for (Instruction &I : llvm::make_early_inc_range(*Tail)) {
+  // Split at the opaque jump: the head keeps everything before it, the tail
+  // holds the opaque call plus the lifter's register clobbers. Nothing after
+  // an unconditional indirect branch runs, so a tail of dead clobbers is
+  // dropped and the switch default becomes unreachable.
+  BasicBlock *Tail = BB.splitBasicBlock(Opaque, "sw.ptr.tail");
+  bool TailAlive = false;
+  {
+    SmallVector<Instruction *, 8> Dead;
+    for (Instruction &I : make_early_inc_range(*Tail)) {
       if (I.isTerminator())
         continue;
-      I.dropAllReferences();
-      I.eraseFromParent();
+      if (&I != Opaque) {
+        // A register-clobber store (the lifter's model of a dead register
+        // write) has no effect on the program; anything else real, or a live
+        // value, keeps the tail as the switch default.
+        bool DeadClobber = false;
+        if (auto *St = dyn_cast<StoreInst>(&I))
+          DeadClobber = isa<UndefValue>(St->getValueOperand()) ||
+                        isa<PoisonValue>(St->getValueOperand());
+        if (!DeadClobber && (I.mayHaveSideEffects() || !I.use_empty())) {
+          TailAlive = true;
+          break;
+        }
+      }
+      Dead.push_back(&I);
+    }
+    for (Instruction *D : Dead) {
+      D->dropAllReferences();
+      D->eraseFromParent();
     }
   }
+  BasicBlock *Dead = Tail;
+  if (!TailAlive)
+    Dead = BasicBlock::Create(Ctx, "sw.ptr.dead", &F);
+
+  // One direct tail call per entry. The argument register slots are read
+  // here, before the opaque jump, so they still hold the values the tail
+  // call passes.
   Instruction *HeadTerm = BB.getTerminator();
   IRBuilder<> B(HeadTerm);
-  // `Idx / 8`: the table entries are 8 bytes apart.
   Value *Idx64 = IdxVal;
   if (Idx64->getType() != Type::getInt64Ty(Ctx))
     Idx64 = B.CreateZExtOrTrunc(Idx64, Type::getInt64Ty(Ctx), "sw.ptr.idx");
-  Value *Elem = B.CreateLShr(Idx64, ConstantInt::get(Ctx, APInt(64, 3)),
-                             "sw.ptr.elem");
-  BasicBlock *Dead = nullptr;
-  if (TailIsDead)
-    Dead = BasicBlock::Create(Ctx, "sw.ptr.dead", &F);
-  else
-    Dead = Tail;
+  // Table entries are 8 bytes apart.
+  Value *Elem =
+      B.CreateLShr(Idx64, ConstantInt::get(Ctx, APInt(64, 3)), "sw.ptr.elem");
   auto *SI = B.CreateSwitch(Elem, Dead, Entries);
-  copyProvenance(SI, Opaque);
+  copyVA(SI, &BB.front());
 
   // Win64 integer argument slots, in argument order.
   static const char *ArgRegs[] = {"rcx", "rdx", "r8", "r9"};
@@ -2061,8 +2255,7 @@ bool tryPtrTable(Function &F, BasicBlock &BB) {
     for (Instruction &I : BB) {
       auto *Al = dyn_cast<AllocaInst>(&I);
       if (Al && Al->getName() == Name &&
-          Al->getAllocatedType()->isIntegerTy(64) &&
-          Al->isArrayAllocation() == false) {
+          Al->getAllocatedType()->isIntegerTy(64) && !Al->isArrayAllocation()) {
         Slot = Al;
         break;
       }
@@ -2072,14 +2265,14 @@ bool tryPtrTable(Function &F, BasicBlock &BB) {
 
   for (unsigned I = 0; I < Entries; ++I) {
     Function *Callee = Callees[I];
-    BasicBlock *CB = BasicBlock::Create(Ctx, "sw.ptr.case", &F, Tail);
+    BasicBlock *CB = BasicBlock::Create(Ctx, "sw.ptr.case", &F);
     IRBuilder<> CBb(CB);
     SmallVector<Value *, 4> Args;
     bool Ok = true;
     for (Argument &A : Callee->args()) {
       unsigned Pos = A.getArgNo();
       if (Pos >= Slots.size() || !Slots[Pos]) {
-        Ok = false;
+        Ok = false; // an argument slot the lift did not model
         break;
       }
       Value *V = CBb.CreateLoad(Type::getInt64Ty(Ctx), Slots[Pos], "sw.ptr.arg");
@@ -2088,12 +2281,16 @@ bool tryPtrTable(Function &F, BasicBlock &BB) {
       Args.push_back(V);
     }
     if (!Ok) {
-      // Cannot rebuild the call: undo by dropping the case block and bail.
+      // Cannot rebuild the call: undo the switch and leave the opaque jump.
       CB->eraseFromParent();
+      SI->eraseFromParent();
+      for (Value *A : Args)
+        if (auto *IA = dyn_cast<Instruction>(A))
+          IA->eraseFromParent();
       return false;
     }
     CallInst *CI = CBb.CreateCall(Callee, Args);
-    copyProvenance(CI, Opaque);
+    copyVA(CI, &BB.front());
     CI->setTailCall(true);
     Value *Ret = CI;
     if (Callee->getReturnType() != F.getReturnType())
@@ -2102,13 +2299,13 @@ bool tryPtrTable(Function &F, BasicBlock &BB) {
     SI->addCase(ConstantInt::get(Ctx, APInt(64, I)), CB);
   }
 
-  if (Dead->isEntryBlock() == false && TailIsDead) {
+  HeadTerm->eraseFromParent();
+  if (!TailAlive) {
+    Tail->dropAllReferences();
+    Tail->eraseFromParent();
     IRBuilder<> DB(Dead);
     DB.CreateUnreachable();
   }
-  HeadTerm->eraseFromParent();
-  if (TailIsDead)
-    Tail->eraseFromParent();
   return true;
 }
 
