@@ -31,11 +31,14 @@ X:
 }
 
 
-; CHECK: %s1 = add i32 %s, %l0, !revenant.va !{{[0-9]+}}
-; CHECK: %inext = add i32 %i, 1, !revenant.va !{{[0-9]+}}
-; The dropped window's address math and merge are gone; the exit takes the
-; folded accumulator through its phi.
-; CHECK: %r = phi i32 [ 0, %entry ], [ %s1, %L ]
+; A pre-check excludes n == 0 but does not prove n >= D (2). For n == 1
+; the original executes once and reads two values; folding would execute
+; twice and drop one load. Preserve the original loop and its provenance.
+; CHECK: %g1 = getelementptr i32, ptr %g0, i32 1, !revenant.va !{{[0-9]+}}
+; CHECK: %l1 = load i32, ptr %g1, align 4, !revenant.va !{{[0-9]+}}
+; CHECK: %inext = add i32 %i, 2, !revenant.va !{{[0-9]+}}
+; CHECK: %c = icmp ult i32 %inext, %scaled, !revenant.va !{{[0-9]+}}
+; CHECK: %r = phi i32 [ 0, %entry ], [ %s2, %L ]
 ; CHECK: ret i32 %r
 !0 = !{i64 4096}
 !1 = !{i64 4100}

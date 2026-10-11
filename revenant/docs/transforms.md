@@ -113,9 +113,10 @@ vector phis, i128 arithmetic webs, and shared copy webs stay vector.
 
 **revenant-reroll (owner: MuseTxReroll).** Expects scalarized loops.
 Folds unrolled iteration copies back into one induction-variable step
-(partial: keep one copy, divide step) and synthesizes loops for
-fully-unrolled straight-line runs (full). Guarantees shape/offset matching
-only; ambiguous copies stay put.
+(partial: keep one copy, divide step) only when the exit lattice is preserved
+and a latch-tested loop is proven to execute at least the fold factor.
+Synthesizes loops for fully-unrolled straight-line runs (full). Ambiguous
+copies and unproved short-trip loops stay put.
 
 **revenant-unrotate (owner: MuseTxUnrotate).** Expects rerolled loops.
 Rewrites `if (c) { do { body } while (c); }` to while shape when guard and

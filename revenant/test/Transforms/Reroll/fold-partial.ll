@@ -39,11 +39,11 @@ X:
 }
 
 ; CHECK: define i32 @sum_unrolled
-; The four chained adds collapse to one accumulator add.
-; CHECK: %s1 = add i32 %s, %l0
-; The step folds 4 -> 1.
-; CHECK: %inext = add i32 %i, 1
+; The runtime trip count is unknown, so this latch-tested loop must not fold.
+; CHECK: %g1 = getelementptr i32, ptr %g0, i32 1
+; CHECK: %l1 = load i32, ptr %g1, align 4
+; CHECK: %inext = add i32 %i, 4
+; CHECK: %c = icmp ult i32 %inext, %nm
 ; CHECK: br i1 %c, label %L, label %X
-; The exit takes the folded accumulator; the unguarded n==0 arm is 0.
-; CHECK: %r = phi i32 [ 0, %entry ], [ %s1, %L ]
+; CHECK: %r = phi i32 [ 0, %entry ], [ %s4, %L ]
 ; CHECK: ret i32 %r
