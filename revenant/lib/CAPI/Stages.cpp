@@ -235,9 +235,12 @@ void record(std::vector<StageReport> &Stages, StringRef Name, StringRef Status,
 
 /// Triple, datalayout and language flag. The lifter declares imports and
 /// callees itself, typed from the recovered signatures.
-std::unique_ptr<Module> moduleFor(LLVMContext &Ctx, Lang Out) {
+std::unique_ptr<Module> moduleFor(LLVMContext &Ctx, Lang Out,
+                                  Compiler Producer) {
   auto M = std::make_unique<Module>("revenant", Ctx);
-  M->setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  M->setTargetTriple(Triple(Producer == Compiler::MinGwGcc
+                                ? "x86_64-w64-windows-gnu"
+                                : "x86_64-pc-windows-msvc"));
   M->setDataLayout(
       "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:"
       "32:64-S128");
@@ -912,7 +915,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- lift -> ir-raw ----------------------------------------------------
     LLVMContext Ctx;
-    auto M = moduleFor(Ctx, Out);
+    auto M = moduleFor(Ctx, Out, Compiler.Producer);
     // Decode the image's EH metadata once, then associate each lifted function
     // with its table entry. The EH vector owns these entries through the loop.
     std::vector<FunctionEH> EHFunctions = decodeEHTables(pe());
