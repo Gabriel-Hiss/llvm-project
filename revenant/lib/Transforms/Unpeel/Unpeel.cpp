@@ -38,6 +38,8 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 
+#include <functional>
+
 using namespace llvm;
 
 namespace {
@@ -321,7 +323,7 @@ bool undoPeelPure(Function &F) {
         SmallPtrSet<BasicBlock *, 4> SeenB;
         for (unsigned i = 0; i < HP.getNumIncomingValues();) {
           if (!SeenB.insert(HP.getIncomingBlock(i)).second)
-            HP.removeIncomingValue(i, /*KeepOneInputPHIs=*/true);
+            HP.removeIncomingValue(i, /*DeletePHIIfEmpty=*/true);
           else
             ++i;
         }
@@ -523,7 +525,7 @@ bool undoPeelWithStore(Function &F) {
         SmallPtrSet<BasicBlock *, 4> SeenB;
         for (unsigned i = 0; i < HP.getNumIncomingValues();) {
           if (!SeenB.insert(HP.getIncomingBlock(i)).second)
-            HP.removeIncomingValue(i, /*KeepOneInputPHIs=*/true);
+            HP.removeIncomingValue(i, /*DeletePHIIfEmpty=*/true);
           else
             ++i;
         }
@@ -652,10 +654,102 @@ bool undoGuardRotation(Function &F) {
       }
       if (!Pure)
         continue;
-      // All checks pass: redirect G's predecessor to H.
+      // Deleting G's test is only sound when the loop itself re-applies an
+      // equivalent test: the rotation guard and the latch decide continue
+      // vs exit on the same comparison evaluated at different IV steps. The
+      // latch is the sole non-G predecessor of H (or H itself for a self-
+      // backedge); the test lives there, or in the single block feeding an
+      // unconditional latch.
+      BasicBlock *Latch = HPreds.empty() ? H : HPreds[0];
+      BasicBlock *TestBlock = Latch;
+      {
+        auto *LB = dyn_cast<BranchInst>(Latch->getTerminator());
+        if (!LB || !LB->isConditional()) {
+          // Unconditional latch: the test must live in the single block
+          // that feeds it and branches back (do-while bottom test).
+          BasicBlock *TP = Latch->getSinglePredecessor();
+          if (!TP || TP == G)
+            continue;
+          auto *TB = dyn_cast<BranchInst>(TP->getTerminator());
+          if (!TB || !TB->isConditional())
+            continue;
+          bool Back = false;
+          for (BasicBlock *TS : successors(TP))
+            if (TS == Latch || TS == H)
+              Back = true;
+          if (!Back)
+            continue;
+          TestBlock = TP;
+        }
+      }
+      auto *TB = cast<BranchInst>(TestBlock->getTerminator());
+      // One TestBlock edge must continue the loop (to Latch, or to H when
+      // the body itself is the test) and the other must be exactly G's
+      // Exit. The continue edge must sit on the same arm of the condition
+      // as G's edge to H; otherwise the loop exits on the guard's enter-
+      // value and deleting G inverts the trip decision.
+      BasicBlock *LContinue = nullptr;
+      bool SameArm = false;
+      for (unsigned k = 0; k < 2; ++k) {
+        BasicBlock *TS = TB->getSuccessor(k);
+        if (TS == Latch || TS == H) {
+          if (LContinue)
+            continue; // two continue edges: not a guard/latch pair
+          LContinue = TS;
+          SameArm = GB->getSuccessor(k) == H;
+        }
+      }
+      if (!LContinue || !SameArm)
+        continue;
+      BasicBlock *LExit = TB->getSuccessor(0) == LContinue ? TB->getSuccessor(1)
+                                                         : TB->getSuccessor(0);
+      if (LExit != Exit)
+        continue;
+      // The conditions must compare the same shape: same predicate, one
+      // operand loop-invariant and identical, the other tracking the IV.
+      // The latch compares the next-step IV (or a value derived from it);
+      // following the test operand back through an H phi to its G incoming
+      // must land on the guard's compared operand.
+      std::function<Value *(Value *, unsigned)> IVInitIn;
+      IVInitIn = [&](Value *V, unsigned Depth) -> Value * {
+        if (auto *PN = dyn_cast<PHINode>(V)) {
+          if (PN->getParent() != H)
+            return nullptr;
+          int K = PN->getBasicBlockIndex(G);
+          return K < 0 ? nullptr : PN->getIncomingValue(K);
+        }
+        auto *I = dyn_cast<Instruction>(V);
+        if (!I || Depth > 8)
+          return nullptr;
+        for (Value *Op : I->operands())
+          if (Value *R = IVInitIn(Op, Depth + 1))
+            return R;
+        return nullptr;
+      };
+      auto *GCmp = dyn_cast<ICmpInst>(GB->getCondition());
+      auto *LCmp = dyn_cast<ICmpInst>(TB->getCondition());
+      if (!GCmp || !LCmp)
+        continue;
+      auto operandsMatch = [&](Value *GA, Value *LA) {
+        if (GA == LA)
+          return true;
+        if (isa<Instruction>(LA))
+          return IVInitIn(LA, 0) == GA;
+        return false;
+      };
+      bool CondMatch =
+          (GCmp->getPredicate() == LCmp->getPredicate() &&
+           operandsMatch(GCmp->getOperand(0), LCmp->getOperand(0)) &&
+           operandsMatch(GCmp->getOperand(1), LCmp->getOperand(1))) ||
+          (GCmp->getPredicate() == LCmp->getSwappedPredicate() &&
+           operandsMatch(GCmp->getOperand(0), LCmp->getOperand(1)) &&
+           operandsMatch(GCmp->getOperand(1), LCmp->getOperand(0)));
+      if (!CondMatch)
+        continue;
       BasicBlock *Entry = G->getSinglePredecessor();
       if (!Entry)
         continue;
+      // All checks pass: redirect G's predecessor to H.
       BranchInst *ET = dyn_cast<BranchInst>(Entry->getTerminator());
       bool Retargeted = false;
       if (ET) {
@@ -693,19 +787,31 @@ bool undoGuardRotation(Function &F) {
         SmallPtrSet<BasicBlock *, 4> SeenB;
         for (unsigned i = 0; i < HP.getNumIncomingValues();) {
           if (!SeenB.insert(HP.getIncomingBlock(i)).second)
-            HP.removeIncomingValue(i, /*KeepOneInputPHIs=*/true);
+            HP.removeIncomingValue(i, /*DeletePHIIfEmpty=*/true);
           else
             ++i;
         }
       }
       // Rewrite Exit's PHIs: remove G incoming (G is deleted; Entry now
-      // branches to H, so Entry no longer reaches Exit).
-      for (PHINode &HP : Exit->phis()) {
-        for (unsigned i = 0; i < HP.getNumIncomingValues();) {
-          if (HP.getIncomingBlock(i) == G)
-            HP.removeIncomingValue(i, /*KeepOneInputPHIs=*/true);
-          else
-            ++i;
+      // branches to H, so Entry no longer reaches Exit). Snapshot the phi
+      // list first: removeIncomingValue deletes a phi whose last incoming
+      // was removed, which would free the very node the iterator and the
+      // loop variable still point at.
+      {
+        SmallVector<PHINode *, 8> ExitPhis;
+        for (PHINode &HP : Exit->phis())
+          ExitPhis.push_back(&HP);
+        for (PHINode *HP : ExitPhis) {
+          unsigned N = HP->getNumIncomingValues();
+          for (unsigned i = 0; i < N;) {
+            if (HP->getIncomingBlock(i) != G) {
+              ++i;
+              continue;
+            }
+            HP->removeIncomingValue(i, /*DeletePHIIfEmpty=*/true);
+            if (--N == 0)
+              break; // HP was destroyed along with its last incoming value
+          }
         }
       }
 
