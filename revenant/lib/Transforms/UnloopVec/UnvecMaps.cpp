@@ -69,19 +69,27 @@ struct InnerCascade {
   DenseSet<BasicBlock *> R;
 };
 // Drain-tail fusion: S routes to a countdown drain L (remainder
-// (N-resume)&(K-1)) and a counted tail T (bound N) whose start is
+// (N-indexStart)&(K-1)) and a counted tail T (bound N) whose start is
 // the drain end. When every tail lane group provably equals the
 // drain's scalar body (shared TailCmp valEq per lane group, same
 // bases), the drain is redundant: widen the tail start to the S
 // resume and erase the drain. The tail then covers [resume, N)
 // alone: exactly one loop, step 1 per element per lane group.
+// Range contract (checked in the matcher, relied on by the fold):
+// the drain index IV restarts at the S resume chain value indexStart
+// (the tail IV's S-side value when the drain is skipped), it steps by
+// exactly 1 per iteration, and the countdown runs exactly
+// (N-indexStart)&(K-1) iterations where K is the tail's per-iteration
+// lane-group stride, so the drain end (and the fused tail start) is
+// exactly indexStart+rem. The fold materializes that sum in S.
 struct DrainTail {
   BasicBlock *S = nullptr;
   BasicBlock *L = nullptr; // countdown drain
   ScalarLoopInfo DrainLoop;
   BasicBlock *T = nullptr; // counted tail
   ScalarLoopInfo TailLoop;
-  Value *Resume = nullptr; // S resume value (drain start)
+  Value *IndexStart = nullptr; // S-chain drain index start (fused base)
+  Value *Resume = nullptr; // S resume remainder (drain countdown start)
   Value *N = nullptr;      // trip count root
 };
 static bool tailLanesEqualDrain(BasicBlock *Tail, BasicBlock *Drain,
@@ -284,6 +292,59 @@ static bool matchDrainTail(BasicBlock *S, Function &F, DrainTail &C) {
     }
     if (!Resume)
       continue;
+    // Drain index contract: the drain must also carry a step-1 index
+    // IV restarting at an S-chain value (the fused tail base). The
+    // countdown IV itself may be that index (single-phi drain) or a
+    // sibling phi may index while another counts down (corpus drain
+    // pairs r11 countdown with r10 index).
+    Value *IndexStart = nullptr;
+    for (PHINode &Phi : MaybeDrain->phis()) {
+      if (&Phi == Drain.IV)
+        continue;
+      Value *BackVal = nullptr;
+      Value *StartVal = nullptr;
+      BasicBlock *StartBlock = nullptr;
+      for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+        if (Phi.getIncomingBlock(I) == MaybeDrain)
+          BackVal = Phi.getIncomingValue(I);
+        else {
+          StartVal = Phi.getIncomingValue(I);
+          StartBlock = Phi.getIncomingBlock(I);
+        }
+      }
+      if (!BackVal || !StartVal || StartBlock != S)
+        continue;
+      auto *Step = dyn_cast<BinaryOperator>(BackVal);
+      if (!Step || Step->getParent() != MaybeDrain)
+        continue;
+      if (Step->getOpcode() != Instruction::Add)
+        continue;
+      auto *One = dyn_cast<ConstantInt>(Step->getOperand(1));
+      if (!One || !One->isOne() || Step->getOperand(0) != &Phi)
+        continue;
+      // The start must be an S-chain value (available when S runs).
+      if (!isa<Constant>(StartVal) && !isa<Argument>(StartVal)) {
+        auto *SI = dyn_cast<Instruction>(StartVal);
+        if (!SI)
+          continue;
+        BasicBlock *PB = SI->getParent();
+        if (PB != S && !isa<PHINode>(SI))
+          continue;
+        if (auto *SP = dyn_cast<PHINode>(SI))
+          if (SP->getParent() != S)
+            continue;
+      }
+      IndexStart = StartVal;
+      break;
+    }
+    if (!IndexStart) {
+      // Single-phi drain: the countdown IV doubles as the index when
+      // it steps by exactly 1.
+      if (Drain.Step && Drain.Step->isOne())
+        IndexStart = Resume;
+      else
+        continue;
+    }
     // The other arm reaches the counted tail through a drain-exit
     // block: BFS for the first counted self-loop below it.
     ScalarLoopInfo Tail;
@@ -382,6 +443,7 @@ static bool matchDrainTail(BasicBlock *S, Function &F, DrainTail &C) {
     C.T = TailBB;
     C.TailLoop = Tail;
     C.Resume = Resume;
+    C.IndexStart = IndexStart;
     C.N = stripCountDerivation(TailBound, F);
     return true;
   }
@@ -1004,10 +1066,18 @@ static bool foldInnerCascade(Function &F, const InnerCascade &C) {
   return true;
 }
 
-// Fold drain+tail into the tail alone: S jumps directly to T with
-// the tail IV starting at the S resume, and the drain plus the
-// drain-exit blocks are erased. Only branch targets and the tail
-// start change; kept instructions are untouched.
+// Fold drain+tail by erasing the drain alone: S jumps to the guard
+// block G (the drain-exit block feeding the tail IV), and G's tail-feed
+// phi is rewired to the drain end indexStart+rem materialized in S.
+// The guard, its skip/exit decision, and the tail are untouched, so the
+// folded graph makes exactly the same decisions with exactly the same
+// tail start: the drain covers [indexStart, indexStart+rem) uncondi-
+// tionally (countdown from rem by 1 runs exactly rem iterations; when
+// rem is 0 S skips the drain and fused.start == indexStart), hence the
+// tail runs from the same value over the same range, including the
+// degenerate cases (guard skips the tail; tail entered at N hangs
+// exactly as before). Only branch targets and the tail-feed change;
+// kept instructions are untouched.
 static bool foldDrainTail(Function &F, const DrainTail &C) {
   // Drain-exit blocks: on a path from L to T (forward reachable
   // from L without passing S/T, and able to reach T). The function
@@ -1044,11 +1114,37 @@ static bool foldDrainTail(Function &F, const DrainTail &C) {
       if (Back.count(BB))
         Exit.insert(BB);
   }
-  // Every exit block must be dead after the fold except for feeding
-  // T's start: pure routing/arithmetic only (phis, branches,
-  // compares, casts, GEPs, scalar ALU). No calls, loads, or stores:
-  // anything touching memory could carry a live value.
+  // The tail-feed block G holds the tail IV's non-latch incoming; it
+  // stays (guard decision preserved), everything else on the L->T
+  // paths goes. G must route (branch) only: its non-phi instructions
+  // besides the tail-feed phi must be pure routing/arithmetic with no
+  // memory traffic. Only one G is supported.
+  BasicBlock *G = nullptr;
+  for (unsigned I = 0; I < C.TailLoop.IV->getNumIncomingValues(); ++I) {
+    BasicBlock *PB = C.TailLoop.IV->getIncomingBlock(I);
+    if (PB == C.T)
+      continue;
+    if (G && PB != G)
+      return false;
+    G = PB;
+  }
+  if (!G || !Exit.count(G))
+    return false;
+  for (Instruction &I : *G) {
+    if (isa<PHINode>(&I) || isa<BranchInst>(&I) || isa<ICmpInst>(&I) ||
+        isa<CastInst>(&I) || isa<GetElementPtrInst>(&I))
+      continue;
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (!isa<FixedVectorType>(BO->getType()))
+        continue;
+    }
+    return false;
+  }
+  // Other exit blocks (pure L->G routing) must be dead after the fold
+  // except for feeding G: same whitelist, no memory traffic.
   for (BasicBlock *BB : Exit) {
+    if (BB == G)
+      continue;
     for (Instruction &I : *BB) {
       if (isa<PHINode>(&I) || isa<BranchInst>(&I) || isa<ICmpInst>(&I) ||
           isa<CastInst>(&I) || isa<GetElementPtrInst>(&I))
@@ -1060,32 +1156,66 @@ static bool foldDrainTail(Function &F, const DrainTail &C) {
       return false;
     }
   }
-  // Rewire the tail start to the S resume.
-  for (unsigned I = 0; I < C.TailLoop.IV->getNumIncomingValues(); ++I) {
-    if (C.TailLoop.IV->getIncomingBlock(I) == C.T)
-      continue;
-    C.TailLoop.IV->setIncomingValue(I, C.Resume);
-    C.TailLoop.IV->setIncomingBlock(I, C.S);
+  // Dead set (drain plus non-guard exit blocks). G stays: S will target
+  // it, and the phi cleanup after erasing drops the erased incomings.
+  SmallVector<BasicBlock *, 8> Dead;
+  Dead.push_back(C.L);
+  for (BasicBlock *BB : Exit)
+    if (BB != G)
+      Dead.push_back(BB);
+  DenseSet<BasicBlock *> DeadSet(Dead.begin(), Dead.end());
+  // Kept-predecessor check BEFORE any mutation: every predecessor of a
+  // dead block must itself be dead, S (repointed below), or G (which
+  // stays and keeps its edge). Bailing here leaves the IR untouched.
+  for (BasicBlock *BB : Dead)
+    for (BasicBlock *P : predecessors(BB))
+      if (!DeadSet.count(P) && P != C.S && P != G)
+        return false;
+  // G itself must become reachable only from S: every current
+  // predecessor must be S, the drain, or an erased exit block.
+  // Otherwise collapsing G's tail-feed phi would drop a live entry
+  // (the reviewer's alt-path counterexample).
+  for (BasicBlock *P : predecessors(G))
+    if (P != C.S && P != C.L && !DeadSet.count(P))
+      return false;
+  // Materialize the drain end indexStart+rem in S. When the drain index
+  // restarts at 0 (the cascade-folded shape) the sum folds to rem.
+  Value *FusedStart = C.Resume;
+  if (C.IndexStart != C.Resume) {
+    auto *Sum = BinaryOperator::CreateAdd(C.IndexStart, C.Resume,
+                                          "unvecmaps.fused.start");
+    Sum->insertBefore(C.S->getTerminator());
+    if (auto *IS = dyn_cast<Instruction>(C.IndexStart))
+      if (MDNode *MD = IS->getMetadata("revenant.va"))
+        Sum->setMetadata("revenant.va", MD);
+    FusedStart = Sum;
   }
-  // S jumps directly to T.
+  // Rewire G's tail-feed phi(s) to the fused start from S: any phi in G
+  // feeding the tail IV's start value takes fused.start; the tail IV
+  // itself keeps pointing at G.
+  for (PHINode &Phi : G->phis()) {
+    bool FeedsTail = false;
+    for (unsigned I = 0; I < C.TailLoop.IV->getNumIncomingValues(); ++I) {
+      if (C.TailLoop.IV->getIncomingBlock(I) == G &&
+          C.TailLoop.IV->getIncomingValue(I) == &Phi)
+        FeedsTail = true;
+    }
+    if (!FeedsTail)
+      continue;
+    // Collapse to a single incoming from S: G is only reachable from S
+    // after the fold (drain and sibling exit blocks are erased).
+    while (Phi.getNumIncomingValues() > 1)
+      Phi.removeIncomingValue(Phi.getNumIncomingValues() - 1);
+    Phi.setIncomingValue(0, FusedStart);
+    Phi.setIncomingBlock(0, C.S);
+  }
+  // S jumps to the guard block.
   auto *SBr = cast<BranchInst>(C.S->getTerminator());
-  BranchInst *NewBr = BranchInst::Create(C.T, SBr);
+  BranchInst *NewBr = BranchInst::Create(G, SBr);
   if (MDNode *MD = SBr->getMetadata("revenant.va"))
     NewBr->setMetadata("revenant.va", MD);
   NewBr->setDebugLoc(SBr->getDebugLoc());
   SBr->eraseFromParent();
-  // Erase drain + exit blocks with the standard protocol.
-  SmallVector<BasicBlock *, 8> Dead;
-  Dead.push_back(C.L);
-  for (BasicBlock *BB : Exit)
-    Dead.push_back(BB);
-  DenseSet<BasicBlock *> DeadSet(Dead.begin(), Dead.end());
-  // No kept pred may target dead blocks now (S was the only entry;
-  // S is repointed). Verify before erasing.
-  for (BasicBlock *BB : Dead)
-    for (BasicBlock *P : predecessors(BB))
-      if (!DeadSet.count(P) && P != C.S)
-        return false;
   for (BasicBlock *BB : Dead)
     BB->getTerminator()->setMetadata(LLVMContext::MD_loop, nullptr);
   for (BasicBlock *BB : Dead) {

@@ -101,11 +101,15 @@ bb_140001b0b:
                                      
   ret void
 }
-; The middle tier is gone through the shared lane-equivalence gate;
-; the countdown drain and the counted tail remain.
+; The middle tier is gone through the shared lane-equivalence gate, and
+; the countdown drain folds away through drain-tail fusion: S jumps to
+; the guard block with the tail-feed phi rewired to the drain end, and
+; the guard keeps its skip/exit decision over the counted tail.
 ; CHECK-LABEL: define{{.*}}void @avx2_add_inner
 ; CHECK-NOT: <4 x i32>
 ; CHECK: br label %bb_140001a9a
-; CHECK: store i32 %d.sum
+; CHECK: br label %bb_140001ac3
+; CHECK-NOT: store i32 %d.sum
+; CHECK: br i1 %c437, label %bb_140001b0b, label %bb_140001ad0
 ; CHECK: store i32 %t.sum
 ; CHECK: ret void
