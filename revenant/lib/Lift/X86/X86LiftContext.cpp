@@ -1143,6 +1143,30 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
                           B.CreateZExt(Q, iN(128)));
     return D;
   }
+  if (Name == "vcvtdq2ps" || Name == "vcvtps2dq" ||
+      Name == "vcvttps2dq") {
+    Type *I32Vec = FixedVectorType::get(Type::getInt32Ty(B.getContext()), 4);
+    Type *F32Vec = FixedVectorType::get(F32, 4);
+    Value *Vec = As(I128, Name == "vcvtdq2ps" ? I32Vec : F32Vec);
+    if (Name == "vcvtdq2ps")
+      return B.CreateBitCast(B.CreateSIToFP(Vec, F32Vec), iN(128));
+    if (Name == "vcvttps2dq")
+      return B.CreateBitCast(B.CreateFPToSI(B.CreateUnaryIntrinsic(
+                                                Intrinsic::trunc, Vec),
+                                            I32Vec),
+                             iN(128));
+    Value *Rounded =
+        B.CreateUnaryIntrinsic(Intrinsic::nearbyint, Vec);
+    return B.CreateBitCast(B.CreateFPToSI(Rounded, I32Vec), iN(128));
+  }
+  if (Name == "vcvttpd2dq") {
+    Type *F64Vec = FixedVectorType::get(F64, 2);
+    Value *Vec = As(I128, F64Vec);
+    Value *Truncated =
+        B.CreateFPToSI(B.CreateUnaryIntrinsic(Intrinsic::trunc, Vec),
+                       FixedVectorType::get(Type::getInt32Ty(B.getContext()), 2));
+    return B.CreateZExt(B.CreateBitCast(Truncated, iN(64)), iN(128));
+  }
   if (Name == "vcvtdq2pd") {
     Type *IVT = vecTyOf(B, iN(128), 32);
     Value *V = As(I128, IVT);
@@ -1159,18 +1183,16 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
   }
   if (Name == "vcvtpd2ps") {
     Type *F64Vec = FixedVectorType::get(F64, 2);
-    Type *F32Vec = FixedVectorType::get(F32, 4);
     Value *V = As(I128, F64Vec);
     Value *Lo2 = B.CreateShuffleVector(V, V, {0, 1});
     Value *Truncated = B.CreateFPTrunc(Lo2, FixedVectorType::get(F32, 2));
-    Value *Undef = UndefValue::get(FixedVectorType::get(F32, 2));
-    Value *Combined = B.CreateShuffleVector(Truncated, Undef, {0, 1, 2, 3});
-    return B.CreateBitCast(Combined, iN(128));
+    return B.CreateZExt(B.CreateBitCast(Truncated, iN(64)), iN(128));
   }
   if (Name == "xroundsd") {
     Type *F64Vec = FixedVectorType::get(F64, 2);
-    Value *Vec = As(I128, F64Vec);
-    Value *Lane0 = B.CreateExtractElement(Vec, uint64_t(0));
+    Value *Source = As(I128, F64Vec);
+    Value *Vec = As(Bv ? Bv : I128, F64Vec);
+    Value *Lane0 = B.CreateExtractElement(Source, uint64_t(0));
     Intrinsic::ID IID;
     if (Imm & 0x4) {
       IID = Intrinsic::nearbyint;
@@ -1188,8 +1210,9 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
   }
   if (Name == "xroundss") {
     Type *F32Vec = FixedVectorType::get(F32, 4);
-    Value *Vec = As(I128, F32Vec);
-    Value *Lane0 = B.CreateExtractElement(Vec, uint64_t(0));
+    Value *Source = As(I128, F32Vec);
+    Value *Vec = As(Bv ? Bv : I128, F32Vec);
+    Value *Lane0 = B.CreateExtractElement(Source, uint64_t(0));
     Intrinsic::ID IID;
     if (Imm & 0x4) {
       IID = Intrinsic::nearbyint;

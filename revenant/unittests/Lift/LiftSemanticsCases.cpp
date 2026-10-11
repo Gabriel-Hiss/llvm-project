@@ -569,25 +569,60 @@ std::vector<Case> cases() {
            "fnstcw word ptr [rsp+0x40]\n"
            "mov ax, word ptr [rsp+0x40]")
           .stack({0x027f}));
-  // SSE4.1 packed conversions: CVTPS2PD, CVTPD2PS (reg and mem forms).
-  add(Case("sse4.1 cvtps2pd reg",
-           "cvtps2pd xmm0, xmm1")
-          .xmm(1, 0x40490FDB3F800000ULL, 0) // pi, 1.0 as f32 pairs
+  // Packed float/integer conversions, including the SSE2 integer-to-double
+  // form exercised by compiler-generated vectorized initialization.
+  add(Case("sse cvtdq2pd reg", "cvtdq2pd xmm0, xmm1")
+          .xmm(1, 0xffffffff00000002ULL, 0)
+          .xmm(0, 0, 0));
+  add(Case("sse cvtdq2pd mem", "cvtdq2pd xmm0, qword ptr [rsp+0x20]")
+          .stack({0xffffffff00000002ULL})
+          .xmm(0, 0, 0));
+  add(Case("sse cvtdq2pd packed store chain",
+           "cvtdq2pd xmm0, xmm1\n"
+           "addpd xmm0, xmm2\n"
+           "paddd xmm1, xmm3\n"
+           "movups xmmword ptr [rsp+0x30], xmm0\n"
+           "movups xmmword ptr [rsp+0x40], xmm1")
+          .xmm(1, 0xffffffff00000002ULL, 0)
+          .xmm(2, 0x3ff0000000000000ULL, 0x4000000000000000ULL)
+          .xmm(3, 0x0000000100000001ULL, 0x0000000100000001ULL)
+          .stack({0, 0, 0, 0, 0, 0}));
+  add(Case("sse cvtdq2ps reg", "cvtdq2ps xmm0, xmm1")
+          .xmm(1, 0xffffffff00000002ULL, 0x7fffffff00000001ULL)
+          .xmm(0, 0, 0));
+  add(Case("sse cvtdq2ps mem", "cvtdq2ps xmm0, xmmword ptr [rsp+0x20]")
+          .stack({0xffffffff00000002ULL, 0x7fffffff00000001ULL})
+          .xmm(0, 0, 0));
+  for (const char *Op : {"cvtps2dq", "cvttps2dq"}) {
+    add(Case(std::string("sse ") + Op + " reg",
+             std::string(Op) + " xmm0, xmm1")
+            .xmm(1, 0xbfc000003fc00000ULL, 0xc098000040500000ULL)
+            .xmm(0, 0, 0));
+    add(Case(std::string("sse ") + Op + " mem",
+             std::string(Op) + " xmm0, xmmword ptr [rsp+0x20]")
+            .stack({0xbfc000003fc00000ULL, 0xc098000040500000ULL})
+            .xmm(0, 0, 0));
+  }
+  add(Case("sse cvttpd2dq reg", "cvttpd2dq xmm0, xmm1")
+          .xmm(1, 0x4004000000000000ULL, 0xC014000000000000ULL)
+          .xmm(0, 0xaaaaaaaaaaaaaaaaULL, 0xbbbbbbbbbbbbbbbbULL));
+  add(Case("sse cvttpd2dq mem", "cvttpd2dq xmm0, xmmword ptr [rsp+0x20]")
+          .stack({0x4004000000000000ULL, 0xC014000000000000ULL})
+          .xmm(0, 0xaaaaaaaaaaaaaaaaULL, 0xbbbbbbbbbbbbbbbbULL));
+  add(Case("sse4.1 cvtps2pd reg", "cvtps2pd xmm0, xmm1")
+          .xmm(1, 0x40490FDB3F800000ULL, 0)
           .xmm(0, 0, 0));
   add(Case("sse4.1 cvtps2pd mem",
            "cvtps2pd xmm0, qword ptr [rsp+0x20]")
           .stack({0x40490FDB3F800000ULL})
           .xmm(0, 0, 0));
-  add(Case("sse4.1 cvtpd2ps reg",
-           "cvtpd2ps xmm0, xmm1")
-          .xmm(1, 0x400921FB54442D18ULL, 0) // pi as f64
+  add(Case("sse4.1 cvtpd2ps reg", "cvtpd2ps xmm0, xmm1")
+          .xmm(1, 0x400921FB54442D18ULL, 0)
           .xmm(0, 0, 0));
   add(Case("sse4.1 cvtpd2ps mem",
-           "cvtpd2ps xmm0, qword ptr [rsp+0x20]")
-          .stack({0x400921FB54442D18ULL})
+           "cvtpd2ps xmm0, xmmword ptr [rsp+0x20]")
+          .stack({0x400921FB54442D18ULL, 0})
           .xmm(0, 0, 0));
-  // SSE4.1 scalar rounding: ROUNDSD/ROUNDSS with all 4 rounding modes.
-  // Mode 0 = round-nearest, 1 = floor, 2 = ceil, 3 = trunc.
   for (unsigned Mode = 0; Mode < 4; ++Mode) {
     std::string M = std::to_string(Mode);
     add(Case("sse4.1 roundsd mode " + M,

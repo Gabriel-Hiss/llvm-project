@@ -380,7 +380,9 @@ class RevenantLiftEmitter {
           Name == "rv_pmovmskb" || Name == "rv_movmskps" ||
           Name == "rv_movmskpd" || Name == "rv_vbroadcastb" ||
           Name == "rv_vcvtdq2pd" || Name == "rv_vcvtps2pd" ||
-          Name == "rv_vcvtpd2ps" || Name == "rv_fsqrt" ||
+          Name == "rv_vcvtpd2ps" || Name == "rv_vcvtdq2ps" ||
+          Name == "rv_vcvtps2dq" || Name == "rv_vcvttps2dq" ||
+          Name == "rv_vcvttpd2dq" || Name == "rv_fsqrt" ||
           Name == "rv_sitofpf32" || Name == "rv_sitofpf64" ||
           Name == "rv_fpext" || Name == "rv_fptrunc") {
         if (D->getNumArgs() != 1)
@@ -402,16 +404,14 @@ class RevenantLiftEmitter {
         if (A.empty())
           return {};
         StringRef Vop = Name.drop_front(3);
-        return NewLane ? (Twine("LC.vop(\"") + Vop +
-                          "\", nullptr, " + A + ")")
-                             .str()
-                       : (Twine("LC.vop(\"") + Vop + "\", " + A + ")")
-                             .str();
+        if (NewLane)
+          return (Twine("LC.vop(\"") + Vop + "\", nullptr, " + A + ")")
+              .str();
+        return (Twine("LC.vop(\"") + Vop + "\", " + A + ")").str();
       }
       if (Name == "rv_xroundsd" || Name == "rv_xroundss") {
         if (D->getNumArgs() != 2)
           return {};
-        unsigned W = Name == "rv_xroundsd" ? 64 : 32;
         std::string A = expression(D->getArg(0), Inst, 128,
                                    D->getArgNameStr(0));
         if (A.empty())
@@ -420,7 +420,7 @@ class RevenantLiftEmitter {
         if (Imm.empty())
           return {};
         return (Twine("LC.vop(\"") + Name.drop_front(3) + "\", " + A +
-                ", nullptr, " + Imm + ")")
+                ", LC.readOp(MI, 0, LC.iN(128)), " + Imm + ")")
                    .str();
       }
       if ((Name == "rv_xsetlane0f32" || Name == "rv_xsetlane0f64") &&
