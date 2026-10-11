@@ -292,28 +292,24 @@ bool rangeIsPure(BasicBlock::iterator First, BasicBlock::iterator Last) {
 
 bool allUsersInPureRange(Value *V, BasicBlock *BB,
                          BasicBlock::iterator From) {
-  BasicBlock::iterator LastUse = BB->end();
-  bool Found = false;
+  // Collect the users first: walking `V->users()` in list order makes the
+  // result depend on use-list order, which is not visible in the IR text
+  // and differs between an in-memory and a re-parsed module. Take the
+  // last user in program order instead, which is what the range needs.
+  SmallPtrSet<const Instruction *, 8> Users;
   for (User *U : V->users()) {
     auto *UI = dyn_cast<Instruction>(U);
     if (!UI || UI->getParent() != BB)
       return false;
-    BasicBlock::iterator It = UI->getIterator();
-    if (LastUse == BB->end()) {
-      LastUse = It;
-      Found = true;
-      continue;
-    }
-    // Order check: walk from LastUse; if It is reachable, it is later.
-    for (auto J = LastUse; J != BB->end(); ++J) {
-      if (J == It) {
-        LastUse = It;
-        break;
-      }
-    }
-    Found = true;
+    Users.insert(UI);
   }
-  if (!Found)
+  if (Users.empty())
+    return true;
+  BasicBlock::iterator LastUse = BB->end();
+  for (Instruction &I : *BB)
+    if (Users.contains(&I))
+      LastUse = I.getIterator();
+  if (LastUse == BB->end())
     return true;
   return rangeIsPure(From, LastUse);
 }
