@@ -293,6 +293,31 @@ static void protoParamsOf(Expr *Callee,
     Out.push_back(FPT->getParamType(I));
 }
 
+Expr *ExprBuilderImpl::castCalleeToCallType(llvm::CallInst &I,
+                                            Expr *Callee) {
+  // Point the callee at the function type the call instruction carries, not
+  // at the declared prototype. A prototype that returns void (a system
+  // header can redeclare the import before our own declaration wins, and
+  // recovered signatures read the same) turns every value use of the call
+  // into ill-formed code: `f() & k` is MSVC C2296, `(T)f()` is C2069 and
+  // `return f()` leaves the caller without a value (C2561).
+  // The cast is unconditional on purpose: the emitted prototype matches the
+  // IR here, but the compiled translation unit sees the prototype *and* any
+  // system-header declaration of the same import, and those can disagree.
+  // Reading the result through the call's own function type makes the value
+  // use well-typed either way.
+  llvm::FunctionType *Wanted = I.getFunctionType();
+  QualType RetQT = Types.typeOf(Wanted->getReturnType(), nullptr);
+  llvm::SmallVector<QualType, 8> ParamQTs;
+  for (llvm::Type *PT : Wanted->params())
+    ParamQTs.push_back(Types.typeOf(PT, nullptr));
+  FunctionProtoType::ExtProtoInfo EPI;
+  EPI.Variadic = Wanted->isVarArg();
+  QualType WantedPtr = AST->getPointerType(
+      AST->getFunctionType(RetQT, ParamQTs, EPI));
+  return makeCStyleCast(WantedPtr, CK_BitCast, Callee);
+}
+
 Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
                                      Expr *Callee, QualType RetTy) {
   llvm::SmallVector<Expr *, 8> Args;
@@ -414,13 +439,25 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
     if (Callee->getType()->isFunctionType())
       Callee = makeImplicit(AST->getPointerType(Callee->getType()),
                             CK_FunctionToPointerDecay, Callee);
-    // A re-targeted direct call can keep a call shape its recovered
-    // declaration does not have (an indirect call the lifter folded onto
-    // one candidate target still carries the register/pointer arity, and an
-    // import recovered with the wrong arity stays at its own). Calling the
-    // name then violates the prototype: spell the callee through a cast to
-    // the call's own function type, which keeps the arguments legal.
-    if (!matchesCallShape(*DF, I)) {
+    // Declaration-only callees are imports: the emitted prototype can lose
+    // a redeclaration fight with a system header (corecrt.h declares
+    // `_invalid_parameter_noinfo` `void`) or come back `void` from a
+    // recovered signature, while the lifted body still reads the return
+    // register.  Read the result through the call's own function type so
+    // the value use compiles (C2296/C2069/C2561).
+    if (!I.getType()->isVoidTy() && DF->isDeclaration()) {
+      Callee = castCalleeToCallType(I, Callee);
+      // Parenthesize the designator so the call reads
+      // `((T (*)(args))f)(args)` and not `(T) f(args)`.
+      Callee = new (*AST) clang::ParenExpr(SourceLocation(),
+                                           SourceLocation(), Callee);
+    } else if (!matchesCallShape(*DF, I)) {
+      // A re-targeted direct call can keep a call shape its recovered
+      // declaration does not have (an indirect call the lifter folded onto
+      // one candidate target still carries the register/pointer arity, and an
+      // import recovered with the wrong arity stays at its own). Calling the
+      // name then violates the prototype: spell the callee through a cast to
+      // the call's own function type, which keeps the arguments legal.
       Callee = makeCStyleCast(WantedPtr, CK_BitCast, Callee);
     }
     Expr *Call = buildCallExpr(I, Scope, Callee, RetTy);

@@ -288,6 +288,12 @@ public:
                                   ParamDI[I])
                          : typeOfIR(F.getFunctionType()->getParamType(I)));
         }
+        // A recovered `void` return for an IR function that returns a value
+        // is contradictory: every value use of a call to it becomes
+        // ill-formed (`f() & k`, `(T)f()`, `return f()`). The lifted IR is
+        // what the body actually reads, so keep the IR return type.
+        if (Ret->isVoidType() && !F.getReturnType()->isVoidTy())
+          Ret = typeOfIR(F.getReturnType());
         return buildFunctionType(Ret, Params, F.getFunctionType()->isVarArg());
       }
     }

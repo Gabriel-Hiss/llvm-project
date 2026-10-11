@@ -576,7 +576,77 @@ TEST_F(ExprTest, DirectCallByName) {
   llvm::Value *C = B.CreateCall(FT, Callee, {H.A}, "c");
   clang::Expr *E = Exprs->value(C, Scope);
   std::string S = print(E);
-  EXPECT_TRUE(S.find("helper(a)") != std::string::npos);
+  // Imports (declaration-only callees) are read through the call's own
+  // function type: a system header or a recovered signature can shadow the
+  // prototype with a `void` return, and a value use must still compile.
+  EXPECT_TRUE(S.find("((int (*)(int))helper)(a)") != std::string::npos)
+      << S;
+}
+
+TEST_F(ExprTest, ValueCallToVoidImportReadsThroughCast) {
+  // corecrt.h declares `void _invalid_parameter_noinfo(void)`; the emitted
+  // prototype can be shadowed by it, and a recovered signature says void
+  // just as often, while the lifted IR still reads the return register.
+  // The value use must be typed by the call, not the declaration.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT =
+      FunctionType::get(Type::getInt64Ty(LLCtx), {}, false);
+  llvm::Function *Callee =
+      Function::Create(FT, GlobalValue::ExternalLinkage,
+                       "_invalid_parameter_noinfo", M.get());
+  // Bind the import with the prototype a system header wins with: void.
+  clang::IdentifierInfo *Id = FCtx->ident("_invalid_parameter_noinfo");
+  clang::FunctionProtoType::ExtProtoInfo EPI;
+  clang::QualType FQT = ACtx->getFunctionType(ACtx->VoidTy, {}, EPI);
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      *ACtx, ACtx->getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FQT,
+      ACtx->getTrivialTypeSourceInfo(FQT), clang::SC_Extern);
+  FCtx->bindDecl(Callee, FD);
+  llvm::Value *C = B.CreateCall(FT, Callee, {}, "c");
+  clang::Expr *E = Exprs->value(C, Scope);
+  std::string S = print(E);
+  EXPECT_TRUE(S.find("((long long (*)(void))_invalid_parameter_noinfo)()") !=
+              std::string::npos)
+      << S;
+  // The call's value keeps the IR type: a mask over it is well-formed.
+  llvm::Value *Masked = B.CreateAnd(C, llvm::ConstantInt::get(
+                                           Type::getInt64Ty(LLCtx), 0xFF00));
+  clang::Expr *E2 = Exprs->value(Masked, Scope);
+  std::string S2 = print(E2);
+  EXPECT_TRUE(S2.find("& 0xFF00") != std::string::npos) << S2;
+}
+
+TEST_F(ExprTest, VoidImportCallStatementNeedsNoCast) {
+  // Dead-result and void calls stay plain statements.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT =
+      FunctionType::get(Type::getVoidTy(LLCtx), {}, false);
+  llvm::Function *Callee = Function::Create(
+      FT, GlobalValue::ExternalLinkage, "import_noreturn", M.get());
+  clang::IdentifierInfo *Id = FCtx->ident("import_noreturn");
+  clang::FunctionProtoType::ExtProtoInfo EPI;
+  clang::QualType FQT = ACtx->getFunctionType(ACtx->VoidTy, {}, EPI);
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      *ACtx, ACtx->getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FQT,
+      ACtx->getTrivialTypeSourceInfo(FQT), clang::SC_Extern);
+  FCtx->bindDecl(Callee, FD);
+  llvm::Value *C = B.CreateCall(FT, Callee, {}, "c");
+  clang::Stmt *S = Exprs->buildCallStmt(*llvm::cast<llvm::CallInst>(C), Scope);
+  clang::PrintingPolicy Policy(LangOpts);
+  llvm::SmallString<128> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  S->printPretty(OS, nullptr, Policy);
+  std::string Text = std::string(OS.str());
+  EXPECT_TRUE(Text.find("import_noreturn();") != std::string::npos) << Text;
+  EXPECT_TRUE(Text.find("(*)(void)") == std::string::npos) << Text;
 }
 
 TEST_F(ExprTest, CondFlipsNotCmp) {

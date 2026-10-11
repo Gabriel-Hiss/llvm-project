@@ -116,6 +116,11 @@ private:
                             llvm::ArrayRef<llvm::Value *> Idxs,
                             ExprScope &Scope);
   clang::Expr *buildCallValue(llvm::CallInst &I, ExprScope &Scope);
+  // Cast the callee to the function type the call instruction itself
+  // carries. Used when a prototype that returns void shadows the import
+  // (system headers, recovered signatures), which would otherwise make
+  // every value use of the call ill-formed.
+  clang::Expr *castCalleeToCallType(llvm::CallInst &I, clang::Expr *Callee);
   clang::Expr *buildPHIValue(llvm::PHINode &I, ExprScope &Scope);
   clang::Expr *buildExtractValue(llvm::ExtractValueInst &I, ExprScope &Scope);
   clang::Stmt *buildStore(llvm::StoreInst &I, ExprScope &Scope);

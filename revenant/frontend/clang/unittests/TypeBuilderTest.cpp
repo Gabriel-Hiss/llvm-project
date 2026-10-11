@@ -142,4 +142,27 @@ TEST_F(TypeFixture, VirtualSlotResolves) {
   EXPECT_NE(Types->methodFor(Area), nullptr);
 }
 
+TEST_F(TypeFixture, VoidDISubprogramKeepsIRReturnForValueUse) {
+  // A recovered `void` prototype for a function whose IR returns a value
+  // would make every value use of a call to it ill-formed (`f() & k`,
+  // `(T)f()`, `return f()`); the lifted IR is authoritative for the return.
+  DIBuilder B(*M);
+  DIFile *File = B.createFile("t.cpp", "/");
+  DIBasicType *VoidT = B.createBasicType("void", 0, dwarf::DW_ATE_address);
+  DISubroutineType *Sig =
+      B.createSubroutineType(B.getOrCreateTypeArray({VoidT}));
+  Function *F = Function::Create(
+      FunctionType::get(Type::getInt64Ty(Ctx), {}, false),
+      GlobalValue::ExternalLinkage, "imported", M.get());
+  DISubprogram *SP = B.createFunction(
+      File, "imported", "imported", File, 1, Sig, /*ScopeLine=*/1,
+      DINode::FlagZero, DISubprogram::SPFlagDefinition, nullptr, nullptr,
+      nullptr, nullptr);
+  F->setSubprogram(SP);
+  clang::QualType FT = Types->functionType(*F);
+  const auto *Proto = FT->getAs<clang::FunctionProtoType>();
+  ASSERT_NE(Proto, nullptr);
+  EXPECT_FALSE(Proto->getReturnType()->isVoidType());
+}
+
 } // namespace
