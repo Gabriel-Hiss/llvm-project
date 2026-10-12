@@ -182,4 +182,28 @@ TEST(PeFileTest, ImageReads) {
   EXPECT_EQ(Pe->Img->vaOfRva(*Rva), Pe->EntryPoint);
 }
 
+#ifdef REVENANT_TEST_GO_UNOPTIMIZED
+TEST(PeFileTest, GoBuildIdDetected) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_GO_UNOPTIMIZED);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  if (!Pe) {
+    consumeError(Pe.takeError());
+    return;
+  }
+  ASSERT_TRUE(Pe->GoBuildId.has_value())
+      << "goBuildId must detect the Go build-id blob";
+  // Blob is 128 bytes at .text start (RVA 0x1000, VA 0x140001000).
+  EXPECT_EQ(Pe->GoBuildId->Start.Value, 0x140001000ULL);
+  EXPECT_EQ(Pe->GoBuildId->End.Value, 0x140001080ULL);
+  // The blob must be in InlineData so discovery skips it.
+  EXPECT_TRUE(Pe->Img->inInlineData(Va(0x140001000)));
+  EXPECT_TRUE(Pe->Img->inInlineData(Va(0x140001001)));
+  EXPECT_TRUE(Pe->Img->inInlineData(Va(0x14000107f)));
+  EXPECT_FALSE(Pe->Img->inInlineData(Va(0x140001080)));
+}
+#endif
+
 } // end anonymous namespace

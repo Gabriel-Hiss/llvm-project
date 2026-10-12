@@ -328,16 +328,13 @@ static std::optional<VaRange> goBuildId(const Image &Img) {
     if (End - Pos != 0x80)
       return std::nullopt;
     ArrayRef<uint8_t> D(Sec->Data.data() + Pos, 0x80);
-    // The record ends at `\n \xff`; the rest of the blob is 0xcc.
     auto CcIt = std::find(D.begin(), D.end(), (uint8_t)0xcc);
     if (CcIt == D.end())
       continue;
     size_t TailAt = CcIt - D.begin();
-    // The record ends at `\n \xff`; the rest of the blob is 0xcc.
-    // Rust: `data[..tail_at].windows(3).rposition(w == b"\n \xff") + 3`.
     size_t Last = std::string::npos;
-    for (size_t I = 0; I + 3 <= TailAt; ++I)
-      if (D[I] == '\n' && D[I + 1] == ' ' && D[I + 2] == '\xff')
+    for (size_t I = 0; I + 2 < TailAt; ++I)
+      if (D[I] == '\n' && D[I + 1] == ' ' && D[I + 2] == 0xff)
         Last = I;
     std::optional<size_t> TextEnd;
     if (Last != std::string::npos)
