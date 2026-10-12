@@ -246,4 +246,171 @@ TEST(PeFileTest, JumpTablesClassifiedAsData) {
   EXPECT_LT(unknownCount, 100) << "Unknown spans should be rare after jump table fix";
 }
 
+// audio-nodegraph-cl-o1.dll: .text raw slack [0xa37f0, 0xa3800) is 16
+// zero bytes past VirtualSize — unmapped linker fill, not Unknown.
+TEST(PeFileTest, ExecSlackZerosAreOverlay) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_AUDIO_CL_O1);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  Program Prog;
+  Prog.Img = Pe->Img;
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0xa37f0);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Offset, 0xa37f0u);
+  EXPECT_EQ(S->End, 0xa3800u);
+  EXPECT_EQ(S->Kind, FileByteKind::Overlay);
+  EXPECT_FALSE(S->SpanVa.has_value());
+}
+
+// audio-nodegraph-clang-o3.dll: .text raw slack [0xa3e66, 0xa4000) is
+// 410 0xcc bytes past VirtualSize — compiler fill, not Unknown.
+TEST(PeFileTest, ExecSlackInt3FillIsPadding) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_AUDIO_CLANG_O3);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  Program Prog;
+  Prog.Img = Pe->Img;
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0xa3e66);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Padding);
+  EXPECT_FALSE(S->SpanVa.has_value());
+}
+
+// c-o2.exe: the CRT __GSHandlerCheckCommon switch table at file offset
+// 6160 is a 20-byte `dd` RVA table followed by a 36-byte case bitmap
+// and 8 bytes of 0xcc — it sits inside a gap the padding runs carve
+// out, and must classify as Data, not Unknown.
+TEST(PeFileTest, BitmapTailJumpTableIsData) {
+  auto Pe = openCorpus();
+  ASSERT_TRUE(Pe.has_value());
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(6160);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Offset, 6160u);
+  EXPECT_EQ(S->End, 6224u);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// c-gcc-o2.exe: MinGW CRT record at file offset 12832 — 40 bytes of
+// {~0, fn, 0, ~0, 0} holding one code pointer — is data, not Unknown.
+TEST(PeFileTest, MingwCrtRecordIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(12832);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// go-unoptimized divisiveis.exe: the 128-byte Go build-id blob at
+// .text start (file offset 0x600) is loader-recorded InlineData.
+TEST(PeFileTest, GoBuildIdSpanIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_GO_UNOPTIMIZED);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x600);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// json-cl-o2.exe: file offset 0x6c7c4 is a mid-table slice — a `dd`
+// switch table whose run starts mid-gap, entries into .text with a
+// bitmap in between. It must classify as Data.
+TEST(PeFileTest, MidTableSliceIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_JSON_CL_O2);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x6c7c4);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// go-cards-o0: the 29-byte Go FIPS signature constant at file offset
+// 0x1eb242 sits between `eb 1d` (jmp over it) and `ret`. The branch
+// skips exactly the blob, so it is inline data, not Unknown.
+TEST(PeFileTest, JumpedOverBlobIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_GO_CARDS);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x1eb242);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// backupd-o0: file offset 0x1f92b47 holds a 74-byte ASCII string
+// ("Montgomery Multiplication for x86_64, CRYPTOGAMS...") compiled
+// into .text — inline string data, not Unknown.
+TEST(PeFileTest, AsciiLiteralIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_BACKUPD);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x1f92b47);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// lua-gcc-o0: file offset 0x45ce0 holds {1.0, 1/sqrt(2)} doubles boxed
+// between a NOP padding run and x87 code — a literal pool constant.
+TEST(PeFileTest, LiteralPoolAfterPaddingIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_LUA_GCC);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x45ce0);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
 } // end anonymous namespace

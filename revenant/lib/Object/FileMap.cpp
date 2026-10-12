@@ -37,38 +37,102 @@ static FileByteKind claimKind(const Claim &C, const PeFile &Pe) {
   return FileByteKind::Data;
 }
 
-/// Check if a byte range looks like a jump table (array of RVAs).
-/// Returns true if the range is a 4-byte aligned array of 4-byte values
-/// that mostly look like RVAs pointing into the image.
+/// Check if a byte range looks like a jump table.
+/// Two proven shapes, both seen in the parity corpus:
+///  * a 4-aligned run of dword RVAs covering the whole range, at least
+///    25% of entries inside the image (linker `dd` tables).
+///  * a leading run of dword entries pointing into an executable
+///    section followed by a tail the table entry scan cannot parse
+///    (MSVC switch bitmap bytes and trailing 0xcc fill). Requiring the
+///    prefix entries to land in an executable section keeps string
+///    tables and pointer-free records out.
 static bool looksLikeJumpTable(const uint8_t *Data, uint64_t Len,
-                                uint64_t ImageBase) {
-  if (Len < 8 || Len % 4 != 0)
+                               const Image &Img) {
+  if (Len < 8)
     return false;
   uint64_t Count = Len / 4;
   const uint32_t *Vals = reinterpret_cast<const uint32_t *>(Data);
-  // Check if values look like RVAs (pointing into the image)
-  uint64_t MinRva = 0x200;
-  uint64_t MaxRva = 0x200000;
+  uint64_t MaxRva = 0x4000000;
   uint64_t ValidCount = 0;
+  uint64_t ExecPrefix = 0;
   for (uint64_t I = 0; I < Count; ++I) {
     uint64_t V = Vals[I];
-    if (V >= MinRva && V <= MaxRva)
+    if (V >= 0x200 && V <= MaxRva)
       ++ValidCount;
+    Va Target = Img.Base.wrappingAdd(V);
+    if (V >= 0x200 && Img.isExecutable(Target)) {
+      if (I == ExecPrefix)
+        ++ExecPrefix;
+    } else {
+      break;
+    }
   }
-  // At least 25% of values should be valid RVAs
-  if (ValidCount * 4 < Count)
-    return false;
-  // Values are valid RVAs; no monotonicity requirement
-  // (jump tables may not be monotonic if sorted by case value)
-  return true;
+  // Whole range mostly RVAs: a pure dword table.
+  if (Len % 4 == 0 && ValidCount * 4 >= Count)
+    return true;
+  // Leading exec-pointer run: table plus a non-pointer tail (MSVC emits
+  // the case bitmap right after `dd` entries, then 0xcc fill). The
+  // prefix does not have to cover the whole range and does not have to
+  // be file-aligned: a table clipped by a padding run still shows its
+  // leading entries.
+  // Two entries minimum so a lone stray pointer cannot claim a gap.
+  if (ExecPrefix >= 2)
+    return true;
+  // Absolute-pointer records (MinGW `dq` switch tables and the runtime
+  // {sentinel, fn, fn, 0} records it emits inside .text): at least two
+  // qword entries holding VAs of executable code.
+  if (Len % 8 == 0) {
+    const uint64_t *Q = reinterpret_cast<const uint64_t *>(Data);
+    uint64_t ExecQ = 0;
+    for (uint64_t I = 0; I < Len / 8; ++I)
+      if (Img.isExecutable(Va(Q[I])))
+        ++ExecQ;
+    if (ExecQ >= 2)
+      return true;
+    // MinGW CRT function records: {~0, fn, 0, ~0, 0} — exactly 40 bytes
+    // of sentinels and zeros around one code pointer.
+    if (Len == 40 && ExecQ == 1 && Q[0] == UINT64_MAX && Q[2] == 0 &&
+        Q[3] == UINT64_MAX && Q[4] == 0)
+      return true;
+  }
+  // A mid-table slice (the gap boundary ran through the table): mostly
+  // dword entries into executable code with no usable leading run.
+  uint64_t ExecAny = 0;
+  for (uint64_t I = 0; I < Count; ++I) {
+    uint64_t V = Vals[I];
+    if (V >= 0x200 && Img.isExecutable(Img.Base.wrappingAdd(V)))
+      ++ExecAny;
+  }
+  return ExecAny >= 3 && ExecAny * 5 >= Count * 2;
+}
+
+// True when every byte is ASCII printable or whitespace: compiler-
+// generated string literals embedded in .text (e.g. backupd's BoringSSL
+// "Montgomery Multiplication for x86_64" strings).
+static bool isAsciiLiteral(const uint8_t *Data, uint64_t Len) {
+  uint64_t Printable = 0, Fill = 0;
+  for (uint64_t I = 0; I < Len; ++I) {
+    if (Data[I] == 0)
+      continue; // terminator or alignment tail
+    if (Data[I] == 0x90 || Data[I] == 0xcc) {
+      ++Fill; // alignment fill between the string and the next function
+      continue;
+    }
+    if (!(Data[I] >= 0x20 && Data[I] <= 0x7E))
+      return false;
+    ++Printable;
+  }
+  return Printable >= 8 && Fill * 4 <= Len;
 }
 
 /// Executable claim `[foff, fend)`: Code where accepted instruction
 /// chunks cover it, Padding for the program's accepted padding runs,
 /// Data for known jump tables, Unknown otherwise. `DataLen` bounds what
-/// actually maps to image VAs.
+/// actually maps to image VAs; `Slack` holds the file bytes past that
+/// extent (unmapped linker fill).
 static void emitExecRegion(const Program &Prog, uint64_t FOff,
                            uint64_t FEnd, uint64_t DataLen, Va Va0,
+                           llvm::ArrayRef<uint8_t> Slack,
                            std::vector<FileSpan> &Spans) {
   // Collect all known jump table ranges from all functions
   std::vector<std::pair<Va, Va>> DataRanges;
@@ -106,28 +170,15 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
   auto emitGap = [&](uint64_t GEnd) {
     uint64_t GVa = Va0.Value + (Pos - FOff);
     uint64_t GVEnd = Va0.Value + (GEnd - FOff);
-    uint64_t Sub = Pos;
-    for (const PaddingRun &Run : Prog.Padding) {
-      if (Base + Run.End <= GVa)
-        continue;
-      if (Base + Run.Start >= GVEnd)
-        break;
-      uint64_t Rs = std::max(FOff + (Base + Run.Start - Va0.Value), Pos);
-      uint64_t Re = std::min(FOff + (Base + Run.End - Va0.Value), GEnd);
-      if (Rs > Sub)
-        Spans.push_back(
-            {Sub, Rs, Va(Va0.Value + (Sub - FOff)), FileByteKind::Unknown});
-      if (Rs < Re) {
-        Spans.push_back(
-            {Rs, Re, Va(Va0.Value + (Rs - FOff)), FileByteKind::Padding});
-        Sub = Re;
-      }
-    }
-    if (Sub < GEnd) {
-      uint64_t GapLen = GEnd - Sub;
-      uint64_t GVa2 = Va0.Value + (Sub - FOff);
-      uint64_t GVe2 = Va0.Value + (GEnd - FOff);
-      // Check if this gap is a known jump table from DataRanges
+    // Classify an unclaimed sub-range [s, e): a known jump table is
+    // Data, all-zero is Padding, a table-looking byte run is Data, and
+    // anything else stays Unknown.
+    auto emitSub = [&](uint64_t S, uint64_t E, bool FollowsPad = false) {
+      if (S >= E)
+        return;
+      uint64_t GapLen = E - S;
+      uint64_t GVa2 = Va0.Value + (S - FOff);
+      uint64_t GVe2 = Va0.Value + (E - FOff);
       bool isKnownJumpTable = false;
       for (const auto &Range : DataRanges) {
         if (Range.first.Value <= GVa2 && Range.second.Value >= GVe2) {
@@ -135,28 +186,74 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
           break;
         }
       }
+      // Loader-recorded inline data (relocation slots, the Go build-id
+      // blob) is data by construction.
+      if (!isKnownJumpTable)
+        for (const VaRange &R : Prog.Img->InlineData)
+          if (R.Start.Value <= GVa2 && R.End.Value >= GVe2) {
+            isKnownJumpTable = true;
+            break;
+          }
       if (isKnownJumpTable) {
-        Spans.push_back(
-            {Sub, GEnd, Va(GVa2), FileByteKind::Data});
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        return;
+      }
+      auto Bytes = Prog.Img->dataAt(Va(GVa2), GapLen);
+      bool allZeros = (Bytes.size() == GapLen) &&
+                      std::all_of(Bytes.begin(), Bytes.end(),
+                                  [](uint8_t b) { return b == 0; });
+      if (allZeros) {
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Padding});
+      } else if (GapLen >= 8 && Bytes.size() == GapLen &&
+                 looksLikeJumpTable(Bytes.data(), GapLen, *Prog.Img)) {
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
       } else {
-        auto Bytes = Prog.Img->dataAt(Va(GVa2), GapLen);
-        bool allZeros = (Bytes.size() == GapLen) &&
-                        std::all_of(Bytes.begin(), Bytes.end(),
-                                    [](uint8_t b) { return b == 0; });
-        if (allZeros) {
-          Spans.push_back(
-              {Sub, GEnd, Va(GVa2), FileByteKind::Padding});
-        } else if (GapLen >= 8 && GapLen % 4 == 0 &&
-                   Bytes.size() == GapLen &&
-                   looksLikeJumpTable(Bytes.data(), GapLen, Base)) {
-          Spans.push_back(
-              {Sub, GEnd, Va(GVa2), FileByteKind::Data});
-        } else {
-          Spans.push_back(
-              {Sub, GEnd, Va(GVa2), FileByteKind::Unknown});
+        // A blob immediately after an unconditional branch that skips
+        // exactly its length is inline data (e.g. the Go signature
+        // constant behind `jmp end; blob; ret`).
+        bool JumpedOver = false;
+        if (GVa2 > Va0.Value) {
+          auto Prev = Prog.Img->dataAt(Va(GVa2 - 2), 2);
+          if (Prev.size() == 2 && Prev[0] == 0xEB &&
+              GVa2 - 2 + 2 + (int8_t)Prev[1] == GVe2)
+            JumpedOver = true;
         }
+        if (JumpedOver)
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        else if (GapLen >= 8 && Bytes.size() == GapLen &&
+                 isAsciiLiteral(Bytes.data(), GapLen))
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        else if (FollowsPad)
+          // Nonzero bytes boxed between a padding run and code are the
+          // compiler's literal pool (e.g. GCC's x87 constant pool
+          // behind `dd 05 disp32`).
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        else
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Unknown});
+      }
+    };
+    uint64_t Sub = Pos;
+    bool PrevWasPadding = false;
+    for (const PaddingRun &Run : Prog.Padding) {
+      if (Base + Run.End <= GVa)
+        continue;
+      if (Base + Run.Start >= GVEnd)
+        break;
+      uint64_t Rs = std::max(FOff + (Base + Run.Start - Va0.Value), Pos);
+      uint64_t Re = std::min(FOff + (Base + Run.End - Va0.Value), GEnd);
+      if (Rs > Sub) {
+        emitSub(Sub, Rs, PrevWasPadding);
+        PrevWasPadding = false;
+      }
+      if (Rs < Re) {
+        Spans.push_back(
+            {Rs, Re, Va(Va0.Value + (Rs - FOff)), FileByteKind::Padding});
+        Sub = Re;
+        PrevWasPadding = true;
       }
     }
+    if (Sub < GEnd)
+      emitSub(Sub, GEnd, PrevWasPadding);
   };
 
   for (auto [A, B] : Merged) {
@@ -172,16 +269,21 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
   if (Pos < MappedEnd)
     emitGap(MappedEnd);
   if (MappedEnd < FEnd) {
-    uint64_t TailLen = FEnd - MappedEnd;
-    auto TailBytes = Prog.Img->dataAt(Va(Va0.Value + (MappedEnd - FOff)), TailLen);
-    bool allZeros = (TailBytes.size() == TailLen) &&
-                    std::all_of(TailBytes.begin(), TailBytes.end(),
-                                [](uint8_t b) { return b == 0; });
-    if (allZeros) {
-      Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Overlay});
-    } else {
-      Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Unknown});
-    }
+    // Raw slack past the mapped extent: the image cannot read it, so
+    // classify from the file bytes captured at parse time. Zeros are
+    // linker round-up fill (Overlay); compiler fill bytes are Padding.
+    bool HaveSlack = Slack.size() == (size_t)(FEnd - MappedEnd);
+    bool AllZeros =
+        HaveSlack && llvm::all_of(Slack, [](uint8_t b) { return b == 0; });
+    bool AllFill =
+        HaveSlack &&
+        llvm::all_of(Slack, [](uint8_t b) { return b == 0xcc || b == 0x90; });
+    FileByteKind TailKind = FileByteKind::Unknown;
+    if (AllZeros)
+      TailKind = FileByteKind::Overlay;
+    else if (AllFill)
+      TailKind = FileByteKind::Padding;
+    Spans.push_back({MappedEnd, FEnd, std::nullopt, TailKind});
   }
 }
 
@@ -326,13 +428,19 @@ FileMap FileMap::build(const PeFile &Pe, const Program &Prog) {
       uint64_t FOff = std::get<0>(C), FEnd = std::get<1>(C);
       Va Va0 = *std::get<2>(C);
       uint64_t DataLen = 0;
+      llvm::ArrayRef<uint8_t> Slack;
       for (const RawSection &S : Pe.RawSections)
         if (S.FileOffset == FOff && S.SecVa == Va0) {
           DataLen = mappedDataLen(S);
+          Slack = S.RawSlack;
           break;
         }
       DataLen = std::min(DataLen, FEnd - FOff);
-      emitExecRegion(Prog, FOff, FEnd, DataLen, Va0, Spans);
+      // FEnd may stop short of the raw extent at FileSize.
+      uint64_t SlackNeed = (FEnd - FOff) - DataLen;
+      if (Slack.size() > SlackNeed)
+        Slack = Slack.take_front(SlackNeed);
+      emitExecRegion(Prog, FOff, FEnd, DataLen, Va0, Slack, Spans);
     } else if (J - I == 1) {
       // Sole non-executable claim. Mapped extent: min(vsize, raw_size)
       // for sections; the header claim maps fully.

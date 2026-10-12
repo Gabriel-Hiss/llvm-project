@@ -69,11 +69,23 @@ static Error buildImage(const COFFObjectFile &Obj, Va Base, Image &Img,
                  (Ch & COFF::IMAGE_SCN_MEM_WRITE) != 0,
                  (Ch & COFF::IMAGE_SCN_MEM_EXECUTE) != 0};
     Img.Sections.push_back(std::move(Sec));
-
-    RawSections.push_back(RawSection{Nm.str(), (uint64_t)Sh->PointerToRawData,
-                                     (uint64_t)Sh->SizeOfRawData, Sec.SecVa,
-                                     (uint64_t)Sh->VirtualSize,
-                                     Sec.Flags.Execute});
+    RawSection Raw{Nm.str(), (uint64_t)Sh->PointerToRawData,
+                   (uint64_t)Sh->SizeOfRawData, Sec.SecVa,
+                   (uint64_t)Sh->VirtualSize, {},
+                   Sec.Flags.Execute};
+    // Raw slack: file bytes the section claims but the loader does not
+    // map (SizeOfRawData past the mapped extent). The mapped Image
+    // cannot answer for them, so keep a copy for the file map.
+    uint64_t MappedLen =
+        Raw.VirtualSize == 0 ? Raw.RawSize
+                             : std::min(Raw.VirtualSize, Raw.RawSize);
+    StringRef File = Obj.getData();
+    if (Raw.RawSize > MappedLen && Raw.FileOffset + Raw.RawSize <= File.size() &&
+        Raw.FileOffset + MappedLen <= File.size()) {
+      const char *P = File.data() + Raw.FileOffset + MappedLen;
+      Raw.RawSlack.assign(P, P + (Raw.RawSize - MappedLen));
+    }
+    RawSections.push_back(std::move(Raw));
   }
   if (Img.Sections.empty())
     return peError("no sections");
