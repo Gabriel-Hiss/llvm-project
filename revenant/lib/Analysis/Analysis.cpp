@@ -118,6 +118,7 @@ void insertFunction(Program &P, Function F) {
     R.Blocks.push_back(BR);
   }
   R.Chunks = std::move(F.Chunks);
+  R.DataRanges = std::move(F.DataRanges);
   R.UnresolvedIndirects = std::move(F.UnresolvedIndirects);
   R.NoreturnCalls = std::move(F.NoreturnCalls);
   R.CallTargets = std::move(F.CallTargets);

@@ -2,7 +2,7 @@ revenant_add_unittest(RevenantUnitTests RevenantObjectTests
   PeFileTest.cpp
   )
 
-target_link_libraries(RevenantObjectTests PRIVATE RevenantObject)
+target_link_libraries(RevenantObjectTests PRIVATE RevenantObject RevenantAnalysis RevenantTargetX86)
 
 # Corpus binary the loader is checked against, and the Rust reference
 # CLI used as the oracle for section/pdata/import counts.

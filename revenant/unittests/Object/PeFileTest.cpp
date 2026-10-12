@@ -9,12 +9,16 @@
 #include "revenant/Core/Program.h"
 #include "revenant/Object/FileMap.h"
 #include "revenant/Object/PeFile.h"
+#include "revenant/Analysis/Analysis.h"
+#include "revenant/Target/TargetHooks.h"
 
 #include "gtest/gtest.h"
 
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <vector>
+#include <utility>
 
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -205,5 +209,41 @@ TEST(PeFileTest, GoBuildIdDetected) {
   EXPECT_FALSE(Pe->Img->inInlineData(Va(0x140001080)));
 }
 #endif
+
+TEST(PeFileTest, JumpTablesClassifiedAsData) {
+  auto Pe = openCorpus();
+  ASSERT_TRUE(Pe.has_value());
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  ASSERT_FALSE(Prog.Functions.empty());
+
+  // Collect all known jump table ranges
+  std::vector<std::pair<Va, Va>> DataRanges;
+  for (auto &[Start, Rec] : Prog.Functions)
+    for (const auto &Range : Rec.DataRanges)
+      DataRanges.push_back(Range);
+  ASSERT_FALSE(DataRanges.empty()) << "Corpus binary should have jump tables";
+
+  FileMap Map = FileMap::build(*Pe, Prog);
+  ASSERT_FALSE(Map.Spans.empty());
+
+  // Count spans by kind
+  int dataCount = 0, unknownCount = 0, paddingCount = 0;
+  for (const FileSpan &S : Map.Spans) {
+    if (S.Kind == FileByteKind::Data) dataCount++;
+    if (S.Kind == FileByteKind::Unknown) unknownCount++;
+    if (S.Kind == FileByteKind::Padding) paddingCount++;
+  }
+
+  // Jump tables should produce Data spans
+  EXPECT_GT(dataCount, 0) << "Known jump tables should produce Data spans";
+
+  // Alignment padding between code chunks must be Padding
+  EXPECT_GT(paddingCount, 0) << "Should have alignment padding spans";
+
+  // Unknown should be much lower than before the fix
+  EXPECT_LT(unknownCount, 100) << "Unknown spans should be rare after jump table fix";
+}
 
 } // end anonymous namespace

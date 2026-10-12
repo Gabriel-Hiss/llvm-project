@@ -277,6 +277,10 @@ struct FuncRecord {
   std::vector<std::pair<uint32_t, Va>> EdgeOut;
   /// Sorted, disjoint code ranges belonging to this function.
   std::vector<std::pair<Va, Va>> Chunks;
+  /// Data byte ranges inside this function's region (resolved or
+  /// recognized jump-table spans): consumed by the gap sweep and padding
+  /// classification, never emitted as code.
+  std::vector<std::pair<Va, Va>> DataRanges;
   /// Indirect jump sites that stayed unresolved.
   std::vector<Va> UnresolvedIndirects;
   /// Call sites to noreturn callees that terminate paths.
