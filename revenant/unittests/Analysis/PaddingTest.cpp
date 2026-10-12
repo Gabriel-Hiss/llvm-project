@@ -168,4 +168,58 @@ TEST(PaddingTest, PadLenCountsBytesAndFillers) {
   EXPECT_EQ(padLen(*E.Dis, *E.Img, Va(E.Base.Value + 3)), 0u);
 }
 
+// Function boundary: a closed function ends in `ret`, the linker pads the
+// alignment gap with int3, and the next function opens on the 16-byte
+// boundary. A tail jump to that address must not absorb the callee.
+TEST(PaddingTest, StartAfterRetAndInt3Padding) {
+  std::vector<uint8_t> Text(0x20, 0xCC);
+  Text[0] = 0xC3; // ret
+  Text[0x10] = 0xC3;
+  Env E(Text);
+  EXPECT_TRUE(startsAfterInt3(*E.Dis, *E.Img, Va(E.Base.Value + 0x10)));
+  // The ret itself opens nothing: no padding precedes it.
+  EXPECT_FALSE(startsAfterInt3(*E.Dis, *E.Img, Va(E.Base.Value + 0x00)));
+}
+
+// An unconditional `jmp` over int3 padding aligns a continuation block
+// inside one function; the padding run after a jmp opens no new function.
+TEST(PaddingTest, StartAfterJmpOverInt3PaddingIsRejected) {
+  std::vector<uint8_t> Text(0x20, 0xCC);
+  Text[0] = 0xE9;
+  Text[1] = 0x0B;
+  Text[2] = 0x00;
+  Text[3] = 0x00;
+  Text[4] = 0x00; // jmp +0x0b -> 0x10
+  Text[0x10] = 0xC3;
+  Env E(Text);
+  EXPECT_FALSE(startsAfterInt3(*E.Dis, *E.Img, Va(E.Base.Value + 0x10)));
+}
+
+// Loop and cold-block alignment inside a function uses the nop family,
+// never int3, so a nop-padded block leader is not a function start.
+TEST(PaddingTest, StartAfterNopAlignmentIsRejected) {
+  std::vector<uint8_t> Text(0x20, 0x90);
+  Text[0] = 0xC3; // ret
+  Text[0x10] = 0xC3;
+  Env E(Text);
+  EXPECT_FALSE(startsAfterInt3(*E.Dis, *E.Img, Va(E.Base.Value + 0x10)));
+}
+
+// An aligned address with real code (push rcx) before it has no padding
+// run and opens nothing.
+TEST(PaddingTest, StartWithoutPaddingIsRejected) {
+  std::vector<uint8_t> Text(0x20, 0x51);
+  Env E(Text);
+  EXPECT_FALSE(startsAfterInt3(*E.Dis, *E.Img, Va(E.Base.Value + 0x10)));
+}
+
+// An int3 run that closes on a non-16-byte address is not a function
+// start even when it follows a ret.
+TEST(PaddingTest, UnalignedStartAfterInt3IsRejected) {
+  std::vector<uint8_t> Text(0x20, 0xCC);
+  Text[0] = 0xC3; // ret
+  Env E(Text);
+  EXPECT_FALSE(startsAfterInt3(*E.Dis, *E.Img, Va(E.Base.Value + 0x0C)));
+}
+
 } // end anonymous namespace

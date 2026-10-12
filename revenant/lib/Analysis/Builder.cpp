@@ -127,6 +127,24 @@ struct Builder {
            foreign(Address);
   }
 
+  // An unconditional `jmp` whose target opens a 16-byte-aligned code region
+  // right after an int3 padding run starts its own function: MSVC x64 pads
+  // between functions with int3 and aligns every function start, while loops
+  // and cold blocks inside a function are aligned with nop padding.
+  // Treating such a target as an intra-function block leader absorbs the
+  // callee's bytes into this function, and a leaf function reached only by
+  // that tail jump is then never discovered (an LTCG-specialized caller
+  // that lost its function-pointer table leaves no other reference). The
+  // function's own start is excluded: a `jmp` to the entry is a loop.
+  //
+  // Only the unconditional form uses this rule. `liftTerminator` skips
+  // TailCall edges when it emits a conditional branch, so turning a jcc
+  // target into one silently drops the taken edge; a conditional target
+  // must stay an inline block leader.
+  bool startsAfterPadding(Va Address) const {
+    return Address != Start && startsAfterInt3(Dis, Img, Address);
+  }
+
   bool enqueue(Va Address) {
     if (!inBound(Address) || !Img.isExecutable(Address) || inData(Address))
       return false;
@@ -462,8 +480,10 @@ struct Builder {
       case FlowKind::Branch:
         if (I.HasTarget) {
           const Va Target = I.Target;
-          if (foreignTarget(Target) || !inBound(Target)) {
+          if (foreignTarget(Target) || !inBound(Target) ||
+              startsAfterPadding(Target)) {
             ForeignTargets.push_back(Target);
+            F.CallTargets.push_back(Target);
             EndKind = BlockEnd::TailCall;
             Edges.push_back(makeEdge(Target, EdgeKind::TailCall));
           } else {
