@@ -87,9 +87,23 @@ static bool looksLikeJumpTable(const uint8_t *Data, uint64_t Len,
     for (uint64_t I = 0; I < Len / 8; ++I)
       if (Img.isExecutable(Va(Q[I])))
         ++ExecQ;
-    return ExecQ >= 2;
+    if (ExecQ >= 2)
+      return true;
+    // MinGW CRT function records: {~0, fn, 0, ~0, 0} — exactly 40 bytes
+    // of sentinels and zeros around one code pointer.
+    if (Len == 40 && ExecQ == 1 && Q[0] == UINT64_MAX && Q[2] == 0 &&
+        Q[3] == UINT64_MAX && Q[4] == 0)
+      return true;
   }
-  return false;
+  // A mid-table slice (the gap boundary ran through the table): mostly
+  // dword entries into executable code with no usable leading run.
+  uint64_t ExecAny = 0;
+  for (uint64_t I = 0; I < Count; ++I) {
+    uint64_t V = Vals[I];
+    if (V >= 0x200 && Img.isExecutable(Img.Base.wrappingAdd(V)))
+      ++ExecAny;
+  }
+  return ExecAny >= 3 && ExecAny * 5 >= Count * 2;
 }
 
 /// Executable claim `[foff, fend)`: Code where accepted instruction
@@ -153,6 +167,14 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
           break;
         }
       }
+      // Loader-recorded inline data (relocation slots, the Go build-id
+      // blob) is data by construction.
+      if (!isKnownJumpTable)
+        for (const VaRange &R : Prog.Img->InlineData)
+          if (R.Start.Value <= GVa2 && R.End.Value >= GVe2) {
+            isKnownJumpTable = true;
+            break;
+          }
       if (isKnownJumpTable) {
         Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
         return;

@@ -302,4 +302,59 @@ TEST(PeFileTest, BitmapTailJumpTableIsData) {
   EXPECT_EQ(S->Kind, FileByteKind::Data);
 }
 
+// c-gcc-o2.exe: MinGW CRT record at file offset 12832 — 40 bytes of
+// {~0, fn, 0, ~0, 0} holding one code pointer — is data, not Unknown.
+TEST(PeFileTest, MingwCrtRecordIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(12832);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// go-unoptimized divisiveis.exe: the 128-byte Go build-id blob at
+// .text start (file offset 0x600) is loader-recorded InlineData.
+TEST(PeFileTest, GoBuildIdSpanIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_GO_UNOPTIMIZED);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x600);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// json-cl-o2.exe: file offset 0x6c7c4 is a mid-table slice — a `dd`
+// switch table whose run starts mid-gap, entries into .text with a
+// bitmap in between. It must classify as Data.
+TEST(PeFileTest, MidTableSliceIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_JSON_CL_O2);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x6c7c4);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
 } // end anonymous namespace
