@@ -37,30 +37,59 @@ static FileByteKind claimKind(const Claim &C, const PeFile &Pe) {
   return FileByteKind::Data;
 }
 
-/// Check if a byte range looks like a jump table (array of RVAs).
-/// Returns true if the range is a 4-byte aligned array of 4-byte values
-/// that mostly look like RVAs pointing into the image.
+/// Check if a byte range looks like a jump table.
+/// Two proven shapes, both seen in the parity corpus:
+///  * a 4-aligned run of dword RVAs covering the whole range, at least
+///    25% of entries inside the image (linker `dd` tables).
+///  * a leading run of dword entries pointing into an executable
+///    section followed by a tail the table entry scan cannot parse
+///    (MSVC switch bitmap bytes and trailing 0xcc fill). Requiring the
+///    prefix entries to land in an executable section keeps string
+///    tables and pointer-free records out.
 static bool looksLikeJumpTable(const uint8_t *Data, uint64_t Len,
-                                uint64_t ImageBase) {
-  if (Len < 8 || Len % 4 != 0)
+                               const Image &Img) {
+  if (Len < 8)
     return false;
   uint64_t Count = Len / 4;
   const uint32_t *Vals = reinterpret_cast<const uint32_t *>(Data);
-  // Check if values look like RVAs (pointing into the image)
-  uint64_t MinRva = 0x200;
-  uint64_t MaxRva = 0x200000;
+  uint64_t MaxRva = 0x4000000;
   uint64_t ValidCount = 0;
+  uint64_t ExecPrefix = 0;
   for (uint64_t I = 0; I < Count; ++I) {
     uint64_t V = Vals[I];
-    if (V >= MinRva && V <= MaxRva)
+    if (V >= 0x200 && V <= MaxRva)
       ++ValidCount;
+    Va Target = Img.Base.wrappingAdd(V);
+    if (V >= 0x200 && Img.isExecutable(Target)) {
+      if (I == ExecPrefix)
+        ++ExecPrefix;
+    } else {
+      break;
+    }
   }
-  // At least 25% of values should be valid RVAs
-  if (ValidCount * 4 < Count)
-    return false;
-  // Values are valid RVAs; no monotonicity requirement
-  // (jump tables may not be monotonic if sorted by case value)
-  return true;
+  // Whole range mostly RVAs: a pure dword table.
+  if (Len % 4 == 0 && ValidCount * 4 >= Count)
+    return true;
+  // Leading exec-pointer run: table plus a non-pointer tail (MSVC emits
+  // the case bitmap right after `dd` entries, then 0xcc fill). The
+  // prefix does not have to cover the whole range and does not have to
+  // be file-aligned: a table clipped by a padding run still shows its
+  // leading entries.
+  // Two entries minimum so a lone stray pointer cannot claim a gap.
+  if (ExecPrefix >= 2)
+    return true;
+  // Absolute-pointer records (MinGW `dq` switch tables and the runtime
+  // {sentinel, fn, fn, 0} records it emits inside .text): at least two
+  // qword entries holding VAs of executable code.
+  if (Len % 8 == 0) {
+    const uint64_t *Q = reinterpret_cast<const uint64_t *>(Data);
+    uint64_t ExecQ = 0;
+    for (uint64_t I = 0; I < Len / 8; ++I)
+      if (Img.isExecutable(Va(Q[I])))
+        ++ExecQ;
+    return ExecQ >= 2;
+  }
+  return false;
 }
 
 /// Executable claim `[foff, fend)`: Code where accepted instruction
@@ -108,6 +137,39 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
   auto emitGap = [&](uint64_t GEnd) {
     uint64_t GVa = Va0.Value + (Pos - FOff);
     uint64_t GVEnd = Va0.Value + (GEnd - FOff);
+    // Classify an unclaimed sub-range [s, e): a known jump table is
+    // Data, all-zero is Padding, a table-looking byte run is Data, and
+    // anything else stays Unknown.
+    auto emitSub = [&](uint64_t S, uint64_t E) {
+      if (S >= E)
+        return;
+      uint64_t GapLen = E - S;
+      uint64_t GVa2 = Va0.Value + (S - FOff);
+      uint64_t GVe2 = Va0.Value + (E - FOff);
+      bool isKnownJumpTable = false;
+      for (const auto &Range : DataRanges) {
+        if (Range.first.Value <= GVa2 && Range.second.Value >= GVe2) {
+          isKnownJumpTable = true;
+          break;
+        }
+      }
+      if (isKnownJumpTable) {
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        return;
+      }
+      auto Bytes = Prog.Img->dataAt(Va(GVa2), GapLen);
+      bool allZeros = (Bytes.size() == GapLen) &&
+                      std::all_of(Bytes.begin(), Bytes.end(),
+                                  [](uint8_t b) { return b == 0; });
+      if (allZeros) {
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Padding});
+      } else if (GapLen >= 8 && Bytes.size() == GapLen &&
+                 looksLikeJumpTable(Bytes.data(), GapLen, *Prog.Img)) {
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+      } else {
+        Spans.push_back({S, E, Va(GVa2), FileByteKind::Unknown});
+      }
+    };
     uint64_t Sub = Pos;
     for (const PaddingRun &Run : Prog.Padding) {
       if (Base + Run.End <= GVa)
@@ -117,48 +179,15 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
       uint64_t Rs = std::max(FOff + (Base + Run.Start - Va0.Value), Pos);
       uint64_t Re = std::min(FOff + (Base + Run.End - Va0.Value), GEnd);
       if (Rs > Sub)
-        Spans.push_back(
-            {Sub, Rs, Va(Va0.Value + (Sub - FOff)), FileByteKind::Unknown});
+        emitSub(Sub, Rs);
       if (Rs < Re) {
         Spans.push_back(
             {Rs, Re, Va(Va0.Value + (Rs - FOff)), FileByteKind::Padding});
         Sub = Re;
       }
     }
-    if (Sub < GEnd) {
-      uint64_t GapLen = GEnd - Sub;
-      uint64_t GVa2 = Va0.Value + (Sub - FOff);
-      uint64_t GVe2 = Va0.Value + (GEnd - FOff);
-      // Check if this gap is a known jump table from DataRanges
-      bool isKnownJumpTable = false;
-      for (const auto &Range : DataRanges) {
-        if (Range.first.Value <= GVa2 && Range.second.Value >= GVe2) {
-          isKnownJumpTable = true;
-          break;
-        }
-      }
-      if (isKnownJumpTable) {
-        Spans.push_back(
-            {Sub, GEnd, Va(GVa2), FileByteKind::Data});
-      } else {
-        auto Bytes = Prog.Img->dataAt(Va(GVa2), GapLen);
-        bool allZeros = (Bytes.size() == GapLen) &&
-                        std::all_of(Bytes.begin(), Bytes.end(),
-                                    [](uint8_t b) { return b == 0; });
-        if (allZeros) {
-          Spans.push_back(
-              {Sub, GEnd, Va(GVa2), FileByteKind::Padding});
-        } else if (GapLen >= 8 && GapLen % 4 == 0 &&
-                   Bytes.size() == GapLen &&
-                   looksLikeJumpTable(Bytes.data(), GapLen, Base)) {
-          Spans.push_back(
-              {Sub, GEnd, Va(GVa2), FileByteKind::Data});
-        } else {
-          Spans.push_back(
-              {Sub, GEnd, Va(GVa2), FileByteKind::Unknown});
-        }
-      }
-    }
+    if (Sub < GEnd)
+      emitSub(Sub, GEnd);
   };
 
   for (auto [A, B] : Merged) {

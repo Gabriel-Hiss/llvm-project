@@ -284,4 +284,22 @@ TEST(PeFileTest, ExecSlackInt3FillIsPadding) {
   EXPECT_FALSE(S->SpanVa.has_value());
 }
 
+// c-o2.exe: the CRT __GSHandlerCheckCommon switch table at file offset
+// 6160 is a 20-byte `dd` RVA table followed by a 36-byte case bitmap
+// and 8 bytes of 0xcc — it sits inside a gap the padding runs carve
+// out, and must classify as Data, not Unknown.
+TEST(PeFileTest, BitmapTailJumpTableIsData) {
+  auto Pe = openCorpus();
+  ASSERT_TRUE(Pe.has_value());
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(6160);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Offset, 6160u);
+  EXPECT_EQ(S->End, 6224u);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
 } // end anonymous namespace
