@@ -154,11 +154,13 @@ static std::optional<uint64_t> boundImm(const JtInsn &I) {
 }
 
 /// Does `ins`'s operand 0 match the compare operand / tracked location?
-static bool cmpMatches(const CmpOperand &CmpOp, const JtInsn &I,
-                       const CmpOperand &Cur) {
+/// Registers compare by their full register: the guard's `cmp edx,0Bh`
+/// bounds the same location as a tracked `rdx`.
+static bool cmpMatches(const JtInsnOps &Ops, const CmpOperand &CmpOp,
+                       const JtInsn &I, const CmpOperand &Cur) {
   if (CmpOp.Tag == CmpOperand::Kind::Reg && Cur.Tag == CmpOperand::Kind::Reg &&
       I.Op0 == JtOpKind::Reg)
-    return I.Reg0 == CmpOp.Reg && Cur.Reg == CmpOp.Reg;
+    return full(Ops, I.Reg0) == CmpOp.Reg && Cur.Reg == CmpOp.Reg;
   if (CmpOp.Tag == CmpOperand::Kind::Mem && Cur.Tag == CmpOperand::Kind::Mem &&
       I.Op0 == JtOpKind::Mem)
     return I.MemBase == CmpOp.Base && I.MemIndex == CmpOp.Index &&
@@ -811,7 +813,7 @@ static IndexTrace traceIndex(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
     // The guard's compare on the tracked location (real `cmp`, or `sub`
     // when the subtraction doubles as the bound check).
     if (Ins.Mn == JtMnemonic::Cmp && CmpOp &&
-        cmpMatches(*CmpOp, Ins, Cur)) {
+        cmpMatches(Ops, *CmpOp, Ins, Cur)) {
       MatchedCmp = true;
       continue;
     }

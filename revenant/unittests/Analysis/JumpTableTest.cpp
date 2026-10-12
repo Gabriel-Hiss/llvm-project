@@ -217,6 +217,69 @@ TEST(JumpTableRecoveryTest, MsvcImageBaseTableUsesRvaEntries) {
   EXPECT_EQ(Result->Targets[1].first, Img.Base.wrappingAdd(0x41));
 }
 
+// MSVC bounds the switch on a 32-bit register and copies it into the index
+// (`cmp edx,N; ja default; mov eax,edx; mov eax,[r9+rax*4+T]`). The guard's
+// compare names `edx` while the trace tracks `rdx`; they are the same
+// location, so the guard must bound the table. Shape of sqlite-cl-o2pgo
+// sqlite3VdbeSerialGet, whose cases were otherwise never discovered.
+TEST(JumpTableRecoveryTest, SubRegisterGuardBoundsMsvcTable) {
+  std::vector<uint8_t> Bytes(0x300, 0xcc);
+  const uint8_t Code[] = {
+      0x4c, 0x8d, 0x0d, 0xf9, 0xff, 0xff, 0xff, // lea r9,[rip-7] (image base)
+      0x83, 0xfa, 0x02,                         // cmp edx,2
+      0x77, 0x54,                               // ja +0x60 (default)
+      0x8b, 0xc2,                               // mov eax,edx
+      0x41, 0x8b, 0x84, 0x81, 0x00, 0x02, 0x00, 0x00, // mov eax,[r9+rax*4+200h]
+      0x49, 0x03, 0xc1,                         // add rax,r9
+      0xff, 0xe0};                              // jmp rax
+  std::copy(std::begin(Code), std::end(Code), Bytes.begin());
+  // Three cases bounded by the guard, then a fourth dword that also points
+  // at code: only the guard keeps the walk from taking it.
+  for (uint32_t I = 0; I < 4; ++I) {
+    llvm::support::endian::write32le(Bytes.data() + 0x200 + 4 * I, 0x40 + I);
+    Bytes[0x40 + I] = 0xc3;
+  }
+  Bytes[0x60] = 0xc3;
+  Image Img;
+  Img.Base = Va(0x140000000);
+  Section Text;
+  Text.Name = ".text";
+  Text.SecVa = Img.Base;
+  Text.Vsize = Bytes.size();
+  Text.Data = std::move(Bytes);
+  Text.Flags = SectionFlags::rx();
+  Img.Sections.push_back(std::move(Text));
+
+  std::vector<Instr> Instrs =
+      decode(Img, Img.Base, Img.Base.wrappingAdd(sizeof(Code)));
+  ASSERT_EQ(Instrs.size(), 7u);
+  std::vector<BasicBlock> Blocks(2);
+  Blocks[0].Start = Img.Base;
+  Blocks[0].End = Img.Base.wrappingAdd(12);
+  Blocks[0].InstrsBegin = 0;
+  Blocks[0].InstrsEnd = 3;
+  Blocks[0].Edges = {{Img.Base.wrappingAdd(0x60), EdgeKind::CondTaken},
+                     {Img.Base.wrappingAdd(12), EdgeKind::CondNotTaken}};
+  Blocks[0].EndKind = BlockEnd::Branch;
+  Blocks[1].Start = Img.Base.wrappingAdd(12);
+  Blocks[1].End = Img.Base.wrappingAdd(sizeof(Code));
+  Blocks[1].InstrsBegin = 3;
+  Blocks[1].InstrsEnd = Instrs.size();
+  Blocks[1].EndKind = BlockEnd::UnresolvedIndirect;
+  std::set<Va> Refs;
+  std::map<Va, uint64_t> Limits;
+  std::pair<Va, Va> Range{Img.Base, Img.Base.wrappingAdd(0x100)};
+  JumpTableCtx Ctx{Img, llvm::ArrayRef<std::pair<Va, Va>>(Range), Refs, Refs,
+                   Limits};
+  Hooks H;
+  auto Result = resolveJumpTable(Ctx, H, Blocks, Instrs, 1);
+  ASSERT_TRUE(Result);
+  EXPECT_TRUE(Result->Guard);
+  EXPECT_EQ(Result->Table, Img.Base.wrappingAdd(0x200));
+  ASSERT_EQ(Result->Targets.size(), 3u);
+  EXPECT_EQ(Result->Targets[2].first, Img.Base.wrappingAdd(0x42));
+}
+
 TEST(JumpTableRecoveryTest, ClangTwoLevelByteTableResolvesCases) {
   std::vector<uint8_t> Bytes(0x500, 0xcc);
   const uint8_t Code[] = {
