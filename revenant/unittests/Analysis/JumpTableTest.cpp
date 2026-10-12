@@ -354,4 +354,92 @@ TEST(JumpTableImmediateTest, ReadsSubByteBoundAsUnsigned) {
   EXPECT_EQ(getX86JumpTableInsnOps()->operands(*Branch).Cond, JtCond::A);
 }
 
+// Dispatch bytes from lz4-clang-o1's XXH32_finalize (0x1adfe): a 16-case
+// clang switch whose case bodies live on both sides of the dispatch, with
+// the case table parked in .rdata next to the next function's table.
+// The dispatch block is chained into a different function (a tail `jmp`
+// absorbed it), so the owning function's code region does not contain it.
+TEST(JumpTableRecoveryTest, ChainedSwitchTailIgnoresForeignCodeRange) {
+  std::vector<uint8_t> Text(0x2000, 0xcc);
+  const uint8_t Dispatch[] = {
+      0x41, 0x83, 0xe0, 0x0f,                   // and r8d, 0xf
+      0x48, 0x8d, 0x05, 0xf5, 0x6f, 0x00, 0x00, // lea rax, [0x8000]
+      0x4e, 0x63, 0x04, 0x80,                   // movsxd r8, [rax+r8*4]
+      0x49, 0x01, 0xc8,                         // add r8, rax
+      0x41, 0xff, 0xe0};                        // jmp r8
+  std::copy(std::begin(Dispatch), std::end(Dispatch), Text.begin());
+  // Ten case bodies below the dispatch and six above it, mirroring the
+  // real switch's layout.
+  const Va Cases[] = {Va(0x1400), Va(0x1500), Va(0x1600), Va(0x1700),
+                      Va(0x1800), Va(0x1900), Va(0x1a00), Va(0x1b00),
+                      Va(0x1c00), Va(0x1d00), Va(0x2000), Va(0x2100),
+                      Va(0x2200), Va(0x2300), Va(0x2400), Va(0x2500)};
+  for (Va C : Cases)
+    Text[C.Value - 0x1000] = 0xc3;
+
+  std::vector<uint8_t> Rdata(0x100, 0xcc);
+  for (size_t I = 0; I < std::size(Cases); ++I)
+    llvm::support::endian::write32le(Rdata.data() + 4 * I,
+                                     (uint32_t)(Cases[I].Value - 0x8000));
+  Image Img;
+  Img.Base = Va(0x1000);
+  Section Txt;
+  Txt.Name = ".text";
+  Txt.SecVa = Img.Base;
+  Txt.Vsize = Text.size();
+  Txt.Data = std::move(Text);
+  Txt.Flags = SectionFlags::rx();
+  Img.Sections.push_back(std::move(Txt));
+  Section RdataSec;
+  RdataSec.Name = ".rdata";
+  RdataSec.SecVa = Va(0x8000);
+  RdataSec.Vsize = Rdata.size();
+  RdataSec.Data = std::move(Rdata);
+  RdataSec.Flags = SectionFlags::r();
+  Img.Sections.push_back(std::move(RdataSec));
+
+  const Va DispatchIp = Img.Base;
+  std::vector<Instr> Instrs = decode(Img, DispatchIp, Va(0x1015));
+  ASSERT_EQ(Instrs.size(), 5u);
+  EXPECT_EQ(Instrs.back().Flow, FlowKind::IndirectBranch);
+  BasicBlock Block;
+  Block.Start = DispatchIp;
+  Block.End = Instrs.back().nextVa();
+  Block.InstrsBegin = 0;
+  Block.InstrsEnd = Instrs.size();
+  Block.EndKind = BlockEnd::UnresolvedIndirect;
+  std::vector<BasicBlock> Blocks{Block};
+  std::set<Va> Refs;
+  std::map<Va, uint64_t> Limits;
+
+  // The owning function's region ends long before the dispatch block, so
+  // every case body of this table sits outside it.
+  std::pair<Va, Va> ForeignRange{Va(0x3000), Va(0x3200)};
+  JumpTableCtx Ctx{Img, llvm::ArrayRef<std::pair<Va, Va>>(ForeignRange), Refs,
+                   Refs, Limits};
+  Hooks H;
+  auto Result = resolveJumpTable(Ctx, H, Blocks, Instrs, 0);
+  ASSERT_TRUE(Result);
+  EXPECT_EQ(Result->Table, Va(0x8000));
+  ASSERT_EQ(Result->Targets.size(), 16u);
+  for (Va C : Cases)
+    EXPECT_TRUE(llvm::any_of(Result->Targets,
+                             [&](const std::pair<Va, std::vector<int64_t>> &T) {
+                               return T.first == C;
+                             }))
+        << "missing case at " << C.Value;
+
+  // With the dispatch inside the region the old bound still applies: the
+  // walk stops at the first case body that lies outside it, so the six
+  // low-address cases past the tenth entry are never reached.
+  std::pair<Va, Va> OwnRange{Va(0x1000), Va(0x1e00)};
+  JumpTableCtx Own{Img, llvm::ArrayRef<std::pair<Va, Va>>(OwnRange), Refs,
+                   Refs, Limits};
+  auto Bounded = resolveJumpTable(Own, H, Blocks, Instrs, 0);
+  ASSERT_TRUE(Bounded);
+  ASSERT_EQ(Bounded->Targets.size(), 10u);
+  EXPECT_EQ(Bounded->Targets.front().first, Va(0x1400));
+  EXPECT_EQ(Bounded->Targets.back().first, Va(0x1d00));
+}
+
 } // namespace
