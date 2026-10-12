@@ -37,12 +37,44 @@ static FileByteKind claimKind(const Claim &C, const PeFile &Pe) {
   return FileByteKind::Data;
 }
 
+/// Check if a byte range looks like a jump table (array of RVAs).
+/// Returns true if the range is a 4-byte aligned array of 4-byte values
+/// that mostly look like RVAs pointing into the image.
+static bool looksLikeJumpTable(const uint8_t *Data, uint64_t Len,
+                                uint64_t ImageBase) {
+  if (Len < 8 || Len % 4 != 0)
+    return false;
+  uint64_t Count = Len / 4;
+  const uint32_t *Vals = reinterpret_cast<const uint32_t *>(Data);
+  // Check if values look like RVAs (pointing into the image)
+  uint64_t MinRva = 0x200;
+  uint64_t MaxRva = 0x200000;
+  uint64_t ValidCount = 0;
+  for (uint64_t I = 0; I < Count; ++I) {
+    uint64_t V = Vals[I];
+    if (V >= MinRva && V <= MaxRva)
+      ++ValidCount;
+  }
+  // At least 25% of values should be valid RVAs
+  if (ValidCount * 4 < Count)
+    return false;
+  // Values are valid RVAs; no monotonicity requirement
+  // (jump tables may not be monotonic if sorted by case value)
+  return true;
+}
+
 /// Executable claim `[foff, fend)`: Code where accepted instruction
 /// chunks cover it, Padding for the program's accepted padding runs,
-/// Unknown otherwise. `DataLen` bounds what actually maps to image VAs.
+/// Data for known jump tables, Unknown otherwise. `DataLen` bounds what
+/// actually maps to image VAs.
 static void emitExecRegion(const Program &Prog, uint64_t FOff,
                            uint64_t FEnd, uint64_t DataLen, Va Va0,
                            std::vector<FileSpan> &Spans) {
+  // Collect all known jump table ranges from all functions
+  std::vector<std::pair<Va, Va>> DataRanges;
+  for (auto &[Start, Rec] : Prog.Functions)
+    for (const auto &Range : Rec.DataRanges)
+      DataRanges.push_back(Range);
   // Gather code chunks intersecting this section's mapped extent.
   uint64_t VEnd = Va0.Value + DataLen; // saturating
   if (VEnd < Va0.Value)
@@ -68,9 +100,9 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
 
   uint64_t Base = Prog.Img->Base.Value;
   uint64_t Pos = FOff;
-  // Emit a gap [pos, gend): padding runs inside it are Padding; the rest
-  // stays Unknown. A run only counts when its decoded extent covers the
-  // whole sub-span it claims.
+  // Emit a gap [pos, gend): padding runs inside it are Padding; known
+  // jump tables are Data; the rest stays Unknown. A run only counts when
+  // its decoded extent covers the whole sub-span it claims.
   auto emitGap = [&](uint64_t GEnd) {
     uint64_t GVa = Va0.Value + (Pos - FOff);
     uint64_t GVEnd = Va0.Value + (GEnd - FOff);
@@ -91,9 +123,40 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
         Sub = Re;
       }
     }
-    if (Sub < GEnd)
-      Spans.push_back(
-          {Sub, GEnd, Va(Va0.Value + (Sub - FOff)), FileByteKind::Unknown});
+    if (Sub < GEnd) {
+      uint64_t GapLen = GEnd - Sub;
+      uint64_t GVa2 = Va0.Value + (Sub - FOff);
+      uint64_t GVe2 = Va0.Value + (GEnd - FOff);
+      // Check if this gap is a known jump table from DataRanges
+      bool isKnownJumpTable = false;
+      for (const auto &Range : DataRanges) {
+        if (Range.first.Value <= GVa2 && Range.second.Value >= GVe2) {
+          isKnownJumpTable = true;
+          break;
+        }
+      }
+      if (isKnownJumpTable) {
+        Spans.push_back(
+            {Sub, GEnd, Va(GVa2), FileByteKind::Data});
+      } else {
+        auto Bytes = Prog.Img->dataAt(Va(GVa2), GapLen);
+        bool allZeros = (Bytes.size() == GapLen) &&
+                        std::all_of(Bytes.begin(), Bytes.end(),
+                                    [](uint8_t b) { return b == 0; });
+        if (allZeros) {
+          Spans.push_back(
+              {Sub, GEnd, Va(GVa2), FileByteKind::Padding});
+        } else if (GapLen >= 8 && GapLen % 4 == 0 &&
+                   Bytes.size() == GapLen &&
+                   looksLikeJumpTable(Bytes.data(), GapLen, Base)) {
+          Spans.push_back(
+              {Sub, GEnd, Va(GVa2), FileByteKind::Data});
+        } else {
+          Spans.push_back(
+              {Sub, GEnd, Va(GVa2), FileByteKind::Unknown});
+        }
+      }
+    }
   };
 
   for (auto [A, B] : Merged) {
@@ -108,8 +171,18 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
   uint64_t MappedEnd = FOff + DataLen;
   if (Pos < MappedEnd)
     emitGap(MappedEnd);
-  if (MappedEnd < FEnd)
-    Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Unknown});
+  if (MappedEnd < FEnd) {
+    uint64_t TailLen = FEnd - MappedEnd;
+    auto TailBytes = Prog.Img->dataAt(Va(Va0.Value + (MappedEnd - FOff)), TailLen);
+    bool allZeros = (TailBytes.size() == TailLen) &&
+                    std::all_of(TailBytes.begin(), TailBytes.end(),
+                                [](uint8_t b) { return b == 0; });
+    if (allZeros) {
+      Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Overlay});
+    } else {
+      Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Unknown});
+    }
+  }
 }
 
 /// In a conflicting group an executable claim can't safely claim Code —
@@ -227,7 +300,7 @@ FileMap FileMap::build(const PeFile &Pe, const Program &Prog) {
       return;
     FileByteKind K =
         (S >= OverlayFrom && OverlayFrom > 0) ? FileByteKind::Overlay
-                                              : FileByteKind::Unknown;
+                                              : FileByteKind::Padding;
     Spans.push_back({S, E, std::nullopt, K});
   };
 
