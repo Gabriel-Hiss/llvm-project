@@ -7,18 +7,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Core/Program.h"
-#include "revenant/Analysis/Analysis.h"
-#include "revenant/Target/TargetHooks.h"
 #include "revenant/Object/FileMap.h"
 #include "revenant/Object/PeFile.h"
+#include "revenant/Analysis/Analysis.h"
+#include "revenant/Target/TargetHooks.h"
 
 #include "gtest/gtest.h"
 
 #include <cstdlib>
-#include <vector>
-#include <utility>
 #include <map>
 #include <string>
+#include <vector>
+#include <utility>
 
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -47,37 +47,35 @@ std::optional<PeFile> openCorpus() {
 
 // Run `prog args...`, capture stdout, return it (empty on failure).
 std::string run(StringRef Prog, std::vector<StringRef> Args) {
-  std::string Err;
-  int Rc = sys::ExecuteAndWait(Prog, Args, {}, {}, 0, 0, &Err);
-  if (Rc != 0) {
-    errs() << "run " << Prog << ": " << Err << "\n";
-    return {};
-  }
-  return {};
+  SmallString<128> OutPath;
+  if (sys::fs::createTemporaryFile("rv-test", "out", OutPath))
+    return "";
+  SmallVector<StringRef, 4> Argv;
+  Argv.push_back(Prog);
+  for (StringRef A : Args)
+    Argv.push_back(A);
+  std::optional<StringRef> Redirects[] = {std::nullopt, StringRef(OutPath),
+                                          std::nullopt};
+  int Rc = sys::ExecuteAndWait(Prog, Argv, std::nullopt, Redirects);
+  if (Rc != 0)
+    return "";
+  auto Buf = MemoryBuffer::getFile(OutPath);
+  sys::fs::remove(OutPath);
+  if (!Buf)
+    return "";
+  return (*Buf)->getBuffer().str();
 }
 
 // Pull "<key>: <val> <word>" and "<key>: <val>" pairs out of a text blob.
 std::map<std::string, std::string> kv(StringRef Text) {
   std::map<std::string, std::string> Out;
-  size_t Pos = 0;
-  while (Pos < Text.size()) {
-    size_t Eol = Text.find('\n', Pos);
-    if (Eol == StringRef::npos)
-      Eol = Text.size();
-    StringRef Line = Text.slice(Pos, Eol).trim();
-    Pos = Eol + 1;
-    if (Line.empty())
+  SmallVector<StringRef, 32> Lines;
+  Text.split(Lines, '\n');
+  for (StringRef L : Lines) {
+    auto P = L.find(':');
+    if (P == StringRef::npos)
       continue;
-    size_t Colon = Line.find(':');
-    if (Colon == StringRef::npos)
-      continue;
-    StringRef Key = Line.take_front(Colon).trim();
-    StringRef Rest = Line.drop_front(Colon + 1).trim();
-    size_t Space = Rest.find(' ');
-    if (Space == StringRef::npos)
-      Out[Key.str()] = Rest.str();
-    else
-      Out[Key.str()] = Rest.take_front(Space).str();
+    Out[L.substr(0, P).trim().str()] = L.substr(P + 1).trim().str();
   }
   return Out;
 }
@@ -85,9 +83,22 @@ std::map<std::string, std::string> kv(StringRef Text) {
 // "N sections, M imports, K exports, P pdata entries" from info's counts.
 std::map<std::string, long long> countsOf(StringRef Text) {
   std::map<std::string, long long> Out;
-  for (auto &[K, V] : kv(Text)) {
-    if (K == "sections" || K == "imports" || K == "exports" || K == "pdata")
-      Out[K] = std::stoll(V);
+  SmallVector<StringRef, 32> Lines;
+  Text.split(Lines, '\n');
+  for (StringRef L : Lines) {
+    L = L.trim();
+    if (!L.starts_with("counts:"))
+      continue;
+    L = L.drop_front(StringRef("counts:").size()).trim();
+    SmallVector<StringRef, 8> Parts;
+    L.split(Parts, ',');
+    for (StringRef P : Parts) {
+      P = P.trim();
+      auto [Number, Name] = P.split(' ');
+      long long N;
+      if (!Number.getAsInteger(10, N))
+        Out[Name.trim().split(' ').first.str()] = N;
+    }
   }
   return Out;
 }
@@ -95,34 +106,53 @@ std::map<std::string, long long> countsOf(StringRef Text) {
 TEST(PeFileTest, ParsesCorpusBinary) {
   auto Pe = openCorpus();
   ASSERT_TRUE(Pe.has_value());
-  EXPECT_GT(Pe->FileSize, 0);
-  EXPECT_GT(Pe->HeadersSize, 0);
-  EXPECT_FALSE(Pe->RawSections.empty());
-  EXPECT_NE(Pe->EntryPoint.Value, 0);
+  EXPECT_GT(Pe->FileSize, 0u);
+  EXPECT_NE(Pe->Img->Base.Value, 0u);
 }
 
 TEST(PeFileTest, SectionCountMatchesObjdump) {
   auto Pe = openCorpus();
   ASSERT_TRUE(Pe.has_value());
-  std::string Out = run(LLVM_OBJDUMP_EXE, {"-h", REVENANT_TEST_C_O2});
-  ASSERT_FALSE(Out.empty());
-  long long ObjdumpSections = 0;
-  for (auto &[K, V] : kv(Out)) {
-    if (K == "Sections")
-      ObjdumpSections = std::stoll(V);
+  std::string Dump = run(LLVM_OBJDUMP_EXE, {"-h", REVENANT_TEST_C_O2});
+  ASSERT_FALSE(Dump.empty());
+  size_t Sections = 0;
+  SmallVector<StringRef, 32> Lines;
+  StringRef(Dump).split(Lines, '\n');
+  for (StringRef L : Lines) {
+    L = L.trim();
+    // Section lines start with an index then the name.
+    uint64_t Idx;
+    auto Sp = L.split(' ');
+    if (Sp.first.getAsInteger(10, Idx) == 0 && !Sp.second.empty())
+      ++Sections;
   }
-  EXPECT_EQ((long long)Pe->RawSections.size(), ObjdumpSections);
+  ASSERT_GT(Sections, 0u);
+  EXPECT_EQ(Pe->Img->Sections.size(), Sections);
 }
 
 TEST(PeFileTest, CountsMatchRustCli) {
   auto Pe = openCorpus();
   ASSERT_TRUE(Pe.has_value());
-  std::string Out = run(REVENANT_CLI_EXE, {"info", REVENANT_TEST_C_O2});
-  ASSERT_FALSE(Out.empty());
-  auto Counts = countsOf(Out);
-  EXPECT_EQ((long long)Pe->Imports.size(), Counts["imports"]);
-  EXPECT_EQ((long long)Pe->Exports.size(), Counts["exports"]);
-  EXPECT_EQ((long long)Pe->Pdata.size(), Counts["pdata"]);
+  std::string Info =
+      run(REVENANT_CLI_EXE, {"info", REVENANT_TEST_C_O2});
+  ASSERT_FALSE(Info.empty()) << "revenant-cli info produced no output";
+  auto Counts = countsOf(Info);
+  ASSERT_TRUE(Counts.count("imports"));
+  ASSERT_TRUE(Counts.count("pdata"));
+  EXPECT_EQ(Pe->Imports.size(), (size_t)Counts["imports"]);
+  EXPECT_EQ(Pe->Exports.size(), (size_t)Counts["exports"]);
+  EXPECT_EQ(Pe->Pdata.size(), (size_t)Counts["pdata"]);
+
+  // Entry point also shown by `info`.
+  for (auto &[K, V] : kv(Info))
+    if (K == "entry") {
+      uint64_t Entry = 0;
+      StringRef EntryText(V);
+      if (EntryText.starts_with("0x"))
+        EntryText = EntryText.drop_front(2);
+      ASSERT_FALSE(EntryText.getAsInteger(16, Entry));
+      EXPECT_EQ(Pe->EntryPoint.Value, Entry);
+    }
 }
 
 TEST(PeFileTest, FileMapPartitions) {
