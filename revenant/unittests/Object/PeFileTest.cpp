@@ -357,4 +357,23 @@ TEST(PeFileTest, MidTableSliceIsData) {
   EXPECT_EQ(S->Kind, FileByteKind::Data);
 }
 
+// go-cards-o0: the 29-byte Go FIPS signature constant at file offset
+// 0x1eb242 sits between `eb 1d` (jmp over it) and `ret`. The branch
+// skips exactly the blob, so it is inline data, not Unknown.
+TEST(PeFileTest, JumpedOverBlobIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_GO_CARDS);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x1eb242);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
 } // end anonymous namespace

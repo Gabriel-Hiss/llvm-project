@@ -189,7 +189,20 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
                  looksLikeJumpTable(Bytes.data(), GapLen, *Prog.Img)) {
         Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
       } else {
-        Spans.push_back({S, E, Va(GVa2), FileByteKind::Unknown});
+        // A blob immediately after an unconditional branch that skips
+        // exactly its length is inline data (e.g. the Go signature
+        // constant behind `jmp end; blob; ret`).
+        bool JumpedOver = false;
+        if (GVa2 > Va0.Value) {
+          auto Prev = Prog.Img->dataAt(Va(GVa2 - 2), 2);
+          if (Prev.size() == 2 && Prev[0] == 0xEB &&
+              GVa2 - 2 + 2 + (int8_t)Prev[1] == GVe2)
+            JumpedOver = true;
+        }
+        if (JumpedOver)
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        else
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Unknown});
       }
     };
     uint64_t Sub = Pos;
