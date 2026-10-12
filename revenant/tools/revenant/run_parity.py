@@ -221,6 +221,10 @@ def canon(text, near_branch=False, ip_rel_memory=False,
     t = re.sub(r"\b(?:ds|ss):", "", t)
     t = _SCALE.sub(r"\2*\1", t)
     t = _NUMBER.sub(lambda m: f"#{_number_value(m.group(0))}", t)
+    # Negative displacement inside brackets (`[-8]`): convert to the
+    # unsigned 64-bit equivalent so it matches printers that render the
+    # same bytes as `[0FFFFFFFFFFFFFFF8h]`.
+    t = re.sub(r"\[-#(\d+)\]", lambda m: f"[#{str((1 << 64) - int(m.group(1)))}]", t)
     t = _WS.sub("", t)
     t = re.sub(r"^movabs", "mov", t)
     shift = re.fullmatch(r"(shl|shr|sal|sar|rol|ror|rcl|rcr)([^,]+)", t)
