@@ -246,4 +246,42 @@ TEST(PeFileTest, JumpTablesClassifiedAsData) {
   EXPECT_LT(unknownCount, 100) << "Unknown spans should be rare after jump table fix";
 }
 
+// audio-nodegraph-cl-o1.dll: .text raw slack [0xa37f0, 0xa3800) is 16
+// zero bytes past VirtualSize — unmapped linker fill, not Unknown.
+TEST(PeFileTest, ExecSlackZerosAreOverlay) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_AUDIO_CL_O1);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  Program Prog;
+  Prog.Img = Pe->Img;
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0xa37f0);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Offset, 0xa37f0u);
+  EXPECT_EQ(S->End, 0xa3800u);
+  EXPECT_EQ(S->Kind, FileByteKind::Overlay);
+  EXPECT_FALSE(S->SpanVa.has_value());
+}
+
+// audio-nodegraph-clang-o3.dll: .text raw slack [0xa3e66, 0xa4000) is
+// 410 0xcc bytes past VirtualSize — compiler fill, not Unknown.
+TEST(PeFileTest, ExecSlackInt3FillIsPadding) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_AUDIO_CLANG_O3);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  Program Prog;
+  Prog.Img = Pe->Img;
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0xa3e66);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Padding);
+  EXPECT_FALSE(S->SpanVa.has_value());
+}
+
 } // end anonymous namespace

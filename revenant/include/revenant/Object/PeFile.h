@@ -92,10 +92,13 @@ struct RawSection {
   uint64_t FileOffset = 0;
   /// Bytes claimed in the file (SizeOfRawData).
   uint64_t RawSize = 0;
-  /// Absolute VA of the mapped section.
   Va SecVa;
   /// Virtual size (mapped extent, may exceed `RawSize`).
   uint64_t VirtualSize = 0;
+  /// Raw bytes past the mapped extent (`min(VirtualSize, RawSize)` ..
+  /// `RawSize`): linker fill the image never maps. Empty when there is
+  /// no slack or the slack could not be read.
+  std::vector<uint8_t> RawSlack;
   bool Executable = false;
 };
 

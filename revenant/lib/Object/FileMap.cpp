@@ -66,9 +66,11 @@ static bool looksLikeJumpTable(const uint8_t *Data, uint64_t Len,
 /// Executable claim `[foff, fend)`: Code where accepted instruction
 /// chunks cover it, Padding for the program's accepted padding runs,
 /// Data for known jump tables, Unknown otherwise. `DataLen` bounds what
-/// actually maps to image VAs.
+/// actually maps to image VAs; `Slack` holds the file bytes past that
+/// extent (unmapped linker fill).
 static void emitExecRegion(const Program &Prog, uint64_t FOff,
                            uint64_t FEnd, uint64_t DataLen, Va Va0,
+                           llvm::ArrayRef<uint8_t> Slack,
                            std::vector<FileSpan> &Spans) {
   // Collect all known jump table ranges from all functions
   std::vector<std::pair<Va, Va>> DataRanges;
@@ -172,16 +174,21 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
   if (Pos < MappedEnd)
     emitGap(MappedEnd);
   if (MappedEnd < FEnd) {
-    uint64_t TailLen = FEnd - MappedEnd;
-    auto TailBytes = Prog.Img->dataAt(Va(Va0.Value + (MappedEnd - FOff)), TailLen);
-    bool allZeros = (TailBytes.size() == TailLen) &&
-                    std::all_of(TailBytes.begin(), TailBytes.end(),
-                                [](uint8_t b) { return b == 0; });
-    if (allZeros) {
-      Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Overlay});
-    } else {
-      Spans.push_back({MappedEnd, FEnd, std::nullopt, FileByteKind::Unknown});
-    }
+    // Raw slack past the mapped extent: the image cannot read it, so
+    // classify from the file bytes captured at parse time. Zeros are
+    // linker round-up fill (Overlay); compiler fill bytes are Padding.
+    bool HaveSlack = Slack.size() == (size_t)(FEnd - MappedEnd);
+    bool AllZeros =
+        HaveSlack && llvm::all_of(Slack, [](uint8_t b) { return b == 0; });
+    bool AllFill =
+        HaveSlack &&
+        llvm::all_of(Slack, [](uint8_t b) { return b == 0xcc || b == 0x90; });
+    FileByteKind TailKind = FileByteKind::Unknown;
+    if (AllZeros)
+      TailKind = FileByteKind::Overlay;
+    else if (AllFill)
+      TailKind = FileByteKind::Padding;
+    Spans.push_back({MappedEnd, FEnd, std::nullopt, TailKind});
   }
 }
 
@@ -326,13 +333,19 @@ FileMap FileMap::build(const PeFile &Pe, const Program &Prog) {
       uint64_t FOff = std::get<0>(C), FEnd = std::get<1>(C);
       Va Va0 = *std::get<2>(C);
       uint64_t DataLen = 0;
+      llvm::ArrayRef<uint8_t> Slack;
       for (const RawSection &S : Pe.RawSections)
         if (S.FileOffset == FOff && S.SecVa == Va0) {
           DataLen = mappedDataLen(S);
+          Slack = S.RawSlack;
           break;
         }
       DataLen = std::min(DataLen, FEnd - FOff);
-      emitExecRegion(Prog, FOff, FEnd, DataLen, Va0, Spans);
+      // FEnd may stop short of the raw extent at FileSize.
+      uint64_t SlackNeed = (FEnd - FOff) - DataLen;
+      if (Slack.size() > SlackNeed)
+        Slack = Slack.take_front(SlackNeed);
+      emitExecRegion(Prog, FOff, FEnd, DataLen, Va0, Slack, Spans);
     } else if (J - I == 1) {
       // Sole non-executable claim. Mapped extent: min(vsize, raw_size)
       // for sections; the header claim maps fully.
