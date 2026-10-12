@@ -1100,29 +1100,6 @@ static Va extendFillerTail(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
   return FillEnd;
 }
 
-/// Does the function's code region actually contain the dispatch block?
-/// The region comes from the owning function's `.pdata` extent, but a
-/// switch tail can be chained into a function whose range ends far
-/// earlier (a tail `jmp` that absorbed it, or a compiler-placed cold tail
-/// past the pdata end). Such a region cannot bound the table: every case
-/// body of that switch sits outside it, so the enumeration would stop on
-/// its very first entry.
-static bool regionCoversBlock(const JumpTableCtx &Ctx,
-                              const BasicBlock &Block,
-                              ArrayRef<Instr> Instrs) {
-  if (Ctx.CodeRanges.empty())
-    return true;
-  if (Block.InstrsBegin >= Instrs.size() ||
-      Block.InstrsEnd > Instrs.size() || Block.InstrsEnd == 0)
-    return true;
-  const Va Lo = Instrs[Block.InstrsBegin].Addr;
-  const Va Hi = Instrs[Block.InstrsEnd - 1].nextVa();
-  for (auto [S, E] : Ctx.CodeRanges)
-    if (Lo >= S && Hi <= E)
-      return true;
-  return false;
-}
-
 /// Entries an unbounded table enumeration accepts, in order:
 /// `(enumeration index, case-table slot index, target VA)`. Stops at the
 /// first unreadable entry, the first entry address some other
@@ -1209,16 +1186,7 @@ resolveUnbounded(const JumpTableCtx &Ctx, const JtInsnOps &Ops,
   auto LimIt = Ctx.Limits.find(EnumBase);
   if (LimIt != Ctx.Limits.end())
     Cap = std::min(Cap, LimIt->second);
-  // The region bound only makes sense while it contains the dispatch:
-  // a chained-in switch tail (see `regionCoversBlock`) leaves every case
-  // body of this table outside the function's range, and the walk would
-  // stop on its first entry. Without a usable range the section itself
-  // bounds the enumeration, which stops on the adjacent data structure
-  // its RIP-relative references expose.
-  JumpTableCtx WalkCtx = Ctx;
-  if (!regionCoversBlock(Ctx, B, Instrs))
-    WalkCtx.CodeRanges = {};
-  auto List = unboundedEntries(WalkCtx, Access, It.Tr, Cap, false);
+  auto List = unboundedEntries(Ctx, Access, It.Tr, Cap, false);
   std::map<Va, std::vector<int64_t>> Targets;
   uint64_t MaxSlot = 0;
   int64_t Offset = 0;
@@ -1502,11 +1470,6 @@ bogusTableEntryIndex(const JumpTableCtx &Ctx, const TargetHooks &Hooks,
   auto LimIt = Ctx.Limits.find(EnumBase);
   if (LimIt != Ctx.Limits.end())
     Cap = std::min(Cap, LimIt->second);
-  // Same dispatch-coverage rule as the enumeration itself: a region that
-  // misses the dispatch block would cut the overrun proof short.
-  JumpTableCtx WalkCtx = Ctx;
-  if (!regionCoversBlock(Ctx, Blocks[Dispatch], Instrs))
-    WalkCtx.CodeRanges = {};
   // The first entry whose address another operand references starts
   // the next data structure (a sibling table): this table ends there.
   // The reference may come from a block decoded after the first
@@ -1523,7 +1486,7 @@ bogusTableEntryIndex(const JumpTableCtx &Ctx, const TargetHooks &Hooks,
   }
   std::optional<uint64_t> Overrun;
   for (auto &[I, Slot, T] :
-       unboundedEntries(WalkCtx, *Access, It.Tr, Cap, true)) {
+       unboundedEntries(Ctx, *Access, It.Tr, Cap, true)) {
     (void)Slot;
     if (Straddles(T) || IsIndirect(T)) {
       Overrun = I;
