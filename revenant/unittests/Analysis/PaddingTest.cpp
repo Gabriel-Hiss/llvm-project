@@ -58,7 +58,7 @@ TEST(PaddingTest, WholeNopGapIsPadding) {
   Pe.Img = E.Img;
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
+      {".text", 0x400, 0x200, E.Base, 0x200, /*RawSlack=*/{}, /*Executable=*/true});
   auto Runs = decodePadding(Pe, C, {});
   ASSERT_EQ(Runs.size(), 1u);
   EXPECT_EQ(Runs[0].Start, 1u);
@@ -75,7 +75,7 @@ TEST(PaddingTest, MixedGapWithoutAlignedEndIsRejected) {
   Pe.Img = E.Img;
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
+      {".text", 0x400, 0x200, E.Base, 0x200, /*RawSlack=*/{}, /*Executable=*/true});
   EXPECT_TRUE(decodePadding(Pe, C, {}).empty());
 }
 
@@ -88,7 +88,7 @@ TEST(PaddingTest, Int3WholeGapIsPadding) {
   Pe.Img = E.Img;
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
+      {".text", 0x400, 0x200, E.Base, 0x200, /*RawSlack=*/{}, /*Executable=*/true});
   auto Runs = decodePadding(Pe, C, {});
   ASSERT_EQ(Runs.size(), 1u);
   EXPECT_EQ(Runs[0].Start, 1u);
@@ -104,7 +104,7 @@ TEST(PaddingTest, CallNextIsNotGapPadding) {
   Pe.Img = E.Img;
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
+      {".text", 0x400, 0x200, E.Base, 0x200, /*RawSlack=*/{}, /*Executable=*/true});
   EXPECT_TRUE(decodePadding(Pe, C, {}).empty());
 }
 
@@ -125,7 +125,7 @@ TEST(PaddingTest, MultiByteNopIsPadding) {
   Pe.Img = E.Img;
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
+      {".text", 0x400, 0x200, E.Base, 0x200, /*RawSlack=*/{}, /*Executable=*/true});
   auto Runs = decodePadding(Pe, C, {});
   ASSERT_EQ(Runs.size(), 1u);
   EXPECT_EQ(Runs[0].Start, 1u);
@@ -140,7 +140,7 @@ TEST(PaddingTest, XchgAxAxIsPadding) {
   Pe.Img = E.Img;
   Pe.FileSize = 0x1000;
   Pe.RawSections.push_back(
-      {".text", 0x400, 0x200, E.Base, 0x200, /*Executable=*/true});
+      {".text", 0x400, 0x200, E.Base, 0x200, /*RawSlack=*/{}, /*Executable=*/true});
   auto Runs = decodePadding(Pe, C, {});
   ASSERT_EQ(Runs.size(), 1u);
   EXPECT_EQ(Runs[0].Start, 1u);
