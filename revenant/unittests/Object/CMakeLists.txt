@@ -14,5 +14,7 @@ target_compile_definitions(RevenantObjectTests PRIVATE
   REVENANT_TEST_JSON_CL_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/json-cl-o2/json-cl-o2.exe"
   REVENANT_TEST_GO_UNOPTIMIZED="C:/Users/User/RustroverProjects/Revenant/target/parity/go-unoptimized/divisiveis.exe"
   REVENANT_TEST_GO_CARDS="C:/Users/User/RustroverProjects/Revenant/target/parity/go-cards-o0/cr-card-counter.exe"
+  REVENANT_TEST_BACKUPD="C:/Users/User/RustroverProjects/Revenant/target/parity/backupd-o0/backupD.exe"
+  REVENANT_TEST_LUA_GCC="C:/Users/User/RustroverProjects/Revenant/target/parity/lua-gcc-o0/lua-gcc-o0.exe"
   REVENANT_CLI_EXE="C:/Users/User/RustroverProjects/Revenant/target/release/revenant-cli.exe"
   LLVM_OBJDUMP_EXE="${LLVM_TOOLS_BINARY_DIR}/llvm-objdump.exe")

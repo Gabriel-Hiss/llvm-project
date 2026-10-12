@@ -376,4 +376,41 @@ TEST(PeFileTest, JumpedOverBlobIsData) {
   EXPECT_EQ(S->Kind, FileByteKind::Data);
 }
 
+// backupd-o0: file offset 0x1f92b47 holds a 74-byte ASCII string
+// ("Montgomery Multiplication for x86_64, CRYPTOGAMS...") compiled
+// into .text — inline string data, not Unknown.
+TEST(PeFileTest, AsciiLiteralIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_BACKUPD);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x1f92b47);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
+// lua-gcc-o0: file offset 0x45ce0 holds {1.0, 1/sqrt(2)} doubles boxed
+// between a NOP padding run and x87 code — a literal pool constant.
+TEST(PeFileTest, LiteralPoolAfterPaddingIsData) {
+  auto Buf = MemoryBuffer::getFile(REVENANT_TEST_LUA_GCC);
+  ASSERT_TRUE(Buf);
+  StringRef Data = (*Buf)->getBuffer();
+  auto Pe = PeFile::parse(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(Data.data()), Data.size()));
+  ASSERT_TRUE(!!Pe);
+  auto Hooks = createX86TargetHooks();
+  ASSERT_TRUE(Hooks);
+  Program Prog = analyze(*Pe, *Hooks);
+  FileMap Map = FileMap::build(*Pe, Prog);
+  const FileSpan *S = Map.spanAt(0x45ce0);
+  ASSERT_TRUE(S);
+  EXPECT_EQ(S->Kind, FileByteKind::Data);
+}
+
 } // end anonymous namespace

@@ -106,6 +106,25 @@ static bool looksLikeJumpTable(const uint8_t *Data, uint64_t Len,
   return ExecAny >= 3 && ExecAny * 5 >= Count * 2;
 }
 
+// True when every byte is ASCII printable or whitespace: compiler-
+// generated string literals embedded in .text (e.g. backupd's BoringSSL
+// "Montgomery Multiplication for x86_64" strings).
+static bool isAsciiLiteral(const uint8_t *Data, uint64_t Len) {
+  uint64_t Printable = 0, Fill = 0;
+  for (uint64_t I = 0; I < Len; ++I) {
+    if (Data[I] == 0)
+      continue; // terminator or alignment tail
+    if (Data[I] == 0x90 || Data[I] == 0xcc) {
+      ++Fill; // alignment fill between the string and the next function
+      continue;
+    }
+    if (!(Data[I] >= 0x20 && Data[I] <= 0x7E))
+      return false;
+    ++Printable;
+  }
+  return Printable >= 8 && Fill * 4 <= Len;
+}
+
 /// Executable claim `[foff, fend)`: Code where accepted instruction
 /// chunks cover it, Padding for the program's accepted padding runs,
 /// Data for known jump tables, Unknown otherwise. `DataLen` bounds what
@@ -154,7 +173,7 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
     // Classify an unclaimed sub-range [s, e): a known jump table is
     // Data, all-zero is Padding, a table-looking byte run is Data, and
     // anything else stays Unknown.
-    auto emitSub = [&](uint64_t S, uint64_t E) {
+    auto emitSub = [&](uint64_t S, uint64_t E, bool FollowsPad = false) {
       if (S >= E)
         return;
       uint64_t GapLen = E - S;
@@ -201,11 +220,20 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
         }
         if (JumpedOver)
           Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        else if (GapLen >= 8 && Bytes.size() == GapLen &&
+                 isAsciiLiteral(Bytes.data(), GapLen))
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
+        else if (FollowsPad)
+          // Nonzero bytes boxed between a padding run and code are the
+          // compiler's literal pool (e.g. GCC's x87 constant pool
+          // behind `dd 05 disp32`).
+          Spans.push_back({S, E, Va(GVa2), FileByteKind::Data});
         else
           Spans.push_back({S, E, Va(GVa2), FileByteKind::Unknown});
       }
     };
     uint64_t Sub = Pos;
+    bool PrevWasPadding = false;
     for (const PaddingRun &Run : Prog.Padding) {
       if (Base + Run.End <= GVa)
         continue;
@@ -213,16 +241,19 @@ static void emitExecRegion(const Program &Prog, uint64_t FOff,
         break;
       uint64_t Rs = std::max(FOff + (Base + Run.Start - Va0.Value), Pos);
       uint64_t Re = std::min(FOff + (Base + Run.End - Va0.Value), GEnd);
-      if (Rs > Sub)
-        emitSub(Sub, Rs);
+      if (Rs > Sub) {
+        emitSub(Sub, Rs, PrevWasPadding);
+        PrevWasPadding = false;
+      }
       if (Rs < Re) {
         Spans.push_back(
             {Rs, Re, Va(Va0.Value + (Rs - FOff)), FileByteKind::Padding});
         Sub = Re;
+        PrevWasPadding = true;
       }
     }
     if (Sub < GEnd)
-      emitSub(Sub, GEnd);
+      emitSub(Sub, GEnd, PrevWasPadding);
   };
 
   for (auto [A, B] : Merged) {
