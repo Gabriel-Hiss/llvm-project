@@ -298,10 +298,12 @@ FileMap FileMap::build(const PeFile &Pe, const Program &Prog) {
   auto pushGap = [&](uint64_t S, uint64_t E) {
     if (S >= E)
       return;
-    FileByteKind K =
-        (S >= OverlayFrom && OverlayFrom > 0) ? FileByteKind::Overlay
-                                              : FileByteKind::Padding;
-    Spans.push_back({S, E, std::nullopt, K});
+    // Bytes past the last claimed region are Overlay
+    if (S >= OverlayFrom && OverlayFrom > 0) {
+      Spans.push_back({S, E, std::nullopt, FileByteKind::Overlay});
+      return;
+    }
+    Spans.push_back({S, E, std::nullopt, FileByteKind::Padding});
   };
 
   size_t I = 0;
