@@ -818,11 +818,7 @@ Value *LiftState::memPtr(const Instr &I, unsigned L) {
   return B.CreateIntToPtr(Addr, ptrTy(), "p");
 }
 
-Value *LiftState::globalPtr(Va Addr) {
-  if (auto It = Globals.find(Addr); It != Globals.end())
-    return It->second;
-  std::string Name;
-  std::optional<std::vector<uint8_t>> Init;
+std::string lift::globalNameFor(const Program &P, Va Addr) {
   if (P.Strings) {
     if (auto It = P.Strings->find(Addr); It != P.Strings->end()) {
       const std::string &S = It->second;
@@ -831,29 +827,32 @@ Value *LiftState::globalPtr(Va Addr) {
       for (char C : S)
         if ((unsigned char)C > 0x7e || (unsigned char)C < 0x20)
           Ascii = false;
-      Name = Ascii ? "a" + San : "str_" + utohexstr(Addr.Value, true);
-      Init = std::vector<uint8_t>(S.begin(), S.end());
+      return Ascii ? "a" + San : "str_" + utohexstr(Addr.Value, true);
     }
   }
-  if (Name.empty() && P.Functions.count(Addr)) {
-    std::string N;
+  if (P.Functions.count(Addr)) {
     if (P.Names)
       if (auto It = P.Names->find(Addr); It != P.Names->end())
-        N = "f_" + sanitizeName(It->second);
-    if (N.empty())
-      N = "f_" + utohexstr(Addr.Value, true);
-    Name = N;
+        return "f_" + sanitizeName(It->second);
+    return "f_" + utohexstr(Addr.Value, true);
   }
-  if (Name.empty() && P.Names) {
-    if (auto It = P.Names->find(Addr); It != P.Names->end()) {
-      Name = sanitizeName(It->second);
-      Init = P.Img->readAtMost(Addr, 4096);
-    }
+  if (P.Names)
+    if (auto It = P.Names->find(Addr); It != P.Names->end())
+      return sanitizeName(It->second);
+  return "g_" + utohexstr(Addr.Value, true);
+}
+
+Value *LiftState::globalPtr(Va Addr) {
+  if (auto It = Globals.find(Addr); It != Globals.end())
+    return It->second;
+  std::string Name = globalNameFor(P, Addr);
+  std::optional<std::vector<uint8_t>> Init;
+  if (P.Strings) {
+    if (auto It = P.Strings->find(Addr); It != P.Strings->end())
+      Init = std::vector<uint8_t>(It->second.begin(), It->second.end());
   }
-  if (Name.empty()) {
-    Name = "g_" + utohexstr(Addr.Value, true);
+  if (!Init && !P.Functions.count(Addr))
     Init = P.Img->readAtMost(Addr, 4096);
-  }
   unsigned Sz = Init ? (unsigned)Init->size() : 16;
   if (Sz == 0)
     Sz = 16;

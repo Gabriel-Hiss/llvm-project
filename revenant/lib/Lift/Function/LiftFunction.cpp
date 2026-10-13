@@ -83,6 +83,28 @@ static const Signature *signatureFor(const Signatures *Sigs, Va Addr) {
   return Sigs ? Sigs->of(Addr) : nullptr;
 }
 
+std::string lift::definitionName(const FuncRecord &F) {
+  return F.Name.empty() ? llvm::formatv("sub_{0:x}", F.Start.Value).str()
+                        : sanitizeName(F.Name);
+}
+
+llvm::Function *lift::claimDefinition(llvm::Module &M, llvm::StringRef Name,
+                                      const Signature *Sig) {
+  llvm::FunctionType *FT = functionType(M.getContext(), Sig);
+  if (llvm::Function *Old = M.getFunction(Name)) {
+    if (!Old->empty())
+      return nullptr;
+    // A previous callee decl with the same name: keep it only when the type
+    // already matches; else rename the old decl out of the way.
+    if (Old->getFunctionType() != FT)
+      Old->setName(Name + ".decl");
+  }
+  if (llvm::Function *Old = M.getFunction(Name))
+    return Old;
+  return llvm::cast<llvm::Function>(
+      M.getOrInsertFunction(Name, FT).getCallee());
+}
+
 static void attachVa(llvm::Instruction *I, uint64_t VA) {
   if (I)
     ir::setInstructionVA(*I, VA);
@@ -329,26 +351,12 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     return StackOrErr.takeError();
 
   const Signature *Sig = signatureFor(Sigs, F.Start);
-  llvm::FunctionType *FT = functionType(M.getContext(), Sig);
-  std::string Name = F.Name.empty()
-                         ? llvm::formatv("sub_{0:x}", F.Start.Value).str()
-                         : sanitizeName(F.Name);
-  if (llvm::Function *Old = M.getFunction(Name)) {
-    if (!Old->empty())
-      return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                     "function already defined: %s",
-                                     Name.c_str());
-    // A previous callee decl with the same name: keep it only when the type
-    // already matches; else rename the old decl out of the way.
-    if (Old->getFunctionType() != FT)
-      Old->setName(Name + ".decl");
-  }
-  llvm::Function *Fn = nullptr;
-  if (llvm::Function *Old = M.getFunction(Name)) {
-    Fn = Old;
-  } else {
-    Fn = llvm::cast<llvm::Function>(M.getOrInsertFunction(Name, FT).getCallee());
-  }
+  std::string Name = definitionName(F);
+  llvm::Function *Fn = claimDefinition(M, Name, Sig);
+  if (!Fn)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "function already defined: %s",
+                                   Name.c_str());
   ir::setFunctionVA(*Fn, F.Start.Value);
   if (auto It = P.Embedded.find(F.Start); It != P.Embedded.end()) {
     const EmbeddedFunctionMetadata &Meta = It->second;

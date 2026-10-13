@@ -142,6 +142,21 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
 /// file and frame, the simplifycfg options keep the CFG close to the asm.
 llvm::StringRef liftCleanupPasses();
 
+/// The name the lifter requests for a global at `Addr`, before LLVM's
+/// module-level uniquing appends `.N`. Each lifted function creates its own
+/// global per address, so the final names depend on lift order.
+std::string globalNameFor(const Program &P, Va Addr);
+
+/// The module name `liftFunction` gives the definition of `F`.
+std::string definitionName(const FuncRecord &F);
+
+/// What `liftFunction` does to `M` before lifting a body named `Name` with
+/// signature `Sig`: reuse a declaration of the same type, or rename a
+/// clashing declaration to `Name.decl` and declare `Name` anew. Returns the
+/// function the body goes into, or null when `Name` is already defined.
+llvm::Function *claimDefinition(llvm::Module &M, llvm::StringRef Name,
+                                const Signature *Sig);
+
 } // namespace lift
 } // namespace revenant
 
