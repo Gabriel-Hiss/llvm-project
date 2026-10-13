@@ -40,7 +40,10 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "X86BaseInfo.h"
 #include "llvm/ADT/DenseSet.h"
@@ -54,6 +57,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/TargetParser/Triple.h"
 
 using namespace llvm;
@@ -234,7 +238,10 @@ SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
                           std::vector<StageReport> &Reports,
                           CxxFlavor Flavor,
-                          const DenseSet<llvm::Function *> *UserFns) {
+                          const DenseSet<llvm::Function *> *UserFns,
+                          bool Guarded,
+                          function_ref<void(size_t, llvm::Function &)>
+                              AfterRun = nullptr) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -246,10 +253,21 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   PB.registerCGSCCAnalyses(CGAM);
   PB.registerModuleAnalyses(MAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-  // Verify each function pass independently and retain its last valid body.
   if (!Pipeline.consume_front("function(") || !Pipeline.consume_back(")"))
     return createStringError("expected a function pipeline");
   auto Passes = pipelineElements(Pipeline);
+  // Build one single-pass manager per pass up front. Both paths keep the
+  // original pass-major order (every function sees pass N before any
+  // function sees pass N+1): some passes read callees and callers, so
+  // reordering changes results. Unguarded runs with no clone and no
+  // per-function verify; the caller restores the stage input and reruns
+  // guarded if the stage verify at the end fails. Guarded is the original
+  // algorithm: clone, run one pass, verify, restore on failure. Function
+  // passes are not run concurrently over one module: passes mutate use
+  // lists of shared callees and globals and create constants in one
+  // LLVMContext, none of which is locked; a threaded attempt corrupted
+  // Value use lists within seconds.
+  std::vector<FunctionPassManager> Managers;
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
     if (Pass == "revenant-uncxx")
@@ -257,33 +275,48 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
     else if (Error E = PB.parsePassPipeline(FPM, Pass))
       return createStringError("pipeline '" + Pass.str() +
                                "': " + toString(std::move(E)));
+    Managers.push_back(std::move(FPM));
+  }
+  auto RestoreFrom = [](llvm::Function *F, llvm::Function *Saved,
+                        FunctionAnalysisManager &FAM) {
+    std::string Name = F->getName().str();
+    FAM.clear(*F, Name);
+    F->deleteBody();
+    F->copyAttributesFrom(Saved);
+    ValueToValueMapTy RestoreMap;
+    RestoreMap[Saved] = F;
+    auto Dest = F->arg_begin();
+    for (Argument &A : Saved->args())
+      RestoreMap[&A] = &*Dest++;
+    SmallVector<ReturnInst *, 8> Returns;
+    CloneFunctionInto(F, Saved, RestoreMap,
+                      CloneFunctionChangeType::LocalChangesOnly, Returns);
+  };
+  for (size_t I = 0; I < Managers.size(); ++I) {
     SmallVector<llvm::Function *, 32> Functions;
     for (llvm::Function &F : M)
       if (!F.isDeclaration())
         Functions.push_back(&F);
     for (llvm::Function *F : Functions) {
-      FunctionStageTrace Trace(Stage, Pass, F->getName());
+      if (!Guarded) {
+        FunctionStageTrace Trace(Stage, Passes[I], F->getName());
+        Managers[I].run(*F, FAM);
+        if (AfterRun)
+          AfterRun(I, *F);
+        continue;
+      }
+      FunctionStageTrace Trace(Stage, Passes[I], F->getName());
       ValueToValueMapTy SavedMap;
       llvm::Function *Saved = CloneFunction(F, SavedMap);
-      FPM.run(*F, FAM);
+      Managers[I].run(*F, FAM);
       std::string Message;
       raw_string_ostream OS(Message);
       if (verifyFunction(*F, &OS)) {
         std::string Name = F->getName().str();
-        FAM.clear(*F, Name);
-        F->deleteBody();
-        F->copyAttributesFrom(Saved);
-        ValueToValueMapTy RestoreMap;
-        RestoreMap[Saved] = F;
-        auto Dest = F->arg_begin();
-        for (Argument &A : Saved->args())
-          RestoreMap[&A] = &*Dest++;
-        SmallVector<ReturnInst *, 8> Returns;
-        CloneFunctionInto(F, Saved, RestoreMap,
-                          CloneFunctionChangeType::LocalChangesOnly, Returns);
+        RestoreFrom(F, Saved, FAM);
         record(Reports, Stage, "failed",
-               Name + ": " + Pass.str() + ": " + Message);
-        errs() << "[failed] " << Stage << ": " << Name << ": " << Pass
+               Name + ": " + Passes[I].str() + ": " + Message);
+        errs() << "[failed] " << Stage << ": " << Name << ": " << Passes[I]
                << ": " << Message;
       }
       Saved->eraseFromParent();
@@ -334,7 +367,8 @@ Error runModulePass(Module &M, StringRef Pass) {
 Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
                       StringRef Pipeline, std::vector<StageReport> &Reports,
                       CxxFlavor Flavor = CxxFlavor::Auto,
-                      const DenseSet<llvm::Function *> *UserFns = nullptr) {
+                      const DenseSet<llvm::Function *> *UserFns = nullptr,
+                      StringRef InputText = "") {
   // Validate the whole pipeline first: unknown pass names are configuration
   // errors, not recoverable failures of a particular function or module.
   PassBuilder PB;
@@ -342,26 +376,55 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
   ModulePassManager Parsed;
   if (Error E = PB.parsePassPipeline(Parsed, Pipeline))
     return E;
-  for (StringRef Element : pipelineElements(Pipeline)) {
-    if (Element.starts_with("function(")) {
-      if (Error E =
-              runFunctionPipeline(Stage, *M, Element, Reports, Flavor, UserFns))
-        return E;
-      continue;
+  auto RunAll = [&](bool Guarded) -> Error {
+    for (StringRef Element : pipelineElements(Pipeline)) {
+      if (Element.starts_with("function(")) {
+        if (Error E = runFunctionPipeline(Stage, *M, Element, Reports,
+                                          Flavor, UserFns, Guarded))
+          return E;
+        continue;
+      }
+      FunctionStageTrace Trace(Stage, Element, "module");
+      auto Saved = CloneModule(*M);
+      // Analysis managers die inside runModulePass before the module is
+      // swapped.
+      if (Error E = runModulePass(*M, Element)) {
+        std::string Message = toString(std::move(E));
+        M.swap(Saved);
+        record(Reports, Stage, "failed",
+               "module: " + Element.str() + ": " + Message);
+        errs() << "[failed] " << Stage << ": module: " << Element << ": "
+               << Message << "\n";
+      }
     }
-    FunctionStageTrace Trace(Stage, Element, "module");
-    auto Saved = CloneModule(*M);
-    // Analysis managers die inside runModulePass before the module is swapped.
-    if (Error E = runModulePass(*M, Element)) {
-      std::string Message = toString(std::move(E));
+    return verifyStage(Stage, *M);
+  };
+  // Insurance is paid only on failure. When the caller already holds the
+  // stage input as text (the common path), restore by reparsing it; the
+  // old premium was one module clone per stage plus one function clone
+  // and one full verify per function, which cost more than the passes.
+  // Without input text, fall back to one upfront module clone per stage.
+  std::unique_ptr<Module> Saved;
+  if (InputText.empty())
+    Saved = CloneModule(*M);
+  if (Error E = RunAll(/*Guarded=*/false)) {
+    errs() << "[failed] " << Stage << ": " << toString(std::move(E)) << "\n";
+    if (Saved) {
       M.swap(Saved);
-      record(Reports, Stage, "failed",
-             "module: " + Element.str() + ": " + Message);
-      errs() << "[failed] " << Stage << ": module: " << Element << ": "
-             << Message << "\n";
+    } else {
+      SMDiagnostic ParseErr;
+      std::unique_ptr<Module> Restored =
+          parseIR(MemoryBufferRef(InputText, Stage), ParseErr,
+                  M->getContext());
+      if (!Restored)
+        return createStringError("failed to restore stage input for " +
+                                 Stage.str() + ": " +
+                                 ParseErr.getMessage().str());
+      M.swap(Restored);
     }
+    return RunAll(/*Guarded=*/true);
   }
-  return verifyStage(Stage, *M);
+  return Error::success();
 }
 
 /// Enable struct-layout recovery and its associated debug types only when
