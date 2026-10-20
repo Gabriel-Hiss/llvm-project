@@ -937,9 +937,17 @@ revenant::UncxxPass::run(llvm::Function &F, llvm::FunctionAnalysisManager &) {
     if (!Name || Name->getString() != "cpp")
       return llvm::PreservedAnalyses::all();
   }
-  CxxFlavor Fl = Flavor == CxxFlavor::Auto
-                     ? uncxx::flavorOf(*F.getParent())
-                     : Flavor;
+  CxxFlavor Fl = Flavor;
+  if (Fl == CxxFlavor::Auto) {
+    // The flavor is a property of the module's symbols; inferring it walks
+    // every function and global name, so it is done once per module.
+    if (!FlavorResolved || CachedModule != F.getParent()) {
+      CachedFlavor = uncxx::flavorOf(*F.getParent());
+      CachedModule = F.getParent();
+      FlavorResolved = true;
+    }
+    Fl = CachedFlavor;
+  }
   unsigned N = 0;
   const llvm::DataLayout &DL = F.getParent()->getDataLayout();
   // Block idioms first: they consume calls (grow/reallocate) the scalar

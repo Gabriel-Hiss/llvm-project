@@ -38,6 +38,10 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/PassManager.h"
 
+namespace llvm {
+class Module;
+}
+
 namespace revenant {
 
 /// STL implementation flavor. `Auto` infers from module symbols and target.
@@ -46,6 +50,12 @@ enum class CxxFlavor { Auto, Msvc, Gnu, Libcxx };
 class UncxxPass : public llvm::PassInfoMixin<UncxxPass> {
   CxxFlavor Flavor = CxxFlavor::Auto;
   const llvm::DenseSet<llvm::Function *> *UserFns = nullptr;
+  // The STL flavor is a property of the module's symbols, but inferring it
+  // scans every function and global name. The pass object outlives the
+  // per-function runs, so the inference is done once per module.
+  CxxFlavor CachedFlavor = CxxFlavor::Auto;
+  const llvm::Module *CachedModule = nullptr;
+  bool FlavorResolved = false;
 
 public:
   explicit UncxxPass(CxxFlavor F = CxxFlavor::Auto,
