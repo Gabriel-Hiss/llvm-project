@@ -920,11 +920,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     std::vector<std::string> GlobalOrder;
     uint32_t SerialGlobalCounter = 0;
     {
+      // Parallel lift+clean is the default source path; REVENANT_PARALLEL_CLEAN=0
+      // restores the serial algorithm (useful for debugging or artifact parity).
       const char *PC = std::getenv("REVENANT_PARALLEL_CLEAN");
       unsigned Threads = std::thread::hardware_concurrency();
       if (const char *V = std::getenv("REVENANT_THREADS"))
         Threads = std::max(1u, static_cast<unsigned>(std::atoi(V)));
-      bool Wanted = PC && StringRef(PC) == "1" && Threads > 1 &&
+      bool Wanted = (!PC || StringRef(PC) != "0") && Threads > 1 &&
                     Todo.size() >= 256 && Opts.Emit == EmitKind::Source &&
                     !structDIEnabled();
       if (Wanted) {
