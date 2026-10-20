@@ -216,13 +216,27 @@ std::optional<Function> function(const Program &P, Va Start) {
 }
 
 const FuncRecord *functionAt(const Program &P, Va Address) {
-  for (const auto &[Start, F] : P.Functions) {
-    (void)Start;
-    for (const auto &[A, B] : F.Chunks)
-      if (Address >= A && Address < B)
-        return &F;
+  if (!P.ChunkIndexBuilt) {
+    P.ChunkIndexBuilt = true;
+    P.ChunkIndex.clear();
+    for (const auto &[Start, F] : P.Functions) {
+      (void)Start;
+      for (const auto &[A, B] : F.Chunks)
+        if (B > A)
+          P.ChunkIndex.emplace_back(A.Value, B.Value, &F);
+    }
+    llvm::sort(P.ChunkIndex,
+               [](const auto &X, const auto &Y) {
+                 return std::get<0>(X) < std::get<0>(Y);
+               });
   }
-  return nullptr;
+  auto It = llvm::partition_point(
+      P.ChunkIndex,
+      [Address](const auto &Entry) { return std::get<0>(Entry) <= Address.Value; });
+  if (It == P.ChunkIndex.begin())
+    return nullptr;
+  --It;
+  return Address.Value < std::get<1>(*It) ? std::get<2>(*It) : nullptr;
 }
 
 const PaddingRun *paddingAt(const Program &P, Rva RVA) {

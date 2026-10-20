@@ -216,12 +216,12 @@ Expected<std::shared_ptr<const lift::Signatures>>
 recoverSignatures(Program &Prog, const Disasm &Dis, StringRef LibraryDBPath) {
   revenant::Signatures A = revenant::analyzeSignatures(Prog, Dis);
   if (!LibraryDBPath.empty()) {
-    auto DB = LibraryDatabase::load(LibraryDBPath);
+    auto DB = loadLibraryDatabaseCached(LibraryDBPath);
     if (!DB)
       return DB.takeError();
-    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DB);
-    extendLibraryMatchesByCalleeEvidence(Prog, *DB, Matches);
-    applyLibraryMatches(Prog, A, Matches, *DB);
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, **DB);
+    extendLibraryMatchesByCalleeEvidence(Prog, **DB, Matches);
+    applyLibraryMatches(Prog, A, Matches, **DB);
   }
   auto Out = std::make_shared<lift::Signatures>();
   for (const auto &[At, S] : A.Funcs)
@@ -404,12 +404,18 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
         continue;
       }
       FunctionStageTrace Trace(Stage, Element, "module");
-      auto Saved = CloneModule(*M);
+      // Restore-on-failure: when the caller supplies the stage input as
+      // text (the common path), reparsing it is cheaper than cloning the
+      // whole module; clone only when no text is available.
+      std::unique_ptr<Module> Saved;
+      if (InputText.empty())
+        Saved = CloneModule(*M);
       // Analysis managers die inside runModulePass before the module is
       // swapped.
       if (Error E = runModulePass(*M, Element)) {
         std::string Message = toString(std::move(E));
-        M.swap(Saved);
+        if (Saved)
+          M.swap(Saved);
         record(Reports, Stage, "failed",
                "module: " + Element.str() + ": " + Message);
         errs() << "[failed] " << Stage << ": module: " << Element << ": "
@@ -924,11 +930,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     std::vector<std::string> GlobalOrder;
     uint32_t SerialGlobalCounter = 0;
     {
+      // Parallel lift+clean is the default source path; REVENANT_PARALLEL_CLEAN=0
+      // restores the serial algorithm (useful for debugging or artifact parity).
       const char *PC = std::getenv("REVENANT_PARALLEL_CLEAN");
       unsigned Threads = std::thread::hardware_concurrency();
       if (const char *V = std::getenv("REVENANT_THREADS"))
         Threads = std::max(1u, static_cast<unsigned>(std::atoi(V)));
-      bool Wanted = PC && StringRef(PC) == "1" && Threads > 1 &&
+      bool Wanted = (!PC || StringRef(PC) != "0") && Threads > 1 &&
                     Todo.size() >= 256 && Opts.Emit == EmitKind::Source &&
                     !structDIEnabled();
       if (Wanted) {

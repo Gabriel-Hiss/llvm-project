@@ -19,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "llvm/ADT/SmallVector.h"
@@ -448,6 +449,11 @@ struct Program {
   /// Executable export VAs (non-forwarders): external callers read their
   /// return values outside the image.
   std::set<Va> Exports;
+  /// Sorted (lo, hi, function) chunk index for `functionAt`, rebuilt lazily
+  /// when `Functions` changes.
+  mutable std::vector<std::tuple<uint64_t, uint64_t, const FuncRecord *>>
+      ChunkIndex;
+  mutable bool ChunkIndexBuilt = false;
 };
 
 } // end namespace revenant

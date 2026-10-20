@@ -226,16 +226,17 @@ Expected<FunctionClassification>
 Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   FunctionClassification Result;
   if (!LibraryDBPath.empty()) {
-    auto DBOrErr = LibraryDatabase::load(LibraryDBPath);
+    auto DBOrErr = loadLibraryDatabaseCached(LibraryDBPath);
     if (!DBOrErr)
       return DBOrErr.takeError();
-    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DBOrErr);
-    extendLibraryMatchesByCalleeEvidence(Prog, *DBOrErr, Matches);
+    const LibraryDatabase &DB = **DBOrErr;
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, DB);
+    extendLibraryMatchesByCalleeEvidence(Prog, DB, Matches);
     for (const LibraryMatch &Match : Matches) {
       Result.LibraryStarts.insert(Match.Start);
-      if (Match.FunctionIndex < DBOrErr->Functions.size())
+      if (Match.FunctionIndex < DB.Functions.size())
         Result.LibraryNames[Match.Start] =
-            DBOrErr->Functions[Match.FunctionIndex].Name;
+            DB.Functions[Match.FunctionIndex].Name;
     }
   }
 

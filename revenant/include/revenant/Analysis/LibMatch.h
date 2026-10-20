@@ -60,6 +60,11 @@ struct LibraryDatabase {
   llvm::Error save(llvm::StringRef Path) const;
 };
 
+/// Load `Path` once per process and reuse the immutable database; later
+/// calls return the cached instance. Thread-safe.
+llvm::Expected<std::shared_ptr<const LibraryDatabase>>
+loadLibraryDatabaseCached(llvm::StringRef Path);
+
 struct LibraryMatch {
   Va Start;
   uint32_t FunctionIndex = 0;
