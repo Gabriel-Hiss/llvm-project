@@ -47,9 +47,12 @@
 
 namespace revenant {
 
+/// Module pass: the cold-chunk search is module-wide (a cold chunk is a
+/// sibling function of its hot caller), so the candidate index is built
+/// once per module instead of once per function.
 struct UnhotColdPass : public llvm::PassInfoMixin<UnhotColdPass> {
-  llvm::PreservedAnalyses run(llvm::Function &F,
-                              llvm::FunctionAnalysisManager &AM);
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
   static bool isRequired() { return true; }
 };
 

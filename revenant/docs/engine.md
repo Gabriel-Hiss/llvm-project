@@ -19,7 +19,7 @@ failed stage and skips that function while the remaining functions continue.
 | sigs | `analyzeSignatures` over the whole program, cached per session, converted to the lifter's `lift::Signatures` |
 | lift (ir-raw) | `lift::liftFunction`, then the module verifier |
 | ir-clean | `CleanupPipeline` + `revenant-idioms`, then the verifier |
-| ir-final | unopt passes, `revenant-structure`, `revenant-types`, `revenant-ssaout` (and `revenant-patterns` with `--patterns`), then the verifier |
+| ir-final | `revenant-uncxx` (C++ output), unopt passes, `revenant-unhotcold` (module pass), `revenant-structure`, `revenant-types`, `revenant-ssaout` (and `revenant-patterns` with `--patterns`), then the verifier |
 | source | C/C++: `RevenantClangCore` + `printTranslationUnit`; Rust: the rustc fork |
 
 The verifier runs after lift and after each individual cleanup or final

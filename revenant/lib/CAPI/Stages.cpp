@@ -473,9 +473,13 @@ std::string cleanPipeline(bool EnableStructDI) {
 }
 
 /// ir-final: deoptimization, type recovery, SSA-out, then control-flow shape.
+/// `revenant-unhotcold` is a module pass (the cold-chunk search looks at
+/// sibling functions), so it sits between the two function blocks: the pass
+/// order is unchanged.
 std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
-  return formatv("function({0}{1}{2},revenant-unhotcold,revenant-types,"
-                 "revenant-ssaout,revenant-structure)",
+  return formatv("function({0}{1}),revenant-unhotcold,"
+                 "function(revenant-types,revenant-ssaout,"
+                 "revenant-structure{2})",
                  IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
                  Patterns ? ",revenant-patterns" : "")
       .str();

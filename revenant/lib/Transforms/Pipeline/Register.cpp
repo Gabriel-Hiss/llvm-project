@@ -181,12 +181,6 @@ void registerRevenantPasses(PassBuilder &PB) {
           return true;
         }
 #endif
-#if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
-        if (Name == "revenant-unhotcold") {
-          FPM.addPass(UnhotColdPass());
-          return true;
-        }
-#endif
 #if __has_include("revenant/Transforms/Unselect/Unselect.h")
         if (Name == "revenant-unselect") {
           FPM.addPass(UnselectPass());
@@ -252,6 +246,12 @@ void registerRevenantPasses(PassBuilder &PB) {
           MPM.addPass(LiftStructsPass());
           return true;
         }
+#if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
+        if (Name == "revenant-unhotcold") {
+          MPM.addPass(UnhotColdPass());
+          return true;
+        }
+#endif
 #if __has_include("revenant/Transforms/Unabi/Unabi.h")
         if (Name == "revenant-unabi") {
           MPM.addPass(UnabiPass());

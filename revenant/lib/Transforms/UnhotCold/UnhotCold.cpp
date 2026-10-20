@@ -27,6 +27,11 @@
 // Both preserve `!revenant.va` (blocks keep their names, instructions are
 // moved not recreated) and never touch `!revenant.opaque` calls.
 //
+// The pass is a module pass: the cold-chunk search looks at sibling
+// functions, so the candidate index is built once per module (one walk plus
+// the CFG edges that can carry a chunk) instead of walking the whole module
+// twice for every function.
+//
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/UnhotCold/UnhotCold.h"
@@ -34,6 +39,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -517,44 +523,119 @@ bool undoReorder(Function &F) {
   return bChanged;
 }
 
+//===----------------------------------------------------------------------===//
+// Module-wide cold-chunk index.
+//===----------------------------------------------------------------------===//
+
+/// The cold chunks that can belong to a hot function, indexed once per
+/// module. The search is module-wide: a cold chunk is a sibling of its hot
+/// caller, so the old per-function search walked the whole module twice for
+/// every function (quadratic in the number of functions). The index keeps
+/// the same candidate sets with one walk and the CFG edges that can carry a
+/// chunk.
+struct ColdIndex {
+  /// Name-based candidates: chunks whose name starts with the hot
+  /// function's name and carries a cold marker (`<hot>.cold`, ...).
+  StringMap<SmallVector<Function *, 4>> ByName;
+  /// Shape-based candidates: local-linkage chunks whose hot edge comes
+  /// from the hot function.
+  DenseMap<Function *, SmallVector<Function *, 4>> ByShape;
+};
+
+/// True when a function name carries a cold marker.
+bool hasColdMarker(StringRef N) {
+  return N.ends_with(".cold") || N.ends_with(".unlikely") ||
+         N.contains(".cold.") || N.contains(".unlikely.");
+}
+
+ColdIndex buildColdIndex(Module &M) {
+  ColdIndex Index;
+  // Name-based: the hot function's name is a prefix of the chunk's name.
+  // Cold-marked names are rare, so the prefix search over the module's
+  // functions stays cheap.
+  for (Function &G : M) {
+    if (G.isDeclaration())
+      continue;
+    StringRef N = G.getName();
+    if (!hasColdMarker(N))
+      continue;
+    for (Function &F : M) {
+      if (&F == &G || F.isDeclaration())
+        continue;
+      if (!N.starts_with(F.getName()))
+        continue;
+      Index.ByName[F.getName()].push_back(&G);
+    }
+  }
+  // Shape-based: a local-linkage chunk reached from a hot block. The chunk
+  // must have exactly one hot predecessor (findColdMerge checks that), so
+  // the index only keeps the edges that can carry one.
+  for (Function &G : M) {
+    if (G.isDeclaration() || !G.hasLocalLinkage())
+      continue;
+    BasicBlock *Entry = &G.getEntryBlock();
+    bool bHasPred = false;
+    for (BasicBlock *Pred : predecessors(Entry)) {
+      bHasPred = true;
+      if (Pred->getParent() == &G)
+        continue;
+      Index.ByShape[Pred->getParent()].push_back(&G);
+    }
+    if (bHasPred)
+      continue;
+    // Call shape: the chunk is called, not branched to.
+    if (!G.hasOneUse())
+      continue;
+    const Use &U = *G.use_begin();
+    const auto *CB = dyn_cast<CallBase>(U.getUser());
+    if (!CB || CB->getCalledFunction() != &G)
+      continue;
+    BasicBlock *Caller = const_cast<BasicBlock *>(CB->getParent());
+    Index.ByShape[Caller->getParent()].push_back(&G);
+  }
+  return Index;
+}
+
 } // namespace
 
-PreservedAnalyses revenant::UnhotColdPass::run(Function &F,
-                                               FunctionAnalysisManager &) {
+PreservedAnalyses revenant::UnhotColdPass::run(Module &M,
+                                               ModuleAnalysisManager &) {
   bool bChanged = false;
-  Module *M = F.getParent();
 
   // Phase 1: cross-function cold merge. The cold chunk is its own function
   // (GCC `.cold` / clang MFS outline); find it among module siblings by
-  // name suffix or by shape. Name check first (cheap): `<hot>.cold`,
-  // `<hot>.unlikely`, `<hot>.llvm.`.
-  if (M) {
+  // name suffix or by shape. The search is module-wide, so the candidates
+  // are indexed once here instead of scanning the whole module for every
+  // function (that scan was the pass's whole cost: two module walks per
+  // function, quadratic in the number of functions).
+  ColdIndex Index = buildColdIndex(M);
+  // The function list is fixed up front: a merge erases the cold chunk, so
+  // the iteration must not walk the module's function list while it
+  // changes.
+  SmallVector<Function *, 64> Functions;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Functions.push_back(&F);
+  for (Function *F : Functions) {
+    // A chunk merged into an earlier function is gone.
+    if (F->getParent() != &M)
+      continue;
     SmallVector<Function *, 4> ColdCands;
-    std::string HotName = F.getName().str();
-    for (Function &G : *M) {
-      if (&G == &F || G.isDeclaration())
-        continue;
-      StringRef N = G.getName();
-      if (N.starts_with(HotName) &&
-          (N.ends_with(".cold") || N.ends_with(".unlikely") ||
-           N.contains(".cold.") || N.contains(".unlikely.")))
-        ColdCands.push_back(&G);
-    }
-    // Shape fallback: any local-linkage single-use function far away.
-    if (ColdCands.empty()) {
-      for (Function &G : *M) {
-        if (&G == &F || G.isDeclaration() || !G.hasLocalLinkage())
-          continue;
-        ColdMerge Probe;
-        if (findColdMerge(F, G, Probe))
-          ColdCands.push_back(&G);
-      }
+    auto ByName = Index.ByName.find(F->getName());
+    if (ByName != Index.ByName.end() && !ByName->second.empty())
+      ColdCands = ByName->second;
+    else {
+      auto ByShape = Index.ByShape.find(F);
+      if (ByShape != Index.ByShape.end())
+        ColdCands = ByShape->second;
     }
     for (Function *Cold : ColdCands) {
-      ColdMerge CM;
-      if (!findColdMerge(F, *Cold, CM))
+      if (Cold->getParent() != &M)
         continue;
-      if (!mergeCold(F, *Cold, CM))
+      ColdMerge CM;
+      if (!findColdMerge(*F, *Cold, CM))
+        continue;
+      if (!mergeCold(*F, *Cold, CM))
         continue;
       // The call-shape merge empties Cold (body spliced into Hot);
       // the block-splice merge leaves Cold empty too. Erase when dead.
@@ -565,10 +646,10 @@ PreservedAnalyses revenant::UnhotColdPass::run(Function &F,
       bChanged = true;
       break; // one merge per run; rerun the pass for chains
     }
-  }
 
-  // Phase 2: intra-function PGO reorder/branch fix.
-  bChanged |= undoReorder(F);
+    // Phase 2: intra-function PGO reorder/branch fix.
+    bChanged |= undoReorder(*F);
+  }
 
   return bChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
