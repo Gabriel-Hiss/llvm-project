@@ -404,12 +404,18 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
         continue;
       }
       FunctionStageTrace Trace(Stage, Element, "module");
-      auto Saved = CloneModule(*M);
+      // Restore-on-failure: when the caller supplies the stage input as
+      // text (the common path), reparsing it is cheaper than cloning the
+      // whole module; clone only when no text is available.
+      std::unique_ptr<Module> Saved;
+      if (InputText.empty())
+        Saved = CloneModule(*M);
       // Analysis managers die inside runModulePass before the module is
       // swapped.
       if (Error E = runModulePass(*M, Element)) {
         std::string Message = toString(std::move(E));
-        M.swap(Saved);
+        if (Saved)
+          M.swap(Saved);
         record(Reports, Stage, "failed",
                "module: " + Element.str() + ": " + Message);
         errs() << "[failed] " << Stage << ": module: " << Element << ": "
