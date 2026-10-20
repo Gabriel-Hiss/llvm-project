@@ -216,12 +216,12 @@ Expected<std::shared_ptr<const lift::Signatures>>
 recoverSignatures(Program &Prog, const Disasm &Dis, StringRef LibraryDBPath) {
   revenant::Signatures A = revenant::analyzeSignatures(Prog, Dis);
   if (!LibraryDBPath.empty()) {
-    auto DB = LibraryDatabase::load(LibraryDBPath);
+    auto DB = loadLibraryDatabaseCached(LibraryDBPath);
     if (!DB)
       return DB.takeError();
-    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, *DB);
-    extendLibraryMatchesByCalleeEvidence(Prog, *DB, Matches);
-    applyLibraryMatches(Prog, A, Matches, *DB);
+    std::vector<LibraryMatch> Matches = matchLibraryFunctions(Prog, **DB);
+    extendLibraryMatchesByCalleeEvidence(Prog, **DB, Matches);
+    applyLibraryMatches(Prog, A, Matches, **DB);
   }
   auto Out = std::make_shared<lift::Signatures>();
   for (const auto &[At, S] : A.Funcs)
