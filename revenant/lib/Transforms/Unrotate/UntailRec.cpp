@@ -26,6 +26,12 @@
 // nothing else observable: pure value ops (binop/cmp/cast/select/gep) plus
 // the backedge branch. The exit path returns directly as before.
 //
+// The header must branch to the latch (the shape above) and its other edge
+// must leave the loop: an ordinary loop whose header branches to a body
+// block that reaches the latch is left alone. The rewrite also needs every
+// header value that outlives the header to have the function's return type,
+// since the recursion result replaces those uses.
+//
 // Rewritten shape (mirrors the clang -O0 form):
 //
 //   entry: <cond> ; br cond, exit, rec
@@ -240,6 +246,34 @@ bool matchLoop(Function &F, LoopShape &S) {
     }
     if (Bad || !Latch || Latch == &E)
       continue;
+    // The header must branch to the latch. TailCallElim leaves the whole
+    // loop body in the header and lets the latch compute the next values
+    // and jump back, so the header's terminator goes to the latch. An
+    // ordinary loop whose header branches to a body block that reaches the
+    // latch (spdlog-gcc-o0 @sub_1400417D0: the header only holds the
+    // loop-carried phis, the loads live in later blocks) is not that
+    // shape: rewriting it would drop the body and turn the header phis
+    // into the call result, which is not even type-correct.
+    {
+      auto *HTerm = dyn_cast<BranchInst>(H->getTerminator());
+      if (!HTerm)
+        continue;
+      bool LatchIsSucc = false;
+      BasicBlock *Other = nullptr;
+      for (unsigned i = 0, e = HTerm->getNumSuccessors(); i != e; ++i) {
+        BasicBlock *Succ = HTerm->getSuccessor(i);
+        if (Succ == Latch)
+          LatchIsSucc = true;
+        else if (!Other)
+          Other = Succ;
+      }
+      if (!LatchIsSucc)
+        continue;
+      // The other edge leaves the loop for good: an edge that reaches the
+      // header again is part of the loop body, not the exit.
+      if (Other && (canReach(Other, H) || canReach(Other, Latch)))
+        continue;
+    }
     // A self-loop header (Latch == H: the single-block loop clang -O2
     // leaves, e.g. @tail_gcd block %4 above) is split first: the latch
     // computation moves into a dedicated latch block, turning this into
@@ -441,7 +475,6 @@ bool rewrite(Function &F, const LoopShape &S) {
   // Then route the entry guard's header edge to L and delete the header.
   BasicBlock *L = S.Latch;
   BasicBlock *H = S.Header;
-  L->getTerminator()->eraseFromParent();
 
   // Carry provenance: prefer the latch's last value op.
   const Instruction *VASrc = nullptr;
@@ -484,6 +517,31 @@ bool rewrite(Function &F, const LoopShape &S) {
     for (Value *Op : I->operands())
       Work.push_back(Op);
   }
+  // The recursion result replaces every use of a header value that outlives
+  // the header, so such a value must have the function's return type: a
+  // header phi of another type (a pointer phi in a function that returns an
+  // integer) would leave the rewritten function with a load of a non
+  // pointer. Veto the rewrite instead of producing that IR; the function
+  // keeps its loop, which is what the guarded path restored anyway when
+  // the rewrite produced invalid IR.
+  if (!RetTy->isVoidTy()) {
+    for (Instruction &D : *H) {
+      if (D.getType()->isVoidTy())
+        continue;
+      for (Use &U : D.uses()) {
+        auto *UI = dyn_cast<Instruction>(U.getUser());
+        if (!UI)
+          continue;
+        BasicBlock *Parent = UI->getParent();
+        // A use inside the header dies with it, a use inside the latch is
+        // rewritten to the entry value or kept.
+        if (Parent == H || Parent == L)
+          continue;
+        if (D.getType() != RetTy)
+          return false;
+      }
+    }
+  }
   // Header order is already topological. A reverse worklist order is not:
   // shared dependencies can be visited before another user is discovered.
   // Do not infer clone identity from instruction names, which are optional.
@@ -493,6 +551,8 @@ bool rewrite(Function &F, const LoopShape &S) {
   for (Instruction &I : *H)
     if (Needed.contains(&I))
       Ordered.push_back(&I);
+  // The latch block ends in the call from here on.
+  L->getTerminator()->eraseFromParent();
   BasicBlock::iterator At = L->getFirstNonPHIIt();
   for (Instruction *I : Ordered)
     I->moveBefore(*L, At);
@@ -610,6 +670,7 @@ PreservedAnalyses revenant::UntailRecPass::run(Function &F,
   LoopShape S;
   if (!matchLoop(F, S))
     return PreservedAnalyses::all();
-  rewrite(F, S);
+  if (!rewrite(F, S))
+    return PreservedAnalyses::all();
   return PreservedAnalyses::none();
 }
