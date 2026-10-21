@@ -603,9 +603,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       Todo.push_back(KV.first);
 
   // ---- asm -----------------------------------------------------------
-  // The listing feeds the asm emit and the artifact. Formatting it decodes
-  // each function a second time, and it fails only when decoding fails,
-  // which the materialize call reports first.
+  // The listing feeds the asm emit and the artifact. The formatting reuses
+  // the function the materialize call already decoded, so the listing costs
+  // one decode per function instead of two.
   const bool WantAsmText =
       Opts.Emit == EmitKind::Asm || !Opts.ArtifactBase.empty();
   std::string AsmText;
@@ -620,17 +620,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       errs() << "[failed] asm: " << Note << "\n";
       continue;
     }
-    if (WantAsmText) {
-      auto A = disasmFunction(T);
-      if (!A) {
-        std::string Note =
-            formatv("0x{0:x}: {1}", T.Value, toString(A.takeError())).str();
-        record(R.Stages, "asm", "failed", Note);
-        errs() << "[failed] asm: " << Note << "\n";
-        continue;
-      }
-      AsmText += *A;
-    }
+    if (WantAsmText)
+      AsmText += formatAsm(*FOrErr);
     Ready.push_back(T);
     InstrCount += FOrErr->Instrs.size();
     if (Opts.Emit == EmitKind::Asm)

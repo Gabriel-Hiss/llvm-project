@@ -146,6 +146,10 @@ public:
   /// Intel-syntax disassembly of the function at `start`.
   llvm::Expected<std::string> disasmFunction(Va Start) const;
 
+  /// Intel-syntax disassembly of an already materialized function. The
+  /// caller pays the decode once and reuses the result.
+  std::string formatAsm(const Function &F) const;
+
   /// Materialize the fat `Function` (decoded instrs + edges) for `start`.
   llvm::Expected<Function> materialize(Va Start) const;
 

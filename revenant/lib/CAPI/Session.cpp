@@ -556,7 +556,10 @@ Expected<std::string> Session::disasmFunction(Va Start) const {
   auto FOrErr = materialize(Start);
   if (!FOrErr)
     return FOrErr.takeError();
-  const Function &F = *FOrErr;
+  return formatAsm(*FOrErr);
+}
+
+std::string Session::formatAsm(const Function &F) const {
   std::string Out;
   raw_string_ostream OS(Out);
   for (const Instr &I : F.Instrs) {
