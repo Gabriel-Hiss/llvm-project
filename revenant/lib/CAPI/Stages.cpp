@@ -1190,6 +1190,60 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         DenseMap<uint64_t, size_t> TodoSlot;
         for (size_t I = 0; I < Todo.size(); ++I)
           TodoSlot[Todo[I].Value] = I + 1;
+        // Each personality name binds to whatever `getFunction` returns at
+        // conversion time, and serial can already have a typed callee
+        // declaration for it: a funclet or an earlier-lifted function that
+        // calls the personality thunk declares the name before the first
+        // EH conversion runs. Only when no such caller exists does the
+        // conversion invent `declare i32 @P(...)` itself. The shards
+        // pre-declare each name up front, so they must pick the same
+        // shape. A caller after the first conversion changes nothing: it
+        // reuses the vararg stub serial already created, and the thunk's
+        // own lift renames either stub to `.decl` all the same.
+        StringSet<> TypedPersonalityDecls;
+        {
+          DenseMap<uint64_t, std::string> OwnerNameByVa;
+          for (const auto &Entry : PersonalityOwner)
+            OwnerNameByVa[Todo[Entry.second].Value] = Entry.getKey().str();
+          StringMap<size_t> FirstBinder;
+          for (size_t Idx = 0; Idx < Todo.size(); ++Idx) {
+            const FunctionEH *EH = nullptr;
+            for (const FunctionEH &Entry : EHFunctions)
+              if (Entry.Function == Todo[Idx]) {
+                EH = &Entry;
+                break;
+              }
+            if (!EH || EH->TryRegions.empty() ||
+                (EH->Handlers.empty() && EH->Cleanups.empty()))
+              continue;
+            std::string Name = personalityName(EH->Model).str();
+            if (Name.empty())
+              continue;
+            auto Owner = PersonalityOwner.find(Name);
+            if (Owner != PersonalityOwner.end() && Owner->second <= Idx)
+              continue;
+            FirstBinder.try_emplace(std::move(Name), Idx);
+          }
+          auto noteCaller = [&](const FuncRecord &F,
+                                std::optional<size_t> Slot) {
+            for (Va Target : F.CallTargets) {
+              auto It = OwnerNameByVa.find(Target.Value);
+              if (It == OwnerNameByVa.end())
+                continue;
+              auto Binder = FirstBinder.find(It->second);
+              if (Binder != FirstBinder.end() &&
+                  (!Slot || *Slot < Binder->second))
+                TypedPersonalityDecls.insert(It->second);
+            }
+          };
+          for (uint64_t Address : FuncletOrder)
+            if (auto It = Prog.Functions.find(Va(Address));
+                It != Prog.Functions.end())
+              noteCaller(It->second, std::nullopt);
+          for (size_t Idx = 0; Idx < Todo.size(); ++Idx)
+            if (!FuncletAddresses.contains(Todo[Idx].Value))
+              noteCaller(Prog.Functions.at(Todo[Idx]), Idx);
+        }
         // Wave 1: lift.
         runWave([&](unsigned S) {
           ShardState &St = State[S];
@@ -1207,13 +1261,26 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // a function without the declaration binds the calls to the
           // callee instead of the personality, and the extra declaration
           // takes the name the definition wants. Create it up front; the
-          // merge gives it the serial creation slot.
-          for (const std::string &Name : PersonalityNames)
-            if (!St.Mod->getFunction(Name))
-              St.Mod->getOrInsertFunction(
-                  Name, llvm::FunctionType::get(
-                            llvm::Type::getInt32Ty(St.Mod->getContext()),
-                            true));
+          // merge gives it the serial creation slot. When an earlier lift
+          // already declares the name (a funclet or an earlier function
+          // that calls the personality thunk), serial binds the typed
+          // callee declaration instead: claim it with the owner's own
+          // signature so call sites and personalities resolve the same
+          // way, and the thunk's lift reuses it unchanged.
+          for (const std::string &Name : PersonalityNames) {
+            if (St.Mod->getFunction(Name))
+              continue;
+            if (TypedPersonalityDecls.contains(Name)) {
+              auto Owner = PersonalityOwner.find(Name);
+              lift::claimDefinition(*St.Mod, Name,
+                                    Sigs->of(Todo[Owner->second]));
+              continue;
+            }
+            St.Mod->getOrInsertFunction(
+                Name, llvm::FunctionType::get(
+                          llvm::Type::getInt32Ty(St.Mod->getContext()),
+                          true));
+          }
           // Replay the serial module state each lift sees: funclets are
           // defined before anything else, and when the function at Todo
           // slot s is lifted every function at a smaller slot is already
