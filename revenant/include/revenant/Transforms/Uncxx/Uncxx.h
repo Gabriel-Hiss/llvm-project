@@ -36,6 +36,7 @@
 #define REVENANT_TRANSFORMS_UNCXX_UNCXX_H
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
@@ -49,7 +50,12 @@ enum class CxxFlavor { Auto, Msvc, Gnu, Libcxx };
 
 class UncxxPass : public llvm::PassInfoMixin<UncxxPass> {
   CxxFlavor Flavor = CxxFlavor::Auto;
-  const llvm::DenseSet<llvm::Function *> *UserFns = nullptr;
+  // The user functions the pass may rewrite, by name. The names survive the
+  // stage copies (a stage that fails is restored by reparsing its input
+  // text, which builds a new module with new function objects), so a set of
+  // function pointers would silently stop matching -- and match by accident
+  // when the allocator reuses an address.
+  const llvm::StringSet<> *UserNames = nullptr;
   // The STL flavor is a property of the module's symbols, but inferring it
   // scans every function and global name. The pass object outlives the
   // per-function runs, so the inference is done once per module.
@@ -59,8 +65,8 @@ class UncxxPass : public llvm::PassInfoMixin<UncxxPass> {
 
 public:
   explicit UncxxPass(CxxFlavor F = CxxFlavor::Auto,
-                     const llvm::DenseSet<llvm::Function *> *Users = nullptr)
-      : Flavor(F), UserFns(Users) {}
+                     const llvm::StringSet<> *Users = nullptr)
+      : Flavor(F), UserNames(Users) {}
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &FAM);
   static bool isRequired() { return false; }

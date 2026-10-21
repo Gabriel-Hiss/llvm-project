@@ -465,9 +465,24 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         EdgeCopies[Pred].push_back({AI, V});
       }
     }
-    for (auto &EC : EdgeCopies) {
-      BasicBlock *Pred = EC.first;
-      auto &Copies = EC.second;
+    // The copies must be emitted in a fixed order: a map keyed by block
+    // pointer iterates in address order, which differs per process and
+    // would give the emitted loads (and the names they get) a different
+    // order in every run.
+    SmallVector<BasicBlock *, 8> EdgeOrder;
+    for (auto &EC : EdgeCopies)
+      EdgeOrder.push_back(EC.first);
+    {
+      DenseMap<const BasicBlock *, unsigned> BlockPos;
+      unsigned Pos = 0;
+      for (BasicBlock &BB : F)
+        BlockPos[&BB] = Pos++;
+      llvm::sort(EdgeOrder, [&](BasicBlock *A, BasicBlock *B) {
+        return BlockPos.lookup(A) < BlockPos.lookup(B);
+      });
+    }
+    for (BasicBlock *Pred : EdgeOrder) {
+      auto &Copies = EdgeCopies[Pred];
       // Order: repeatedly emit a copy whose destination no other pending
       // copy reads; on a cycle, spill one destination through a temp.
       SmallVector<std::pair<AllocaInst *, Value *>, 4> Pending = Copies;

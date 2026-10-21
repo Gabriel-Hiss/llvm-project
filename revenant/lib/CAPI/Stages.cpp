@@ -257,7 +257,7 @@ SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
                           std::vector<StageReport> &Reports,
                           CxxFlavor Flavor,
-                          const DenseSet<llvm::Function *> *UserFns,
+                          const StringSet<> *UserNames,
                           bool Guarded,
                           function_ref<void(size_t, llvm::Function &)>
                               AfterRun = nullptr) {
@@ -290,7 +290,7 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   for (StringRef Pass : Passes) {
     FunctionPassManager FPM;
     if (Pass == "revenant-uncxx")
-      FPM.addPass(UncxxPass(Flavor, UserFns));
+      FPM.addPass(UncxxPass(Flavor, UserNames));
     else if (Error E = PB.parsePassPipeline(FPM, Pass))
       return createStringError("pipeline '" + Pass.str() +
                                "': " + toString(std::move(E)));
@@ -386,7 +386,7 @@ Error runModulePass(Module &M, StringRef Pass) {
 Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
                       StringRef Pipeline, std::vector<StageReport> &Reports,
                       CxxFlavor Flavor = CxxFlavor::Auto,
-                      const DenseSet<llvm::Function *> *UserFns = nullptr,
+                      const StringSet<> *UserNames = nullptr,
                       StringRef InputText = "") {
   // Validate the whole pipeline first: unknown pass names are configuration
   // errors, not recoverable failures of a particular function or module.
@@ -399,7 +399,7 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
     for (StringRef Element : pipelineElements(Pipeline)) {
       if (Element.starts_with("function(")) {
         if (Error E = runFunctionPipeline(Stage, *M, Element, Reports,
-                                          Flavor, UserFns, Guarded))
+                                          Flavor, UserNames, Guarded))
           return E;
         continue;
       }
@@ -1752,7 +1752,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     if (!ParallelClean)
       if (Error E = liftFunclets(*M, *Dis, Funclets, nullptr))
         return E;
-    DenseSet<llvm::Function *> UserFunctions;
+    // The user functions the uncxx pass may rewrite. The set holds names, not
+    // pointers: a stage that fails is restored by reparsing its input text,
+    // which builds a new module with new function objects, so a set of
+    // pointers would stop matching (and match by accident when the
+    // allocator reuses an address).
+    StringSet<> UserFunctionNames;
     size_t OpaqueSites = 0;
     if (ParallelClean) {
       for (size_t Idx = 0; Idx < Todo.size(); ++Idx) {
@@ -1767,7 +1772,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       for (llvm::Function &F : *M)
         if (!F.isDeclaration() &&
             F.getFnAttribute("revenant.user").getValueAsString() == "true")
-          UserFunctions.insert(&F);
+          UserFunctionNames.insert(F.getName());
     }
     // Serial lift: the fallback, and the only path for funclet binaries
     // and non-source emits. Lift alone does not shard well: merging raw
@@ -1804,7 +1809,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       if (Library != Classification.LibraryNames.end())
         F->addFnAttr("revenant.lib", Library->second);
       if (Classification.UserReachable.count(T))
-        UserFunctions.insert(F);
+        UserFunctionNames.insert(F->getName());
       OpaqueSites += L->AsmFallbacks.size();
     }
     if (!ParallelClean)
@@ -1861,7 +1866,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               .str();
       if (auto E = runPipelineText("ir-pre-like", M, PreLikePipeline,
                                    R.Stages, uncxxFlavor(Compiler.Producer),
-                                   &UserFunctions))
+                                   &UserFunctionNames))
         return std::move(E);
       record(R.Stages, "ir-pre-like", "ok",
              "deopt + types + locals-to-slots + structure");
@@ -1873,7 +1878,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     if (auto E = runPipelineText("ir-final", M,
                                  finalPipeline(Opts.Patterns, Out == Lang::Cpp),
                                  R.Stages, uncxxFlavor(Compiler.Producer),
-                                 &UserFunctions, CleanText))
+                                 &UserFunctionNames, CleanText))
       return std::move(E);
     record(R.Stages, "ir-final", "ok",
            "Uncxx (C++ only) + unopt + structure + types + ssaout");
