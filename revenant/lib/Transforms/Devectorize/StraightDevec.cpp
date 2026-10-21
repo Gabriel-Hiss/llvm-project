@@ -919,9 +919,13 @@ bool explodeBlock(Function &F, BasicBlock *BB, unsigned &ChangedOut,
   // scalar extract dsts may feed code below (the reference applies subs
   // function-wide). Only same-type scalar aliases propagate; vector defs
   // never leave their block (commit precheck guarantees no outside uses).
-  // Aliases flow forward only (layout order after BB).
+  // Aliases flow forward only (layout order after BB). Without aliases the
+  // walk has nothing to rewire, and walking every later block per block
+  // made the pass quadratic in function size.
   bool Past = false;
   for (BasicBlock &JB : F) {
+    if (Cx.Subs.empty())
+      break;
     if (&JB == BB)
       Past = true;
     if (!Past)
