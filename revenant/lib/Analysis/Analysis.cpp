@@ -217,27 +217,61 @@ std::optional<Function> function(const Program &P, Va Start) {
 }
 
 void buildChunkIndex(const Program &P) {
-  P.ChunkIndex.clear();
+  // Elementary intervals between chunk bounds, each owned by the function
+  // the old linear scan would return: the first in `Functions` order whose
+  // chunk covers the interval. Adjacent intervals with the same owner merge,
+  // so the binary search in `functionAt` stays O(log n) with or without
+  // overlapping chunks.
+  struct Event {
+    uint64_t Bound;
+    Va FStart;
+    bool Start;
+  };
+  std::vector<Event> Events;
   for (const auto &[Start, F] : P.Functions) {
     (void)Start;
-    for (const auto &[A, B] : F.Chunks)
-      if (B > A)
-        P.ChunkIndex.emplace_back(A.Value, B.Value, F.Start);
-  }
-  llvm::sort(P.ChunkIndex, [](const auto &X, const auto &Y) {
-    return std::get<0>(X) < std::get<0>(Y);
-  });
-  // Binary search only finds the chunk with the largest lo <= addr. With
-  // overlapping chunks the linear scan below is what the old functionAt did.
-  P.ChunkIndexDisjoint = true;
-  uint64_t MaxHi = 0;
-  for (const auto &[Lo, Hi, FStart] : P.ChunkIndex) {
-    (void)FStart;
-    if (Lo < MaxHi) {
-      P.ChunkIndexDisjoint = false;
-      break;
+    for (const auto &[A, B] : F.Chunks) {
+      if (B <= A)
+        continue;
+      Events.push_back({A.Value, F.Start, true});
+      Events.push_back({B.Value, F.Start, false});
     }
-    MaxHi = Hi;
+  }
+  // At a shared bound a chunk ending there stops covering before a chunk
+  // starting there begins, matching the half-open range tests.
+  llvm::stable_sort(Events, [](const Event &X, const Event &Y) {
+    if (X.Bound != Y.Bound)
+      return X.Bound < Y.Bound;
+    return X.Start < Y.Start;
+  });
+  P.ChunkIndex.clear();
+  // Covering functions, ordered like `Functions` itself, so the front is the
+  // owner the linear scan would pick. The count tracks a function's own
+  // overlapping chunks.
+  std::map<Va, uint32_t> Cover;
+  uint64_t Prev = Events.empty() ? 0 : Events.front().Bound;
+  for (size_t I = 0; I < Events.size();) {
+    uint64_t Bound = Events[I].Bound;
+    if (Bound > Prev && !Cover.empty()) {
+      Va Owner = Cover.begin()->first;
+      if (!P.ChunkIndex.empty() &&
+          std::get<1>(P.ChunkIndex.back()) == Prev &&
+          std::get<2>(P.ChunkIndex.back()) == Owner)
+        std::get<1>(P.ChunkIndex.back()) = Bound;
+      else
+        P.ChunkIndex.emplace_back(Prev, Bound, Owner);
+    }
+    while (I < Events.size() && Events[I].Bound == Bound) {
+      Va FS = Events[I].FStart;
+      if (Events[I].Start) {
+        ++Cover[FS];
+      } else if (auto It2 = Cover.find(FS);
+                 It2 != Cover.end() && --It2->second == 0) {
+        Cover.erase(It2);
+      }
+      ++I;
+    }
+    Prev = Bound;
   }
   P.ChunkIndexBuilt = true;
 }
@@ -245,15 +279,6 @@ void buildChunkIndex(const Program &P) {
 const FuncRecord *functionAt(const Program &P, Va Address) {
   if (!P.ChunkIndexBuilt)
     buildChunkIndex(P);
-  if (!P.ChunkIndexDisjoint) {
-    for (const auto &[Start, F] : P.Functions) {
-      (void)Start;
-      for (const auto &[A, B] : F.Chunks)
-        if (Address >= A && Address < B)
-          return &F;
-    }
-    return nullptr;
-  }
   auto It = llvm::partition_point(
       P.ChunkIndex,
       [Address](const auto &Entry) { return std::get<0>(Entry) <= Address.Value; });

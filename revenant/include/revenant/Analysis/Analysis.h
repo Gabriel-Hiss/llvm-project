@@ -59,9 +59,11 @@ Function materialize(const Program &P, const FuncRecord &R);
 /// `Program::function`.
 std::optional<Function> function(const Program &P, Va Start);
 
-/// Rebuilds `P.ChunkIndex`. `analyze` calls it once after all functions are
-/// inserted so later parallel `functionAt` calls never race the lazy build;
-/// `insertFunction` marks it stale again.
+/// Rebuilds `P.ChunkIndex`: the disjoint elementary intervals between chunk
+/// bounds, each owned by the function the linear scan would pick (first in
+/// `Functions` order covering it). `analyze` calls it once after all
+/// functions are inserted so later parallel `functionAt` calls never race
+/// the lazy build; `insertFunction` marks it stale again.
 void buildChunkIndex(const Program &P);
 
 /// The function whose code chunks contain `Addr`, if any. Mirrors
