@@ -252,15 +252,35 @@ Error verifyStage(StringRef Stage, const Module &M) {
 
 SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 
+/// The function the verifier complained about, when its message names one.
+/// The verifier prints "Basic Block in function 'f' does not have
+/// terminator!" for the block a pass left without a terminator. Returns an
+/// empty name when the message names no function.
+std::string verifierFunctionName(StringRef Message) {
+  size_t Pos = Message.find("in function '");
+  if (Pos == StringRef::npos)
+    return "";
+  Pos += sizeof("in function '") - 1;
+  size_t End = Message.find('\'', Pos);
+  if (End == StringRef::npos)
+    return "";
+  return Message.slice(Pos, End).str();
+}
+
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
+/// `Only` runs the element for the given functions alone (the recovery of
+/// one broken function); `BrokenName` names the function the element broke,
+/// when the verifier's message names one.
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
                           std::vector<StageReport> &Reports,
                           CxxFlavor Flavor,
                           const StringSet<> *UserNames,
                           bool Guarded,
                           function_ref<void(size_t, llvm::Function &)>
-                              AfterRun = nullptr) {
+                              AfterRun = nullptr,
+                          ArrayRef<llvm::Function *> Only = {},
+                          std::string *BrokenName = nullptr) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -314,10 +334,10 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   for (size_t I = 0; I < Managers.size(); ++I) {
     SmallVector<llvm::Function *, 32> Functions;
     for (llvm::Function &F : M)
-      if (!F.isDeclaration())
+      if (!F.isDeclaration() && (Only.empty() || llvm::is_contained(Only, &F)))
         Functions.push_back(&F);
     for (llvm::Function *F : Functions) {
-      if (!Guarded) {
+      if (!Guarded && Only.empty()) {
         FunctionStageTrace Trace(Stage, Passes[I], F->getName());
         Managers[I].run(*F, FAM);
         if (AfterRun)
@@ -330,6 +350,9 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
       Managers[I].run(*F, FAM);
       std::string Message;
       raw_string_ostream OS(Message);
+      // The function alone is checked: a pass that breaks it is rolled back
+      // to the state before that pass, which is what the guarded run of the
+      // whole stage did for it.
       if (verifyFunction(*F, &OS)) {
         std::string Name = F->getName().str();
         RestoreFrom(F, Saved, FAM);
@@ -341,7 +364,21 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
       Saved->eraseFromParent();
     }
   }
-  return verifyStage(Stage, M);
+  std::string VerifyMessage;
+  bool Valid = true;
+  {
+    raw_string_ostream OS(VerifyMessage);
+    Valid = !verifyModule(M, &OS);
+  }
+  // The verifier names the function in the message it prints for the
+  // checks that can fail here ("Basic Block in function 'f' does not have
+  // terminator!"). The recovery of one broken function needs that name.
+  if (BrokenName)
+    *BrokenName = Valid ? "" : verifierFunctionName(VerifyMessage);
+  if (!Valid)
+    return createStringError("IR verifier failed after " + Stage.str() + ": " +
+                             VerifyMessage);
+  return Error::success();
 }
 
 // Split only between pipeline elements, never inside adaptors or options.
