@@ -106,3 +106,91 @@ TEST(AnalysisTest, PaddingBoundedTailJumpTargetIsDiscovered) {
   GTEST_SKIP() << "REVENANT_TEST_C_O2GL not defined";
 #endif
 }
+
+// ---- functionAt chunk index ------------------------------------------------
+//
+// The binary-search index must answer what the old linear scan over
+// `P.Functions`/`Chunks` answered, at every boundary, after every mutation
+// path, and under overlapping chunks.
+
+namespace {
+
+Function fnWithChunks(Va Start, std::vector<std::pair<Va, Va>> Chunks) {
+  Function F;
+  F.Start = Start;
+  F.End = Start + 0x10;
+  F.Chunks = std::move(Chunks);
+  return F;
+}
+
+Program programWithImage() {
+  Program P;
+  P.Img = std::make_shared<Image>();
+  return P;
+}
+
+} // namespace
+
+TEST(AnalysisTest, FunctionAtMatchesChunkBoundaries) {
+  Program P = programWithImage();
+  insertFunction(P, fnWithChunks(Va(0x1000), {{Va(0x1000), Va(0x1100)},
+                                            {Va(0x1200), Va(0x1300)}}));
+  buildChunkIndex(P);
+  EXPECT_EQ(functionAt(P, Va(0x0FFF)), nullptr);
+  EXPECT_EQ(functionAt(P, Va(0x1000))->Start, Va(0x1000));
+  EXPECT_EQ(functionAt(P, Va(0x10FF))->Start, Va(0x1000));
+  // A half-open range does not contain its own end.
+  EXPECT_EQ(functionAt(P, Va(0x1100)), nullptr);
+  EXPECT_EQ(functionAt(P, Va(0x11FF)), nullptr);
+  EXPECT_EQ(functionAt(P, Va(0x1200))->Start, Va(0x1000));
+  EXPECT_EQ(functionAt(P, Va(0x1300)), nullptr);
+  EXPECT_EQ(functionAt(programWithImage(), Va(0x1000)), nullptr);
+}
+
+TEST(AnalysisTest, FunctionAtSkipsEmptyChunks) {
+  Program P = programWithImage();
+  insertFunction(P, fnWithChunks(Va(0x1000), {{Va(0x1050), Va(0x1050)},
+                                            {Va(0x1000), Va(0x1100)}}));
+  EXPECT_EQ(functionAt(P, Va(0x1050))->Start, Va(0x1000));
+}
+
+// insertFunction must not leave a stale index.
+TEST(AnalysisTest, FunctionAtSeesFunctionsInsertedAfterLookup) {
+  Program P = programWithImage();
+  insertFunction(P, fnWithChunks(Va(0x1000), {{Va(0x1000), Va(0x1100)}}));
+  EXPECT_EQ(functionAt(P, Va(0x1050))->Start, Va(0x1000));
+  EXPECT_EQ(functionAt(P, Va(0x2050)), nullptr);
+  insertFunction(P, fnWithChunks(Va(0x2000), {{Va(0x2000), Va(0x2100)}}));
+  EXPECT_EQ(functionAt(P, Va(0x2050))->Start, Va(0x2000));
+}
+
+// A copied Program must not reuse the source's index pointers.
+TEST(AnalysisTest, FunctionAtOnCopiedProgramUsesOwnRecords) {
+  Program P = programWithImage();
+  insertFunction(P, fnWithChunks(Va(0x1000), {{Va(0x1000), Va(0x1100)}}));
+  buildChunkIndex(P);
+  Program Q = P;
+  const FuncRecord *Hit = functionAt(Q, Va(0x1050));
+  ASSERT_NE(Hit, nullptr);
+  EXPECT_EQ(Hit, &Q.Functions.find(Va(0x1000))->second);
+  // After the source is gone the copy still answers.
+  {
+    Program Q2 = P;
+    P.Functions.clear();
+    EXPECT_EQ(functionAt(Q2, Va(0x1050))->Start, Va(0x1000));
+  }
+}
+
+// With overlapping chunks the old linear scan won the first match in
+// function-map order, which is not the chunk with the largest lo.
+TEST(AnalysisTest, FunctionAtOverlapMatchesLinearScan) {
+  Program P = programWithImage();
+  insertFunction(P, fnWithChunks(Va(0x1000), {{Va(0x1000), Va(0x1300)}}));
+  insertFunction(P, fnWithChunks(Va(0x2000), {{Va(0x1200), Va(0x1210)}}));
+  // 0x1205 sits inside both chunks; the first function in map order wins,
+  // not the later one a binary search would pick.
+  EXPECT_EQ(functionAt(P, Va(0x1205))->Start, Va(0x1000));
+  EXPECT_EQ(functionAt(P, Va(0x1100))->Start, Va(0x1000));
+  EXPECT_EQ(functionAt(P, Va(0x1250))->Start, Va(0x1000));
+  EXPECT_EQ(functionAt(P, Va(0x1300)), nullptr);
+}

@@ -5,6 +5,7 @@ revenant_add_unittest(RevenantUnitTests RevenantAnalysisTests
   NoreturnTest.cpp
   OrphanTest.cpp
   OverlapsTest.cpp
+  LibMatchTest.cpp
   PaddingTest.cpp
   ResolverTest.cpp
   SignaturesTest.cpp
