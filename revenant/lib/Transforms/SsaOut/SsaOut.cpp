@@ -338,6 +338,11 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     // copies below, not here).
     SmallVector<Instruction *, 8> LoadUsers;
     for (Use &U : I->uses()) {
+      // Lifetime markers require the original alloca, not a load from
+      // its materialized pointer slot.
+      if (auto *CB = dyn_cast<CallBase>(U.getUser()))
+        if (CB->isLifetimeStartOrEnd())
+          continue;
       if (isa<PHINode>(U.getUser()))
         continue;
       LoadUsers.push_back(cast<Instruction>(U.getUser()));
