@@ -976,6 +976,38 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         // Funclets exist only to be inlined into owners.
         if (!FuncletAddresses.empty() && Shards[Threads].empty())
           Shards[Threads].push_back(SIZE_MAX);
+        // The EH personality is a module-level name: the lifter creates the
+        // declaration lazily, and a function can carry the same name (a
+        // library match names the personality thunk after the runtime symbol
+        // it forwards to). The first creator keeps the plain name and the
+        // other is renamed to `.decl`, so the lift order decides which is
+        // which. Serial lifts in program order: when an earlier function
+        // owns the name, its definition holds it and the EH conversion does
+        // not fire for the functions lifted after it. The shards lift out of
+        // program order, so they need the owner slot to keep the same
+        // module state.
+        StringMap<size_t> PersonalityOwner;
+        for (size_t I = 0; I < Todo.size(); ++I) {
+          std::string Name = lift::definitionName(Prog.Functions.at(Todo[I]));
+          for (EHModel Model :
+               {EHModel::MSVC, EHModel::SEH, EHModel::Itanium, EHModel::Rust}) {
+            StringRef Personality = personalityName(Model);
+            if (Personality.empty() || Name != Personality)
+              continue;
+            PersonalityOwner.try_emplace(Personality.str(), I);
+          }
+        }
+        // The personality names this program uses: every shard declares them
+        // (see the lift wave) so that the calls bind the way they do in
+        // serial, and the merge puts each declaration at the slot of the
+        // first function whose EH conversion fired.
+        std::vector<std::string> PersonalityNames;
+        for (const FunctionEH &EH : EHFunctions) {
+          StringRef Name = personalityName(EH.Model);
+          if (Name.empty() || llvm::is_contained(PersonalityNames, Name.str()))
+            continue;
+          PersonalityNames.push_back(Name.str());
+        }
         std::vector<unsigned> ShardOf(Todo.size(), ~0u);
         for (unsigned S = 0; S < Shards.size(); ++S)
           for (size_t Idx : Shards[S])
@@ -1077,6 +1109,19 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           St.Ctx = std::make_unique<LLVMContext>();
           St.Mod = moduleFor(*St.Ctx, Out);
           St.KindSeen = kindCount(St);
+          // The lifter creates the EH personality declaration lazily, at
+          // the first function whose EH conversion fires, and serial has it
+          // for every function lifted after that. A shard that lifts such
+          // a function without the declaration binds the calls to the
+          // callee instead of the personality, and the extra declaration
+          // takes the name the definition wants. Create it up front; the
+          // merge gives it the serial creation slot.
+          for (const std::string &Name : PersonalityNames)
+            if (!St.Mod->getFunction(Name))
+              St.Mod->getOrInsertFunction(
+                  Name, llvm::FunctionType::get(
+                            llvm::Type::getInt32Ty(St.Mod->getContext()),
+                            true));
           // Replay the serial module state each lift sees: funclets are
           // defined before anything else, and when the function at Todo
           // slot s is lifted every function at a smaller slot is already
@@ -1128,6 +1173,16 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                       });
             if (EHIt != EHFunctions.end())
               EH = &*EHIt;
+            // An earlier function owns the personality name: serial has its
+            // definition under that name when this function is lifted, so
+            // the EH conversion does not fire here. Drop the EH entry to
+            // keep the shard's module in the serial state.
+            if (EH) {
+              auto Owner =
+                  PersonalityOwner.find(personalityName(EH->Model).str());
+              if (Owner != PersonalityOwner.end() && Owner->second < Idx)
+                EH = nullptr;
+            }
             size_t Before = St.Mod->global_size();
             auto L = lift::liftFunction(*St.Mod, Prog, Prog.Functions.at(T),
                                         *ThreadDis, Sigs.get(),
@@ -1600,6 +1655,39 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                 if (R.Phase == 0)
                   if (llvm::Function *F = M->getFunction(R.Name))
                     minInto(FnCreated, F, {0, R.Slot, R.Seq});
+            // The personality declaration is created at the first EH
+            // conversion, so serial has it right after that function. The
+            // shards declare it up front (the lifter creates it lazily and
+            // a shard can miss the first conversion), so put it back at the
+            // slot of the first function that uses it.
+            for (const std::string &Name : PersonalityNames) {
+              llvm::Function *Decl = M->getFunction(Name + ".decl");
+              if (!Decl) {
+                Decl = M->getFunction(Name);
+                if (!Decl || !Decl->isDeclaration())
+                  continue;
+              }
+              size_t First = SIZE_MAX;
+              for (llvm::Function &F : *M) {
+                if (!F.hasPersonalityFn())
+                  continue;
+                auto *P = dyn_cast<llvm::Function>(
+                    F.getPersonalityFn()->stripPointerCasts());
+                if (P != Decl)
+                  continue;
+                size_t Slot = Rank.lookup(&F);
+                if (Slot < Todo.size())
+                  First = std::min(First, Slot);
+              }
+              if (First == SIZE_MAX) {
+                // No EH conversion fired: serial never created the
+                // declaration. Drop it when nothing uses it.
+                if (Decl->use_empty())
+                  Decl->eraseFromParent();
+                continue;
+              }
+              FnCreated[Decl] = {0, First + 1, UINT64_MAX};
+            }
             std::vector<const llvm::Function *> LiftOrder;
             for (auto &[F, K] : FnCreated)
               LiftOrder.push_back(F);

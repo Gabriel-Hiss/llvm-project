@@ -67,22 +67,6 @@ Function *personalityDecl(Module *M, StringRef Name) {
   return Function::Create(FTy, GlobalValue::ExternalLinkage, Name, M);
 }
 
-StringRef personalityFor(EHModel Model) {
-  switch (Model) {
-  case EHModel::MSVC:
-    return "__CxxFrameHandler3";
-  case EHModel::SEH:
-    return "__C_specific_handler";
-  case EHModel::Itanium:
-    return "__gxx_personality_seh0";
-  case EHModel::Rust:
-    return "__CxxFrameHandler3";
-  case EHModel::None:
-    return "";
-  }
-  return "";
-}
-
 /// Index of the try range containing VA, or -1.
 int rangeIndex(const FunctionEH &EH, uint64_t VA) {
   for (size_t N = 0; N < EH.TryRegions.size(); ++N) {
@@ -101,7 +85,7 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
   Module *M = Fn.getParent();
   if (!M)
     return 0;
-  StringRef PersonalityName = personalityFor(EH.Model);
+  StringRef PersonalityName = personalityName(EH.Model);
   if (PersonalityName.empty())
     return 0;
 

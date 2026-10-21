@@ -18,6 +18,28 @@ namespace revenant {
 enum class EHModel : uint8_t { None, MSVC, SEH, Itanium, Rust };
 enum class HandlerKind : uint8_t { Catch, Filter, Finally, Cleanup };
 
+/// The runtime personality function the EH lift attaches for `Model` (empty
+/// for `EHModel::None`). The name is a module-level global: the lift
+/// creates the declaration lazily, and a lifted function can carry the same
+/// name (a personality thunk a library match renamed after the runtime
+/// symbol it forwards to). Whoever creates it first keeps the plain name and
+/// the other is renamed to `<name>.decl`, so the lift order decides which
+/// is which.
+inline llvm::StringRef personalityName(EHModel Model) {
+  switch (Model) {
+  case EHModel::MSVC:
+  case EHModel::Rust:
+    return "__CxxFrameHandler3";
+  case EHModel::SEH:
+    return "__C_specific_handler";
+  case EHModel::Itanium:
+    return "__gxx_personality_seh0";
+  case EHModel::None:
+    break;
+  }
+  return "";
+}
+
 struct EHTryRegion {
   Va Begin;
   Va End;
