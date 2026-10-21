@@ -137,6 +137,59 @@ TEST(LiftFunction, LeafBlockOverRealBytes) {
   EXPECT_EQ(Diags, 0u);
 }
 
+TEST(LiftFunction, TailThunkWithDifferentlyTypedReturnVerifies) {
+  auto Fx = open(REVENANT_TEST_PARITY "/fmt-cl-o2gl/fmt-cl-o2gl.exe");
+  ASSERT_TRUE(Fx.has_value());
+  Program P = analyze(*Fx->Pe, *createX86TargetHooks());
+  const Va Thunk(0x14007AA00);
+  const Va Callee(0x1400FD430);
+  ASSERT_TRUE(P.Functions.count(Thunk));
+  ASSERT_TRUE(P.Functions.count(Callee));
+
+  lift::Signatures Sigs;
+  Sigs.Funcs[Thunk].Ret = lift::RetLoc{false, 64};
+  Sigs.Funcs[Callee].Ret = lift::RetLoc{true, 64};
+  llvm::LLVMContext C;
+  llvm::Module M("tail_return", C);
+  auto Lifted = lift::liftFunction(M, P, P.Functions.at(Thunk), *Fx->Dis,
+                                   &Sigs, nullptr, /*RunPasses=*/false);
+  if (!Lifted)
+    FAIL() << toString(Lifted.takeError());
+  EXPECT_TRUE(Lifted->Fn->getReturnType()->isIntegerTy(64));
+  const auto *Ret =
+      llvm::dyn_cast<llvm::ReturnInst>(Lifted->Fn->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  EXPECT_TRUE(llvm::isa<llvm::BitCastInst>(Ret->getReturnValue()));
+  EXPECT_FALSE(verifyModule(M, &llvm::errs()));
+}
+
+TEST(LiftFunction, FloatTailThunkFromIntegerCalleeVerifies) {
+  auto Fx = open(REVENANT_TEST_PARITY "/spdlog-gcc-o0/spdlog-gcc-o0.exe");
+  ASSERT_TRUE(Fx.has_value());
+  Program P = analyze(*Fx->Pe, *createX86TargetHooks());
+  const Va Thunk(0x1400C0170);
+  const Va Callee(0x1400BEE00);
+  ASSERT_TRUE(P.Functions.count(Thunk));
+  ASSERT_TRUE(P.Functions.count(Callee));
+
+  lift::Signatures Sigs;
+  Sigs.Funcs[Thunk].Ret = lift::RetLoc{true, 32};
+  Sigs.Funcs[Callee].Ret = lift::RetLoc{false, 64};
+  llvm::LLVMContext C;
+  llvm::Module M("float_tail_return", C);
+  auto Lifted = lift::liftFunction(M, P, P.Functions.at(Thunk), *Fx->Dis,
+                                   &Sigs, nullptr, /*RunPasses=*/false);
+  if (!Lifted)
+    FAIL() << toString(Lifted.takeError());
+  EXPECT_TRUE(Lifted->Fn->getReturnType()->isFloatTy());
+  const auto *Ret =
+      llvm::dyn_cast<llvm::ReturnInst>(Lifted->Fn->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  EXPECT_TRUE(llvm::isa<llvm::BitCastInst>(Ret->getReturnValue()));
+  EXPECT_FALSE(verifyModule(M, &llvm::errs()));
+}
+
+
 TEST(LiftFunction, CleanupPipelineVerifies) {
   auto Fx = open(REVENANT_TEST_C_O0);
   ASSERT_TRUE(Fx.has_value());

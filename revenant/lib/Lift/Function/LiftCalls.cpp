@@ -410,21 +410,30 @@ void LiftState::emitTailCall(Va Target) {
   ir::setInstructionVA(*Call, CurVa.Value);
   const Signature *Caller = Sigs ? Sigs->of(F.Start) : nullptr;
   if (Caller && Caller->Ret) {
+    llvm::Type *ReturnTy = Fn.getReturnType();
     llvm::Value *RV = Call;
-    if (Call->getType()->isVoidTy())
-      RV = llvm::Constant::getNullValue(
-          Caller->Ret->Float
-              ? (llvm::Type *)(Caller->Ret->Bits == 32
-                                   ? llvm::Type::getFloatTy(Mod.getContext())
-                                   : llvm::Type::getDoubleTy(Mod.getContext()))
-              : (llvm::Type *)llvm::Type::getIntNTy(
-                    Mod.getContext(), std::max(1u, Caller->Ret->Bits)));
-    else if (Call->getType()->isIntegerTy() && !Caller->Ret->Float)
-      RV = B.CreateZExtOrTrunc(
-          Call,
-          llvm::Type::getIntNTy(Mod.getContext(),
-                                std::max(1u, Caller->Ret->Bits)),
-          "tr");
+    if (Call->getType()->isVoidTy()) {
+      RV = llvm::Constant::getNullValue(ReturnTy);
+    } else if (Call->getType() != ReturnTy) {
+      if (Call->getType()->isFloatingPointTy() &&
+          ReturnTy->isFloatingPointTy()) {
+        RV = B.CreateFPCast(Call, ReturnTy, "tr");
+      } else {
+        // Tail thunks can have a different recovered return type from the
+        // callee. Preserve floating-point result bits before adapting the
+        // width, just as regular calls write them to XMM0.
+        if (Call->getType()->isFloatingPointTy())
+          RV = B.CreateBitCast(
+              RV, iN(Call->getType()->getPrimitiveSizeInBits()), "tr");
+        llvm::Type *IntTy =
+            ReturnTy->isFloatingPointTy()
+                ? iN(ReturnTy->getPrimitiveSizeInBits())
+                : ReturnTy;
+        RV = B.CreateZExtOrTrunc(RV, IntTy, "tr");
+        if (ReturnTy->isFloatingPointTy())
+          RV = B.CreateBitCast(RV, ReturnTy, "trf");
+      }
+    }
     B.CreateRet(RV);
   } else {
     B.CreateRetVoid();
