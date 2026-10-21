@@ -498,6 +498,7 @@ TEST(StructuredStmtBuilderTest, ItaniumTryCatch) {
 TEST(StructuredStmtBuilderTest, SehTryExcept) {
   LLVMContext &C = ctx();
   llvm::Module M("t_seh", C);
+  M.setTargetTriple(llvm::Triple("x86_64-pc-windows-msvc"));
   auto *I32 = llvm::Type::getInt32Ty(C);
   auto *Ptr = llvm::PointerType::getUnqual(C);
   llvm::Function *Callee = llvm::Function::Create(
@@ -536,6 +537,7 @@ TEST(StructuredStmtBuilderTest, SehTryExcept) {
 TEST(StructuredStmtBuilderTest, SehTryFinally) {
   LLVMContext &C = ctx();
   llvm::Module M("t_seh_finally", C);
+  M.setTargetTriple(llvm::Triple("x86_64-pc-windows-msvc"));
   llvm::Type *VoidTy = llvm::Type::getVoidTy(C);
   llvm::Function *Throw = llvm::Function::Create(
       llvm::FunctionType::get(VoidTy, {}, false),
@@ -733,6 +735,70 @@ TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
   std::string S = printFunction(M, *F);
   EXPECT_NE(S.find("while"), std::string::npos);
   EXPECT_NE(S.find("break"), std::string::npos);
+}
+
+TEST(StructuredStmtBuilderTest, IfHeaderLeafStatementsEmitBeforeBranch) {
+  // An if-region header that computes values must print them ahead of the
+  // if: previously they were dropped entirely (spdlog-gcc-o0
+  // @sub_140145C40 lost the loads that fed both the test and later
+  // blocks). The callee call must survive and come before `if`.
+  LLVMContext &C = ctx();
+  llvm::Module M("t_ifhead", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "side_effect", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_hdr", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_9000", F);
+  llvm::BasicBlock *Then = BasicBlock::Create(C, "bb_9010", F);
+  llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_9020", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateCall(Callee);
+  B.CreateCondBr(B.CreateICmpNE(X, llvm::ConstantInt::get(I32, 0)), Then,
+                 Follow);
+  B.SetInsertPoint(Then);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(Follow);
+  B.CreateRet(X);
+  tagRegion(Entry->getTerminator(), "if", {indexOf(*F, Follow)});
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("side_effect"), std::string::npos);
+  EXPECT_NE(S.find("if"), std::string::npos);
+  EXPECT_LT(S.find("side_effect"), S.find("if ("));
+}
+
+TEST(StructuredStmtBuilderTest, SwitchHeaderLeafStatementsEmitBeforeBranch) {
+  // Same drop for switch headers: header statements run before the
+  // dispatch and must not vanish.
+  LLVMContext &C = ctx();
+  llvm::Module M("t_swhead", C);
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  llvm::Function *Callee = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {}, false),
+      llvm::GlobalValue::ExternalLinkage, "side_effect", M);
+  llvm::Function *F = llvm::Function::Create(
+      llvm::FunctionType::get(I32, {I32}, false),
+      llvm::GlobalValue::ExternalLinkage, "f_swhead", M);
+  llvm::Argument *X = F->getArg(0);
+  llvm::BasicBlock *Entry = BasicBlock::Create(C, "bb_9100", F);
+  llvm::BasicBlock *A = BasicBlock::Create(C, "bb_9110", F);
+  llvm::BasicBlock *Follow = BasicBlock::Create(C, "bb_9130", F);
+  llvm::IRBuilder<> B(Entry);
+  B.CreateCall(Callee);
+  llvm::SwitchInst *SW = B.CreateSwitch(X, Follow, 1);
+  SW->addCase(llvm::ConstantInt::get(cast<llvm::IntegerType>(I32), 0), A);
+  B.SetInsertPoint(A);
+  B.CreateBr(Follow);
+  B.SetInsertPoint(Follow);
+  B.CreateRet(X);
+  tagRegion(Entry->getTerminator(), "switch", {indexOf(*F, Follow)});
+  std::string S = printFunction(M, *F);
+  EXPECT_NE(S.find("side_effect"), std::string::npos);
+  EXPECT_NE(S.find("switch"), std::string::npos);
+  EXPECT_LT(S.find("side_effect"), S.find("switch"));
 }
 
 } // namespace

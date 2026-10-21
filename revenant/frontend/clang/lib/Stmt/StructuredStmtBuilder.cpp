@@ -443,8 +443,11 @@ void StructuredStmtBuilder::collectRegions() {
 }
 void StructuredStmtBuilder::collectReturnStores() {
   ReturnStoreFollows.clear();
-  for (const auto &Entry : Regions) {
-    Region &R = *Entry.second;
+  for (BasicBlock *Hdr : Blocks) {
+    Region *RP = regionOf(Hdr);
+    if (!RP)
+      continue;
+    Region &R = *RP;
     if (R.Kind != RegionKind::If || !R.Follow)
       continue;
     auto *RI = dyn_cast<ReturnInst>(R.Follow->getTerminator());
@@ -474,7 +477,9 @@ void StructuredStmtBuilder::collectReturnStores() {
     if (SlotEscapes)
       continue;
 
-    for (BasicBlock *BB : R.Members) {
+    for (BasicBlock *BB : Blocks) {
+      if (!R.Members.contains(BB))
+        continue;
       auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
       if (!BI || !BI->isUnconditional() ||
           BI->getSuccessor(0) != R.Follow)
@@ -502,11 +507,10 @@ StoreInst *StructuredStmtBuilder::returnStoreForEdge(BasicBlock *Target,
     return nullptr;
 
   StoreInst *ReturnStore = nullptr;
-  for (const auto &Entry : ReturnStoreFollows)
-    if (Entry.first->getParent() == Target) {
-      ReturnStore = Entry.first;
-      break;
-    }
+  for (Instruction &I : *Target)
+    if (auto *S = dyn_cast<StoreInst>(&I);
+        S && ReturnStoreFollows.contains(S))
+      ReturnStore = S;
   if (!ReturnStore)
     return nullptr;
 
@@ -532,12 +536,22 @@ StoreInst *StructuredStmtBuilder::returnStoreForEdge(BasicBlock *Target,
 }
 
 Region *StructuredStmtBuilder::enclosingRegion(BasicBlock *BB) {
+  // Walk candidates in block order so the answer never depends on
+  // DenseMap pointer-hash order (ASLR makes it differ per process).
+  // A region whose header is itself a member of the current best is the
+  // inner one and wins outright; non-nested overlapping regions pick the
+  // smaller member set, then the earlier header in block order.
   Region *Best = nullptr;
-  for (auto &KV : Regions) {
-    Region *R = KV.second.get();
-    if (!R->Members.contains(BB) || R->Header == BB)
+  for (BasicBlock *Cand : Blocks) {
+    Region *R = regionOf(Cand);
+    if (!R || !R->Members.contains(BB) || R->Header == BB)
       continue;
-    if (!Best || Best->Members.contains(R->Header))
+    if (!Best || Best->Members.contains(R->Header)) {
+      Best = R;
+      continue;
+    }
+    if (!R->Members.contains(Best->Header) &&
+        R->Members.size() < Best->Members.size())
       Best = R;
   }
   return Best;
@@ -563,7 +577,10 @@ bool StructuredStmtBuilder::flowsIntoNext(BasicBlock *To, BasicBlock *From,
 }
 
 /// Non-terminator statements of a block (phis, debug intrinsics and
-/// instructions claimed by a for-header are skipped).
+/// instructions claimed by a for-header are skipped). Instructions the
+/// emitted condition folds inline return no statement from instr(); a
+/// multi-use condition operand materializes a temp whose initializer
+/// instr() emits here, so nothing may be skipped by hand.
 void StructuredStmtBuilder::emitBlockStmts(BasicBlock *BB,
                                            SmallVectorImpl<Stmt *> &Out) {
   for (Instruction &I : *BB) {
@@ -694,11 +711,14 @@ Stmt *StructuredStmtBuilder::emitTerminator(BasicBlock *BB,
   if (auto *BI = dyn_cast<BranchInst>(T)) {
     if (BI->isUnconditional()) {
       BasicBlock *S = BI->getSuccessor(0);
-      for (const auto &Entry : ReturnStoreFollows)
-        if (Entry.first->getParent() == BB && Entry.second == S)
-          return ReturnStmt::Create(
-              *AST, SourceLocation(),
-              Exprs->retVal(Entry.first->getValueOperand(), *Scope), nullptr);
+      for (Instruction &I : *BB)
+        if (auto *St = dyn_cast<StoreInst>(&I)) {
+          auto It = ReturnStoreFollows.find(St);
+          if (It != ReturnStoreFollows.end() && It->second == S)
+            return ReturnStmt::Create(
+                *AST, SourceLocation(),
+                Exprs->retVal(It->first->getValueOperand(), *Scope), nullptr);
+        }
       if (Rgn && !Rgn->Degraded) {
         // A non-latch edge back to the header is a source-level continue;
         // in a for-loop, Clang routes it through the emitted increment.
@@ -856,8 +876,8 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
       return Out;
     if (R.Members.contains(Arm))
       Out.insert(Arm);
-    for (BasicBlock *BB : R.Members)
-      if (DT->dominates(Arm, BB))
+    for (BasicBlock *BB : Blocks)
+      if (BB != Arm && R.Members.contains(BB) && DT->dominates(Arm, BB))
         Out.insert(BB);
     return Out;
   };
@@ -886,9 +906,11 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
   // member's true successor is the partner/true arm and false is the
   // region false arm; `A || B` mirrored.
   Expr *C = Exprs->cond(BI->getCondition(), *Scope);
-  for (auto &KV : ScTags) {
-    BasicBlock *SC = KV.first;
-    BasicBlock *Partner = KV.second.Partner;
+  for (BasicBlock *SC : Blocks) {
+    auto It = ScTags.find(SC);
+    if (It == ScTags.end())
+      continue;
+    BasicBlock *Partner = It->second.Partner;
     if (!Partner || !R.Members.contains(SC))
       continue;
     auto *SBI = dyn_cast<BranchInst>(SC->getTerminator());
@@ -907,6 +929,22 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
                                  VK_PRValue, OK_Ordinary, SourceLocation(),
                                  FPOptionsOverride());
   }
+
+  // The header's leaf statements run before the branch: emit them ahead
+  // of the if. Without this an if-region header that computes values
+  // (spdlog-gcc-o0 @sub_140145C40: loads that feed both the test and
+  // later blocks) silently loses them. Nothing is skipped: instr()
+  // returns null for operands the condition folded inline, while a
+  // multi-use operand emits its temp assignment here.
+  SmallVector<Stmt *, 8> Head;
+  emitBlockStmts(R.Header, Head);
+  auto withHead = [&](Stmt *S) -> Stmt * {
+    if (Head.empty())
+      return S;
+    Head.push_back(S);
+    return CompoundStmt::Create(*AST, Head, FPOptionsOverride(),
+                                SourceLocation(), SourceLocation());
+  };
 
   auto emitArm = [&](BasicBlock *Arm,
                      const SmallPtrSetImpl<BasicBlock *> &Mem) -> Stmt * {
@@ -960,22 +998,23 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
                                   SourceLocation(), nullptr));
     for (Stmt *S : cast<CompoundStmt>(Then)->body())
       Flat.push_back(S);
-    return CompoundStmt::Create(*AST, Flat, FPOptionsOverride(),
-                                SourceLocation(), SourceLocation());
+    return withHead(CompoundStmt::Create(*AST, Flat, FPOptionsOverride(),
+                                         SourceLocation(), SourceLocation()));
   }
 
   if (!Then && Else) {
     // Guard-only arm on the false edge: `if (!c) { else }`.
-    return IfStmt::Create(*AST, SourceLocation(), IfStatementKind::Ordinary,
-                          nullptr, nullptr, inverted(BI->getCondition()),
-                          SourceLocation(), SourceLocation(), Else,
-                          SourceLocation(), nullptr);
+    return withHead(IfStmt::Create(
+        *AST, SourceLocation(), IfStatementKind::Ordinary, nullptr, nullptr,
+        inverted(BI->getCondition()), SourceLocation(), SourceLocation(),
+        Else, SourceLocation(), nullptr));
   }
   if (!Then)
     Then = new (*AST) NullStmt(SourceLocation());
-  return IfStmt::Create(*AST, SourceLocation(), IfStatementKind::Ordinary,
-                        nullptr, nullptr, C, SourceLocation(),
-                        SourceLocation(), Then, SourceLocation(), Else);
+  return withHead(IfStmt::Create(*AST, SourceLocation(),
+                                 IfStatementKind::Ordinary, nullptr, nullptr,
+                                 C, SourceLocation(), SourceLocation(),
+                                 Then, SourceLocation(), Else));
 }
 
 /// Match `init; while(cond refs v) {...; v=v+k}` and claim the pieces.
@@ -1136,22 +1175,7 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
   if (R.Kind == RegionKind::Loop) {
     Cond = IntegerLiteral::Create(*AST, APInt(32, 1), AST->IntTy,
                                   SourceLocation());
-    SmallPtrSet<Instruction *, 4> FeedsCond;
-    if (BI && BI->isConditional()) {
-      if (auto *CmpI = dyn_cast<Instruction>(BI->getCondition()))
-        FeedsCond.insert(CmpI);
-      if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition()))
-        for (Value *Op : Cmp->operands())
-          if (auto *I = dyn_cast<Instruction>(Op))
-            FeedsCond.insert(I);
-    }
-    for (Instruction &I : *R.Header) {
-      if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I) ||
-          FeedsCond.contains(&I))
-        continue;
-      if (Stmt *S = Exprs->instr(I, *Scope))
-        Body.push_back(S);
-    }
+    emitBlockStmts(R.Header, Body);
     if (Stmt *T = emitTerminator(R.Header, &R))
       Body.push_back(T);
   } else if (BI && BI->isConditional()) {
@@ -1160,26 +1184,11 @@ Stmt *StructuredStmtBuilder::emitLoop(Region &R, const Region *Outer) {
                            ? BI->getSuccessor(1)
                            : BI->getSuccessor(0);
     Cond = condOf(BI, Cont);
-    // Header instructions the condition reads (the icmp itself and the
-    // loads it compares) fold into the cond expression through
-    // ExprBuilder; emitting them again at body top would run them after
-    // the test. Everything else in the header is per-iteration work and
-    // goes at the top of the body.
-    SmallPtrSet<Instruction *, 4> FeedsCond;
-    if (auto *CmpI = dyn_cast<Instruction>(BI->getCondition()))
-      FeedsCond.insert(CmpI);
-    if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition()))
-      for (Value *Op : Cmp->operands())
-        if (auto *I = dyn_cast<Instruction>(Op))
-          FeedsCond.insert(I);
-    for (Instruction &I : *R.Header) {
-      if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I))
-        continue;
-      if (FeedsCond.contains(&I))
-        continue;
-      if (Stmt *S = Exprs->instr(I, *Scope))
-        Body.push_back(S);
-    }
+    // Header instructions the condition reads fold into the cond
+    // expression through ExprBuilder: instr() returns null for them, so
+    // nothing prints twice. A multi-use operand materializes a temp and
+    // its initializer must print here or the temp reads uninitialized.
+    emitBlockStmts(R.Header, Body);
   } else {
     Cond = R.Kind == RegionKind::For
                ? nullptr
@@ -1250,6 +1259,12 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
   SwitchStmt *SW = SwitchStmt::Create(*AST, nullptr, nullptr, Cond,
                                       SourceLocation(), SourceLocation());
 
+  // Header leaf statements run before the dispatch; emit them ahead of
+  // the switch. instr() returns null for operands the condition folded
+  // inline and emits the temp assignment for multi-use ones.
+  SmallVector<Stmt *, 8> Head;
+  emitBlockStmts(R.Header, Head);
+
   // Group case values by destination, preserving switch order; shared
   // destinations print as stacked labels over one body.
   SmallVector<BasicBlock *, 8> DestOrder;
@@ -1276,8 +1291,8 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
     if (D != R.Follow && R.Members.contains(D)) {
       SmallPtrSet<BasicBlock *, 8> Mem;
       Mem.insert(D);
-      for (BasicBlock *BB : R.Members)
-        if (BB != D && DT->dominates(D, BB)) {
+      for (BasicBlock *BB : Blocks)
+        if (BB != D && R.Members.contains(BB) && DT->dominates(D, BB)) {
           bool Stolen = false;
           for (BasicBlock *O : DestSet)
             if (O != D && O != R.Follow && DT->dominates(O, BB))
@@ -1293,8 +1308,8 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
     bool EndsInCaseGoto = false;
     if (!SS.empty())
       if (auto *G = dyn_cast<GotoStmt>(SS.back())) {
-        for (auto &KV : Labels)
-          if (KV.second == G->getLabel() && DestSet.contains(KV.first))
+        for (BasicBlock *LBB : Blocks)
+          if (DestSet.contains(LBB) && Labels.lookup(LBB) == G->getLabel())
             EndsInCaseGoto = true;
       }
     if (!endsTerminal(SS) && !EndsInCaseGoto)
@@ -1342,7 +1357,11 @@ Stmt *StructuredStmtBuilder::emitSwitch(Region &R, const Region *Outer) {
                                    emitCase(Def)));
   SW->setBody(CompoundStmt::Create(*AST, Body, FPOptionsOverride(),
                                    SourceLocation(), SourceLocation()));
-  return SW;
+  if (Head.empty())
+    return SW;
+  Head.push_back(SW);
+  return CompoundStmt::Create(*AST, Head, FPOptionsOverride(),
+                              SourceLocation(), SourceLocation());
 }
 
 Stmt *StructuredStmtBuilder::emitRegionHeader(Region &R,
@@ -1724,11 +1743,13 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
     // A region follow is emitted linearly after the structured construct;
     // it needs a label only when a real goto targets it.
     bool IsRegionFollow = false;
-    for (const auto &KV : Regions)
-      if (KV.second->Follow == BB && !KV.second->Degraded) {
+    for (BasicBlock *Hdr : Blocks) {
+      Region *R = regionOf(Hdr);
+      if (R && R->Follow == BB && !R->Degraded) {
         IsRegionFollow = true;
         break;
       }
+    }
     SmallVector<Stmt *, 8> BS;
     emitBlockStmts(BB, BS);
     if (Stmt *T = emitTerminator(BB, Parent && Parent->Degraded ? Parent

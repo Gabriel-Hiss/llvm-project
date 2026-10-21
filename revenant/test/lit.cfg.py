@@ -77,6 +77,9 @@ def _tool_in(build_dir, name):
         _join(build_dir, "bin"),
         build_dir,
         _join(build_dir, "tools", name),
+        # add_llvm_executable under revenant/frontend/clang builds into
+        # <build>/frontend/clang (revenant-clang lives there).
+        _join(build_dir, "frontend", "clang"),
     ]
     bases.extend(sorted(_join(build_dir, "lib", area, "tool")
                         for area in _lib_areas(build_dir)))
@@ -112,6 +115,7 @@ opt = _tool("opt", ("RV_OPT",))
 filecheck = _tool("FileCheck", ("RV_FILECHECK", "FILECHECK"))
 revenant_opt = _tool("revenant-opt", ("REVENANT_OPT", "RV_REVENANT_OPT"))
 revenant_decompile = _tool("revenant-decompile", ("REVENANT_DECOMPILE",))
+revenant_clang = _tool("revenant-clang", ("REVENANT_CLANG",))
 
 # rv-structure-tool ships with the Structure slice build.
 rv_tool_dir = _first_env("RV_STRUCTURE_TOOL_DIR")
@@ -139,6 +143,10 @@ if revenant_opt:
 if revenant_decompile:
     config.substitutions.append(("%revenant-decompile", revenant_decompile))
     config.substitutions.append(("%{revenant-decompile}", revenant_decompile))
+if revenant_clang:
+    config.substitutions.append(("%revenant-clang", revenant_clang))
+    config.substitutions.append(("%{revenant-clang}", revenant_clang))
+    config.available_features.add("revenant-clang")
 config.substitutions.append(("%{rv-structure-tool}", rv_structure_tool))
 config.substitutions.append(("%{rv-structure-tool-exe}", rv_structure_tool))
 

@@ -165,7 +165,9 @@ static bool splitSelfLoop(Function &F, BasicBlock *H,
                            SmallVectorImpl<Value *> &NextForArg);
 
 // Match the TailCallElim loop shape. Returns true and fills S on success.
-bool matchLoop(Function &F, LoopShape &S) {
+// Sets Mutated when splitSelfLoop rewrote the CFG even if the match later
+// fails, so the caller can report analyses correctly.
+bool matchLoop(Function &F, LoopShape &S, bool &Mutated) {
   unsigned NumArgs = F.arg_size();
   if (NumArgs == 0)
     return false;
@@ -264,14 +266,15 @@ bool matchLoop(Function &F, LoopShape &S) {
         BasicBlock *Succ = HTerm->getSuccessor(i);
         if (Succ == Latch)
           LatchIsSucc = true;
-        else if (!Other)
+        else
           Other = Succ;
       }
-      if (!LatchIsSucc)
+      // Every edge that is not the latch must leave the loop: no other
+      // edge (unconditional or both-to-latch branch) means no exit, and
+      // an edge that reaches the header again is loop body, not exit.
+      if (!LatchIsSucc || !Other)
         continue;
-      // The other edge leaves the loop for good: an edge that reaches the
-      // header again is part of the loop body, not the exit.
-      if (Other && (canReach(Other, H) || canReach(Other, Latch)))
+      if (canReach(Other, H) || canReach(Other, Latch))
         continue;
     }
     // A self-loop header (Latch == H: the single-block loop clang -O2
@@ -285,6 +288,7 @@ bool matchLoop(Function &F, LoopShape &S) {
     if (Latch == H) {
       if (!splitSelfLoop(F, H, PhiForArg, NextForArg))
         continue;
+      Mutated = true;
       // The split created a new latch block and rewired the phis: rescan
       // the non-entry incoming to find it.
       Latch = nullptr;
@@ -517,29 +521,34 @@ bool rewrite(Function &F, const LoopShape &S) {
     for (Value *Op : I->operands())
       Work.push_back(Op);
   }
-  // The recursion result replaces every use of a header value that outlives
-  // the header, so such a value must have the function's return type: a
-  // header phi of another type (a pointer phi in a function that returns an
-  // integer) would leave the rewritten function with a load of a non
-  // pointer. Veto the rewrite instead of producing that IR; the function
-  // keeps its loop, which is what the guarded path restored anyway when
-  // the rewrite produced invalid IR.
-  if (!RetTy->isVoidTy()) {
-    for (Instruction &D : *H) {
-      if (D.getType()->isVoidTy())
+  // Two shapes of escaped header values are unsafe to rewrite:
+  //  - A header value used outside H and L gets replaced by the recursion
+  //    result below, so its type must equal the return type: a pointer
+  //    phi in a function returning an integer would leave a load of a
+  //    non-pointer.
+  //  - A header def the latch still needs (in Moved) that also has a use
+  //    outside H and L would move into the call block, leaving the
+  //    outside use behind a def that no longer dominates it: L ends in
+  //    ret and dominates nothing downstream.
+  // Veto the rewrite in both cases; the function keeps its loop, which
+  // is what the guarded path restored anyway when the rewrite produced
+  // invalid IR.
+  for (Instruction &D : *H) {
+    if (D.getType()->isVoidTy())
+      continue;
+    for (Use &U : D.uses()) {
+      auto *UI = dyn_cast<Instruction>(U.getUser());
+      if (!UI)
         continue;
-      for (Use &U : D.uses()) {
-        auto *UI = dyn_cast<Instruction>(U.getUser());
-        if (!UI)
-          continue;
-        BasicBlock *Parent = UI->getParent();
-        // A use inside the header dies with it, a use inside the latch is
-        // rewritten to the entry value or kept.
-        if (Parent == H || Parent == L)
-          continue;
-        if (D.getType() != RetTy)
-          return false;
-      }
+      BasicBlock *Parent = UI->getParent();
+      // A use inside the header dies with it, a use inside the latch is
+      // rewritten to the entry value or kept.
+      if (Parent == H || Parent == L)
+        continue;
+      if (Moved.count(&D))
+        return false;
+      if (!RetTy->isVoidTy() && D.getType() != RetTy)
+        return false;
     }
   }
   // Header order is already topological. A reverse worklist order is not:
@@ -605,7 +614,10 @@ bool rewrite(Function &F, const LoopShape &S) {
   for (Instruction &I : *H)
     HeaderDefs.push_back(&I);
   for (Instruction *D : HeaderDefs) {
-    if (D->getType()->isVoidTy() || Moved.count(D))
+    // Defs that moved into the latch no longer live in H, so every
+    // remaining header def with a use outside the latch reads the
+    // recursion result.
+    if (D->getType()->isVoidTy())
       continue;
     SmallVector<Use *, 8> Outside;
     for (Use &U : D->uses()) {
@@ -668,9 +680,12 @@ PreservedAnalyses revenant::UntailRecPass::run(Function &F,
   if (hasSelfCall(F))
     return PreservedAnalyses::all();
   LoopShape S;
-  if (!matchLoop(F, S))
-    return PreservedAnalyses::all();
+  bool Mutated = false;
+  if (!matchLoop(F, S, Mutated))
+    return Mutated ? PreservedAnalyses::none() : PreservedAnalyses::all();
   if (!rewrite(F, S))
-    return PreservedAnalyses::all();
+    // A veto leaves the IR as matchLoop made it: still changed when the
+    // matcher split a self-loop.
+    return Mutated ? PreservedAnalyses::none() : PreservedAnalyses::all();
   return PreservedAnalyses::none();
 }
