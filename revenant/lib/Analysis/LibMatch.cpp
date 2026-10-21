@@ -13,9 +13,13 @@
 #include "llvm/Support/FileSystem.h"
 #include "revenant/Core/Program.h"
 
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -32,7 +36,7 @@ using namespace llvm;
 namespace revenant {
 namespace {
 
-static Error invalidDB(StringRef Why) {
+static Error invalidDB(const Twine &Why) {
   return createStringError(inconvertibleErrorCode(), "invalid libdb: %s",
                            Why.str().c_str());
 }
@@ -58,12 +62,15 @@ static Expected<std::vector<uint8_t>> parseHexBytes(StringRef Hex) {
 // "archive", "member", "size", "bytes", "masked_relocations", "callees" and
 // an optional "prototype". Building the generic json value tree costs about
 // 2 s for the 85 MB database; this parser walks the same schema straight into
-// LibraryFunction records, preserving the validation order and messages of
-// the original json-based implementation.
+// LibraryFunction records while preserving the grammar, conversion and error
+// behavior of llvm/lib/Support/JSON.cpp: whitespace-terminated root, no
+// trailing commas, strto* numbers, U+FFFD for unpaired surrogates, UTF-8
+// validation for the whole document, and last-key-wins objects where a
+// wrong-typed value counts as absent.
 class JParser {
 public:
   JParser(StringRef Text)
-      : P(Text.data()), E(Text.data() + Text.size()) {}
+      : Start(Text.data()), P(Text.data()), E(Text.data() + Text.size()) {}
 
   void skipWs() {
     while (P < E && (*P == ' ' || *P == '\t' || *P == '\n' || *P == '\r'))
@@ -81,86 +88,50 @@ public:
     skipWs();
     return P < E && *P == C;
   }
+  const char *pos() const { return P; }
+  const char *end() const { return E; }
+  /// The recorded parse error, wrapped with position. Callers must only use
+  /// it after a parse step failed; it falls back to the first recorded error.
+  Error error() const {
+    const char *At = ErrPos ? ErrPos : P;
+    return invalidDB(Twine("malformed JSON at byte ") +
+                     Twine(static_cast<uint64_t>(At - Start)) + ": " +
+                     (Err.empty() ? StringRef("parse error") : Err));
+  }
+
+  /// Records the first parse error at byte `Off` (current position when
+  /// negative). Returns an Error carrying it, for `return J.failAt(...)`.
+  Error failAt(StringRef Msg, int64_t Off = -1) {
+    if (!Failed) {
+      Failed = true;
+      Err = Msg;
+      ErrPos = Off < 0 ? P : Start + Off;
+    }
+    return error();
+  }
+
+  /// Object key: a quoted string after optional whitespace.
+  bool parseKey(std::string &Out) {
+    skipWs();
+    if (P >= E || *P != '"')
+      return fail("expected object key");
+    ++P;
+    return parseStringBody(Out);
+  }
+  /// Quoted string after optional whitespace.
   bool parseString(std::string &Out) {
     skipWs();
     if (P >= E || *P != '"')
       return fail("expected string");
     ++P;
-    Out.clear();
-    while (P < E) {
-      unsigned char C = static_cast<unsigned char>(*P);
-      if (C == '"') {
-        ++P;
-        return true;
-      }
-      if (C == '\\') {
-        ++P;
-        if (P >= E)
-          return fail("bad escape");
-        switch (*P) {
-        case '"': Out.push_back('"'); break;
-        case '\\': Out.push_back('\\'); break;
-        case '/': Out.push_back('/'); break;
-        case 'b': Out.push_back('\b'); break;
-        case 'f': Out.push_back('\f'); break;
-        case 'n': Out.push_back('\n'); break;
-        case 'r': Out.push_back('\r'); break;
-        case 't': Out.push_back('\t'); break;
-        case 'u': {
-          ++P;
-          uint32_t Cp = 0;
-          if (!parseHex4(Cp))
-            return fail("bad \\u escape");
-          if (Cp >= 0xD800 && Cp <= 0xDBFF) {
-            if (P + 1 < E && P[0] == '\\' && P[1] == 'u') {
-              P += 2;
-              uint32_t Lo = 0;
-              if (!parseHex4(Lo) || Lo < 0xDC00 || Lo > 0xDFFF)
-                return fail("bad surrogate pair");
-              Cp = 0x10000 + ((Cp - 0xD800) << 10) + (Lo - 0xDC00);
-            } else {
-              return fail("bad surrogate pair");
-            }
-          } else if (Cp >= 0xDC00 && Cp <= 0xDFFF) {
-            return fail("lone surrogate");
-          }
-          appendUtf8(Out, Cp);
-          break;
-        }
-        default:
-          return fail("bad escape");
-        }
-        ++P;
-        continue;
-      }
-      if (C < 0x20)
-        return fail("control char in string");
-      Out.push_back(static_cast<char>(C));
-      ++P;
-    }
-    return fail("unterminated string");
+    return parseStringBody(Out);
   }
-  bool parseInt(int64_t &Out) {
-    skipWs();
-    bool Neg = false;
-    if (P < E && (*P == '-' || *P == '+')) {
-      Neg = *P == '-';
-      ++P;
-    }
-    if (P >= E || *P < '0' || *P > '9')
-      return fail("expected integer");
-    uint64_t V = 0;
-    while (P < E && *P >= '0' && *P <= '9')
-      V = V * 10 + static_cast<uint64_t>(*P++ - '0');
-    if (P < E && (*P == '.' || *P == 'e' || *P == 'E'))
-      return fail("expected integer");
-    Out = Neg ? -static_cast<int64_t>(V) : static_cast<int64_t>(V);
-    return true;
-  }
+
+  /// Skips one complete JSON value, grammar-checked like llvm::json.
   bool skipValue() {
     skipWs();
     if (P >= E)
-      return fail("unexpected end");
+      return fail("unexpected end of input");
     switch (*P) {
     case '{': {
       ++P;
@@ -168,14 +139,16 @@ public:
         return true;
       for (;;) {
         std::string K;
-        if (!parseString(K) || !consume(':'))
+        if (!parseKey(K))
           return false;
+        if (!consume(':'))
+          return fail("expected ':'");
         if (!skipValue())
           return false;
         if (consume('}'))
           return true;
         if (!consume(','))
-          return fail("expected ','");
+          return fail("expected ',' or '}'");
       }
     }
     case '[': {
@@ -188,42 +161,283 @@ public:
         if (consume(']'))
           return true;
         if (!consume(','))
-          return fail("expected ','");
+          return fail("expected ',' or ']'");
       }
     }
     case '"': {
       std::string S;
       return parseString(S);
     }
-    case 't': return consumeWord("true", 4);
-    case 'f': return consumeWord("false", 5);
-    case 'n': return consumeWord("null", 4);
-    default: {
-      int64_t V;
-      return parseInt(V);
-    }
+    case 't':
+      return consumeWord("true", 4);
+    case 'f':
+      return consumeWord("false", 5);
+    case 'n':
+      return consumeWord("null", 4);
+    default:
+      JsonNumber N;
+      switch (parseNumber(N)) {
+      case NumOk:
+        return true;
+      case NumBad:
+        return false;
+      default:
+        return fail("expected a JSON value");
+      }
     }
   }
-  bool parseHex4(uint32_t &Out) {
-    Out = 0;
-    for (int I = 0; I < 4; ++I) {
+
+  /// llvm::json number classification: strtoll, then strtoull for
+  /// non-negative literals, then strtod; the whole run must convert.
+  struct JsonNumber {
+    enum Kind { Int, UInt, Double } K;
+    int64_t I;
+    uint64_t U;
+    double D;
+  };
+  /// llvm::json::Value::getAsInteger: exactly representable int64_t.
+  static bool jsonAsInteger(const JsonNumber &N, int64_t &Out) {
+    if (N.K == JsonNumber::Int) {
+      Out = N.I;
+      return true;
+    }
+    if (N.K == JsonNumber::UInt) {
+      if (N.U <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        Out = static_cast<int64_t>(N.U);
+        return true;
+      }
+      return false;
+    }
+    double I;
+    if (std::modf(N.D, &I) == 0.0 && I >= -9223372036854775808.0 &&
+        I < 9223372036854775808.0) {
+      Out = static_cast<int64_t>(I);
+      return true;
+    }
+    return false;
+  }
+
+  enum IntResult { IntOk, IntNotNumber, IntNotInteger, IntBad };
+  /// Parses one number token. IntNotNumber leaves the cursor before the
+  /// token; IntNotInteger consumed a valid non-integer number; IntBad
+  /// consumed a malformed token and recorded an error.
+  IntResult parseInteger(int64_t &Out) {
+    JsonNumber N;
+    switch (parseNumber(N)) {
+    case NumNotNumber:
+      return IntNotNumber;
+    case NumBad:
+      return IntBad;
+    case NumOk:
+      break;
+    }
+    if (!jsonAsInteger(N, Out))
+      return IntNotInteger;
+    return IntOk;
+  }
+
+  /// Old `getUInt`: a number that converts to a non-negative int64_t, else
+  /// absent (the value is still consumed). Errors only on malformed JSON.
+  Expected<std::optional<uint64_t>> parseUIntField() {
+    skipWs();
+    const char *At = P;
+    int64_t I = 0;
+    switch (parseInteger(I)) {
+    case IntBad:
+      return error();
+    case IntNotNumber:
+      P = At;
+      if (!skipValue())
+        return error();
+      return std::optional<uint64_t>();
+    case IntNotInteger:
+      return std::optional<uint64_t>();
+    case IntOk:
+      break;
+    }
+    if (I < 0)
+      return std::optional<uint64_t>();
+    return std::optional<uint64_t>(static_cast<uint64_t>(I));
+  }
+
+  /// Old `getString`: a string or absent (non-string value consumed).
+  Expected<std::optional<std::string>> parseStrField() {
+    skipWs();
+    if (P < E && *P == '"') {
+      std::string S;
+      ++P;
+      if (!parseStringBody(S))
+        return error();
+      return std::optional<std::string>(std::move(S));
+    }
+    if (!skipValue())
+      return error();
+    return std::optional<std::string>();
+  }
+
+  /// Old `getBoolean`: a boolean or absent (non-boolean value consumed).
+  Expected<std::optional<bool>> parseBoolField() {
+    skipWs();
+    const char *At = P;
+    if (P < E && *P == 't') {
+      if (!consumeWord("true", 4))
+        return error();
+      return std::optional<bool>(true);
+    }
+    if (P < E && *P == 'f') {
+      if (!consumeWord("false", 5))
+        return error();
+      return std::optional<bool>(false);
+    }
+    P = At;
+    if (!skipValue())
+      return error();
+    return std::optional<bool>();
+  }
+
+private:
+  enum NumResult { NumOk, NumNotNumber, NumBad };
+
+  static bool isNumChar(char C) {
+    // Same set llvm::json uses, which intentionally accepts more than the
+    // strict JSON grammar (leading '+', "1.", "1e", ...) so strto* decides.
+    return (C >= '0' && C <= '9') || C == 'e' || C == 'E' || C == '+' ||
+           C == '-' || C == '.';
+  }
+
+  /// Port of llvm::json's Parser::parseNumber.
+  NumResult parseNumber(JsonNumber &Out) {
+    skipWs();
+    const char *Tok = P;
+    while (P < E && isNumChar(*P))
+      ++P;
+    if (P == Tok)
+      return NumNotNumber;
+    SmallString<32> S;
+    S.assign(Tok, P);
+    char *End = nullptr;
+    errno = 0;
+    int64_t I = std::strtoll(S.c_str(), &End, 10);
+    if (End == S.end() && errno != ERANGE) {
+      Out.K = JsonNumber::Int;
+      Out.I = I;
+      return NumOk;
+    }
+    if (*Tok != '-') {
+      errno = 0;
+      uint64_t UI = std::strtoull(S.c_str(), &End, 10);
+      if (End == S.end() && errno != ERANGE) {
+        Out.K = JsonNumber::UInt;
+        Out.U = UI;
+        return NumOk;
+      }
+    }
+    Out.D = std::strtod(S.c_str(), &End);
+    if (End != S.end()) {
+      fail("invalid JSON number");
+      return NumBad;
+    }
+    Out.K = JsonNumber::Double;
+    return NumOk;
+  }
+
+  /// String contents after the opening quote. Port of llvm::json's
+  /// Parser::parseString.
+  bool parseStringBody(std::string &Out) {
+    Out.clear();
+    for (;;) {
       if (P >= E)
-        return false;
-      char C = *P;
-      Out <<= 4;
-      if (C >= '0' && C <= '9')
-        Out |= static_cast<uint32_t>(C - '0');
-      else if (C >= 'a' && C <= 'f')
-        Out |= static_cast<uint32_t>(C - 'a' + 10);
-      else if (C >= 'A' && C <= 'F')
-        Out |= static_cast<uint32_t>(C - 'A' + 10);
-      else
-        return false;
+        return fail("unterminated string");
+      unsigned char C = static_cast<unsigned char>(*P);
+      if (C == '"') {
+        ++P;
+        return true;
+      }
+      if (C == '\\') {
+        ++P;
+        if (P >= E)
+          return fail("invalid escape sequence");
+        switch (*P) {
+        case '"': Out.push_back('"'); ++P; continue;
+        case '\\': Out.push_back('\\'); ++P; continue;
+        case '/': Out.push_back('/'); ++P; continue;
+        case 'b': Out.push_back('\b'); ++P; continue;
+        case 'f': Out.push_back('\f'); ++P; continue;
+        case 'n': Out.push_back('\n'); ++P; continue;
+        case 'r': Out.push_back('\r'); ++P; continue;
+        case 't': Out.push_back('\t'); ++P; continue;
+        case 'u':
+          ++P;
+          if (!parseUnicode(Out))
+            return false;
+          continue;
+        default:
+          return fail("invalid escape sequence");
+        }
+      }
+      if (C < 0x20)
+        return fail("control character in string");
+      Out.push_back(static_cast<char>(C));
       ++P;
     }
+  }
+
+  bool parseHex16(uint16_t &Out) {
+    uint32_t V = 0;
+    for (int I = 0; I < 4; ++I) {
+      if (P >= E)
+        return fail("bad \\u escape sequence");
+      char C = *P;
+      V <<= 4;
+      if (C >= '0' && C <= '9')
+        V |= static_cast<uint32_t>(C - '0');
+      else if (C >= 'a' && C <= 'f')
+        V |= static_cast<uint32_t>(C - 'a' + 10);
+      else if (C >= 'A' && C <= 'F')
+        V |= static_cast<uint32_t>(C - 'A' + 10);
+      else
+        return fail("bad \\u escape sequence");
+      ++P;
+    }
+    Out = static_cast<uint16_t>(V);
     return true;
   }
-  void appendUtf8(std::string &Out, uint32_t Cp) {
+
+  /// Port of llvm::json's Parser::parseUnicode: unpaired surrogates are
+  /// replaced by U+FFFD rather than rejected ("\u" was already consumed).
+  bool parseUnicode(std::string &Out) {
+    auto Invalid = [&Out] { Out.append("\xef\xbf\xbd", 3); };
+    uint16_t First = 0;
+    if (!parseHex16(First))
+      return false;
+    for (;;) {
+      if (First < 0xD800 || First >= 0xE000) {
+        appendUtf8(Out, First);
+        return true;
+      }
+      if (First >= 0xDC00) {
+        Invalid();
+        return true;
+      }
+      if (P + 2 > E || P[0] != '\\' || P[1] != 'u') {
+        Invalid();
+        return true;
+      }
+      P += 2;
+      uint16_t Second = 0;
+      if (!parseHex16(Second))
+        return false;
+      if (Second < 0xDC00 || Second >= 0xE000) {
+        Invalid();
+        First = Second;
+        continue;
+      }
+      appendUtf8(Out, 0x10000 | ((First - 0xD800) << 10) | (Second - 0xDC00));
+      return true;
+    }
+  }
+
+  static void appendUtf8(std::string &Out, uint32_t Cp) {
     if (Cp < 0x80) {
       Out.push_back(static_cast<char>(Cp));
     } else if (Cp < 0x800) {
@@ -240,10 +454,7 @@ public:
       Out.push_back(static_cast<char>(0x80 | (Cp & 0x3F)));
     }
   }
-  const char *pos() const { return P; }
-  const char *end() const { return E; }
-  void advance(size_t N) { P += N; }
-private:
+
   bool consumeWord(const char *W, size_t Len) {
     if (static_cast<size_t>(E - P) >= Len && memcmp(P, W, Len) == 0) {
       P += Len;
@@ -255,237 +466,305 @@ private:
     if (!Failed) {
       Failed = true;
       Err = Msg;
+      ErrPos = P;
     }
     return false;
   }
+
+  const char *Start;
   const char *P;
   const char *E;
   bool Failed = false;
+  const char *ErrPos = nullptr;
   StringRef Err;
 };
-static bool parseBool(JParser &J, bool &Out);
 
-
-// Parse a prototype object (schema of `prototypeFromJSON`).
+// Parse a prototype object (schema of `prototypeFromJSON`). Mirroring the old
+// json accessors, a present-but-wrong-typed field counts as missing and the
+// last duplicate key wins.
 static Expected<LibraryPrototype> parsePrototypeFast(JParser &J) {
   LibraryPrototype P;
-  bool HasReturnType = false, HasReturnBits = false, HasReturnFloat = false;
-  bool HasReturnVoid = false, HasVarArgs = false, HasParams = false;
+  std::optional<std::string> ReturnType;
+  std::optional<uint64_t> ReturnBits;
+  std::optional<bool> ReturnFloat, ReturnVoid, VarArgs;
+  std::optional<bool> HasParams;
   if (!J.consume('{'))
-    return invalidDB("malformed JSON");
-  while (!J.consume('}')) {
-    std::string Key;
-    if (!J.parseString(Key) || !J.consume(':'))
-      return invalidDB("malformed JSON");
-    if (Key == "return_type") {
-      HasReturnType = true;
-      if (!J.parseString(P.ReturnType))
-        return invalidDB("malformed JSON");
-    } else if (Key == "return_bits") {
-      int64_t V;
-      if (!J.parseInt(V))
-        return invalidDB("malformed JSON");
-      HasReturnBits = true;
-      P.ReturnBits = static_cast<uint32_t>(V);
-    } else if (Key == "return_float") {
-      if (!parseBool(J, P.ReturnFloat))
-        return invalidDB("malformed JSON");
-      HasReturnFloat = true;
-    } else if (Key == "return_void") {
-      if (!parseBool(J, P.ReturnVoid))
-        return invalidDB("malformed JSON");
-      HasReturnVoid = true;
-    } else if (Key == "varargs") {
-      if (!parseBool(J, P.VarArgs))
-        return invalidDB("malformed JSON");
-      HasVarArgs = true;
-    } else if (Key == "params") {
-      HasParams = true;
-      if (!J.consume('['))
-        return invalidDB("malformed JSON");
-      if (!J.consume(']')) {
-        for (;;) {
-          LibraryParam Param;
-          bool HasName = false, HasType = false, HasBits = false;
-          bool HasFloat = false;
-          if (!J.consume('{'))
-            return invalidDB("malformed JSON");
-          while (!J.consume('}')) {
-            std::string PKey;
-            if (!J.parseString(PKey) || !J.consume(':'))
-              return invalidDB("malformed JSON");
-            if (PKey == "name") {
-              HasName = true;
-              if (!J.parseString(Param.Name))
-                return invalidDB("malformed JSON");
-            } else if (PKey == "type") {
-              HasType = true;
-              if (!J.parseString(Param.Type))
-                return invalidDB("malformed JSON");
-            } else if (PKey == "bits") {
-              int64_t V;
-              if (!J.parseInt(V))
-                return invalidDB("malformed JSON");
-              HasBits = true;
-              Param.Bits = static_cast<uint32_t>(V);
-            } else if (PKey == "float") {
-              if (!parseBool(J, Param.Float))
-                return invalidDB("malformed JSON");
-              HasFloat = true;
-            } else if (!J.skipValue()) {
-              return invalidDB("malformed JSON");
+    return J.failAt("expected '{'");
+  if (!J.consume('}')) {
+    for (;;) {
+      std::string Key;
+      if (!J.parseKey(Key))
+        return J.error();
+      if (!J.consume(':'))
+        return J.failAt("expected ':'");
+      if (Key == "return_type") {
+        auto S = J.parseStrField();
+        if (!S)
+          return S.takeError();
+        ReturnType = std::move(*S);
+        if (ReturnType)
+          P.ReturnType = *ReturnType;
+      } else if (Key == "return_bits") {
+        auto V = J.parseUIntField();
+        if (!V)
+          return V.takeError();
+        ReturnBits = *V;
+        if (ReturnBits)
+          P.ReturnBits = static_cast<uint32_t>(*ReturnBits);
+      } else if (Key == "return_float") {
+        auto B = J.parseBoolField();
+        if (!B)
+          return B.takeError();
+        ReturnFloat = *B;
+        if (ReturnFloat)
+          P.ReturnFloat = *ReturnFloat;
+      } else if (Key == "return_void") {
+        auto B = J.parseBoolField();
+        if (!B)
+          return B.takeError();
+        ReturnVoid = *B;
+        if (ReturnVoid)
+          P.ReturnVoid = *ReturnVoid;
+      } else if (Key == "varargs") {
+        auto B = J.parseBoolField();
+        if (!B)
+          return B.takeError();
+        VarArgs = *B;
+        if (VarArgs)
+          P.VarArgs = *VarArgs;
+      } else if (Key == "params") {
+        P.Params.clear();
+        HasParams = false;
+        if (!J.consume('[')) {
+          if (!J.skipValue())
+            return J.error();
+        } else {
+          HasParams = true;
+          if (!J.consume(']')) {
+            for (;;) {
+              LibraryParam Param;
+              std::optional<std::string> ParamName, ParamType;
+              std::optional<uint64_t> ParamBits;
+              std::optional<bool> ParamFloat;
+              // The old loader required each parameter element to be an
+              // object.
+              if (!J.consume('{'))
+                return invalidDB("prototype parameter is not an object");
+              if (!J.consume('}')) {
+                for (;;) {
+                  std::string PKey;
+                  if (!J.parseKey(PKey))
+                    return J.error();
+                  if (!J.consume(':'))
+                    return J.failAt("expected ':'");
+                  if (PKey == "name") {
+                    auto S = J.parseStrField();
+                    if (!S)
+                      return S.takeError();
+                    ParamName = std::move(*S);
+                    if (ParamName)
+                      Param.Name = *ParamName;
+                  } else if (PKey == "type") {
+                    auto S = J.parseStrField();
+                    if (!S)
+                      return S.takeError();
+                    ParamType = std::move(*S);
+                    if (ParamType)
+                      Param.Type = *ParamType;
+                  } else if (PKey == "bits") {
+                    auto V = J.parseUIntField();
+                    if (!V)
+                      return V.takeError();
+                    ParamBits = *V;
+                    if (ParamBits)
+                      Param.Bits = static_cast<uint32_t>(*ParamBits);
+                  } else if (PKey == "float") {
+                    auto B = J.parseBoolField();
+                    if (!B)
+                      return B.takeError();
+                    ParamFloat = *B;
+                    if (ParamFloat)
+                      Param.Float = *ParamFloat;
+                  } else if (!J.skipValue()) {
+                    return J.error();
+                  }
+                  if (J.consume('}'))
+                    break;
+                  if (!J.consume(','))
+                    return J.failAt("expected ',' or '}'");
+                }
+              }
+              if (!ParamName || !ParamType || !ParamBits || !ParamFloat)
+                return invalidDB(
+                    "prototype parameter is missing required fields");
+              P.Params.push_back(std::move(Param));
+              if (J.consume(']'))
+                break;
+              if (!J.consume(','))
+                return J.failAt("expected ',' or ']'");
             }
-            if (J.peek('}'))
-              continue;
-            if (!J.consume(','))
-              return invalidDB("malformed JSON");
           }
-          if (!HasName || !HasType || !HasBits || !HasFloat)
-            return invalidDB("prototype parameter is missing required fields");
-          P.Params.push_back(std::move(Param));
-          if (J.consume(']'))
-            break;
-          if (!J.consume(','))
-            return invalidDB("malformed JSON");
         }
+      } else if (!J.skipValue()) {
+        return J.error();
       }
-    } else if (!J.skipValue()) {
-      return invalidDB("malformed JSON");
+      if (J.consume('}'))
+        break;
+      if (!J.consume(','))
+        return J.failAt("expected ',' or '}'");
     }
-    if (J.peek('}'))
-      continue;
-    if (!J.consume(','))
-      return invalidDB("malformed JSON");
   }
-  if (!HasReturnType || !HasReturnBits || !HasReturnFloat || !HasReturnVoid ||
-      !HasVarArgs || !HasParams)
+  if (!ReturnType || !ReturnBits || !ReturnFloat || !ReturnVoid || !VarArgs ||
+      HasParams != std::optional<bool>(true))
     return invalidDB("prototype is missing required fields");
   return P;
 }
 
-static bool parseBool(JParser &J, bool &Out) {
-  J.skipWs();
-  const char *P = J.pos();
-  const char *E = J.end();
-  if (E - P >= 4 && memcmp(P, "true", 4) == 0) {
-    J.advance(4);
-    Out = true;
-    return true;
-  }
-  if (E - P >= 5 && memcmp(P, "false", 5) == 0) {
-    J.advance(5);
-    Out = false;
-    return true;
-  }
-  return false;
-}
-
-// Parse one `functions` array entry into DB. On malformed JSON returns an
-// invalidDB error; semantic validation mirrors the original json loader.
+// Parse one `functions` array entry into DB. Semantic validation mirrors the
+// original json loader; parse failures surface the JParser error.
 static Error parseFunctionEntry(JParser &J, LibraryDatabase &DB) {
-  std::string Name, MangledName, Archive, Member;
-  std::string BytesStr;
-  StringRef BytesHex;
+  std::optional<std::string> Name, MangledName, Archive, Member, BytesHex;
   std::optional<uint64_t> Size;
   std::vector<int64_t> Mask;
   std::vector<std::string> Callees;
   std::optional<LibraryPrototype> Prototype;
-  bool HasName = false, HasMangled = false, HasArchive = false;
-  bool HasMember = false, HasSize = false, HasBytes = false;
   bool HasMask = false, HasCallees = false;
   if (!J.consume('{'))
-    return invalidDB("malformed JSON");
-  while (!J.consume('}')) {
-    std::string Key;
-    if (!J.parseString(Key) || !J.consume(':'))
-      return invalidDB("malformed JSON");
-    if (Key == "name") {
-      HasName = true;
-      if (!J.parseString(Name))
-        return invalidDB("malformed JSON");
-    } else if (Key == "mangled_name") {
-      HasMangled = true;
-      if (!J.parseString(MangledName))
-        return invalidDB("malformed JSON");
-    } else if (Key == "archive") {
-      HasArchive = true;
-      if (!J.parseString(Archive))
-        return invalidDB("malformed JSON");
-    } else if (Key == "member") {
-      HasMember = true;
-      if (!J.parseString(Member))
-        return invalidDB("malformed JSON");
-    } else if (Key == "size") {
-      int64_t V;
-      if (!J.parseInt(V))
-        return invalidDB("malformed JSON");
-      HasSize = true;
-      Size = V < 0 ? std::optional<uint64_t>() : uint64_t(V);
-    } else if (Key == "bytes") {
-      if (!J.parseString(BytesStr))
-        return invalidDB("malformed JSON");
-      HasBytes = true;
-      BytesHex = BytesStr;
-    } else if (Key == "masked_relocations") {
-      HasMask = true;
-      if (!J.consume('['))
-        return invalidDB("malformed JSON");
-      if (!J.consume(']')) {
-        for (;;) {
-          int64_t V;
-          if (!J.parseInt(V))
-            return invalidDB("malformed JSON");
-          Mask.push_back(V);
-          if (J.consume(']'))
-            break;
-          if (!J.consume(','))
-            return invalidDB("malformed JSON");
+    return J.failAt("expected '{'");
+  if (!J.consume('}')) {
+    for (;;) {
+      std::string Key;
+      if (!J.parseKey(Key))
+        return J.error();
+      if (!J.consume(':'))
+        return J.failAt("expected ':'");
+      if (Key == "name") {
+        auto S = J.parseStrField();
+        if (!S)
+          return S.takeError();
+        Name = std::move(*S);
+      } else if (Key == "mangled_name") {
+        auto S = J.parseStrField();
+        if (!S)
+          return S.takeError();
+        MangledName = std::move(*S);
+      } else if (Key == "archive") {
+        auto S = J.parseStrField();
+        if (!S)
+          return S.takeError();
+        Archive = std::move(*S);
+      } else if (Key == "member") {
+        auto S = J.parseStrField();
+        if (!S)
+          return S.takeError();
+        Member = std::move(*S);
+      } else if (Key == "size") {
+        auto V = J.parseUIntField();
+        if (!V)
+          return V.takeError();
+        Size = *V;
+      } else if (Key == "bytes") {
+        auto S = J.parseStrField();
+        if (!S)
+          return S.takeError();
+        BytesHex = std::move(*S);
+      } else if (Key == "masked_relocations") {
+        Mask.clear();
+        HasMask = false;
+        if (!J.consume('[')) {
+          if (!J.skipValue())
+            return J.error();
+        } else {
+          HasMask = true;
+          if (!J.consume(']')) {
+            for (;;) {
+              // Every element must convert via getAsInteger like the old
+              // loader: non-integer values are rejected by the bounds check
+              // below, malformed JSON by the parser.
+              int64_t V = 0;
+              switch (J.parseInteger(V)) {
+              case JParser::IntBad:
+                return J.error();
+              case JParser::IntNotNumber:
+                if (!J.skipValue())
+                  return J.error();
+                return invalidDB(
+                    "relocation mask offset is outside the function");
+              case JParser::IntNotInteger:
+                return invalidDB(
+                    "relocation mask offset is outside the function");
+              case JParser::IntOk:
+                break;
+              }
+              Mask.push_back(V);
+              if (J.consume(']'))
+                break;
+              if (!J.consume(','))
+                return J.failAt("expected ',' or ']'");
+            }
+          }
         }
-      }
-    } else if (Key == "callees") {
-      HasCallees = true;
-      if (!J.consume('['))
-        return invalidDB("malformed JSON");
-      if (!J.consume(']')) {
-        for (;;) {
-          std::string Callee;
-          if (!J.parseString(Callee))
-            return invalidDB("callee name is not a string");
-          Callees.push_back(std::move(Callee));
-          if (J.consume(']'))
-            break;
-          if (!J.consume(','))
-            return invalidDB("malformed JSON");
+      } else if (Key == "callees") {
+        Callees.clear();
+        HasCallees = false;
+        if (!J.consume('[')) {
+          if (!J.skipValue())
+            return J.error();
+        } else {
+          HasCallees = true;
+          if (!J.consume(']')) {
+            for (;;) {
+              J.skipWs();
+              if (J.pos() >= J.end() || *J.pos() != '"') {
+                if (!J.skipValue())
+                  return J.error();
+                return invalidDB("callee name is not a string");
+              }
+              std::string Callee;
+              if (!J.parseString(Callee))
+                return J.error();
+              Callees.push_back(std::move(Callee));
+              if (J.consume(']'))
+                break;
+              if (!J.consume(','))
+                return J.failAt("expected ',' or ']'");
+            }
+          }
         }
+      } else if (Key == "prototype") {
+        // Old code used getObject("prototype"): a non-object value is
+        // silently ignored, an object must parse as a full prototype.
+        Prototype.reset();
+        if (J.peek('{')) {
+          auto Parsed = parsePrototypeFast(J);
+          if (!Parsed)
+            return Parsed.takeError();
+          Prototype = std::move(*Parsed);
+        } else if (!J.skipValue()) {
+          return J.error();
+        }
+      } else if (!J.skipValue()) {
+        return J.error();
       }
-    } else if (Key == "prototype") {
-      auto Parsed = parsePrototypeFast(J);
-      if (!Parsed)
-        return Parsed.takeError();
-      Prototype = std::move(*Parsed);
-    } else if (!J.skipValue()) {
-      return invalidDB("malformed JSON");
+      if (J.consume('}'))
+        break;
+      if (!J.consume(','))
+        return J.failAt("expected ',' or '}'");
     }
-    if (J.peek('}'))
-      continue;
-    if (!J.consume(','))
-      return invalidDB("malformed JSON");
   }
-  if (!HasName || !HasMangled || !HasArchive || !HasMember || !HasSize ||
-      !HasBytes || !HasMask || !HasCallees)
+  if (!Name || !MangledName || !Archive || !Member || !Size || !BytesHex ||
+      !HasMask || !HasCallees)
     return invalidDB("function entry is missing required fields");
-  if (!Size)
-    return invalidDB("function entry is missing required fields");
-  auto Bytes = parseHexBytes(BytesHex);
+  auto Bytes = parseHexBytes(*BytesHex);
   if (!Bytes)
     return Bytes.takeError();
   if (*Size != Bytes->size())
     return invalidDB("function size does not match byte string");
   LibraryFunction F;
-  F.Name = std::move(Name);
-  F.MangledName = std::move(MangledName);
-  F.Archive = std::move(Archive);
-  F.Member = std::move(Member);
+  F.Name = std::move(*Name);
+  F.MangledName = std::move(*MangledName);
+  F.Archive = std::move(*Archive);
+  F.Member = std::move(*Member);
   F.Size = *Size;
   F.Bytes = std::move(*Bytes);
   F.MaskedRelocations.reserve(Mask.size());
@@ -502,50 +781,69 @@ static Error parseFunctionEntry(JParser &J, LibraryDatabase &DB) {
 
 static Error loadLibraryDatabaseFromText(StringRef Text, LibraryDatabase &DB) {
   JParser J(Text);
-  bool HaveVersion = false;
-  uint64_t Version = 0;
+  std::optional<uint64_t> Version;
   bool HaveFunctions = false;
+  // llvm::json validates the document encoding before parsing.
+  size_t Utf8Error = 0;
+  if (!json::isUTF8(Text, &Utf8Error))
+    return J.failAt("invalid UTF-8 sequence", static_cast<int64_t>(Utf8Error));
   J.skipWs();
-  if (!J.consume('{'))
+  if (J.pos() >= J.end())
+    return J.failAt("unexpected end of input");
+  if (!J.peek('{'))
     return invalidDB("root is not an object");
-  while (!J.consume('}')) {
-    std::string Key;
-    if (!J.parseString(Key) || !J.consume(':'))
-      return invalidDB("malformed JSON");
-    if (Key == "version") {
-      int64_t V;
-      if (!J.parseInt(V))
-        return invalidDB("malformed JSON");
-      HaveVersion = true;
-      Version = V < 0 ? 0 : uint64_t(V);
-    } else if (Key == "functions") {
-      if (HaveFunctions) {
-        if (!J.skipValue())
-          return invalidDB("malformed JSON");
-      } else if (!J.consume('[')) {
-        return invalidDB("unsupported version or missing functions array");
-      } else if (J.consume(']')) {
-        HaveFunctions = true;
-      } else {
-        for (;;) {
-          if (Error E = parseFunctionEntry(J, DB))
-            return E;
-          if (J.consume(']'))
-            break;
-          if (!J.consume(','))
-            return invalidDB("malformed JSON");
+  J.consume('{');
+  if (!J.consume('}')) {
+    for (;;) {
+      std::string Key;
+      if (!J.parseKey(Key))
+        return J.error();
+      if (!J.consume(':'))
+        return J.failAt("expected ':'");
+      if (Key == "version") {
+        auto V = J.parseUIntField();
+        if (!V)
+          return V.takeError();
+        Version = *V;
+      } else if (Key == "functions") {
+        // Last duplicate key wins, like the old Object map lookup.
+        DB.Functions.clear();
+        HaveFunctions = false;
+        if (!J.consume('[')) {
+          if (!J.skipValue())
+            return J.error();
+        } else {
+          HaveFunctions = true;
+          if (!J.consume(']')) {
+            for (;;) {
+              J.skipWs();
+              if (J.pos() >= J.end() || *J.pos() != '{') {
+                if (!J.skipValue())
+                  return J.error();
+                return invalidDB("function entry is not an object");
+              }
+              if (Error E = parseFunctionEntry(J, DB))
+                return E;
+              if (J.consume(']'))
+                break;
+              if (!J.consume(','))
+                return J.failAt("expected ',' or ']'");
+            }
+          }
         }
-        HaveFunctions = true;
+      } else if (!J.skipValue()) {
+        return J.error();
       }
-    } else if (!J.skipValue()) {
-      return invalidDB("malformed JSON");
+      if (J.consume('}'))
+        break;
+      if (!J.consume(','))
+        return J.failAt("expected ',' or '}'");
     }
-    if (J.peek('}'))
-      continue;
-    if (!J.consume(','))
-      return invalidDB("malformed JSON");
   }
-  if (!HaveVersion || Version != 1 || !HaveFunctions)
+  J.skipWs();
+  if (J.pos() != J.end())
+    return J.failAt("text after end of document");
+  if (Version != std::optional<uint64_t>(1) || !HaveFunctions)
     return invalidDB("unsupported version or missing functions array");
   return Error::success();
 }
