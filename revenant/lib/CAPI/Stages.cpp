@@ -588,6 +588,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       Todo.push_back(KV.first);
 
   // ---- asm -----------------------------------------------------------
+  // The listing feeds the asm emit and the artifact. Formatting it decodes
+  // each function a second time, and it fails only when decoding fails,
+  // which the materialize call reports first.
+  const bool WantAsmText =
+      Opts.Emit == EmitKind::Asm || !Opts.ArtifactBase.empty();
   std::string AsmText;
   size_t InstrCount = 0;
   std::vector<Va> Ready;
@@ -600,16 +605,18 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       errs() << "[failed] asm: " << Note << "\n";
       continue;
     }
-    auto A = disasmFunction(T);
-    if (!A) {
-      std::string Note =
-          formatv("0x{0:x}: {1}", T.Value, toString(A.takeError())).str();
-      record(R.Stages, "asm", "failed", Note);
-      errs() << "[failed] asm: " << Note << "\n";
-      continue;
+    if (WantAsmText) {
+      auto A = disasmFunction(T);
+      if (!A) {
+        std::string Note =
+            formatv("0x{0:x}: {1}", T.Value, toString(A.takeError())).str();
+        record(R.Stages, "asm", "failed", Note);
+        errs() << "[failed] asm: " << Note << "\n";
+        continue;
+      }
+      AsmText += *A;
     }
     Ready.push_back(T);
-    AsmText += *A;
     InstrCount += FOrErr->Instrs.size();
     if (Opts.Emit == EmitKind::Asm)
       for (const revenant::Instr &I : FOrErr->Instrs)
@@ -1882,7 +1889,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       return std::move(E);
     record(R.Stages, "ir-final", "ok",
            "Uncxx (C++ only) + unopt + structure + types + ssaout");
-    FinalText = moduleText(*M);
+    // The text feeds the ir-final emit, the rustc fork and the artifact.
+    if (Opts.Emit == EmitKind::IrFinal || Out == Lang::Rust ||
+        !Opts.ArtifactBase.empty())
+      FinalText = moduleText(*M);
     if (Opts.Emit == EmitKind::IrFinal) {
       R.Text = FinalText;
       break;
