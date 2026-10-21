@@ -695,9 +695,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     std::vector<FunctionEH> EHFunctions = decodeEHTables(pe());
     DenseSet<uint64_t> FuncletAddresses;
     DenseMap<uint64_t, uint64_t> FuncletAliases;
-    // Parents whose EH handlers resolved to a funclet: they get the funclet
-    // inlined before cleanup, so the parallel clean path keeps them serial.
-    DenseSet<uint64_t> FuncletOwners;
+    // Parents whose EH handlers resolved to a funclet, with the funclet each
+    // handler inlines (one entry per handler, so a funclet can repeat).
+    DenseMap<uint64_t, SmallVector<uint64_t, 4>> OwnerFunclets;
     // EH map targets can point at the entry instruction inside a discovered
     // funclet, rather than at its containing Program function's start.
     auto collectFunclet = [&](Va Handler, Va Owner) {
@@ -705,7 +705,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       if (Exact != Prog.Functions.end() && Handler != Owner) {
         FuncletAddresses.insert(Handler.Value);
         FuncletAliases[Handler.Value] = Handler.Value;
-        FuncletOwners.insert(Owner.Value);
+        OwnerFunclets[Owner.Value].push_back(Handler.Value);
         return;
       }
       for (const auto &[Start, F] : Prog.Functions) {
@@ -720,7 +720,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           continue;
         FuncletAddresses.insert(Start.Value);
         FuncletAliases[Handler.Value] = Start.Value;
-        FuncletOwners.insert(Owner.Value);
+        OwnerFunclets[Owner.Value].push_back(Start.Value);
         return;
       }
     };
@@ -732,41 +732,42 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       for (const EHCleanup &C : EH.Cleanups)
         collectFunclet(C.Address, EH.Function);
     }
+    // Serial lifts the funclets in this order, before any other function.
+    const std::vector<uint64_t> FuncletOrder(FuncletAddresses.begin(),
+                                             FuncletAddresses.end());
+    // A funclet takes the parent frame in rdx and returns its continuation
+    // in rax.
+    lift::Signature FuncletSig;
+    FuncletSig.Params.push_back(
+        {lift::ParamLoc::reg(llvm::X86::RDX), 64, false, std::string("frame")});
+    FuncletSig.Ret = lift::RetLoc{false, 64};
     // Funclet lifting and inlining work on any module: the serial path runs
-    // them on M, the parallel path inside the shard that owns EH parents.
-    // `Created`, when given, receives the globals each funclet lift made.
-    auto liftFunclets =
-        [&](Module &Mod, const Disasm &D,
-            DenseMap<uint64_t, llvm::Function *> &Out,
-            std::vector<llvm::GlobalVariable *> *Created) -> Error {
-      for (uint64_t Address : FuncletAddresses) {
-        Va At(Address);
-        auto SignatureMap = *Sigs;
-        lift::Signature FuncletSig;
-        FuncletSig.Params.push_back({lift::ParamLoc::reg(llvm::X86::RDX), 64,
-                                     false, std::string("frame")});
-        FuncletSig.Ret = lift::RetLoc{false, 64};
-        SignatureMap.Funcs[At] = std::move(FuncletSig);
-        size_t Before = Mod.global_size();
-        auto L = lift::liftFunction(Mod, Prog, Prog.Functions.at(At), D,
-                                    &SignatureMap, /*TM=*/nullptr,
-                                    /*RunPasses=*/false, /*EH=*/nullptr);
-        if (!L) {
-          std::string Message = toString(L.takeError());
-          return createStringError(inconvertibleErrorCode(),
-                                   "failed to lift EH funclet 0x%llx: %s",
-                                   static_cast<unsigned long long>(Address),
-                                   Message.c_str());
-        }
-        Out[Address] = L->Fn;
-        if (Created) {
-          size_t K = 0;
-          for (llvm::GlobalVariable &G : Mod.globals())
-            if (K++ >= Before)
-              Created->push_back(&G);
-        }
+    // them on M, the parallel path inside every shard that holds a parent.
+    // `SigMap` is a private copy of *Sigs: the funclet signature replaces
+    // the recovered one only while that funclet itself is lifted, so calls
+    // between funclets bind to their recovered signatures.
+    auto liftFunclet = [&](Module &Mod, const Disasm &D,
+                           lift::Signatures &SigMap,
+                           uint64_t Address) -> Expected<llvm::Function *> {
+      Va At(Address);
+      std::optional<lift::Signature> Recovered;
+      if (auto It = SigMap.Funcs.find(At); It != SigMap.Funcs.end())
+        Recovered = std::move(It->second);
+      SigMap.Funcs[At] = FuncletSig;
+      auto L = lift::liftFunction(Mod, Prog, Prog.Functions.at(At), D, &SigMap,
+                                  /*TM=*/nullptr,
+                                  /*RunPasses=*/false, /*EH=*/nullptr);
+      if (Recovered)
+        SigMap.Funcs[At] = std::move(*Recovered);
+      else
+        SigMap.Funcs.erase(At);
+      if (!L) {
+        std::string Message = toString(L.takeError());
+        return createStringError(
+            inconvertibleErrorCode(), "failed to lift EH funclet 0x%llx: %s",
+            static_cast<unsigned long long>(Address), Message.c_str());
       }
-      return Error::success();
+      return L->Fn;
     };
     // MSVC catch funclets return their continuation VA in rax.
     auto continuationVA = [](const llvm::Function &F)
@@ -793,9 +794,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             }
       return Result;
     };
-    auto inlineFunclets =
-        [&](Module &Mod, DenseMap<uint64_t, llvm::Function *> &Funclets,
-            bool EraseUnused) -> Error {
+    // `AfterParent` runs after each parent that has handler blocks.
+    auto inlineFunclets = [&](Module &Mod,
+                              DenseMap<uint64_t, llvm::Function *> &Funclets,
+                              bool EraseUnused,
+                              function_ref<void(llvm::Function &)> AfterParent =
+                                  nullptr) -> Error {
       if (!Funclets.empty()) {
         SmallVector<llvm::Function *, 32> Parents;
         for (llvm::Function &F : Mod)
@@ -849,7 +853,14 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             if (Alias == FuncletAliases.end())
               continue;
             llvm::Function *Funclet = Funclets.lookup(Alias->second);
-            if (!Funclet || Funclet->arg_size() != 1 || BB.empty())
+            // Serial lifts every funclet; a shard lifts those of its parents.
+            if (!Funclet)
+              return createStringError(
+                  inconvertibleErrorCode(),
+                  "EH funclet 0x%llx of %s was not lifted",
+                  static_cast<unsigned long long>(Alias->second),
+                  Parent.getName().str().c_str());
+            if (Funclet->arg_size() != 1 || BB.empty())
               continue;
             llvm::Instruction *Ret = BB.getTerminator();
             if (!Ret)
@@ -901,6 +912,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                        "failed to inline EH funclet into %s",
                                        Parent.getName().str().c_str());
           }
+          if (AfterParent && !HandlerBlocks.empty())
+            AfterParent(Parent);
         }
       }
       if (EraseUnused)
@@ -929,8 +942,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     //    external linkage (the linker drops unreferenced internal globals)
     //    and are renamed afterwards in serial creation order.
     //  - Module order. Definitions and globals are put back in serial order.
-    // EH funclet owners share one shard that lifts and inlines funclets
-    // before cleanup, exactly as the serial path does on M.
+    // EH parents spread over the shards like any other function. A shard
+    // lifts the funclets its parents use and inlines them before cleanup,
+    // as the serial path does on M; a funclet shared by parents in several
+    // shards is lifted in each (inlining copies its body anyway), and the
+    // merge keeps one copy of the funclet and of its globals.
     // Any failure resets M and the serial path runs unchanged. Source emit
     // only: the raw-IR artifact has no serial meaning here.
     struct CleanSlot {
@@ -964,35 +980,84 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             CleanRemainder += ",";
           CleanRemainder += Elements[I].str();
         }
-        // Shard Threads holds EH funclet owners (and lifts their funclets).
-        // Shards keep Todo order inside, like the serial module.
-        std::vector<std::vector<size_t>> Shards(Threads + 1);
+        // Shards keep Todo order inside, like the serial module. An EH
+        // parent costs its own size plus one inlined funclet body per
+        // handler, plus the lift of each funclet its shard lacks so far.
+        // An inlined body is raw lifted IR: cloning it and cleaning the
+        // grown parent measured about five times the per-instruction cost
+        // of a plain lift and clean (fmt-cl-o2gl: one parent, 11k inlined
+        // instructions, 7 s).
+        constexpr size_t InlinedWeight = 5;
+        std::vector<std::vector<size_t>> Shards(Threads);
         std::vector<size_t> Loads(Threads, 0);
+        std::vector<DenseSet<uint64_t>> ShardFunclets(Threads);
+        auto sizeOf = [&](uint64_t Address) {
+          return Prog.Functions.at(Va(Address)).InstrRvas.size();
+        };
+        std::vector<size_t> Cost(Todo.size());
+        for (size_t Idx = 0; Idx < Todo.size(); ++Idx) {
+          Cost[Idx] = sizeOf(Todo[Idx].Value);
+          if (auto It = OwnerFunclets.find(Todo[Idx].Value);
+              It != OwnerFunclets.end())
+            for (uint64_t Funclet : It->second)
+              Cost[Idx] += InlinedWeight * sizeOf(Funclet);
+        }
         std::vector<size_t> Order(Todo.size());
         std::iota(Order.begin(), Order.end(), size_t(0));
-        llvm::sort(Order, [&](size_t A, size_t B) {
-          return Prog.Functions.at(Todo[A]).InstrRvas.size() >
-                 Prog.Functions.at(Todo[B]).InstrRvas.size();
-        });
+        llvm::stable_sort(
+            Order, [&](size_t A, size_t B) { return Cost[A] > Cost[B]; });
         for (size_t Idx : Order) {
           if (FuncletAddresses.contains(Todo[Idx].Value))
             continue;
-          if (FuncletOwners.contains(Todo[Idx].Value)) {
-            Shards[Threads].push_back(Idx);
-            continue;
-          }
+          auto Owned = OwnerFunclets.find(Todo[Idx].Value);
+          auto liftCost = [&](size_t S) {
+            size_t Extra = 0;
+            if (Owned != OwnerFunclets.end()) {
+              SmallVector<uint64_t, 8> Seen;
+              for (uint64_t Funclet : Owned->second)
+                if (!ShardFunclets[S].contains(Funclet) &&
+                    !llvm::is_contained(Seen, Funclet)) {
+                  Seen.push_back(Funclet);
+                  Extra += sizeOf(Funclet);
+                }
+            }
+            return Extra;
+          };
           size_t Best = 0;
-          for (size_t S = 1; S < Threads; ++S)
-            if (Loads[S] < Loads[Best])
+          size_t BestLoad = Loads[0] + liftCost(0);
+          for (size_t S = 1; S < Threads; ++S) {
+            size_t Load = Loads[S] + liftCost(S);
+            if (Load < BestLoad) {
               Best = S;
+              BestLoad = Load;
+            }
+          }
           Shards[Best].push_back(Idx);
-          Loads[Best] += Prog.Functions.at(Todo[Idx]).InstrRvas.size();
+          Loads[Best] = BestLoad + Cost[Idx];
+          if (Owned != OwnerFunclets.end())
+            ShardFunclets[Best].insert(Owned->second.begin(),
+                                       Owned->second.end());
         }
         for (std::vector<size_t> &Shard : Shards)
           llvm::sort(Shard);
-        // Funclets exist only to be inlined into owners.
-        if (!FuncletAddresses.empty() && Shards[Threads].empty())
-          Shards[Threads].push_back(SIZE_MAX);
+        // Every funclet is lifted at least once, also one that no parent
+        // inlines (its owners are funclets themselves). Its home shard, the
+        // first that lifts it, keeps the copy that survives the merge.
+        DenseMap<uint64_t, unsigned> FuncletHome;
+        for (uint64_t Address : FuncletOrder) {
+          unsigned Home = 0;
+          while (Home < Threads && !ShardFunclets[Home].contains(Address))
+            ++Home;
+          if (Home == Threads) {
+            Home = 0;
+            for (unsigned S = 1; S < Threads; ++S)
+              if (Loads[S] < Loads[Home])
+                Home = S;
+            ShardFunclets[Home].insert(Address);
+            Loads[Home] += sizeOf(Address);
+          }
+          FuncletHome[Address] = Home;
+        }
         // The EH personality is a module-level name: the lifter creates the
         // declaration lazily, and a function can carry the same name (a
         // library match names the personality thunk after the runtime symbol
@@ -1028,13 +1093,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         std::vector<unsigned> ShardOf(Todo.size(), ~0u);
         for (unsigned S = 0; S < Shards.size(); ++S)
           for (size_t Idx : Shards[S])
-            if (Idx != SIZE_MAX)
-              ShardOf[Idx] = S;
-        lift::Signature FuncletSig;
-        FuncletSig.Params.push_back(
-            {lift::ParamLoc::reg(llvm::X86::RDX), 64, false,
-             std::string("frame")});
-        FuncletSig.Ret = lift::RetLoc{false, 64};
+            ShardOf[Idx] = S;
         if (Compiler.Producer == revenant::Compiler::Rustc)
           for (FunctionEH &EH : EHFunctions)
             EH.Model = EHModel::Rust;
@@ -1044,6 +1103,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // (Todo index, globals that lift created) in lift order.
           std::vector<std::pair<size_t, SmallVector<llvm::GlobalVariable *, 4>>>
               Created;
+          // (FuncletOrder index, globals that funclet's lift created).
+          std::vector<std::pair<size_t, SmallVector<llvm::GlobalVariable *, 4>>>
+              FuncletCreated;
           DenseMap<uint64_t, llvm::Function *> Funclets;
           // Function-local name counters, carried across the bitcode trip.
           std::vector<std::pair<std::string, uint32_t>> Counters;
@@ -1083,11 +1145,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           std::string Bitcode;
           std::string Err;
         };
-        std::vector<ShardState> State(Threads + 1);
+        std::vector<ShardState> State(Threads);
         auto runWave = [&](auto &&Body) {
           std::vector<std::thread> Workers;
           for (unsigned S = 0; S < State.size(); ++S)
-            if (!Shards[S].empty())
+            if (!Shards[S].empty() || !ShardFunclets[S].empty())
               Workers.emplace_back([&, S] { Body(S); });
           for (std::thread &W : Workers)
             W.join();
@@ -1158,29 +1220,40 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             // Mirrors of definitions owned elsewhere: not creations here.
             St.FnSeen = St.Mod->size();
           };
-          if (S != Threads) {
-            for (uint64_t Address : FuncletAddresses)
+          // Serial lifts every funclet first, in FuncletOrder. Lift the ones
+          // this shard's parents inline and claim the rest. A funclet lift
+          // gets slot 0 and a sequence that starts at its order index, so
+          // the minimum over shards is the serial creation order.
+          std::optional<lift::Signatures> FuncletSigs;
+          for (size_t K = 0; K < FuncletOrder.size(); ++K) {
+            uint64_t Address = FuncletOrder[K];
+            if (!ShardFunclets[S].contains(Address)) {
               lift::claimDefinition(
                   *St.Mod,
                   lift::definitionName(Prog.Functions.at(Va(Address))),
                   &FuncletSig);
-            St.FnSeen = St.Mod->size();
-          }
-          if (S == Threads) {
-            std::vector<llvm::GlobalVariable *> FuncletCreated;
-            if (Error E = liftFunclets(*St.Mod, *ThreadDis, St.Funclets,
-                                       &FuncletCreated)) {
-              St.Err = toString(std::move(E));
+              St.FnSeen = St.Mod->size();
+              continue;
+            }
+            if (!FuncletSigs)
+              FuncletSigs.emplace(*Sigs);
+            size_t Before = St.Mod->global_size();
+            auto F = liftFunclet(*St.Mod, *ThreadDis, *FuncletSigs, Address);
+            if (!F) {
+              St.Err = toString(F.takeError());
               return;
             }
-            St.Created.emplace_back(
-                SIZE_MAX, SmallVector<llvm::GlobalVariable *, 4>(
-                              FuncletCreated.begin(), FuncletCreated.end()));
+            St.Funclets[Address] = *F;
+            SmallVector<llvm::GlobalVariable *, 4> New;
+            size_t I = 0;
+            for (llvm::GlobalVariable &G : St.Mod->globals())
+              if (I++ >= Before)
+                New.push_back(&G);
+            St.FuncletCreated.emplace_back(K, std::move(New));
+            St.FnSeq = uint64_t(K) << 32;
             noteNewFunctions(St, 0, 0, "");
           }
           for (size_t Idx : Shards[S]) {
-            if (Idx == SIZE_MAX)
-              continue;
             Va T = Todo[Idx];
             claimForeignBefore(Idx);
             const FunctionEH *EH = nullptr;
@@ -1238,21 +1311,18 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // Finish the timeline: serial defines every later function too,
           // renaming any clashing callee declaration to `.decl`.
           claimForeignBefore(Todo.size());
-          if (S == Threads) {
-            // Inlining erases spent funclets, so find new functions by set.
-            DenseSet<llvm::Function *> Known;
-            for (llvm::Function &F : *St.Mod)
-              Known.insert(&F);
+          if (!St.Funclets.empty()) {
+            // Serial inlines parent by parent in module (= Todo) order.
             // Funclets are erased only once no shard uses them; decided
             // after the wave.
+            auto AfterParent = [&](llvm::Function &Parent) {
+              auto VA = ir::getFunctionVA(Parent);
+              noteNewFunctions(
+                  St, 0, Todo.size() + 1 + (VA ? TodoSlot.lookup(*VA) : 0), "");
+            };
             if (Error E = inlineFunclets(*St.Mod, St.Funclets,
-                                         /*EraseUnused=*/false))
+                                         /*EraseUnused=*/false, AfterParent))
               St.Err = toString(std::move(E));
-            for (llvm::Function &F : *St.Mod)
-              if (!Known.contains(&F))
-                St.FnKeys.push_back({WeakVH(&F), 0, Todo.size() + 1,
-                                     St.FnSeq++, "", ""});
-            St.FnSeen = St.Mod->size();
           }
         });
         std::string Why;
@@ -1272,10 +1342,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         }
         // Serial erases a funclet right after inlining when nothing uses it
         // anymore. Uses may sit in any shard, so decide here: erase spent
-        // funclets in the EH shard, and drop unused funclet declarations
-        // elsewhere so they do not reach the merged module.
+        // funclets and their declarations everywhere. A funclet still in
+        // use survives once, from its home shard; the other copies become
+        // declarations that the merge folds onto it.
         if (Why.empty() && !FuncletAddresses.empty()) {
-          for (uint64_t Address : FuncletAddresses) {
+          for (uint64_t Address : FuncletOrder) {
             std::string Name =
                 lift::definitionName(Prog.Functions.at(Va(Address)));
             bool Used = false;
@@ -1283,12 +1354,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               if (St.Mod)
                 if (llvm::Function *F = St.Mod->getFunction(Name))
                   Used |= !F->use_empty();
-            if (Used)
-              continue;
-            for (ShardState &St : State)
-              if (St.Mod)
-                if (llvm::Function *F = St.Mod->getFunction(Name))
-                  F->eraseFromParent();
+            unsigned Home = FuncletHome.lookup(Address);
+            for (unsigned S = 0; S < State.size(); ++S)
+              if (State[S].Mod)
+                if (llvm::Function *F = State[S].Mod->getFunction(Name)) {
+                  if (!Used)
+                    F->eraseFromParent();
+                  else if (S != Home && !F->isDeclaration())
+                    F->deleteBody();
+                }
           }
           for (ShardState &St : State)
             if (St.Mod)
@@ -1301,9 +1375,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // not (a lift that failed late leaves an attributed declaration).
           StringMap<llvm::Function *> DefByName;
           for (size_t Idx = 0; Idx < Todo.size(); ++Idx) {
-            unsigned Owner = FuncletAddresses.contains(Todo[Idx].Value)
-                                 ? Threads
-                                 : ShardOf[Idx];
+            auto Home = FuncletHome.find(Todo[Idx].Value);
+            unsigned Owner =
+                Home != FuncletHome.end() ? Home->second : ShardOf[Idx];
             if (Owner == ~0u || !State[Owner].Mod)
               continue;
             std::string Name =
@@ -1394,17 +1468,55 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         // derive local names from global names (simplifycfg's `<g>.mux`).
         // All globals come from lift, created in serial order funclets
         // first, then Todo order; replay LLVM's makeUniqueName over that
-        // sequence (bump the module counter, append `.N` until free).
+        // sequence (bump the module counter, append `.N` until free). A
+        // funclet lifted in several shards made one copy of each global per
+        // shard: the home copy takes the slot, and every copy the name.
+        // `SharedGlobals` lists those names for the merge.
+        StringSet<> SharedGlobals;
         if (Why.empty()) {
           std::vector<llvm::GlobalVariable *> Seq;
+          // Seq position -> the copies in other shards.
+          DenseMap<size_t, SmallVector<llvm::GlobalVariable *, 2>> Copies;
+          std::vector<std::vector<std::pair<
+              unsigned, const SmallVector<llvm::GlobalVariable *, 4> *>>>
+              ByFunclet(FuncletOrder.size());
           std::vector<const SmallVector<llvm::GlobalVariable *, 4> *> ByIdx(
               Todo.size(), nullptr);
-          for (ShardState &St : State)
-            for (auto &[Idx, Globals] : St.Created)
-              if (Idx == SIZE_MAX)
-                Seq.insert(Seq.end(), Globals.begin(), Globals.end());
-              else
-                ByIdx[Idx] = &Globals;
+          for (unsigned S = 0; S < State.size(); ++S) {
+            for (auto &[K, Globals] : State[S].FuncletCreated)
+              ByFunclet[K].push_back({S, &Globals});
+            for (auto &[Idx, Globals] : State[S].Created)
+              ByIdx[Idx] = &Globals;
+          }
+          for (size_t K = 0; K < FuncletOrder.size() && Why.empty(); ++K) {
+            unsigned Home = FuncletHome.lookup(FuncletOrder[K]);
+            auto HomeIt = llvm::find_if(
+                ByFunclet[K], [&](const auto &C) { return C.first == Home; });
+            if (HomeIt == ByFunclet[K].end()) {
+              Why = "funclet lifted without its home shard";
+              break;
+            }
+            const auto &HomeGlobals = *HomeIt->second;
+            for (const auto &[S, Globals] : ByFunclet[K]) {
+              if (S == Home)
+                continue;
+              if (Globals->size() != HomeGlobals.size()) {
+                Why = "funclet copies created different globals";
+                break;
+              }
+              for (size_t I = 0; I < Globals->size(); ++I) {
+                if (ir::getGlobalVA(*(*Globals)[I]) !=
+                        ir::getGlobalVA(*HomeGlobals[I]) ||
+                    (*Globals)[I]->getValueType()->getArrayNumElements() !=
+                        HomeGlobals[I]->getValueType()->getArrayNumElements()) {
+                  Why = "funclet copies created different globals";
+                  break;
+                }
+                Copies[Seq.size() + I].push_back((*Globals)[I]);
+              }
+            }
+            Seq.insert(Seq.end(), HomeGlobals.begin(), HomeGlobals.end());
+          }
           for (const auto *Globals : ByIdx)
             if (Globals)
               Seq.insert(Seq.end(), Globals->begin(), Globals->end());
@@ -1415,8 +1527,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                 Taken.insert(F.getName());
           uint32_t Counter = 0;
           GlobalOrder.reserve(Seq.size());
-          for (llvm::GlobalVariable *G : Seq) {
-            auto VA = ir::getGlobalVA(*G);
+          for (size_t I = 0; I < Seq.size() && Why.empty(); ++I) {
+            auto VA = ir::getGlobalVA(*Seq[I]);
             if (!VA) {
               Why = "global without VA";
               break;
@@ -1428,12 +1540,24 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             GlobalOrder.push_back(std::move(Name));
           }
           if (Why.empty()) {
-            for (size_t I = 0; I < Seq.size(); ++I)
+            for (size_t I = 0; I < Seq.size(); ++I) {
               Seq[I]->setName("\1rvt." + Twine(I));
+              for (llvm::GlobalVariable *Copy : Copies.lookup(I))
+                Copy->setName("\1rvt." + Twine(I));
+            }
             for (size_t I = 0; I < Seq.size() && Why.empty(); ++I) {
               Seq[I]->setName(GlobalOrder[I]);
               if (Seq[I]->getName() != GlobalOrder[I])
                 Why = "global name collision on " + GlobalOrder[I];
+              auto It = Copies.find(I);
+              if (It == Copies.end())
+                continue;
+              SharedGlobals.insert(GlobalOrder[I]);
+              for (llvm::GlobalVariable *Copy : It->second) {
+                Copy->setName(GlobalOrder[I]);
+                if (Copy->getName() != GlobalOrder[I])
+                  Why = "global name collision on " + GlobalOrder[I];
+              }
             }
           }
           SerialGlobalCounter = Counter;
@@ -1575,8 +1699,16 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               }
             }
             for (llvm::GlobalVariable &G : make_early_inc_range(Src.globals())) {
-              if (M->getNamedValue(G.getName()))
-                return "duplicate global " + G.getName().str();
+              if (llvm::GlobalValue *Old = M->getNamedValue(G.getName())) {
+                // Another shard's copy of a shared funclet global.
+                auto *OldG = dyn_cast<llvm::GlobalVariable>(Old);
+                if (!OldG || !SharedGlobals.contains(G.getName()) ||
+                    OldG->getValueType() != G.getValueType())
+                  return "duplicate global " + G.getName().str();
+                G.replaceAllUsesWith(OldG);
+                G.eraseFromParent();
+                continue;
+              }
               std::string Name = G.getName().str();
               Src.removeGlobalVariable(&G);
               M->insertGlobalVariable(&G);
@@ -1763,9 +1895,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       }
     }
     DenseMap<uint64_t, llvm::Function *> Funclets;
-    if (!ParallelClean)
-      if (Error E = liftFunclets(*M, *Dis, Funclets, nullptr))
-        return E;
+    if (!ParallelClean && !FuncletOrder.empty()) {
+      lift::Signatures FuncletSigs = *Sigs;
+      for (uint64_t Address : FuncletOrder) {
+        auto F = liftFunclet(*M, *Dis, FuncletSigs, Address);
+        if (!F)
+          return F.takeError();
+        Funclets[Address] = *F;
+      }
+    }
     // The user functions the uncxx pass may rewrite. The set holds names, not
     // pointers: a stage that fails is restored by reparsing its input text,
     // which builds a new module with new function objects, so a set of
