@@ -194,7 +194,9 @@ Constant *resolveConstant(Constant *C, const Absolute &Abs) {
 
 /// Point `CB` at F, rebuilding the call when the site's function type no
 /// longer matches (extra register args are dropped, missing ones become
-/// undef, the result is coerced back). Keeps provenance metadata.
+/// undef, the result is coerced back). An invoke is rebuilt as an invoke:
+/// replacing it with a call would drop the unwind edge and leave the block
+/// unterminated. Keeps provenance metadata.
 void retargetCall(CallBase &CB, Function *F) {
   if (CB.getFunctionType() == F->getFunctionType()) {
     CB.setCalledFunction(F);
@@ -209,7 +211,21 @@ void retargetCall(CallBase &CB, Function *F) {
                    : UndefValue::get(FT->getParamType(K));
     Args.push_back(A);
   }
-  auto *New = B.CreateCall(FT, F, Args);
+  // An invoke's result is usable only on its normal edge, so when the site
+  // needs a coercion back to its own type the cast gets a block there. The
+  // split runs before the new invoke is created, while the old invoke is
+  // still the terminator it rewires.
+  BasicBlock *ResultBlock = nullptr;
+  if (auto *II = dyn_cast<InvokeInst>(&CB))
+    if (!CB.getType()->isVoidTy() && !FT->getReturnType()->isVoidTy() &&
+        FT->getReturnType() != CB.getType())
+      ResultBlock = SplitEdge(II->getParent(), II->getNormalDest());
+  CallBase *New;
+  if (auto *II = dyn_cast<InvokeInst>(&CB))
+    New = B.CreateInvoke(FT, F, II->getNormalDest(), II->getUnwindDest(),
+                         Args);
+  else
+    New = B.CreateCall(FT, F, Args);
   New->setCallingConv(CB.getCallingConv());
   if (CB.getDebugLoc())
     New->setDebugLoc(CB.getDebugLoc());
@@ -220,8 +236,11 @@ void retargetCall(CallBase &CB, Function *F) {
     Value *Res;
     if (New->getType()->isVoidTy())
       Res = UndefValue::get(CB.getType());
-    else
+    else {
+      if (ResultBlock)
+        B.SetInsertPoint(ResultBlock->getTerminator());
       Res = coerceTo(New, CB.getType(), B);
+    }
     CB.replaceAllUsesWith(Res);
   }
   CB.eraseFromParent();
