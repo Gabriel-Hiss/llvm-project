@@ -396,11 +396,16 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
   if (Error E = PB.parsePassPipeline(Parsed, Pipeline))
     return E;
   auto RunAll = [&](bool Guarded) -> Error {
+    // Both element kinds verify the module when they succeed; verify at the
+    // end only when the last element left it unverified (a rolled-back
+    // module pass, or an empty pipeline).
+    bool Verified = false;
     for (StringRef Element : pipelineElements(Pipeline)) {
       if (Element.starts_with("function(")) {
         if (Error E = runFunctionPipeline(Stage, *M, Element, Reports,
                                           Flavor, UserNames, Guarded))
           return E;
+        Verified = true;
         continue;
       }
       FunctionStageTrace Trace(Stage, Element, "module");
@@ -414,7 +419,9 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
         Saved = CloneModule(*M);
       // Analysis managers die inside runModulePass before the module is
       // swapped.
-      if (Error E = runModulePass(*M, Element)) {
+      Error E = runModulePass(*M, Element);
+      Verified = !E;
+      if (E) {
         if (!Snapshot)
           return E;
         std::string Message = toString(std::move(E));
@@ -425,7 +432,7 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
                << Message << "\n";
       }
     }
-    return verifyStage(Stage, *M);
+    return Verified ? Error::success() : verifyStage(Stage, *M);
   };
   // Insurance is paid only on failure. When the caller already holds the
   // stage input as text (the common path), restore by reparsing it; the
