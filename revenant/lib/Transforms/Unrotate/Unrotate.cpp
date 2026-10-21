@@ -332,6 +332,13 @@ bool tryBlock(Function &F, BasicBlock *L) {
                                             : GuardBr->getSuccessor(0);
   if (GuardExit != Exit)
     return false;
+  // After the rewrite G no longer branches to X, so every X phi would keep
+  // a stale G entry, and its L entry would have to equal the G value
+  // whenever the guard skips the loop, which nothing here proves. Body
+  // values can only leave the loop through X phis (L does not dominate X),
+  // so an X without phis also means no live-outs to remap.
+  if (!Exit->phis().empty())
+    return false;
 
   // Prove guard == latch-at-init (same edge side) or guard == !latch-at-init.
   bool SameSide = GuardToLoopOnTrue == LoopOnTrue;
@@ -392,71 +399,6 @@ bool tryBlock(Function &F, BasicBlock *L) {
   BranchInst *GotoT = BranchInst::Create(L, G);
   copyVAToTerm(GuardBr, GotoT);
   GuardBr->eraseFromParent();
-
-  // Exit-phi remapping at X: values defined by the cond chain or by loop
-  // phis keep their meaning at the header; other live-outs defined in the
-  // body need a header phi [(v_guard, G), (v, B)]. Collect body defs first.
-  DenseMap<const Value *, PHINode *> Back2Phi;
-  for (Instruction &I : *L) {
-    auto *PN = dyn_cast<PHINode>(&I);
-    if (!PN)
-      break;
-    for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
-      if (PN->getIncomingBlock(i) == B)
-        Back2Phi[PN->getIncomingValue(i)] = PN;
-  }
-  SmallPtrSet<const Value *, 16> HeaderVals;
-  for (Instruction &I : *L)
-    if (!I.getType()->isVoidTy())
-      HeaderVals.insert(&I);
-  // Body defs now live in B.
-  SmallPtrSet<const Value *, 16> BodyDefs;
-  for (Instruction &I : *B)
-    if (!I.getType()->isVoidTy())
-      BodyDefs.insert(&I);
-
-  // New header phis for escaping body values, preprended before existing.
-  SmallVector<PHINode *, 4> NewPhis;
-  for (PHINode &XPhi : Exit->phis()) {
-    for (unsigned i = 0, e = XPhi.getNumIncomingValues(); i != e; ++i) {
-      if (XPhi.getIncomingBlock(i) != L)
-        continue;
-      Value *V = XPhi.getIncomingValue(i);
-      if (HeaderVals.count(V) || Back2Phi.count(V))
-        continue;
-      if (!BodyDefs.count(V))
-        continue;
-      // Need the guard-side value: the same exit phi's incoming at G.
-      Value *VG = nullptr;
-      for (unsigned j = 0, f = XPhi.getNumIncomingValues(); j != f; ++j)
-        if (XPhi.getIncomingBlock(j) == G)
-          VG = XPhi.getIncomingValue(j);
-      if (!VG)
-        return false;
-      PHINode *NP = PHINode::Create(V->getType(), 2,
-                                    (V->getName() + ".x").str(), &L->front());
-      NP->addIncoming(VG, G);
-      NP->addIncoming(V, B);
-      NewPhis.push_back(NP);
-    }
-  }
-
-  // Rewrite X's phi incomings from L: the backedge value becomes the loop
-  // phi (when V names one) or the new header phi.
-  DenseMap<Value *, Value *> Remap;
-  for (auto &KV : Back2Phi)
-    Remap[const_cast<Value *>(KV.first)] = KV.second;
-  for (PHINode *NP : NewPhis)
-    Remap[NP->getIncomingValue(1)] = NP;
-  for (PHINode &XPhi : Exit->phis())
-    for (unsigned i = 0, e = XPhi.getNumIncomingValues(); i != e; ++i) {
-      if (XPhi.getIncomingBlock(i) != L)
-        continue;
-      auto It = Remap.find(XPhi.getIncomingValue(i));
-      if (It != Remap.end())
-        XPhi.setIncomingValue(i, It->second);
-    }
-
   return true;
 }
 

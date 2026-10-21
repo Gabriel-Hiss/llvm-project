@@ -19,8 +19,8 @@
 // also L's exit. The guard and latch conditions must be structurally equal
 // once L's PHIs take their G-incoming values (or exact predicate inverses
 // when the guard enters on the opposite edge). The latch condition's def
-// chain must be pure (binop/cmp/cast/select/gep); anything else is left
-// untouched.
+// chain must be pure (binop/cmp/cast/select/gep), and X must have no PHIs
+// (no live-out values); anything else is left untouched.
 //
 // Rewritten shape (T keeps L's name, B is the new body block):
 //
