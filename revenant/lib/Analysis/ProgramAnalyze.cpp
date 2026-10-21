@@ -593,6 +593,7 @@ Program analyze(const PeFile &Pe, const TargetHooks &Hooks) {
   P.Padding = decodePadding(Pe, AllChunks, AllData);
   for (Function &F : Functions)
     insertFunction(P, std::move(F));
+  buildChunkIndex(P);
   P.Resolver = makeResolver(P.Names, P.Externs, P.Strings);
   return P;
 }

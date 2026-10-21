@@ -125,6 +125,7 @@ void insertFunction(Program &P, Function F) {
   R.ExtraRoots = std::move(F.ExtraRoots);
   R.Orphan = F.Orphan;
   R.IsNoreturn = F.IsNoreturn;
+  P.ChunkIndexBuilt = false;
   auto [It, Inserted] = P.Functions.try_emplace(R.Start, std::move(R));
   if (!Inserted) {
     // Merge blocks from the second discovery into the existing record.
@@ -215,20 +216,43 @@ std::optional<Function> function(const Program &P, Va Start) {
   return materialize(P, It->second);
 }
 
+void buildChunkIndex(const Program &P) {
+  P.ChunkIndex.clear();
+  for (const auto &[Start, F] : P.Functions) {
+    (void)Start;
+    for (const auto &[A, B] : F.Chunks)
+      if (B > A)
+        P.ChunkIndex.emplace_back(A.Value, B.Value, F.Start);
+  }
+  llvm::sort(P.ChunkIndex, [](const auto &X, const auto &Y) {
+    return std::get<0>(X) < std::get<0>(Y);
+  });
+  // Binary search only finds the chunk with the largest lo <= addr. With
+  // overlapping chunks the linear scan below is what the old functionAt did.
+  P.ChunkIndexDisjoint = true;
+  uint64_t MaxHi = 0;
+  for (const auto &[Lo, Hi, FStart] : P.ChunkIndex) {
+    (void)FStart;
+    if (Lo < MaxHi) {
+      P.ChunkIndexDisjoint = false;
+      break;
+    }
+    MaxHi = Hi;
+  }
+  P.ChunkIndexBuilt = true;
+}
+
 const FuncRecord *functionAt(const Program &P, Va Address) {
-  if (!P.ChunkIndexBuilt) {
-    P.ChunkIndexBuilt = true;
-    P.ChunkIndex.clear();
+  if (!P.ChunkIndexBuilt)
+    buildChunkIndex(P);
+  if (!P.ChunkIndexDisjoint) {
     for (const auto &[Start, F] : P.Functions) {
       (void)Start;
       for (const auto &[A, B] : F.Chunks)
-        if (B > A)
-          P.ChunkIndex.emplace_back(A.Value, B.Value, &F);
+        if (Address >= A && Address < B)
+          return &F;
     }
-    llvm::sort(P.ChunkIndex,
-               [](const auto &X, const auto &Y) {
-                 return std::get<0>(X) < std::get<0>(Y);
-               });
+    return nullptr;
   }
   auto It = llvm::partition_point(
       P.ChunkIndex,
@@ -236,7 +260,10 @@ const FuncRecord *functionAt(const Program &P, Va Address) {
   if (It == P.ChunkIndex.begin())
     return nullptr;
   --It;
-  return Address.Value < std::get<1>(*It) ? std::get<2>(*It) : nullptr;
+  if (Address.Value >= std::get<1>(*It))
+    return nullptr;
+  auto FIt = P.Functions.find(std::get<2>(*It));
+  return FIt == P.Functions.end() ? nullptr : &FIt->second;
 }
 
 const PaddingRun *paddingAt(const Program &P, Rva RVA) {

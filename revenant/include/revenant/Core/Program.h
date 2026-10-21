@@ -449,11 +449,17 @@ struct Program {
   /// Executable export VAs (non-forwarders): external callers read their
   /// return values outside the image.
   std::set<Va> Exports;
-  /// Sorted (lo, hi, function) chunk index for `functionAt`, rebuilt lazily
-  /// when `Functions` changes.
-  mutable std::vector<std::tuple<uint64_t, uint64_t, const FuncRecord *>>
-      ChunkIndex;
+  /// Sorted `(chunk lo, chunk hi, function start)` index for `functionAt`,
+  /// built lazily on first lookup, eagerly at the end of `analyze`, and
+  /// rebuilt after `insertFunction`. Keyed by function start so a copied
+  /// `Program` keeps a valid index; `ChunkIndexDisjoint` is false when any
+  /// chunks overlap, in which case `functionAt` uses the linear scan.
+  /// Direct mutation of `Functions` or `FuncRecord::Chunks` after the index
+  /// was built leaves it stale: go through `insertFunction` or call
+  /// `buildChunkIndex` again.
+  mutable std::vector<std::tuple<uint64_t, uint64_t, Va>> ChunkIndex;
   mutable bool ChunkIndexBuilt = false;
+  mutable bool ChunkIndexDisjoint = true;
 };
 
 } // end namespace revenant
