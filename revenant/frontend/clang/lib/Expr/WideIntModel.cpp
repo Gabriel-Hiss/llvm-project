@@ -187,6 +187,13 @@ clang::FunctionDecl *wrapperProto(ASTContext &A, QualType Rec, StringRef Name,
   clang::QualType FT = A.getFunctionType(Ret, Params, EPI);
   clang::IdentifierInfo &II = A.Idents.get(Name);
   clang::TranslationUnitDecl *TU = A.getTranslationUnitDecl();
+  // Every same-name declaration added to the TU is compared against all
+  // earlier ones, so a fresh prototype per call site made emission
+  // quadratic in wide operations.
+  for (clang::Decl *D : TU->lookup(clang::DeclarationName(&II)))
+    if (auto *Old = llvm::dyn_cast<clang::FunctionDecl>(D);
+        Old && Old->isImplicit() && Old->getType() == FT)
+      return Old;
   auto *FD = clang::FunctionDecl::Create(
       A, TU, SourceLocation(), SourceLocation(), &II, FT,
       A.getTrivialTypeSourceInfo(Ret), clang::SC_Static);
