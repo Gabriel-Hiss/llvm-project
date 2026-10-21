@@ -930,7 +930,7 @@ revenant::UncxxPass::run(llvm::Function &F, llvm::FunctionAnalysisManager &) {
   Attribute User = F.getFnAttribute("revenant.user");
   if (!User.isStringAttribute() || User.getValueAsString() != "true")
     return llvm::PreservedAnalyses::all();
-  if (UserFns && !UserFns->contains(&F))
+  if (UserNames && !UserNames->contains(F.getName()))
     return llvm::PreservedAnalyses::all();
   if (Metadata *Language = F.getParent()->getModuleFlag("revenant.lang")) {
     auto *Name = dyn_cast<MDString>(Language);
