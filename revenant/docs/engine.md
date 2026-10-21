@@ -68,7 +68,10 @@ per line.
 `<base>.ir-final.ll`, `<base>.source.<c|cpp|rs>` and `<base>.manifest.txt`
 (only the stages that ran). `--time` prints the elapsed time of each stage.
 `--no-artifacts` prints the requested stage on stdout without writing any
-artifact file.
+artifact file. The ir-final artifact text is printed on a background thread
+while the source stage reads the same module.
+`REVENANT_SERIAL_ARTIFACT_PRINT=1` keeps that print on the main thread, and
+`REVENANT_ARTIFACT_TIMING=1` reports what the artifact path costs.
 
 `--list --classify` uses `Session::classifyFunctions`. It traces the user
 entry and reachability from the PE entry even without a library database;
