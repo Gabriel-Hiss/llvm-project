@@ -713,6 +713,23 @@ std::vector<LibraryMatch> matchLibraryFunctions(const Program &P,
   std::map<uint64_t, std::vector<uint32_t>> BySize;
   for (uint32_t I = 0; I < DB.Functions.size(); ++I)
     BySize[DB.Functions[I].Size].push_back(I);
+  // A match needs every unmasked byte equal, so the unmasked bytes among the
+  // first eight must be equal too: one masked 64-bit compare rejects almost
+  // every candidate before the per-byte walk below.
+  struct Prefix {
+    uint64_t Bytes = 0;
+    uint64_t Mask = 0;
+  };
+  std::vector<Prefix> Prefixes(DB.Functions.size());
+  for (uint32_t I = 0; I < DB.Functions.size(); ++I) {
+    const LibraryFunction &F = DB.Functions[I];
+    for (unsigned B = 0; B < 8 && B < F.Bytes.size(); ++B)
+      if (!std::binary_search(F.MaskedRelocations.begin(),
+                              F.MaskedRelocations.end(), B)) {
+        Prefixes[I].Bytes |= uint64_t(F.Bytes[B]) << (8 * B);
+        Prefixes[I].Mask |= uint64_t(0xff) << (8 * B);
+      }
+  }
   std::vector<LibraryMatch> Matches;
   if (!P.Img)
     return Matches;
@@ -725,9 +742,17 @@ std::vector<LibraryMatch> matchLibraryFunctions(const Program &P,
     auto Raw = P.Img->dataAt(Start, static_cast<size_t>(Size));
     if (Raw.size() != Size)
       continue;
+    uint64_t RawPrefix = 0;
+    for (unsigned B = 0; B < 8 && B < Size; ++B)
+      RawPrefix |= uint64_t(Raw[B]) << (8 * B);
+    const uint64_t InSize =
+        Size >= 8 ? ~uint64_t(0) : (uint64_t(1) << (8 * Size)) - 1;
     for (auto It = BySize.lower_bound(Size);
          It != BySize.end() && It->first - Size <= 15; ++It) {
       for (uint32_t Index : It->second) {
+        const Prefix &Pre = Prefixes[Index];
+        if ((RawPrefix ^ Pre.Bytes) & Pre.Mask & InSize)
+          continue;
         const LibraryFunction &F = DB.Functions[Index];
         if (F.Size != F.Bytes.size())
           continue;
