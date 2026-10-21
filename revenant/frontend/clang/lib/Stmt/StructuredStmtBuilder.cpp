@@ -189,6 +189,10 @@ private:
   DenseSet<const IdentifierInfo *> LabelNames;
   SmallPtrSet<BasicBlock *, 8> NeededLabels;
   DenseMap<BasicBlock *, std::unique_ptr<Region>> Regions;
+  /// Regions in header block order, and enclosingRegion answers. Region
+  /// membership is final once collectRegions built every region.
+  SmallVector<Region *, 16> RegionsInOrder;
+  DenseMap<BasicBlock *, Region *> Enclosing;
   DenseMap<BasicBlock *, ScTag> ScTags;
   std::unique_ptr<DominatorTree> DT;
   std::unique_ptr<PostDominatorTree> PDT;
@@ -423,6 +427,9 @@ void StructuredStmtBuilder::collectRegions() {
       computeIfMembers(R);
     Regions[&BB] = std::make_unique<Region>(std::move(R));
   }
+  for (BasicBlock *BB : Blocks)
+    if (Region *R = regionOf(BB))
+      RegionsInOrder.push_back(R);
   collectReturnStores();
   // An edge entering the interior of a region from outside forces a label
   // on the target and degrades that region to goto emission. Members
@@ -536,15 +543,17 @@ StoreInst *StructuredStmtBuilder::returnStoreForEdge(BasicBlock *Target,
 }
 
 Region *StructuredStmtBuilder::enclosingRegion(BasicBlock *BB) {
+  auto [Cached, New] = Enclosing.try_emplace(BB, nullptr);
+  if (!New)
+    return Cached->second;
   // Walk candidates in block order so the answer never depends on
   // DenseMap pointer-hash order (ASLR makes it differ per process).
   // A region whose header is itself a member of the current best is the
   // inner one and wins outright; non-nested overlapping regions pick the
   // smaller member set, then the earlier header in block order.
   Region *Best = nullptr;
-  for (BasicBlock *Cand : Blocks) {
-    Region *R = regionOf(Cand);
-    if (!R || !R->Members.contains(BB) || R->Header == BB)
+  for (Region *R : RegionsInOrder) {
+    if (!R->Members.contains(BB) || R->Header == BB)
       continue;
     if (!Best || Best->Members.contains(R->Header)) {
       Best = R;
@@ -554,6 +563,7 @@ Region *StructuredStmtBuilder::enclosingRegion(BasicBlock *BB) {
         R->Members.size() < Best->Members.size())
       Best = R;
   }
+  Enclosing[BB] = Best;
   return Best;
 }
 bool StructuredStmtBuilder::flowsIntoNext(BasicBlock *To, BasicBlock *From,
@@ -1700,6 +1710,8 @@ CompoundStmt *StructuredStmtBuilder::buildBody(Function &F, FunctionDecl *FD,
   LabelNames.clear();
   NeededLabels.clear();
   Regions.clear();
+  RegionsInOrder.clear();
+  Enclosing.clear();
   ScTags.clear();
   ForClaimed.clear();
   EHClaimed.clear();
