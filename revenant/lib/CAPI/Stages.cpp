@@ -383,11 +383,11 @@ Error runModulePass(Module &M, StringRef Pass) {
   return verifyStage(Pass, M);
 }
 
-Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
-                      StringRef Pipeline, std::vector<StageReport> &Reports,
-                      CxxFlavor Flavor = CxxFlavor::Auto,
-                      const StringSet<> *UserNames = nullptr,
-                      StringRef InputText = "") {
+Error runPipelineText(
+    StringRef Stage, std::unique_ptr<Module> &M, StringRef Pipeline,
+    std::vector<StageReport> &Reports, CxxFlavor Flavor = CxxFlavor::Auto,
+    const StringSet<> *UserNames = nullptr, StringRef InputText = "",
+    function_ref<Expected<std::unique_ptr<Module>>()> Rebuild = nullptr) {
   // Validate the whole pipeline first: unknown pass names are configuration
   // errors, not recoverable failures of a particular function or module.
   PassBuilder PB;
@@ -409,11 +409,11 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
         continue;
       }
       FunctionStageTrace Trace(Stage, Element, "module");
-      // Unguarded with stage input text: a failing module pass aborts the
-      // run, and the caller reparses the input and reruns guarded. Guarded
-      // (or without input text): snapshot the module so a failing pass is
+      // Unguarded: a failing module pass aborts the run, and the caller
+      // restores the stage input (reparsed text or the upfront clone) and
+      // reruns guarded. Guarded: snapshot the module so a failing pass is
       // rolled back and the rest of the pipeline still runs.
-      const bool Snapshot = Guarded || InputText.empty();
+      const bool Snapshot = Guarded;
       std::unique_ptr<Module> Saved;
       if (Snapshot)
         Saved = CloneModule(*M);
@@ -438,14 +438,22 @@ Error runPipelineText(StringRef Stage, std::unique_ptr<Module> &M,
   // stage input as text (the common path), restore by reparsing it; the
   // old premium was one module clone per stage plus one function clone
   // and one full verify per function, which cost more than the passes.
-  // Without input text, fall back to one upfront module clone per stage.
+  // A caller that can rebuild the input passes `Rebuild`. Without either,
+  // fall back to one upfront module clone per stage.
   std::unique_ptr<Module> Saved;
-  if (InputText.empty())
+  if (InputText.empty() && !Rebuild)
     Saved = CloneModule(*M);
   if (Error E = RunAll(/*Guarded=*/false)) {
     errs() << "[failed] " << Stage << ": " << toString(std::move(E)) << "\n";
     if (Saved) {
       M.swap(Saved);
+    } else if (InputText.empty()) {
+      auto Rebuilt = Rebuild();
+      if (!Rebuilt)
+        return createStringError("failed to restore stage input for " +
+                                 Stage.str() + ": " +
+                                 toString(Rebuilt.takeError()));
+      M = std::move(*Rebuilt);
     } else {
       SMDiagnostic ParseErr;
       std::unique_ptr<Module> Restored =
@@ -962,6 +970,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // serial leaves after lift (parallel path).
     std::vector<std::string> GlobalOrder;
     uint32_t SerialGlobalCounter = 0;
+    // Builds the merged module from the shards' bitcode (parallel path). It
+    // stays set through ir-clean, whose failure restore it is.
+    std::function<Expected<std::unique_ptr<Module>>()> MergeShards;
     {
       // Parallel lift+clean is the default source path; REVENANT_PARALLEL_CLEAN=0
       // restores the serial algorithm (useful for debugging or artifact parity).
@@ -1145,7 +1156,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           std::string Bitcode;
           std::string Err;
         };
-        std::vector<ShardState> State(Threads);
+        // Shared with MergeShards, which outlives this block.
+        auto StateOwner = std::make_shared<std::vector<ShardState>>(Threads);
+        std::vector<ShardState> &State = *StateOwner;
         auto runWave = [&](auto &&Body) {
           std::vector<std::thread> Workers;
           for (unsigned S = 0; S < State.size(); ++S)
@@ -1668,102 +1681,100 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             Ctx.getMDKindID(Name);
         }
         if (Why.empty()) {
-          ParallelClean = true;
           // Shards are parsed into M's own context, so types, constants and
           // metadata are already shared: merging is splicing functions and
-          // globals into M and folding same-name declarations onto one
-          // value. IRMover would remap every operand and rescan the whole
+          // globals into the module and folding same-name declarations onto
+          // one value. IRMover would remap every operand and rescan the whole
           // destination per shard, which made merging quadratic.
-          auto mergeShard = [&](Module &Src) -> std::string {
-            for (llvm::Function &F : make_early_inc_range(Src)) {
-              llvm::Function *Dst = M->getFunction(F.getName());
-              if (Dst && Dst->getFunctionType() != F.getFunctionType())
-                return "type clash on " + F.getName().str();
-              if (Dst && F.isDeclaration()) {
-                F.replaceAllUsesWith(Dst);
-                F.eraseFromParent();
-                continue;
+          MergeShards =
+              [&Ctx, &Todo, &GlobalOrder, &SerialGlobalCounter, Out, StateOwner,
+               SharedGlobals,
+               PersonalityNames]() -> Expected<std::unique_ptr<Module>> {
+            std::vector<ShardState> &State = *StateOwner;
+            std::unique_ptr<Module> M = moduleFor(Ctx, Out);
+            auto mergeShard = [&](Module &Src) -> std::string {
+              for (llvm::Function &F : make_early_inc_range(Src)) {
+                llvm::Function *Dst = M->getFunction(F.getName());
+                if (Dst && Dst->getFunctionType() != F.getFunctionType())
+                  return "type clash on " + F.getName().str();
+                if (Dst && F.isDeclaration()) {
+                  F.replaceAllUsesWith(Dst);
+                  F.eraseFromParent();
+                  continue;
+                }
+                if (Dst && !Dst->isDeclaration())
+                  return "duplicate definition of " + F.getName().str();
+                std::string Name;
+                if (Dst) {
+                  Name = Dst->getName().str();
+                  Dst->setName("");
+                }
+                M->getFunctionList().splice(M->end(), Src.getFunctionList(), F);
+                if (Dst) {
+                  Dst->replaceAllUsesWith(&F);
+                  Dst->eraseFromParent();
+                  if (F.getName() != Name)
+                    return "rename while merging " + Name;
+                }
               }
-              if (Dst && !Dst->isDeclaration())
-                return "duplicate definition of " + F.getName().str();
-              std::string Name;
-              if (Dst) {
-                Name = Dst->getName().str();
-                Dst->setName("");
-              }
-              M->getFunctionList().splice(M->end(), Src.getFunctionList(), F);
-              if (Dst) {
-                Dst->replaceAllUsesWith(&F);
-                Dst->eraseFromParent();
-                if (F.getName() != Name)
+              for (llvm::GlobalVariable &G :
+                   make_early_inc_range(Src.globals())) {
+                if (llvm::GlobalValue *Old = M->getNamedValue(G.getName())) {
+                  // Another shard's copy of a shared funclet global.
+                  auto *OldG = dyn_cast<llvm::GlobalVariable>(Old);
+                  if (!OldG || !SharedGlobals.contains(G.getName()) ||
+                      OldG->getValueType() != G.getValueType())
+                    return "duplicate global " + G.getName().str();
+                  G.replaceAllUsesWith(OldG);
+                  G.eraseFromParent();
+                  continue;
+                }
+                std::string Name = G.getName().str();
+                Src.removeGlobalVariable(&G);
+                M->insertGlobalVariable(&G);
+                if (G.getName() != Name)
                   return "rename while merging " + Name;
               }
-            }
-            for (llvm::GlobalVariable &G : make_early_inc_range(Src.globals())) {
-              if (llvm::GlobalValue *Old = M->getNamedValue(G.getName())) {
-                // Another shard's copy of a shared funclet global.
-                auto *OldG = dyn_cast<llvm::GlobalVariable>(Old);
-                if (!OldG || !SharedGlobals.contains(G.getName()) ||
-                    OldG->getValueType() != G.getValueType())
-                  return "duplicate global " + G.getName().str();
-                G.replaceAllUsesWith(OldG);
-                G.eraseFromParent();
-                continue;
-              }
-              std::string Name = G.getName().str();
-              Src.removeGlobalVariable(&G);
-              M->insertGlobalVariable(&G);
-              if (G.getName() != Name)
-                return "rename while merging " + Name;
-            }
-            // Module-level named metadata (`rev.types`, module flags) is
-            // written once per module from whole-program data, so every
-            // shard holds the same uniqued nodes: adopt the first copy,
-            // require the rest to match.
-            for (NamedMDNode &N : Src.named_metadata()) {
-              NamedMDNode *Dst = M->getOrInsertNamedMetadata(N.getName());
-              if (Dst->getNumOperands() == 0) {
-                for (MDNode *Op : N.operands())
-                  Dst->addOperand(Op);
-                continue;
-              }
-              if (Dst->getNumOperands() != N.getNumOperands())
-                return "named metadata differs: " + N.getName().str();
-              for (unsigned I = 0; I < N.getNumOperands(); ++I)
-                if (Dst->getOperand(I) != N.getOperand(I))
+              // Module-level named metadata (`rev.types`, module flags) is
+              // written once per module from whole-program data, so every
+              // shard holds the same uniqued nodes: adopt the first copy,
+              // require the rest to match.
+              for (NamedMDNode &N : Src.named_metadata()) {
+                NamedMDNode *Dst = M->getOrInsertNamedMetadata(N.getName());
+                if (Dst->getNumOperands() == 0) {
+                  for (MDNode *Op : N.operands())
+                    Dst->addOperand(Op);
+                  continue;
+                }
+                if (Dst->getNumOperands() != N.getNumOperands())
                   return "named metadata differs: " + N.getName().str();
+                for (unsigned I = 0; I < N.getNumOperands(); ++I)
+                  if (Dst->getOperand(I) != N.getOperand(I))
+                    return "named metadata differs: " + N.getName().str();
+              }
+              return "";
+            };
+            for (ShardState &St : State) {
+              if (St.Bitcode.empty())
+                continue;
+              auto ShardOrErr = parseBitcodeFile(
+                  MemoryBufferRef(St.Bitcode, "clean-shard"), Ctx);
+              if (!ShardOrErr)
+                return createStringError("parse: " +
+                                         toString(ShardOrErr.takeError()));
+              std::string Err = mergeShard(**ShardOrErr);
+              if (!Err.empty())
+                return createStringError("merge: " + Err);
             }
-            return "";
-          };
-          for (unsigned S = 0; S < State.size() && ParallelClean; ++S) {
-            if (State[S].Bitcode.empty())
-              continue;
-            auto ShardOrErr = parseBitcodeFile(
-                MemoryBufferRef(State[S].Bitcode, "clean-shard"), Ctx);
-            if (!ShardOrErr) {
-              Why = "parse: " + toString(ShardOrErr.takeError());
-              ParallelClean = false;
-              break;
-            }
-            std::string Err = mergeShard(**ShardOrErr);
-            if (!Err.empty()) {
-              Why = "merge: " + Err;
-              ParallelClean = false;
-            }
-            State[S].Bitcode.clear();
-          }
-        }
-        if (ParallelClean) {
-          for (unsigned S = 0; S < State.size() && ParallelClean; ++S)
-            for (auto &[Name, Counter] : State[S].Counters)
-              if (llvm::Function *F = M->getFunction(Name))
-                lastUnique(*F->getValueSymbolTable()) = Counter;
-          // Linking re-points every use of a global value, so use lists come
-          // out in link order. Passes such as revenant-lift-abi walk
-          // F.users() and name what they create in the caller, so restore
-          // the order: inside a caller, the worker's (= serial) order;
-          // across callers, later-lifted first, since LLVM prepends uses.
-          if (ParallelClean) {
+            for (ShardState &St : State)
+              for (auto &[Name, Counter] : St.Counters)
+                if (llvm::Function *F = M->getFunction(Name))
+                  lastUnique(*F->getValueSymbolTable()) = Counter;
+            // Linking re-points every use of a global value, so use lists come
+            // out in link order. Passes such as revenant-lift-abi walk
+            // F.users() and name what they create in the caller, so restore
+            // the order: inside a caller, the worker's (= serial) order;
+            // across callers, later-lifted first, since LLVM prepends uses.
             DenseMap<const Use *, uint32_t> PosOf;
             for (ShardState &St : State) {
               std::vector<std::vector<Instruction *>> InstsOf(St.UseFns.size());
@@ -1783,8 +1794,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             for (llvm::Function &F : *M) {
               auto VA = ir::getFunctionVA(F);
               auto It = VA ? TodoRank.find(*VA) : TodoRank.end();
-              Rank[&F] = It != TodoRank.end() ? It->second
-                                              : Todo.size() + Ordinal;
+              Rank[&F] =
+                  It != TodoRank.end() ? It->second : Todo.size() + Ordinal;
               ++Ordinal;
             }
             auto key = [&](const Use &U) {
@@ -1792,9 +1803,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               if (!I)
                 return std::make_tuple(1, size_t(0), uint32_t(0));
               auto P = PosOf.find(&U);
-              return std::make_tuple(
-                  0, ~Rank.lookup(I->getFunction()),
-                  P == PosOf.end() ? UINT32_MAX : P->second);
+              return std::make_tuple(0, ~Rank.lookup(I->getFunction()),
+                                     P == PosOf.end() ? UINT32_MAX : P->second);
             };
             for (GlobalValue &GV : M->global_values())
               if (!GV.use_empty() && !GV.hasOneUse())
@@ -1855,10 +1865,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             std::vector<const llvm::Function *> LiftOrder;
             for (auto &[F, K] : FnCreated)
               LiftOrder.push_back(F);
-            llvm::sort(LiftOrder, [&](const llvm::Function *A,
-                                      const llvm::Function *B) {
-              return FnCreated.lookup(A) < FnCreated.lookup(B);
-            });
+            llvm::sort(LiftOrder,
+                       [&](const llvm::Function *A, const llvm::Function *B) {
+                         return FnCreated.lookup(A) < FnCreated.lookup(B);
+                       });
             StringMap<uint64_t> RankByName;
             for (size_t I = 0; I < LiftOrder.size(); ++I)
               RankByName[LiftOrder[I]->getName()] = I;
@@ -1867,11 +1877,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                 if (R.Phase != 0)
                   if (llvm::Function *F = M->getFunction(R.Name)) {
                     auto It = RankByName.find(R.By);
-                    if (It == RankByName.end()) {
-                      Why = "cleanup creation by unranked " + R.By;
-                      ParallelClean = false;
-                      continue;
-                    }
+                    if (It == RankByName.end())
+                      return createStringError("cleanup creation by unranked " +
+                                               R.By);
                     minInto(FnCreated, F, {R.Phase, It->second, R.Seq});
                   }
             constexpr CKey Last{UINT64_MAX, UINT64_MAX, UINT64_MAX};
@@ -1879,11 +1887,31 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             for (llvm::Function &F : *M)
               All.push_back(&F);
             llvm::stable_sort(All, [&](llvm::Function *A, llvm::Function *B) {
-              return FnCreated.lookup_or(A, Last) < FnCreated.lookup_or(B, Last);
+              return FnCreated.lookup_or(A, Last) <
+                     FnCreated.lookup_or(B, Last);
             });
             auto &List = M->getFunctionList();
             for (size_t I = All.size(); I-- > 0;)
               List.splice(List.begin(), List, All[I]->getIterator());
+            // Globals already carry their serial names. Restore the module
+            // name counter serial leaves after lift and the global creation
+            // order.
+            lastUnique(M->getValueSymbolTable()) = SerialGlobalCounter;
+            for (const std::string &Name : GlobalOrder) {
+              llvm::GlobalVariable *G = M->getNamedGlobal(Name);
+              if (!G)
+                return createStringError("lost global " + Name);
+              M->removeGlobalVariable(G);
+              M->insertGlobalVariable(G);
+            }
+            return std::move(M);
+          };
+          if (auto Merged = MergeShards()) {
+            M = std::move(*Merged);
+            ParallelClean = true;
+          } else {
+            Why = toString(Merged.takeError());
+            MergeShards = nullptr;
           }
         }
         if (!ParallelClean) {
@@ -1968,18 +1996,6 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     if (!ParallelClean)
       if (Error E = inlineFunclets(*M, Funclets, /*EraseUnused=*/true))
         return E;
-    if (ParallelClean) {
-      // Globals already carry their serial names. Restore the module name
-      // counter serial leaves after lift and the global creation order.
-      lastUnique(M->getValueSymbolTable()) = SerialGlobalCounter;
-      for (const std::string &Name : GlobalOrder) {
-        llvm::GlobalVariable *G = M->getNamedGlobal(Name);
-        if (!G)
-          return createStringError("parallel clean: lost global " + Name);
-        M->removeGlobalVariable(G);
-        M->insertGlobalVariable(G);
-      }
-    }
     if (Error E = verifyStage("lift", *M))
       return E;
     record(
@@ -1996,11 +2012,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-clean ----------------------------------------------------------
+    // A failed parallel ir-clean is restored by merging the shards again.
+    using ModuleBuilder = function_ref<Expected<std::unique_ptr<Module>>()>;
     if (Error E = runPipelineText(
             "ir-clean", M,
             ParallelClean ? CleanRemainder : cleanPipeline(structDIEnabled()),
-            R.Stages, CxxFlavor::Auto, nullptr, RawText))
+            R.Stages, CxxFlavor::Auto, nullptr, RawText,
+            MergeShards ? ModuleBuilder(MergeShards) : nullptr))
       return std::move(E);
+    MergeShards = nullptr;
     record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
     CleanText = moduleText(*M);
     if (Opts.Emit == EmitKind::IrClean) {
