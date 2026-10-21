@@ -252,15 +252,35 @@ Error verifyStage(StringRef Stage, const Module &M) {
 
 SmallVector<StringRef, 16> pipelineElements(StringRef Pipeline);
 
+/// The function the verifier complained about, when its message names one.
+/// The verifier prints "Basic Block in function 'f' does not have
+/// terminator!" for the block a pass left without a terminator. Returns an
+/// empty name when the message names no function.
+std::string verifierFunctionName(StringRef Message) {
+  size_t Pos = Message.find("in function '");
+  if (Pos == StringRef::npos)
+    return "";
+  Pos += sizeof("in function '") - 1;
+  size_t End = Message.find('\'', Pos);
+  if (End == StringRef::npos)
+    return "";
+  return Message.slice(Pos, End).str();
+}
+
 /// Parse and run `Pipeline` over M, then verify it as `Stage`. A pass name
 /// this binary does not know is an error, not a skipped stage.
+/// `Only` runs the element for the given functions alone (the recovery of
+/// one broken function); `BrokenName` names the function the element broke,
+/// when the verifier's message names one.
 Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
                           std::vector<StageReport> &Reports,
                           CxxFlavor Flavor,
                           const StringSet<> *UserNames,
                           bool Guarded,
                           function_ref<void(size_t, llvm::Function &)>
-                              AfterRun = nullptr) {
+                              AfterRun = nullptr,
+                          ArrayRef<llvm::Function *> Only = {},
+                          std::string *BrokenName = nullptr) {
   PassBuilder PB;
   registerRevenantPasses(PB);
   LoopAnalysisManager LAM;
@@ -314,10 +334,10 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
   for (size_t I = 0; I < Managers.size(); ++I) {
     SmallVector<llvm::Function *, 32> Functions;
     for (llvm::Function &F : M)
-      if (!F.isDeclaration())
+      if (!F.isDeclaration() && (Only.empty() || llvm::is_contained(Only, &F)))
         Functions.push_back(&F);
     for (llvm::Function *F : Functions) {
-      if (!Guarded) {
+      if (!Guarded && Only.empty()) {
         FunctionStageTrace Trace(Stage, Passes[I], F->getName());
         Managers[I].run(*F, FAM);
         if (AfterRun)
@@ -330,6 +350,9 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
       Managers[I].run(*F, FAM);
       std::string Message;
       raw_string_ostream OS(Message);
+      // The function alone is checked: a pass that breaks it is rolled back
+      // to the state before that pass, which is what the guarded run of the
+      // whole stage did for it.
       if (verifyFunction(*F, &OS)) {
         std::string Name = F->getName().str();
         RestoreFrom(F, Saved, FAM);
@@ -341,7 +364,21 @@ Error runFunctionPipeline(StringRef Stage, Module &M, StringRef Pipeline,
       Saved->eraseFromParent();
     }
   }
-  return verifyStage(Stage, M);
+  std::string VerifyMessage;
+  bool Valid = true;
+  {
+    raw_string_ostream OS(VerifyMessage);
+    Valid = !verifyModule(M, &OS);
+  }
+  // The verifier names the function in the message it prints for the
+  // checks that can fail here ("Basic Block in function 'f' does not have
+  // terminator!"). The recovery of one broken function needs that name.
+  if (BrokenName)
+    *BrokenName = Valid ? "" : verifierFunctionName(VerifyMessage);
+  if (!Valid)
+    return createStringError("IR verifier failed after " + Stage.str() + ": " +
+                             VerifyMessage);
+  return Error::success();
 }
 
 // Split only between pipeline elements, never inside adaptors or options.
@@ -383,6 +420,78 @@ Error runModulePass(Module &M, StringRef Pass) {
   return verifyStage(Pass, M);
 }
 
+/// The recovery of one broken function. The unguarded run left the module
+/// invalid because a pass broke one function. Reset that function to the
+/// stage input's version and rerun the elements up to the failing one for it
+/// alone, so it reaches the failing element in the state it had there and
+/// the passes of that element are rolled back where they break it. Every
+/// other function keeps the result the unguarded run gave it, which is what
+/// the guarded rerun of the whole stage produced for them too (a function
+/// that never fails the verifier is left as the pass left it).
+Error recoverBrokenFunction(StringRef Stage, Module &M, ArrayRef<StringRef> Elements,
+                            size_t FailedIndex, StringRef BrokenName,
+                            std::vector<StageReport> &Reports, CxxFlavor Flavor,
+                            const StringSet<> *UserNames, StringRef InputText,
+                            function_ref<Expected<std::unique_ptr<Module>>()> Rebuild) {
+  // The stage input: the text the caller kept, or the module it can build
+  // again. The input module has its own globals and declarations, so the
+  // function body is copied with a map onto the live module's.
+  std::unique_ptr<Module> Input;
+  if (!InputText.empty()) {
+    SMDiagnostic ParseErr;
+    Input = parseIR(MemoryBufferRef(InputText, Stage), ParseErr, M.getContext());
+    if (!Input)
+      return createStringError("failed to parse the stage input for " +
+                               Stage.str() + ": " + ParseErr.getMessage().str());
+  } else if (Rebuild) {
+    auto Rebuilt = Rebuild();
+    if (!Rebuilt)
+      return createStringError("failed to rebuild the stage input for " +
+                               Stage.str() + ": " + toString(Rebuilt.takeError()));
+    Input = std::move(*Rebuilt);
+  } else {
+    return createStringError("no stage input to recover " + Stage.str() + " from");
+  }
+  llvm::Function *Src = Input->getFunction(BrokenName);
+  llvm::Function *Dst = M.getFunction(BrokenName);
+  if (!Src || !Dst || Src->isDeclaration() || Dst->isDeclaration())
+    return createStringError("the broken function " + BrokenName.str() +
+                             " is not in the stage input");
+  if (Src->arg_size() != Dst->arg_size())
+    return createStringError("the broken function " + BrokenName.str() +
+                             " has another signature in the stage input");
+  ValueToValueMapTy VMap;
+  // The input's globals and declarations point at the live module's.
+  for (GlobalValue &GV : Input->global_values())
+    if (GlobalValue *Live = M.getNamedValue(GV.getName()))
+      VMap[&GV] = Live;
+  auto Dest = Dst->arg_begin();
+  for (Argument &A : Src->args())
+    VMap[&A] = &*Dest++;
+  Dst->copyAttributesFrom(Src);
+  Dst->deleteBody();
+  SmallVector<ReturnInst *, 8> Returns;
+  // The input is another module, so the copy is a cross-module clone: the
+  // value map points the input's globals and declarations at the live
+  // module's.
+  CloneFunctionInto(Dst, Src, VMap,
+                    CloneFunctionChangeType::DifferentModule, Returns);
+  // The elements before the failing one, and the failing one itself, run
+  // for that function alone. The module passes in between are left alone:
+  // they already ran over the whole module, and running them again would
+  // change the functions they are not supposed to change.
+  for (size_t I = 0; I <= FailedIndex && I < Elements.size(); ++I) {
+    StringRef Element = Elements[I];
+    if (!Element.starts_with("function("))
+      continue;
+    if (Error E = runFunctionPipeline(Stage, M, Element, Reports, Flavor,
+                                      UserNames, /*Guarded=*/true, nullptr,
+                                      {Dst}, nullptr))
+      return E;
+  }
+  return Error::success();
+}
+
 Error runPipelineText(
     StringRef Stage, std::unique_ptr<Module> &M, StringRef Pipeline,
     std::vector<StageReport> &Reports, CxxFlavor Flavor = CxxFlavor::Auto,
@@ -395,16 +504,48 @@ Error runPipelineText(
   ModulePassManager Parsed;
   if (Error E = PB.parsePassPipeline(Parsed, Pipeline))
     return E;
+  auto Elements = pipelineElements(Pipeline);
   auto RunAll = [&](bool Guarded) -> Error {
     // Both element kinds verify the module when they succeed; verify at the
     // end only when the last element left it unverified (a rolled-back
     // module pass, or an empty pipeline).
     bool Verified = false;
-    for (StringRef Element : pipelineElements(Pipeline)) {
+    for (size_t I = 0; I < Elements.size(); ++I) {
+      StringRef Element = Elements[I];
       if (Element.starts_with("function(")) {
+        // The unguarded run names the function it broke, when the
+        // verifier's message names one.
+        std::string BrokenName;
         if (Error E = runFunctionPipeline(Stage, *M, Element, Reports,
-                                          Flavor, UserNames, Guarded))
-          return E;
+                                          Flavor, UserNames, Guarded, nullptr,
+                                          {}, Guarded ? nullptr : &BrokenName)) {
+          if (Guarded || BrokenName.empty())
+            return E;
+          // One function was broken by a pass: recover it alone and keep
+          // the element. The recovery resets the function to the stage
+          // input's version and reruns the elements up to this one for it,
+          // which is what the guarded rerun of the whole stage did for it,
+          // without the guarded rerun's cost (a function clone and a
+          // verify per function per pass). The error of the failed run is
+          // consumed here: the recovery replaces its result.
+          std::string Message = toString(std::move(E));
+          if (Error R = recoverBrokenFunction(Stage, *M, Elements, I,
+                                              BrokenName, Reports, Flavor,
+                                              UserNames, InputText, Rebuild)) {
+            // The function could not be rebuilt from the stage input: the
+            // stage falls back to the old path (restore the stage input,
+            // rerun the whole stage guarded).
+            errs() << "[failed] " << Stage << ": recovery of " << BrokenName
+                   << " failed: " << toString(std::move(R)) << "\n";
+            return createStringError("IR verifier failed after " +
+                                     Stage.str() + ": " + Message);
+          }
+          record(Reports, Stage, "recovered", BrokenName + ": " + Message);
+          errs() << "[recovered] " << Stage << ": " << BrokenName << ": "
+                 << Message << "\n";
+          Verified = true;
+          continue;
+        }
         Verified = true;
         continue;
       }
