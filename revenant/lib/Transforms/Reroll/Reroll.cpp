@@ -52,6 +52,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
 
@@ -874,18 +875,57 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
   if (N < 12)
     return 0;
 
-  // Interned shape keys so the run check is cheap.
+  // Interned shape keys and a flat operand table, so the candidate scan
+  // below compares integers instead of walking Use lists and APInts.
   SmallVector<ShapeKey, 32> Keys;
-  for (Instruction *I : Insns)
-    Keys.push_back(shapeOf(*I));
+  DenseMap<const Instruction *, uint32_t> Index;
+  for (size_t i = 0; i < N; ++i) {
+    Keys.push_back(shapeOf(*Insns[i]));
+    Index[Insns[i]] = (uint32_t)i;
+  }
+  constexpr uint32_t NoDef = UINT32_MAX;
+  struct Operand {
+    Value *V;
+    int64_t Imm;  // the value when Int && Fits
+    uint32_t Def; // index in Insns of an in-block def, else NoDef
+    bool Int;     // ConstantInt
+    bool Fits;    // ConstantInt representable as signed i64
+    bool Leaf;    // accumulator leaf: non-constant, not defined in B
+  };
+  std::vector<Operand> Ops;
+  std::vector<uint32_t> OpBegin(N + 1, 0);
+  for (size_t i = 0; i < N; ++i) {
+    OpBegin[i] = (uint32_t)Ops.size();
+    for (Value *V : Insns[i]->operands()) {
+      Operand Op{V, 0, NoDef, false, false, false};
+      if (auto *CI = dyn_cast<ConstantInt>(V)) {
+        Op.Int = true;
+        if (auto S = signedConstant(CI)) {
+          Op.Fits = true;
+          Op.Imm = *S;
+        }
+      } else if (auto *D = dyn_cast<Instruction>(V);
+                 D && D->getParent() == &B) {
+        Op.Def = Index.lookup(D);
+      } else {
+        Op.Leaf = !isa<Constant>(V);
+      }
+      Ops.push_back(Op);
+    }
+  }
+  OpBegin[N] = (uint32_t)Ops.size();
 
   auto SameKey = [&](size_t A, size_t B) {
     return Keys[A] == Keys[B];
   };
 
+  // Candidates are tried for every window size and start, so a block of N
+  // instructions sees O(N^2) of them; each one only reads the tables above
+  // and allocates nothing until it matches.
+  std::vector<size_t> Same(N + 1, 0);
   for (size_t M = 1; M <= N / MinWindowsForSynth; ++M) {
     // same[i]: run length of key[j] == key[j+M] from i.
-    std::vector<size_t> Same(N - M + 1, 0);
+    Same[N - M] = 0;
     for (size_t i = N - M; i-- > 0;) {
       Same[i] = SameKey(i, i + M) ? Same[i + 1] + 1 : 0;
       if (i == 0)
@@ -895,104 +935,66 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
       if (Same[Start] < 3 * M) {
         continue;
       }
-      // Candidate accumulator leaves: values window 0 reads that are
-      // defined outside the run.
-      SmallPtrSet<Value *, 8> RunDsts;
-      for (size_t i = Start; i < std::min(Start + 4 * M, N); ++i)
-        if (!Insns[i]->getType()->isVoidTy())
-          RunDsts.insert(Insns[i]);
-      SmallVector<Value *, 4> AccLeaves;
-      for (size_t p = 0; p < M; ++p) {
-        Instruction *I = Insns[Start + p];
-        for (Use &U : I->operands()) {
-          Value *V = U.get();
-          if (isa<Constant>(V) || RunDsts.count(V))
-            continue;
-          if (auto *D = dyn_cast<Instruction>(V))
-            if (D->getParent() == &B)
-              continue;
-          if (!llvm::is_contained(AccLeaves, V))
-            AccLeaves.push_back(V);
-        }
-      }
-      DenseMap<Value *, unsigned> W0Pos;
-      for (size_t p = 0; p < M; ++p)
-        if (!Insns[Start + p]->getType()->isVoidTy())
-          W0Pos[Insns[Start + p]] = (unsigned)p;
-
-      // Scan forward for matching windows with a uniform delta.
+      // Scan forward for matching windows with a uniform delta. Window w
+      // is Insns[Start + w*M, Start + (w+1)*M).
       DenseMap<std::pair<unsigned, unsigned>, std::pair<Value *, Type *>>
           Threads;
       std::optional<int64_t> Delta;
       size_t K = 1;
       bool ScanOK = true;
-      std::vector<std::vector<Instruction *>> WSets;
-      {
-        std::vector<Instruction *> W0;
-        for (size_t p = 0; p < M; ++p)
-          W0.push_back(Insns[Start + p]);
-        WSets.push_back(W0);
-      }
       while (Start + (K + 1) * M <= N && ScanOK) {
-        std::vector<Instruction *> WJ, WPrev;
-        for (size_t p = 0; p < M; ++p) {
-          WJ.push_back(Insns[Start + K * M + p]);
-          WPrev.push_back(Insns[Start + (K - 1) * M + p]);
-        }
-        auto &W0 = WSets[0];
+        const size_t JBase = Start + K * M, PrevBase = Start + (K - 1) * M;
         std::optional<int64_t> WinDelta;
         bool SawOff = false;
         for (size_t p = 0; p < M && ScanOK; ++p) {
-          Instruction *A = W0[p], *C = WJ[p];
-          if (!(shapeOf(*A) == shapeOf(*C))) {
+          const size_t IA = Start + p, IC = JBase + p;
+          if (!(Keys[IA] == Keys[IC])) {
             ScanOK = false;
             break;
           }
-          if (A->getNumOperands() != C->getNumOperands()) {
+          const unsigned NumOps = OpBegin[IA + 1] - OpBegin[IA];
+          if (NumOps != OpBegin[IC + 1] - OpBegin[IC]) {
             ScanOK = false;
             break;
           }
-          for (unsigned o = 0; o < A->getNumOperands(); ++o) {
-            Value *VA = A->getOperand(o), *VC = C->getOperand(o);
-            if (VA == VC)
+          const Operand *OA = Ops.data() + OpBegin[IA];
+          const Operand *OC = Ops.data() + OpBegin[IC];
+          for (unsigned o = 0; o < NumOps; ++o) {
+            const Operand &A = OA[o], &C = OC[o];
+            if (A.V == C.V)
               continue;
-            if (auto *IA = dyn_cast<ConstantInt>(VA))
-              if (auto *IC = dyn_cast<ConstantInt>(VC)) {
-                auto Difference = constantDifference(IA, IC);
-                if (!Difference) {
+            if (A.Int && C.Int) {
+              int64_t D;
+              if (!A.Fits || !C.Fits || SubOverflow(C.Imm, A.Imm, D)) {
+                ScanOK = false;
+                break;
+              }
+              if (D != 0) {
+                SawOff = true;
+                int64_t Per = D / (int64_t)K;
+                if (!WinDelta)
+                  WinDelta = Per;
+                else if (*WinDelta != Per) {
                   ScanOK = false;
                   break;
                 }
-                int64_t D = *Difference;
-                if (D != 0) {
-                  SawOff = true;
-                  int64_t Per = D / (int64_t)K;
-                  if (!WinDelta)
-                    WinDelta = Per;
-                  else if (*WinDelta != Per) {
-                    ScanOK = false;
-                    break;
-                  }
-                }
-                continue;
               }
+              continue;
+            }
             // Acc thread: leaf from outside vs previous window dst.
-            if (llvm::is_contained(AccLeaves, VA) &&
-                WPrev[p] == VC) {
-              Threads[{p, o}] = {VA, A->getOperand(o)->getType()};
+            if (A.Leaf && C.Def == PrevBase + p) {
+              Threads[{p, o}] = {A.V, A.V->getType()};
               continue;
             }
-            // Same-position def pair.
-            auto PA = W0Pos.find(VA);
-            if (PA != W0Pos.end() && PA->second < WJ.size() &&
-                WJ[PA->second] == VC)
+            // Same-position def pair: a window-0 def read where window K
+            // reads its own def in the same slot.
+            if (A.Def != NoDef && A.Def >= Start && A.Def < Start + M &&
+                C.Def == JBase + (A.Def - Start))
               continue;
-            // Equal-valued pair only; a differing var pair would reread
-            // window 0 every iteration (reference rejects it).
-            if (VA != VC) {
-              ScanOK = false;
-              break;
-            }
+            // Equal-valued pair only (handled above); a differing var pair
+            // would reread window 0 every iteration (reference rejects it).
+            ScanOK = false;
+            break;
           }
         }
         if (!ScanOK)
@@ -1007,7 +1009,6 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
           Delta = WinDelta;
         else if (*Delta != *WinDelta)
           break;
-        WSets.push_back(WJ);
         ++K;
       }
       if (K < MinWindowsForSynth)
@@ -1118,13 +1119,11 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
       // Rewire the kept body: constants shifted by Delta become
       // i*Delta + c0 (truncated/extended to the operand width), acc
       // leaves become their acc phis.
-      auto &W0 = WSets[0];
-      std::vector<Instruction *> W1(WSets[1].begin(), WSets[1].end());
       IRBuilder<> BB(&Loop->front());
       for (size_t p = 0; p < BodyInsns.size(); ++p) {
         Instruction *NI = BodyInsns[p];
-        Instruction *W0I = W0[p];
-        Instruction *W1I = W1[p];
+        Instruction *W0I = Insns[Start + p];
+        Instruction *W1I = Insns[Start + M + p];
         for (unsigned o = 0; o < NI->getNumOperands(); ++o) {
           Value *VA = W0I->getOperand(o), *VC = W1I->getOperand(o);
           auto *IA = dyn_cast<ConstantInt>(VA);
