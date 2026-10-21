@@ -1400,42 +1400,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             }
             return AttributeSet::get(C, B);
           };
-          for (unsigned S = 0; S < State.size() && Why.empty(); ++S) {
-            if (!State[S].Mod)
-              continue;
-            LLVMContext &C = *State[S].Ctx;
-            for (llvm::Function &D : *State[S].Mod) {
-              if (!D.isDeclaration() || D.isIntrinsic())
-                continue;
-              auto It = DefByName.find(D.getName());
-              if (It == DefByName.end() || It->second == &D)
-                continue;
-              llvm::Function *Def = It->second;
-              if (Def->arg_size() != D.arg_size()) {
-                Why = "signature mismatch for " + D.getName().str();
-                break;
-              }
-              AttributeList From = Def->getAttributes();
-              bool Ok = true;
-              SmallVector<AttributeSet, 8> Params;
-              for (unsigned I = 0; I < D.arg_size(); ++I)
-                Params.push_back(copyAttrs(From.getParamAttrs(I), C, Ok));
-              AttributeList To = AttributeList::get(
-                  C, copyAttrs(From.getFnAttrs(), C, Ok),
-                  copyAttrs(From.getRetAttrs(), C, Ok), Params);
-              if (!Ok) {
-                Why = "non-portable attribute on " + D.getName().str();
-                break;
-              }
-              D.setAttributes(To);
-            }
-          }
-        }
-        // Cleanup is pass-major over the module's function list, and the
-        // first function in that order to need an intrinsic creates it.
-        // Put each shard's functions in serial order (lift-phase creation
-        // keys across all shards) so creations attribute as in serial.
-        if (Why.empty()) {
+          // Cleanup is pass-major over the module's function list, and the
+          // first function in that order to need an intrinsic creates it.
+          // Put each shard's functions in serial order (lift-phase creation
+          // keys across all shards) so creations attribute as in serial.
           StringMap<std::pair<uint64_t, uint64_t>> LiftKey;
           for (ShardState &St : State)
             for (const auto &R : St.FnKeys)
@@ -1450,9 +1418,39 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             auto It = LiftKey.find(F->getName());
             return It == LiftKey.end() ? Last : It->second;
           };
-          for (ShardState &St : State) {
+          // Per shard: each worker writes only its own module and context
+          // and reads definitions elsewhere, which nothing writes now.
+          std::vector<std::string> ShardWhy(State.size());
+          runWave([&](unsigned S) {
+            ShardState &St = State[S];
             if (!St.Mod)
-              continue;
+              return;
+            LLVMContext &C = *St.Ctx;
+            for (llvm::Function &D : *St.Mod) {
+              if (!D.isDeclaration() || D.isIntrinsic())
+                continue;
+              auto It = DefByName.find(D.getName());
+              if (It == DefByName.end() || It->second == &D)
+                continue;
+              llvm::Function *Def = It->second;
+              if (Def->arg_size() != D.arg_size()) {
+                ShardWhy[S] = "signature mismatch for " + D.getName().str();
+                return;
+              }
+              AttributeList From = Def->getAttributes();
+              bool Ok = true;
+              SmallVector<AttributeSet, 8> Params;
+              for (unsigned I = 0; I < D.arg_size(); ++I)
+                Params.push_back(copyAttrs(From.getParamAttrs(I), C, Ok));
+              AttributeList To = AttributeList::get(
+                  C, copyAttrs(From.getFnAttrs(), C, Ok),
+                  copyAttrs(From.getRetAttrs(), C, Ok), Params);
+              if (!Ok) {
+                ShardWhy[S] = "non-portable attribute on " + D.getName().str();
+                return;
+              }
+              D.setAttributes(To);
+            }
             std::vector<llvm::Function *> All;
             for (llvm::Function &F : *St.Mod)
               All.push_back(&F);
@@ -1462,7 +1460,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             auto &List = St.Mod->getFunctionList();
             for (size_t I = All.size(); I-- > 0;)
               List.splice(List.begin(), List, All[I]->getIterator());
-          }
+          });
+          for (const std::string &W : ShardWhy)
+            if (!W.empty() && Why.empty())
+              Why = W;
         }
         // Give every global its serial name before cleanup runs: passes
         // derive local names from global names (simplifycfg's `<g>.mux`).
