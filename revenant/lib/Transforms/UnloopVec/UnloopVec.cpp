@@ -396,7 +396,7 @@ uint64_t matchScaledVecBound(Value *VecBound, Value *N, uint64_t ElemBytes,
   auto *M = dyn_cast<ConstantInt>(Shl->getOperand(1));
   if (!M)
     return 0;
-  uint64_t MVal = M->getZExtValue();
+  uint64_t MVal = M->getLimitedValue(63);
   if (MVal >= 63)
     return 0;
   uint64_t Scale = 1ULL << MVal;
@@ -417,11 +417,13 @@ uint64_t matchScaledVecBound(Value *VecBound, Value *N, uint64_t ElemBytes,
   auto *K = dyn_cast<ConstantInt>(Lshr->getOperand(1));
   if (!K)
     return 0;
-  unsigned KVal = (unsigned)K->getZExtValue();
+  unsigned KVal = (unsigned)K->getLimitedValue(63);
   if (KVal == 0 || KVal >= 63)
     return 0;
-  const Function &F =
-      *cast<Instruction>(VecBound)->getParent()->getParent();
+  const auto *BoundI = dyn_cast<Instruction>(VecBound);
+  if (!BoundI)
+    return 0;
+  const Function &F = *BoundI->getParent()->getParent();
   Value *RootN = stripCountDerivation(N, F);
   if (stripCountDerivation(Lshr->getOperand(0), F) != RootN)
     return 0;
@@ -443,8 +445,10 @@ uint64_t matchScaledVecBound(Value *VecBound, Value *N, uint64_t ElemBytes,
 // n.vec is a multiple of 2^K below N, so the erased vector loop ran
 // whole steps and the tail restarted at 0 covers the full range.
 uint64_t matchVecBound(Value *VecBound, Value *N, uint64_t &StepOut) {
-  const Function &F =
-      *cast<Instruction>(VecBound)->getParent()->getParent();
+  const auto *BoundI = dyn_cast<Instruction>(VecBound);
+  if (!BoundI)
+    return 0;
+  const Function &F = *BoundI->getParent()->getParent();
   Value *RootN = stripCountDerivation(N, F);
   Value *Shape = VecBound;
   while (auto *Cast = dyn_cast<CastInst>(Shape)) {
@@ -477,8 +481,9 @@ uint64_t matchVecBound(Value *VecBound, Value *N, uint64_t &StepOut) {
       if (auto *Rem = dyn_cast<Instruction>(And->getOperand(1))) {
         if (Rem->getOpcode() == Instruction::URem) {
           if (auto *K = dyn_cast<ConstantInt>(Rem->getOperand(1))) {
-            uint64_t Step = K->getZExtValue();
-            if (Step >= 2) {
+            std::optional<uint64_t> StepV = K->getValue().tryZExtValue();
+            if (StepV && *StepV >= 2) {
+              uint64_t Step = *StepV;
               Value *Base0 = stripCountDerivation(And->getOperand(0),
                                                   *And->getParent()->getParent());
               Value *Base1 = stripCountDerivation(Rem->getOperand(0),
@@ -939,9 +944,10 @@ bool matchVectorBody(BasicBlock *B, Candidate &C, Function &F,
     }
     return false;
   }
-  uint64_t Step = V.Step->getZExtValue();
-  if (Step < 2)
+  std::optional<uint64_t> StepV = V.Step->getValue().tryZExtValue();
+  if (!StepV || *StepV < 2)
     return false;
+  uint64_t Step = *StepV;
   Value *Bound = loopBound(V);
   if (!Bound)
     return false;
@@ -1475,8 +1481,8 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
   auto *VectorStartZero = dyn_cast_or_null<ConstantInt>(VectorStart);
   auto *ScalarStep = dyn_cast<ConstantInt>(Scalar.Step);
   if (!VectorStartZero || !VectorStartZero->isZero() || !ScalarStep ||
-      !ScalarStep->isOne() || !VectorStep ||
-      VectorStep->getZExtValue() != 4 || !VectorBound)
+      !ScalarStep->isOne() || !VectorStep || !VectorStep->equalsInt(4) ||
+      !VectorBound)
     return false;
 
   SmallVector<LoadInst *, 2> ScalarLoads, VectorLoads;
@@ -1585,7 +1591,7 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
   auto *MaskValue = Mask && Mask->getOpcode() == Instruction::And
                         ? dyn_cast<ConstantInt>(Mask->getOperand(1))
                         : nullptr;
-  if (!MaskValue || MaskValue->getSExtValue() != -4 ||
+  if (!MaskValue || MaskValue->getLimitedValue() != (uint64_t)-4 ||
       Mask->getOperand(0) != ScalarBound ||
       VectorIndex != Vector.IV || VectorStoreIndex != Vector.IV ||
       ScalarIndex != Scalar.IV || ScalarStoreIndex != Scalar.IV)
@@ -1638,7 +1644,7 @@ bool matchVersionedBody(BasicBlock *B, Candidate &C, Function &F) {
       !SourceAddr ||
       SourceAddr->getPointerOperand() != VLoadPtr->getPointerOperand() ||
       !Offset || !Limit ||
-      Offset->getZExtValue() + Limit->getZExtValue() !=
+      Offset->getLimitedValue(4096) + Limit->getLimitedValue(4096) !=
           VT->getNumElements() * ElemBytes - ElemBytes)
     return false;
   SmallVector<LoadInst *, 4> TailLoads;
@@ -1874,7 +1880,10 @@ static bool matchChainElemOffset(Value *Ptr, Value *Base, PHINode *IP,
     uint64_t S = DL.getTypeStoreSize(ET).getFixedValue();
     Value *Idx = GEP->getOperand(1);
     if (auto *C = dyn_cast<ConstantInt>(Idx)) {
-      ConstBytes += C->getSExtValue() * static_cast<int64_t>(S);
+      std::optional<int64_t> CV = C->getValue().trySExtValue();
+      if (!CV)
+        return false;
+      ConstBytes += *CV * static_cast<int64_t>(S);
     } else if (Idx == IP) {
       PerIP += static_cast<int64_t>(S);
     } else if (auto *Shl = dyn_cast<BinaryOperator>(Idx)) {
@@ -1882,9 +1891,9 @@ static bool matchChainElemOffset(Value *Ptr, Value *Base, PHINode *IP,
       // (1 << K) bytes per IP unit through this GEP's element size).
       auto *C = dyn_cast<ConstantInt>(Shl->getOperand(1));
       if (Shl->getOpcode() != Instruction::Shl || !C ||
-          Shl->getOperand(0) != IP || C->getZExtValue() >= 16)
+          Shl->getOperand(0) != IP || C->getLimitedValue(16) >= 16)
         return false;
-      PerIP += static_cast<int64_t>((1ULL << C->getZExtValue()) * S);
+      PerIP += static_cast<int64_t>((1ULL << C->getLimitedValue(16)) * S);
     } else {
       return false;
     }
@@ -1922,14 +1931,16 @@ static bool matchIndexPlus(Value *V, const PHINode *IP, int64_t &Offset,
   auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
   if (!C)
     return false;
-  int64_t K = C->getSExtValue();
+  std::optional<int64_t> K = C->getValue().trySExtValue();
+  if (!K)
+    return false;
   switch (BO->getOpcode()) {
   case Instruction::Add:
   case Instruction::Or:
-    Offset = Sub + K;
+    Offset = Sub + *K;
     return true;
   case Instruction::Sub:
-    Offset = Sub - K;
+    Offset = Sub - *K;
     return true;
   default:
     return false;
@@ -1969,7 +1980,7 @@ static Value *matchLaneFold(Value *V, unsigned VF, unsigned ElemBits,
     if (!Shr)
       return nullptr;
     auto *C = dyn_cast<ConstantInt>(Shr->getOperand(1));
-    if (!C || C->getZExtValue() != Shift)
+    if (!C || C->getLimitedValue() != Shift)
       return nullptr;
     BitCastInst *BC2 = nullptr;
     for (User *U : Shr->users()) {
@@ -2038,7 +2049,7 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
   if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_ULT)
     return false;
   auto *K = dyn_cast<ConstantInt>(Cmp->getOperand(1));
-  if (!K || K->getZExtValue() < 2 || K->getValue().getActiveBits() > 16)
+  if (!K || K->getLimitedValue(2) < 2 || K->getValue().getActiveBits() > 16)
     return false;
   Value *N32 = Cmp->getOperand(0);
   if (!N32->getType()->isIntegerTy(32))
@@ -2130,11 +2141,11 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
   if (!ElemTy->isIntegerTy() || ElemBits < 8 || ElemBits % 8 != 0 ||
       VT->getNumElements() * ElemBits > 512)
     return false;
-  if (K->getZExtValue() > VF)
+  if (K->getLimitedValue(VF + 1) > VF)
     return false;
   const DataLayout &DL = F.getParent()->getDataLayout();
   uint64_t ElemBytes = DL.getTypeStoreSize(ElemTy).getFixedValue();
-  if (SL.Step->getZExtValue() != VF * ElemBytes)
+  if (SL.Step->getLimitedValue() != VF * ElemBytes)
     return false;
 
   LoadInst *VecLoad = nullptr;
@@ -2195,7 +2206,7 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
     return false;
   APInt PtrOff(DL.getIndexTypeSizeInBits(PtrStep->getType()), 0);
   if (!PtrStep->accumulateConstantOffset(DL, PtrOff) ||
-      PtrOff.getZExtValue() != VF * ElemBytes)
+      PtrOff.getLimitedValue() != VF * ElemBytes)
     return false;
   if (Body->getTerminator()->getNumSuccessors() != 2)
     return false;
@@ -2239,13 +2250,13 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
   if (!MaskC)
     return false;
   uint64_t ExpMask = ((1ull << 31) - VF) << LogVF;
-  if (MaskC->getValue().getZExtValue() != ExpMask)
+  if (MaskC->getLimitedValue() != ExpMask)
     return false;
   auto *Shl = dyn_cast<BinaryOperator>(MaskAnd->getOperand(0));
   if (!Shl || Shl->getOpcode() != Instruction::Shl)
     return false;
   auto *ShlC = dyn_cast<ConstantInt>(Shl->getOperand(1));
-  if (!ShlC || ShlC->getZExtValue() != LogVF)
+  if (!ShlC || ShlC->getLimitedValue() != LogVF)
     return false;
   if (stripCountDerivation(Shl->getOperand(0), F) !=
       stripCountDerivation(N32, F))
@@ -2273,7 +2284,7 @@ static bool matchPackedReduction(BasicBlock *D, Function &F,
       continue;
     auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
     if (!C || !C->getType()->isIntegerTy(64) ||
-        C->getValue().getZExtValue() != ((1ull << 31) - VF))
+        C->getLimitedValue() != ((1ull << 31) - VF))
       continue;
     if (stripCountDerivation(BO->getOperand(0), F) !=
         stripCountDerivation(N32, F))
@@ -2868,7 +2879,8 @@ bool lowerUniformStoreUnroll(Function &F) {
       if (!TestsNext)
         continue;
       // Divisibility under the compare's unsigned interpretation.
-      if (CBound->getZExtValue() % ByteStep != 0)
+      std::optional<uint64_t> CBoundV = CBound->getValue().tryZExtValue();
+      if (!CBoundV || *CBoundV % ByteStep != 0)
         continue;
     }
     auto *StepUpdate =

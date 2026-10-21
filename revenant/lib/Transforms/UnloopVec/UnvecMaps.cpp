@@ -201,7 +201,7 @@ static bool countdownSecondaryOK(BasicBlock *Mid, ScalarLoopInfo &V,
   if (!InitAnd || InitAnd->getOpcode() != Instruction::And)
     return false;
   auto *Mask = dyn_cast<ConstantInt>(InitAnd->getOperand(1));
-  if (!Mask || Mask->getZExtValue() != Found - 1)
+  if (!Mask || Mask->getLimitedValue() != Found - 1)
     return false;
   return stripCountDerivation(InitAnd->getOperand(0), F) == N;
 }
@@ -449,9 +449,10 @@ static bool matchInnerCascade(BasicBlock *D, BasicBlock *S, Function &F,
     }
     if (!Mid)
       continue;
-    uint64_t Step = MidLoop.Step->getZExtValue();
-    if (Step < 2)
+    std::optional<uint64_t> StepV = MidLoop.Step->getValue().tryZExtValue();
+    if (!StepV || *StepV < 2)
       continue;
+    uint64_t Step = *StepV;
     // Trip coverage: the middle bound must be the countdown
     // complement of the drain remainder over the same N.
     if (!countdownSecondaryOK(Mid, MidLoop, Drain, F, Step))
