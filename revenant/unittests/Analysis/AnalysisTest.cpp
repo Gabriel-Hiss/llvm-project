@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <optional>
+#include <random>
 
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -193,4 +194,82 @@ TEST(AnalysisTest, FunctionAtOverlapMatchesLinearScan) {
   EXPECT_EQ(functionAt(P, Va(0x1100))->Start, Va(0x1000));
   EXPECT_EQ(functionAt(P, Va(0x1250))->Start, Va(0x1000));
   EXPECT_EQ(functionAt(P, Va(0x1300)), nullptr);
+}
+
+// Identical ranges in different functions resolve to the earlier start.
+TEST(AnalysisTest, FunctionAtIdenticalRangesPicksFirstFunction) {
+  Program P = programWithImage();
+  insertFunction(P, fnWithChunks(Va(0x2000), {{Va(0x1000), Va(0x1100)}}));
+  insertFunction(P, fnWithChunks(Va(0x1000), {{Va(0x1000), Va(0x1100)}}));
+  EXPECT_EQ(functionAt(P, Va(0x1050))->Start, Va(0x1000));
+}
+
+// Brute-force reference: the pre-index linear scan.
+static const FuncRecord *scanAt(const Program &P, Va Address) {
+  for (const auto &[Start, F] : P.Functions) {
+    (void)Start;
+    for (const auto &[A, B] : F.Chunks)
+      if (Address >= A && Address < B)
+        return &F;
+  }
+  return nullptr;
+}
+
+// The segment index must answer like the linear scan on arbitrary chunk
+// layouts: disjoint, partially overlapping, nested and identical ranges.
+TEST(AnalysisTest, FunctionAtMatchesScanOnRandomChunkSets) {
+  std::mt19937_64 Rng(0xC0FFEE);
+  for (int Iter = 0; Iter < 300; ++Iter) {
+    Program P = programWithImage();
+    int FnCount = 1 + static_cast<int>(Rng() % 12);
+    for (int Fi = 0; Fi < FnCount; ++Fi) {
+      Function F;
+      F.Start = Va((Rng() % 64) * 0x100);
+      F.End = F.Start + 0x2000;
+      int ChunkCount = static_cast<int>(Rng() % 4);
+      for (int Ci = 0; Ci < ChunkCount; ++Ci) {
+        uint64_t Lo = Rng() % 0x2000;
+        uint64_t Span;
+        switch (Iter % 4) {
+        case 0:
+          Span = 1 + Rng() % 0x800; // partially overlapping
+          break;
+        case 1:
+          Span = 0x400; // same-size chunks: nesting and identical ranges
+          break;
+        case 2:
+          Span = 0x1000; // large spans covering most of the field
+          break;
+        default:
+          Span = 1 + Rng() % 0x200;
+          break;
+        }
+        F.Chunks.push_back({Va(Lo), Va(Lo + Span)});
+      }
+      // A function may also duplicate one of its own chunks.
+      if (!F.Chunks.empty() && Rng() % 3 == 0)
+        F.Chunks.push_back(F.Chunks.front());
+      insertFunction(P, std::move(F));
+    }
+    std::vector<uint64_t> Queries;
+    for (uint64_t A = 0; A < 0x2400; A += 0x40)
+      Queries.push_back(A);
+    for (const auto &[Start, F] : P.Functions) {
+      (void)Start;
+      for (const auto &[A, B] : F.Chunks) {
+        Queries.push_back(A.Value);
+        Queries.push_back(B.Value);
+        if (B > A) {
+          Queries.push_back(A.Value + 1);
+          Queries.push_back(B.Value - 1);
+        }
+      }
+    }
+    for (uint64_t A : Queries) {
+      const FuncRecord *Got = functionAt(P, Va(A));
+      const FuncRecord *Want = scanAt(P, Va(A));
+      ASSERT_EQ(Got, Want)
+          << "iter " << Iter << " addr " << format_hex(A, 0);
+    }
+  }
 }
