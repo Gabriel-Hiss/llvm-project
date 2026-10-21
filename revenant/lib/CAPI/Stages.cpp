@@ -121,12 +121,80 @@ public:
 // Small helpers
 //==--------------------------------------------------------------------==//
 
+using StageClock = std::chrono::steady_clock;
+
+/// Set REVENANT_ARTIFACT_TIMING=1 to print what the artifact path costs.
+bool artifactTimingEnabled() {
+  static const bool On = [] {
+    const char *V = std::getenv("REVENANT_ARTIFACT_TIMING");
+    return V && *V == '1';
+  }();
+  return On;
+}
+
+void reportArtifactTiming(StringRef What, int64_t Micros) {
+  if (!artifactTimingEnabled())
+    return;
+  errs() << "[artifact-time] " << What << ": "
+         << formatv("{0:F1}", Micros / 1000.0) << " ms\n";
+}
+
+/// Set REVENANT_SERIAL_ARTIFACT_PRINT=1 to keep the artifact prints on the
+/// main thread. Useful to compare the timings and to rule the background
+/// print out when a run misbehaves.
+bool serialArtifactPrint() {
+  static const bool Serial = [] {
+    const char *V = std::getenv("REVENANT_SERIAL_ARTIFACT_PRINT");
+    return V && *V == '1';
+  }();
+  return Serial;
+}
+
 std::string moduleText(const Module &M) {
   std::string S;
   raw_string_ostream OS(S);
   M.print(OS, nullptr);
   return S;
 }
+
+/// Printing the module text costs about as much as the source stage, and the
+/// source stage only reads the module. This prints the text on a background
+/// thread so the two run at the same time.
+class BackgroundModuleText {
+public:
+  BackgroundModuleText() = default;
+  BackgroundModuleText(const BackgroundModuleText &) = delete;
+  BackgroundModuleText &operator=(const BackgroundModuleText &) = delete;
+  ~BackgroundModuleText() { join(); }
+
+  /// Start printing `M`. The module must outlive the print.
+  void start(const Module &M) {
+    Worker = std::thread([this, &M]() {
+      auto Start = StageClock::now();
+      Text = moduleText(M);
+      reportArtifactTiming(
+          "print-ir-final",
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              StageClock::now() - Start)
+              .count());
+    });
+  }
+
+  /// Wait for the print and hand the text over.
+  std::string take() {
+    join();
+    return std::move(Text);
+  }
+
+private:
+  void join() {
+    if (Worker.joinable())
+      Worker.join();
+  }
+
+  std::thread Worker;
+  std::string Text;
+};
 
 Error writeText(StringRef Path, StringRef Text) {
   std::error_code EC;
@@ -137,7 +205,6 @@ Error writeText(StringRef Path, StringRef Text) {
   return Error::success();
 }
 
-using StageClock = std::chrono::steady_clock;
 thread_local StageClock::time_point LastStageTime;
 thread_local bool StageClockStarted = false;
 
@@ -611,6 +678,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   std::string AsmText;
   size_t InstrCount = 0;
   std::vector<Va> Ready;
+  int64_t AsmDisasmMicros = 0;
   for (Va T : Todo) {
     auto FOrErr = materialize(T);
     if (!FOrErr) {
@@ -620,8 +688,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       errs() << "[failed] asm: " << Note << "\n";
       continue;
     }
-    if (WantAsmText)
+    if (WantAsmText) {
+      auto DisasmStart = StageClock::now();
       AsmText += formatAsm(*FOrErr);
+      AsmDisasmMicros += std::chrono::duration_cast<std::chrono::microseconds>(
+                             StageClock::now() - DisasmStart)
+                             .count();
+    }
     Ready.push_back(T);
     InstrCount += FOrErr->Instrs.size();
     if (Opts.Emit == EmitKind::Asm)
@@ -630,6 +703,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             {static_cast<uint32_t>(R.LineVas.size() + 1), {I.Addr}});
   }
   Todo = std::move(Ready);
+  reportArtifactTiming("asm-disasm", AsmDisasmMicros);
   record(
       R.Stages, "asm", "ok",
       formatv("{0} instructions across {1} functions", InstrCount, Todo.size())
@@ -640,6 +714,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   // Each stage below runs only when a later artifact was asked for: `break`
   // leaves the block once the requested emit kind is produced.
   std::string RawText, CleanText, FinalText;
+  BackgroundModuleText FinalPrinter;
+  bool FinalPrintRunning = false;
   do {
     if (Opts.Emit == EmitKind::Asm)
       break;
@@ -2015,8 +2091,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // The serial path restores a failed ir-final from this text. The
     // parallel path rebuilds its input instead (merge, then ir-clean again),
     // so it prints the text only for the artifact.
-    if (!ParallelClean || !Opts.ArtifactBase.empty())
+    if (!ParallelClean || !Opts.ArtifactBase.empty()) {
+      auto PrintStart = StageClock::now();
       CleanText = moduleText(*M);
+      reportArtifactTiming(
+          "print-ir-clean",
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              StageClock::now() - PrintStart)
+              .count());
+    }
     if (Opts.Emit == EmitKind::IrClean) {
       R.Text = CleanText;
       break;
@@ -2064,9 +2147,27 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     record(R.Stages, "ir-final", "ok",
            "Uncxx (C++ only) + unopt + structure + types + ssaout");
     // The text feeds the ir-final emit, the rustc fork and the artifact.
-    if (Opts.Emit == EmitKind::IrFinal || Out == Lang::Rust ||
-        !Opts.ArtifactBase.empty())
+    // The source emit does not need it, so when only the artifact wants it
+    // the print runs on a background thread while the source stage reads
+    // the same module. Both only read the module.
+    const bool NeedFinalText = Opts.Emit == EmitKind::IrFinal ||
+                               Out == Lang::Rust ||
+                               !Opts.ArtifactBase.empty();
+    const bool BackgroundFinalText =
+        NeedFinalText && Opts.Emit == EmitKind::Source &&
+        Out != Lang::Rust && !serialArtifactPrint();
+    if (BackgroundFinalText) {
+      FinalPrinter.start(*M);
+      FinalPrintRunning = true;
+    } else if (NeedFinalText) {
+      auto PrintStart = StageClock::now();
       FinalText = moduleText(*M);
+      reportArtifactTiming(
+          "print-ir-final",
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              StageClock::now() - PrintStart)
+              .count());
+    }
     if (Opts.Emit == EmitKind::IrFinal) {
       R.Text = FinalText;
       break;
@@ -2089,6 +2190,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       R.LineVas = std::move(Em->LineVas);
     }
   } while (false);
+
+  // The background print of the ir-final module is the artifact text.
+  if (FinalPrintRunning)
+    FinalText = FinalPrinter.take();
 
   // ---- artifacts -----------------------------------------------------------
   if (!Opts.ArtifactBase.empty()) {
@@ -2114,8 +2219,14 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         continue;
       std::string Path =
           (Opts.ArtifactBase + "." + A.Suffix + "." + A.Ext).str();
+      auto WriteStart = StageClock::now();
       if (auto E = writeText(Path, A.Text))
         return std::move(E);
+      reportArtifactTiming(
+          ("write-" + A.Suffix).str(),
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              StageClock::now() - WriteStart)
+              .count());
       for (StageReport &St : R.Stages)
         if (St.Name == A.Stage)
           St.Artifact = Path;
