@@ -1187,10 +1187,17 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                 EH = nullptr;
             }
             size_t Before = St.Mod->global_size();
+            auto LiftStart = StageClock::now();
             auto L = lift::liftFunction(*St.Mod, Prog, Prog.Functions.at(T),
                                         *ThreadDis, Sigs.get(),
                                         /*TM=*/nullptr,
                                         /*RunPasses=*/false, EH);
+            uint64_t FailedLiftMicros = 0;
+            if (!L)
+              FailedLiftMicros =
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      StageClock::now() - LiftStart)
+                      .count();
             SmallVector<llvm::GlobalVariable *, 4> New;
             size_t K = 0;
             for (llvm::GlobalVariable &G : St.Mod->globals())
@@ -1202,7 +1209,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               std::string Message = toString(L.takeError());
               CleanSlots[Idx].Failed = true;
               CleanSlots[Idx].Note =
-                  formatv("0x{0:x}: {1}", T.Value, Message).str();
+                  formatv("0x{0:x}: {1} (liftFunction {2:F2} ms)",
+                          T.Value, Message, FailedLiftMicros / 1000.0)
+                      .str();
               continue;
             }
             CleanSlots[Idx].Opaque = L->AsmFallbacks.size();
@@ -1748,7 +1757,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     if (ParallelClean) {
       for (size_t Idx = 0; Idx < Todo.size(); ++Idx) {
         if (CleanSlots[Idx].Failed) {
-          record(R.Stages, "lift", "failed", CleanSlots[Idx].Note);
+          // The parallel wave ran before this loop; do not charge its
+          // entire duration to the first function that happened to fail.
+          R.Stages.push_back({"lift", "failed", CleanSlots[Idx].Note, "", 0});
           errs() << "[failed] lift: " << CleanSlots[Idx].Note << "\n";
         }
         OpaqueSites += CleanSlots[Idx].Opaque;
