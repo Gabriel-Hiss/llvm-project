@@ -2020,13 +2020,28 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             R.Stages, CxxFlavor::Auto, nullptr, RawText,
             MergeShards ? ModuleBuilder(MergeShards) : nullptr))
       return std::move(E);
-    MergeShards = nullptr;
     record(R.Stages, "ir-clean", "ok", "cleanup + idioms");
-    CleanText = moduleText(*M);
+    // The serial path restores a failed ir-final from this text. The
+    // parallel path rebuilds its input instead (merge, then ir-clean again),
+    // so it prints the text only for the artifact.
+    if (!ParallelClean || !Opts.ArtifactBase.empty())
+      CleanText = moduleText(*M);
     if (Opts.Emit == EmitKind::IrClean) {
       R.Text = CleanText;
       break;
     }
+    auto RebuildClean = [&]() -> Expected<std::unique_ptr<Module>> {
+      auto Merged = MergeShards();
+      if (!Merged)
+        return Merged.takeError();
+      std::unique_ptr<Module> Clean = std::move(*Merged);
+      std::vector<StageReport> Repeated;
+      if (Error E = runPipelineText("ir-clean", Clean, CleanRemainder,
+                                    Repeated, CxxFlavor::Auto, nullptr, "",
+                                    ModuleBuilder(MergeShards)))
+        return std::move(E);
+      return std::move(Clean);
+    };
 
     // ---- ir-pre-like --------------------------------------------------------
     // Run the deopt pipeline with locals-to-slots instead of ssaout, then
@@ -2048,11 +2063,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-final ----------------------------------------------------------
-    if (auto E = runPipelineText("ir-final", M,
-                                 finalPipeline(Opts.Patterns, Out == Lang::Cpp),
-                                 R.Stages, uncxxFlavor(Compiler.Producer),
-                                 &UserFunctionNames, CleanText))
+    if (auto E = runPipelineText(
+            "ir-final", M, finalPipeline(Opts.Patterns, Out == Lang::Cpp),
+            R.Stages, uncxxFlavor(Compiler.Producer), &UserFunctionNames,
+            ParallelClean ? StringRef() : StringRef(CleanText),
+            ParallelClean ? ModuleBuilder(RebuildClean) : nullptr))
       return std::move(E);
+    MergeShards = nullptr;
     record(R.Stages, "ir-final", "ok",
            "Uncxx (C++ only) + unopt + structure + types + ssaout");
     // The text feeds the ir-final emit, the rustc fork and the artifact.
