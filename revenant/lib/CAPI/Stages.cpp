@@ -1420,10 +1420,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           runWave([&](unsigned S) {
             ShardState &St = State[S];
             std::vector<StageReport> LocalReports;
+            llvm::Function *LastFn = &St.Mod->getFunctionList().back();
             auto AfterRun = [&](size_t Pass, llvm::Function &F) {
-              if (St.Mod->size() == St.FnSeen && kindCount(St) == St.KindSeen)
+              // Module::size() walks the function list; this callback runs
+              // after every function in every pass. New functions append.
+              if (&St.Mod->getFunctionList().back() == LastFn &&
+                  kindCount(St) == St.KindSeen)
                 return;
               noteNewFunctions(St, 1 + Pass, 0, F.getName());
+              LastFn = &St.Mod->getFunctionList().back();
             };
             if (Error E = runFunctionPipeline(
                     "ir-clean", *St.Mod, StringRef(CleanBlock1), LocalReports,
