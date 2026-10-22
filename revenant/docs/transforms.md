@@ -191,8 +191,7 @@ Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
 **revenant-unloopvec (owner: MuseDeoptVecLoops).** Expects devectorize output
 (or raw vectorizer skeletons). Collapses vector body + scalar remainder +
 runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
-leaving the CFG untouched when unsure. Runs explicitly, not in the default
-pipeline.
+leaving the CFG untouched when unsure. Runs in the default unopt pipeline.
 
 **revenant-unvecsearch (owner: MuseUnvecSearchR).** Expects devectorize output.
 Folds vectorized early-exit scans (find/strchr/strlen/memchr-like chunk loops
