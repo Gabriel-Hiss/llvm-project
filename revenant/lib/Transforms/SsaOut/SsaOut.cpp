@@ -29,7 +29,6 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <map>
-#include <set>
 #include <string>
 
 using namespace llvm;
@@ -37,42 +36,34 @@ using namespace llvm;
 namespace revenant {
 namespace {
 // A phi web: phi destinations that feed each other through phi incoming
-// edges share one local. `canon` resolves an SSA name to its web's
-// canonical member (hop-bounded; a cycle means a missed coalesce, never
-// a hang). Webs are keyed by name, so an unnamed phi never joins one: all
-// unnamed phis share the empty name, and coalescing through it would put
-// unrelated values in one local. Two webs merge only when no member of
-// one is live where a member of the other is defined: `x = phi [y]`,
-// `y = phi [x + y]` (a Fibonacci step) or a swap keep both values alive
-// in the loop, and one local for both would lose one of them.
+// edges share one local. Two webs merge only when no member of one is live
+// where a member of the other is defined: `x = phi [y]`, `y = phi [x + y]`
+// (a Fibonacci step) or a swap keep both values alive in the loop, and one
+// local for both would lose one of them. A web is named after a named
+// member when it has one; a web of unnamed phis gets a temporary.
 class PhiWebs {
 public:
   void build(Function &F) {
-    for (BasicBlock &BB : F) {
+    for (BasicBlock &BB : F)
       for (PHINode &PN : BB.phis()) {
-        if (!PN.hasName())
-          continue;
-        std::string Name = PN.getName().str();
-        PhiDsts[Name] = &PN;
-        Members[Name].push_back(&PN);
+        Parent[&PN] = &PN;
+        Members[&PN].push_back(&PN);
       }
-    }
     for (BasicBlock &BB : F) {
       for (PHINode &PN : BB.phis()) {
-        if (!PN.hasName())
-          continue;
-        std::string Dst = PN.getName().str();
         for (Value *V : PN.incoming_values()) {
-          if (!V->hasName())
+          auto *Src = dyn_cast<PHINode>(V);
+          if (!Src || !Parent.count(Src))
             continue;
-          std::string N = V->getName().str();
-          if (!PhiDsts.count(N))
-            continue;
-          std::string D = canon(Dst);
-          std::string S = canon(N);
+          PHINode *D = root(&PN);
+          PHINode *S = root(Src);
           if (D == S || Liveness.interferes(Members[D], Members[S]))
             continue;
-          Alias[S] = D;
+          // The web keeps the destination's root, unless only the source
+          // web has a name to give.
+          if (!D->hasName() && S->hasName())
+            std::swap(D, S);
+          Parent[S] = D;
           Members[D].append(Members[S].begin(), Members[S].end());
           Members.erase(S);
         }
@@ -80,25 +71,27 @@ public:
     }
   }
 
-  std::string canon(StringRef N) const { return canon(N.str()); }
-  std::string canon(const std::string &N) const {
-    std::string C = N;
-    for (unsigned I = 0; I < 64; ++I) {
-      auto It = Alias.find(C);
-      if (It == Alias.end())
-        break;
-      C = It->second;
+  PHINode *root(PHINode *PN) {
+    PHINode *R = PN;
+    while (Parent.lookup(R) != R)
+      R = Parent.lookup(R);
+    while (PN != R) {
+      PHINode *Next = Parent.lookup(PN);
+      Parent[PN] = R;
+      PN = Next;
     }
-    return C;
+    return R;
+  }
+
+  ArrayRef<PHINode *> members(PHINode *Root) { return Members[Root]; }
+  bool interferes(ArrayRef<PHINode *> A, ArrayRef<PHINode *> B) {
+    return Liveness.interferes(A, B);
   }
 
 private:
-  // Small-string-keyed sets: phi names are short; std::map keeps this
-  // header-free (no DenseMapInfo<StringRef> specialization needed).
-  std::map<std::string, PHINode *> PhiDsts;
-  std::map<std::string, std::string> Alias;
-  // Web root name -> the phis in that web.
-  std::map<std::string, SmallVector<PHINode *, 4>> Members;
+  DenseMap<PHINode *, PHINode *> Parent;
+  // Web root -> the phis in that web.
+  DenseMap<PHINode *, SmallVector<PHINode *, 4>> Members;
   PhiLiveness Liveness;
 };
 
@@ -296,11 +289,11 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     Changed = true;
     return AI;
   };
-  // Web key: the canonical name, qualified by type when the same web name
-  // already holds a slot of another type (`rax.0` i64 next to `rax.1` i32
-  // must not share one alloca).
+  // Key: the value's name (a web's root name), qualified by type when the
+  // same name already holds a slot of another type (`rax.0` i64 next to
+  // `rax.1` i32 must not share one alloca).
   auto keyFor = [&](StringRef Name, Type *Ty) -> std::string {
-    std::string Base = Webs.canon(Name);
+    std::string Base = Name.str();
     auto It = LocalByName.find(Base);
     if (It == LocalByName.end() || It->second->getAllocatedType() == Ty)
       return Base;
@@ -332,11 +325,10 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     Materialized[I] = AI;
   }
 
-  // Phi webs always get a local, even before uses are rewritten. An
-  // unnamed phi is a web of its own: the first one of each type keeps the
-  // shared unnamed key, every further one takes a fresh temporary, so two
-  // unnamed accumulators never write the same local.
-  std::set<std::string> UnnamedPhiKeys;
+  // Phi webs always get a local, even before uses are rewritten. A web of
+  // unnamed phis has no name to key on: it shares the first temporary of
+  // its type whose webs are never live together with it, and takes a fresh
+  // one otherwise, so two unnamed accumulators never write the same local.
   auto freshTmpKey = [&]() {
     std::string Key;
     do
@@ -344,12 +336,35 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     while (LocalByName.count(Key) || F.getValueSymbolTable()->lookup(Key));
     return Key;
   };
+  struct Temporary {
+    AllocaInst *AI;
+    SmallVector<PHINode *, 8> Phis;
+  };
+  std::map<std::string, SmallVector<Temporary, 2>> Temporaries;
+  DenseMap<PHINode *, AllocaInst *> WebLocal;
   for (BasicBlock &BB : F) {
     for (PHINode &PN : BB.phis()) {
-      std::string Key = keyFor(PN.getName(), PN.getType());
-      if (!PN.hasName() && !UnnamedPhiKeys.insert(Key).second)
-        Key = freshTmpKey();
-      AllocaInst *AI = getOrCreateLocal(Key, PN.getType(), &PN);
+      PHINode *Root = Webs.root(&PN);
+      AllocaInst *&AI = WebLocal[Root];
+      if (!AI && Root->hasName()) {
+        AI = getOrCreateLocal(keyFor(Root->getName(), PN.getType()),
+                              PN.getType(), &PN);
+      } else if (!AI) {
+        ArrayRef<PHINode *> Web = Webs.members(Root);
+        std::string Key = keyFor("", PN.getType());
+        SmallVector<Temporary, 2> &Shared = Temporaries[Key];
+        for (Temporary &T : Shared)
+          if (!Webs.interferes(T.Phis, Web)) {
+            AI = T.AI;
+            T.Phis.append(Web.begin(), Web.end());
+            break;
+          }
+        if (!AI) {
+          AI = getOrCreateLocal(Shared.empty() ? Key : freshTmpKey(),
+                                PN.getType(), &PN);
+          Shared.push_back({AI, SmallVector<PHINode *, 8>(Web)});
+        }
+      }
       Materialized[&PN] = AI;
     }
   }
