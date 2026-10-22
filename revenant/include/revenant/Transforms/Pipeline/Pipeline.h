@@ -49,10 +49,10 @@ inline constexpr llvm::StringLiteral CleanupPipeline =
 /// lane-0 scalarization first (exposing scalar low-lane accumulators), then
 /// produces the canonical one-element-per-iteration form that `reroll`
 /// compacts further; `unrotate`/`untailrec` normalize loop structure.
-/// Recover switches after loop rewrites so the structurer sees switch arms.
+
 inline constexpr llvm::StringLiteral UnoptPipeline =
     "revenant-devectorize,revenant-unloopvec,revenant-reroll,"
-    "revenant-unrotate,revenant-untailrec,revenant-unswitch";
+    "revenant-unrotate,revenant-untailrec";
 
 /// The IR-level idiom stage, ported from `crates/idioms/src/lib.rs`
 /// (`ir_passes()`). Currently just magic-div; AST-level idiom passes
