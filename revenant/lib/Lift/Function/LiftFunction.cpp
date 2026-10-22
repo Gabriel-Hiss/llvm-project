@@ -196,10 +196,23 @@ static bool isTrapInsn(const Instr &I) {
 /// recovered signature is the only place the source shape of a function
 /// is known, so the lifter publishes it: without the attribute the Unabi
 /// pass has no input and never fires.
+///
+/// An empty result means the recovered signature says nothing the flat
+/// ABI does not already say (the widths and the float kinds are the ones
+/// the lifter built the function type from). Such a signature would give
+/// the Unabi pass nothing to rewrite, and carrying it on every function
+/// costs the whole pipeline an attribute list per function, so it is left
+/// out.
 static std::string sigString(const Signature &S) {
   auto IntBits = [](unsigned Bits) {
     return (Bits == 8 || Bits == 16 || Bits == 32) ? Bits : 64;
   };
+  bool Pointer = false;
+  for (const Param &P : S.Params)
+    if (P.Type.find('*') != std::string::npos)
+      Pointer = true;
+  if (!Pointer && !S.VarArgs)
+    return "";
   std::string Out;
   for (const Param &P : S.Params) {
     if (P.Type.find('*') != std::string::npos)
@@ -462,8 +475,11 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
   ir::setFunctionVA(*Fn, F.Start.Value);
   // Publish the recovered signature for the Unabi pass, the only consumer
   // of the source-level shape of a function.
-  if (Sig)
-    Fn->addFnAttr("revenant.sig", sigString(*Sig));
+  if (Sig) {
+    std::string SigText = sigString(*Sig);
+    if (!SigText.empty())
+      Fn->addFnAttr("revenant.sig", SigText);
+  }
   if (auto It = P.Embedded.find(F.Start); It != P.Embedded.end()) {
     const EmbeddedFunctionMetadata &Meta = It->second;
     if (!Meta.SourceFile.empty()) {
