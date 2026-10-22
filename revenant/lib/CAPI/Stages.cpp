@@ -674,10 +674,13 @@ std::string deoptPipeline(bool IncludeUncxx) {
 }
 
 /// The storage the ir-final artifact ends with for clang, MSVC and GCC
-/// binaries: one stack slot per parameter, phi web and multi-return value,
-/// as clang lays out an unoptimized function, then the control-flow shape.
+/// binaries: one alloca per frame object even where frame addresses escape
+/// (the object bounds are inferred, so only ir-final takes this), then one
+/// stack slot per parameter, phi web and multi-return value, as clang lays
+/// out an unoptimized function, then the control-flow shape.
 std::string finalStoragePipeline(bool Patterns) {
-  return formatv("function(revenant-locals-to-slots,revenant-structure{0})",
+  return formatv("function(revenant-frame-slots,revenant-locals-to-slots,"
+                 "revenant-structure{0})",
                  Patterns ? ",revenant-patterns" : "")
       .str();
 }
