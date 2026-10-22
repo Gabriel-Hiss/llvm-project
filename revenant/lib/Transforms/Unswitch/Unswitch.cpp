@@ -2466,6 +2466,20 @@ PreservedAnalyses revenant::UnswitchPass::run(Function &F,
     }
   }
 
+  // Pass G: constant function-pointer tables behind the opaque tail jump.
+  for (int Iter = 0; Iter < 8; ++Iter) {
+    bool More = false;
+    for (BasicBlock &BB : llvm::make_early_inc_range(F)) {
+      if (tryPtrTable(F, BB)) {
+        More = true;
+        Changed = true;
+        break;
+      }
+    }
+    if (!More)
+      break;
+  }
+
   // Pass F: default icmp/select merges (needs switches from A-E first).
   for (int Iter = 0; Iter < 16; ++Iter) {
     bool More = false;
