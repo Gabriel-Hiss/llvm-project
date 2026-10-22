@@ -919,12 +919,10 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
         if (Callee && Callee->isIntrinsic() &&
             Call->arg_size() >= idiomArity(Callee->getIntrinsicID())) {
           Intrinsic::ID ID = Callee->getIntrinsicID();
+          Value *A = Call->getArgOperand(0);
           Value *R = nullptr;
           Value *Cond = nullptr;
           if (ID == Intrinsic::scmp || ID == Intrinsic::ucmp) {
-            if (Call->arg_size() < 2)
-              continue;
-            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             bool Signed = ID == Intrinsic::scmp;
             Value *Less = B.CreateICmp(
@@ -938,9 +936,6 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                                B.CreateSelect(Greater, One, Zero));
           } else if (ID == Intrinsic::smin || ID == Intrinsic::smax ||
                      ID == Intrinsic::umin || ID == Intrinsic::umax) {
-            if (Call->arg_size() < 2)
-              continue;
-            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             bool Signed = ID == Intrinsic::smin || ID == Intrinsic::smax;
             bool Min = ID == Intrinsic::smin || ID == Intrinsic::umin;
@@ -950,25 +945,18 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
                 A, Bv);
             R = B.CreateSelect(Cond, A, Bv);
           } else if (ID == Intrinsic::abs) {
-            Value *A = Call->getArgOperand(0);
             Cond = B.CreateICmpSLT(
                 A, ConstantInt::getNullValue(A->getType()));
             Value *Neg = B.CreateSub(ConstantInt::getNullValue(A->getType()),
                                      A);
             R = B.CreateSelect(Cond, Neg, A);
           } else if (ID == Intrinsic::usub_sat) {
-            if (Call->arg_size() < 2)
-              continue;
-            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             Cond = B.CreateICmpULT(A, Bv);
             Value *Difference = B.CreateSub(A, Bv);
             R = B.CreateSelect(Cond, ConstantInt::getNullValue(A->getType()),
                                Difference);
           } else if (ID == Intrinsic::uadd_sat) {
-            if (Call->arg_size() < 2)
-              continue;
-            Value *A = Call->getArgOperand(0);
             Value *Bv = Call->getArgOperand(1);
             Value *Sum = B.CreateAdd(A, Bv);
             Cond = B.CreateICmpULT(Sum, A);

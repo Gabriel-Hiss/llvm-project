@@ -30,6 +30,9 @@
 /build*
 # Per-suite test runtime cache written by llvm-lit.
 revenant/**/.lit_test_times.txt
+# Transform plugin DLLs built into the worktree root by the ninja targets.
+/RevenantTransform*.dll
+/RevenantTransform*.lib
 
 #==============================================================================#
 # Explicit files to ignore (only matches one).

@@ -1929,7 +1929,7 @@ static bool matchIndexPlus(Value *V, const PHINode *IP, int64_t &Offset,
   if (!matchIndexPlus(BO->getOperand(0), IP, Sub, Depth - 1))
     return false;
   auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
-  if (!C)
+  if (!C || C->getValue().getActiveBits() > 63)
     return false;
   std::optional<int64_t> K = C->getValue().trySExtValue();
   if (!K)

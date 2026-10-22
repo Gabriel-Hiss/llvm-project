@@ -8,16 +8,15 @@
 
 %struct.String = type { ptr, i64, i64 }
 
-; CHECK-LABEL: define i32 @take(ptr %this, ptr %a1)
-; CHECK: ret i32
-define i32 @take(i64 %0, ptr %1) #0 {
+; CHECK-LABEL: define i8 @take(ptr %this, ptr %a1)
+define i64 @take(i64 %0, i64 %1) #0 {
 entry:
-  %p = inttoptr i64 %0 to ptr, !revenant.va !{i64 7024}
-  %l = load i64, ptr %1, align 8, !revenant.va !{i64 7028}
-  %t = trunc i64 %l to i32, !revenant.va !{i64 7032}
-  %slot = alloca %struct.String, align 8
-  store ptr %1, ptr %slot, align 8
-  ret i32 %t
+  %p = inttoptr i64 %1 to ptr, !revenant.va !{i64 7024}
+  %l = load i64, ptr %p, align 8, !revenant.va !{i64 7028}
+  %z = icmp eq i64 %l, 0, !revenant.va !{i64 7032}
+  %z8 = zext i1 %z to i8, !revenant.va !{i64 7036}
+  %e = zext i8 %z8 to i64, !revenant.va !{i64 7040}
+  ret i64 %e
 }
 
-attributes #0 = { "revenant.sig"="T V%struct.String => r32" }
+attributes #0 = { "revenant.sig"="T V%struct.String => r8" }

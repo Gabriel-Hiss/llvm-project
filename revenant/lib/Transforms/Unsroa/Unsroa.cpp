@@ -464,12 +464,18 @@ bool rebuildScalarGroups(Function &F, const DataLayout &DL) {
           Slot, PointerType::get(Ctx, AI->getAddressSpace()));
       Instruction *TypedI = cast<Instruction>(Typed);
       copyVA(AI, TypedI);
+      // The slot sits at a packed offset inside the aggregate: its accesses
+      // keep at most commonAlignment(base align, offset), else the output
+      // promises an alignment the address does not have (misaligned UB).
+      Align SlotAlign = commonAlignment(AI->getAlign(), Off);
       for (Instruction *U : Users) {
         if (auto *LI = dyn_cast<LoadInst>(U)) {
           LI->setOperand(0, Typed);
+          LI->setAlignment(SlotAlign);
         } else if (auto *SI = dyn_cast<StoreInst>(U)) {
           if (SI->getPointerOperand() == AI)
             SI->setOperand(1, Typed);
+          SI->setAlignment(SlotAlign);
         } else if (auto *II = dyn_cast<IntrinsicInst>(U)) {
           II->setOperand(0, Typed);
         }
@@ -1555,6 +1561,10 @@ bool rebuildFieldClusters(Function &F, const DataLayout &DL) {
       for (size_t I = BestStart; I < BestEnd; ++I)
         Local.push_back(std::move(Fields[I]));
       Fields = std::move(Local);
+      // A callee-confirmed run of one field is not a struct: the shape
+      // checks below index Fields[1].
+      if (Fields.size() < 2)
+        continue;
     }
     Lo = Fields.front().Off;
     Hi = Fields.back().Off + Fields.back().Width;

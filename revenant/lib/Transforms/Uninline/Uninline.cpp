@@ -69,7 +69,7 @@
 #define REVENANT_HAS_EVIDENCE 1
 #endif
 #include "revenant/Transforms/Uninline/Uninline.h"
-
+#include "revenant/Evidence/Evidence.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -96,18 +96,18 @@ constexpr unsigned MaxRegionInsts = 64;
 constexpr unsigned MaxOperands = 16;
 
 // Callee bodies we match must be side-effect free apart from the returned
-// value: no stores (memory writes cannot be reordered without alias proof),
-// no volatile/atomic memory operations, no calls except readonly intrinsics
-// the matcher skips (lifetime markers, assume), no inline asm, no fences.
-// Callee bodies are single-entry/single-exit straight lines, so the only
-// effectful instruction allowed is at most one direct call (the wrapper
+// value, except for plain stores: a contiguous store window is outlined
+// back into a call at the same stream position, so every address, value
+// and relative order is preserved (the caller's surrounding traffic sees
+// the same memory states in the same order). Volatile/atomic stores,
+// inline asm, fences and anything harsher stay rejected, as do all other
+// memory writes. No calls except readonly intrinsics the matcher skips
+// (lifetime markers, assume), except at most one direct call (the wrapper
 // family: the callee forwards to one real function, e.g. `mz_deflateInit`
-// tail-calling `mz_deflateInit2`). Stores are rejected: reordering them
-// relative to caller memory traffic needs alias proof this pass does not
-// attempt. The single call may read or write memory; outlining it back
-// into a call preserves order because the region occupies one position in
-// the caller's instruction stream and the call is rebuilt at that same
-// position.
+// tail-calling `mz_deflateInit2`). The single call may read or write
+// memory; outlining it back into a call preserves order because the
+// region occupies one position in the caller's instruction stream and the
+// call is rebuilt at that same position.
 bool isPureForMatch(const Instruction &I, bool &SawCall) {
   if (const auto *CB = dyn_cast<CallBase>(&I)) {
     if (CB->isInlineAsm())
@@ -124,6 +124,12 @@ bool isPureForMatch(const Instruction &I, bool &SawCall) {
     SawCall = true;
     return true;
   }
+  // Plain stores are legal: the rewrite rebuilds the call at the region's
+  // stream position, preserving every address, value and relative order.
+  // Volatile/atomic stores observe or constrain ordering beyond the
+  // stream and stay rejected.
+  if (const auto *S = dyn_cast<StoreInst>(&I))
+    return !S->isVolatile() && !S->isAtomic();
   if (I.mayWriteToMemory())
     return false;
   if (I.isVolatile())
@@ -404,6 +410,21 @@ bool sameMemShape(const Instruction *C, const Instruction *R) {
       return false;
     return true;
   }
+  if (const auto *CS = dyn_cast<StoreInst>(C)) {
+    const auto *RS = dyn_cast<StoreInst>(R);
+    if (!RS)
+      return false;
+    // Alignment is a promise the rebuilt call re-executes: a stronger
+    // callee promise than the site provides would be UB, so require
+    // equality (like the CFG path). Ordering likewise.
+    if (CS->getAlign() != RS->getAlign())
+      return false;
+    if (CS->isVolatile() != RS->isVolatile())
+      return false;
+    if (CS->getOrdering() != RS->getOrdering())
+      return false;
+    return true;
+  }
   return true;
 }
 
@@ -633,15 +654,23 @@ bool tryUninlineCaller(Function &Caller, const CalleeBody &CB) {
         SmallVector<Instruction *, 16> RegionInsts;
         for (unsigned i = 0; i != CB.Insts.size(); ++i)
           RegionInsts.push_back(Body[S + i]);
-        // Evidence-only bodies rewrite solely when the region references
-        // the same distinctive strings or library body as the callee.
-        // The structural match above already passed fully; evidence only
-        // confirms tiny exact matches (the assert-string family).
-#ifdef REVENANT_HAS_EVIDENCE
-        if (CB.EvidenceOnly &&
-            !revenant::evidence::regionMatchesEvidence(Ev, RegionInsts))
-          continue;
-#endif
+        // Evidence-only bodies rewrite solely when the region or the
+        // escape's users reference the same distinctive strings or
+        // library body as the callee: the string use of an inlined
+        // value naturally sits outside the spliced body.
+        if (CB.EvidenceOnly) {
+          SmallVector<Instruction *, 16> EvRegion(RegionInsts.begin(),
+                                                  RegionInsts.end());
+          // matchWindow leaves Escape null when RetVal is unset; mirror
+          // the fallback below so escape users still join the check.
+          Value *EvEscape = Escape ? Escape : RegionInsts.back();
+          for (User *U : EvEscape->users())
+            if (auto *UI = dyn_cast<Instruction>(U))
+              if (UI->getParent() == &BB)
+                EvRegion.push_back(UI);
+          if (!revenant::evidence::regionMatchesEvidence(Ev, EvRegion))
+            continue;
+        }
         if (!Escape) {
           // `ret void` callee: no escaping value; the call goes at the
           // region end. Unlike a real escape, nothing replaces the uses

@@ -595,12 +595,12 @@ bool rewriteFunction(Module &M, Function &F, const Sig &S) {
       return false;
   }
 
-  // V params keep a plain ptr (ir-pre shape); the named struct must exist
-  // so a typo'd annotation bails instead of rewriting blind.
+  // V params keep a plain ptr (ir-pre shape); the token only names the
+  // source struct for readers. A wrong name rewrites the same plain ptr,
+  // so strict validation would only add no-fire noise.
   for (unsigned I = 0; I < S.Params.size(); ++I) {
     if (S.Params[I].K == ParamTok::ByVal) {
-      Type *BT = findStruct(M, S.Params[I].Name);
-      if (!BT || !BT->isStructTy())
+      if (S.Params[I].Name.empty())
         return false;
     }
   }

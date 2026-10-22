@@ -38,7 +38,7 @@ so `ir-final` carries the compiler's pre-optimization shape.
 |---|---|---|
 | cleanup | `sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg<no-switch-to-lookup;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks>,gvn,dse,dce,sroa,instcombine<no-verify-fixpoint>` | `crates/lift/src/pipeline.rs` `CLEANUP_PASSES` |
 | idioms (IR) | `revenant-idioms` | `crates/idioms` `ir_passes()` |
-| unopt | `revenant-devectorize,revenant-reroll,revenant-unrotate,revenant-untailrec` | `crates/unopt` `passes()` |
+| unopt | `revenant-devectorize,revenant-unloopvec,revenant-reroll,revenant-unrotate,revenant-untailrec` | `crates/unopt` `passes()` + vector-loop recovery |
 | patterns (opt-in) | `revenant-patterns` | `crates/patterns`, engine `--patterns` |
 | structure | `revenant-structure` | `crates/structure` |
 | types (post) | `revenant-types` | type recovery, pre-emission |
@@ -106,16 +106,23 @@ The straight-line phase also explodes cross-width lane splits (`<2 x i64>`
 to `<4 x i32>`), lane-0 broadcasts (insertelement / zext+bitcast + shuffle),
 and manual i128 shift/bitcast/add horizontal folds, with per-lane alignment
 (common alignment of vector alignment and lane offset) and exact float lane
-constants. A final pair-split phase turns scalar-i128 copy webs (constant /
+constants.
+
+For straight-line 256-bit reductions, an exact `<8 x i32>` to `<2 x i128>`
+to extracted-half to `<4 x i32>` bitcast round-trip is promoted to a lane
+shuffle before scalarization; any deviation conservatively keeps the vector.
+
+A final pair-split phase turns scalar-i128 copy webs (constant /
 load / phi webs feeding only stores) into i64 halves. Guarantees
 conservative bail-outs: ymm/zmm upper lanes, cross-lane ops, unrecognized
 vector phis, i128 arithmetic webs, and shared copy webs stay vector.
 
 **revenant-reroll (owner: MuseTxReroll).** Expects scalarized loops.
 Folds unrolled iteration copies back into one induction-variable step
-(partial: keep one copy, divide step) and synthesizes loops for
-fully-unrolled straight-line runs (full). Guarantees shape/offset matching
-only; ambiguous copies stay put.
+(partial: keep one copy, divide step) only when the exit lattice is preserved
+and a latch-tested loop is proven to execute at least the fold factor.
+Synthesizes loops for fully-unrolled straight-line runs (full). Ambiguous
+copies and unproved short-trip loops stay put.
 
 **revenant-unrotate (owner: MuseTxUnrotate).** Expects rerolled loops.
 Rewrites `if (c) { do { body } while (c); }` to while shape when guard and
@@ -129,6 +136,14 @@ back into the loop it came from (toward IR 1:1 with the compiler's ir-pre).
 Self-loop headers get a dedicated latch split out first, then the same
 rewrite. Guarantees vetoes on any existing self-call, impure latch, or
 non-covering phis; anything vetoed stays as-is.
+
+**revenant-unswitch (owner: StepUnswitchTables, opt-in).** Recovers
+lookup tables, linear maps, bitmaps, range checks, select chains and
+compare trees as switches when their matched values are proven. This pass
+is not in the default unopt pipeline: enabling it on the integration corpus
+produced invalid PHI predecessor counts in sqlite and imgui. Its standalone
+fixtures exercise the supported shapes; default use remains disabled until
+the control-flow rewrites preserve every successor PHI.
 
 **revenant-patterns (owner: MuseTxPatterns, opt-in).** Expects unopt
 output. Matches oracle-generated library-idiom patterns (anchor-seeded
@@ -176,8 +191,23 @@ Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
 **revenant-unloopvec (owner: MuseDeoptVecLoops).** Expects devectorize output
 (or raw vectorizer skeletons). Collapses vector body + scalar remainder +
 runtime checks back to one scalar loop. Preserves `!revenant.va`; bails
-leaving the CFG untouched when unsure. Runs explicitly, not in the default
-pipeline.
+leaving the CFG untouched when unsure. Runs in the default unopt pipeline.
+
+**revenant-unvecsearch (owner: MuseUnvecSearchR).** Expects devectorize output.
+Folds vectorized early-exit scans (find/strchr/strlen/memchr-like chunk loops
+over i8/i16/i32 lanes, SSE2..AVX2: lane compare + mask fold + bit-scan index,
+with a scalar compare tail) back to the scalar search loop from element 0.
+The needle must prove a byte-symbolic splat of one root (or a second-buffer
+load). Identity rules, never arithmetic: the tail resume incoming must be
+exactly the latch step or the chunk bound SSA value; chunk and tail must
+address the same base SSA value with the same index expression (the chunk
+and tail index phis); the chunk bound must have an and-mask or sub-urem
+multiple form so the exit edge provably fires. Disjoint from unloopvec by
+shape (no counted trip-bound loops touched, no mask+bit-scan skeleton
+accepted there). Preserves `!revenant.va`; bails leaving the CFG untouched
+when unsure. Runs explicitly, not in the default pipeline; the strchr
+two-way taken edge without a bit-scan and arithmetic tail resumes (e.g.
+dual-buffer compare with a recomputed resume) stay for later.
 
 **revenant-unipo.** Module pass, invoked with `-passes=revenant-unipo`. Structural clone folding is disabled: no body comparison can prove two entry points came from one source function (distinct declarations linked to different behavior, opaque observers, distinct exit codes, volatile loads from different objects), and identical bodies are not proof of shared source identity either. The pass keeps signature restoration (returns, dead formals, named clones, the narrow GCC constprop `this` formal), which requires source-signature evidence and rebinds only the same constant object. Uncertain functions stay unchanged. The pass preserves `!revenant.va` and `!revenant.opaque` and is not in the default pipeline.
 
@@ -323,3 +353,45 @@ inlined drop glue re-outlined into `drop_glue.unrust` when every operand the
 free arm reads is remappable. Guarantees semantics-preserving rewrites only,
 `!revenant.va` preserved, `!revenant.opaque` untouched. Runs explicitly via
 `-passes=revenant-unrust`, not in the default pipeline.
+
+## Deopt evidence (owner: MuseDeoptEvidence)
+
+One evidence API that deopt passes query, built from embedded metadata and
+libdb: `revenant/include/revenant/Evidence/Evidence.h`. Header-only pure
+reads, no analysis manager, safe to include from statically linked plugin
+DLLs. Every query defaults to absent when the module carries no metadata,
+so `--meta=none` output stays valid and correct.
+
+Rule: evidence only confirms a rewrite the shape matcher already allows;
+it never enables one on its own. When evidence and shape disagree, shape
+wins.
+
+The lifter attaches per-function `rev.*` metadata from the analyzed
+Program next to the existing `rev.source`/`rev.panic`/`rev.eh.types`/
+`rev.class`/`rev.strings` slots: `!rev.unroll !{i32 D}` is the count of
+repeated straight-line asm opcode windows sharing the function's single
+Location record (gated on crash metadata, so `none` emits nothing);
+`!rev.chunks !{!{i64 start, i64 end}, ...}` lists the disjoint code ranges
+of split functions (plain address facts, always attached). `revenant.lib`
+function attributes carry libdb matches, `!revenant.va` carries per
+instruction provenance, and `!revenant.eh.region` marks invokes inside
+decoded try ranges.
+
+Queries: `evidence::unrollFactor(F)` returns the recorded factor or
+nullopt. Reroll's straight-line synthesis proves every run structurally
+(uniform delta, acc threads, latch) but only acts at K >= 4 alone; with
+factor evidence present the worth-it threshold drops to K >= 2. The
+factor's exact value never gates K, and the in-loop fold keeps its
+`step % D` gate unconditionally (relaxing it on agreement is always
+wrong-code: a dense pre-fold needs Step == D*g, which already implies
+divisibility). `evidence::uninlineEvidence(callee)` returns the callee's
+Location, referenced strings and lib name; tiny exact-match bodies below
+the 3-instruction minimum stay eligible only with non-empty evidence,
+and rewrite only when `regionMatchesEvidence` finds the same string or
+lib reference in the region or the escape's users. The wrapper veto
+stays absolute. `evidence::chunkRanges(F)` returns cold-part boundaries;
+`evidence::ehRegion(I)` returns the try-region id. Corresponding tests:
+`unittests/Evidence/`,
+`test/Transforms/Reroll/evidence-unroll-confirms.ll`,
+`test/Transforms/Reroll/evidence-synth-confirms.ll`,
+`test/Transforms/Uninline/evidence-inline-confirms.ll`.
