@@ -10,6 +10,8 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
@@ -30,22 +32,31 @@ struct Access {
   uint64_t Size;
   Type *Ty;
 };
+// A use of a frame address that leaves the frame (a call argument, a
+// ptrtoint, a stored pointer) at a constant byte offset.
+struct Escape {
+  Use *U;
+  int64_t Offset;
+};
 // The lifter has already resolved StackPtr's instruction-dependent deltas
-// into constant byte GEPs. Only split a closed, nonescaping frame. Replacing
-// an escaped byte range with independent objects would change aliasing.
+// into constant byte GEPs. Without `Escapes` only a closed, nonescaping
+// frame qualifies: replacing an escaped byte range with independent objects
+// changes aliasing. With it, escaping uses are recorded instead.
 bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
                   SmallVectorImpl<Access> &Accesses,
-                  SmallPtrSetImpl<Value *> &Seen) {
+                  SmallPtrSetImpl<Value *> &Seen,
+                  SmallVectorImpl<Escape> *Escapes = nullptr) {
   if (!Seen.insert(P).second)
     return false;
-  for (User *U : P->users()) {
+  for (Use &Use : P->uses()) {
+    User *U = Use.getUser();
     if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
       APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
       if (!G->accumulateConstantOffset(DL, O))
         return false;
       int64_t Next;
       if (AddOverflow(Offset, O.getSExtValue(), Next) ||
-          !collectFrame(G, Next, DL, Accesses, Seen))
+          !collectFrame(G, Next, DL, Accesses, Seen, Escapes))
         return false;
       continue;
     }
@@ -54,11 +65,14 @@ bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
       if (L->getPointerOperand() != P || L->isVolatile() || L->isAtomic())
         return false;
       Ty = L->getType();
-    } else if (auto *S = dyn_cast<StoreInst>(U)) {
-      if (S->getPointerOperand() != P || S->getValueOperand() == P ||
-          S->isVolatile() || S->isAtomic())
+    } else if (auto *S = dyn_cast<StoreInst>(U);
+               S && Use.getOperandNo() == StoreInst::getPointerOperandIndex()) {
+      if (S->getValueOperand() == P || S->isVolatile() || S->isAtomic())
         return false;
       Ty = S->getValueOperand()->getType();
+    } else if (Escapes && !isa<PHINode>(U) && !isa<SelectInst>(U)) {
+      Escapes->push_back({&Use, Offset});
+      continue;
     } else {
       return false;
     }
@@ -69,55 +83,176 @@ bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
   }
   return true;
 }
-bool splitFrame(AllocaInst &Frame, const DataLayout &DL) {
+// One object of the split frame: the bytes [Begin, Limit), the accesses
+// and escapes that land in them, and its type when it is an array of
+// write-only elements.
+struct FrameObject {
+  uint64_t Begin;
+  uint64_t Limit;
+  SmallVector<const Access *, 4> Accesses;
+  SmallVector<const Escape *, 2> Escapes;
+  Type *Ty = nullptr;
+};
+// Splits the lifted frame into one alloca per object. Overlapping accesses
+// stay one byte object; exact, consistently typed slots become scalar
+// allocas, ready for mem2reg; no structs are invented. With
+// `AllowEscapes`, a frame whose addresses escape splits too: an escaped
+// address starts an object that takes the write-only objects directly
+// after it (the fields this function initializes before handing the
+// object out) and reaches up to the next directly accessed offset (the
+// callee may read anything up to there). Escaped objects never overlap.
+// The object bounds are inferred, not proven: a callee that reads past the
+// next accessed offset, or a field this function also reads, would land
+// in another object. Only the ir-final storage tail asks for this.
+// `ScalarSlots` receives the scalar allocas no escape reaches.
+bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
+                bool AllowEscapes = false,
+                SmallVectorImpl<AllocaInst *> *ScalarSlots = nullptr) {
   auto *AT = dyn_cast<ArrayType>(Frame.getAllocatedType());
   if (!AT || !AT->getElementType()->isIntegerTy(8) ||
       !Frame.getName().contains("frame") || !Frame.isStaticAlloca())
     return false;
+  const uint64_t FrameSize = AT->getNumElements();
   SmallVector<Access, 32> A;
+  SmallVector<Escape, 8> E;
   SmallPtrSet<Value *, 32> Seen;
-  if (!collectFrame(&Frame, 0, DL, A, Seen) || A.empty())
+  if (!collectFrame(&Frame, 0, DL, A, Seen, AllowEscapes ? &E : nullptr) ||
+      (A.empty() && E.empty()))
     return false;
   for (const Access &X : A)
-    if (X.Offset < 0 || uint64_t(X.Offset) > AT->getNumElements() ||
-        X.Size > AT->getNumElements() - uint64_t(X.Offset))
+    if (X.Offset < 0 || uint64_t(X.Offset) > FrameSize ||
+        X.Size > FrameSize - uint64_t(X.Offset))
       return false;
-  llvm::sort(A, [](const Access &X, const Access &Y) {
+  for (const Escape &X : E)
+    if (X.Offset < 0 || uint64_t(X.Offset) >= FrameSize)
+      return false;
+  llvm::stable_sort(A, [](const Access &X, const Access &Y) {
     return X.Offset < Y.Offset;
   });
-  IRBuilder<> Entry(&Frame);
-  for (size_t Begin = 0; Begin < A.size();) {
-    size_t End = Begin + 1;
-    uint64_t Limit = uint64_t(A[Begin].Offset) + A[Begin].Size;
-    while (End < A.size() && uint64_t(A[End].Offset) < Limit) {
-      Limit = std::max(Limit, uint64_t(A[End].Offset) + A[End].Size);
-      ++End;
+  llvm::stable_sort(E, [](const Escape &X, const Escape &Y) {
+    return X.Offset < Y.Offset;
+  });
+  // Objects from overlapping direct accesses.
+  SmallVector<FrameObject, 16> Objects;
+  for (const Access &X : A) {
+    uint64_t End = uint64_t(X.Offset) + X.Size;
+    if (!Objects.empty() && uint64_t(X.Offset) < Objects.back().Limit) {
+      Objects.back().Limit = std::max(Objects.back().Limit, End);
+    } else {
+      Objects.push_back({uint64_t(X.Offset), End, {}, {}});
     }
-    // Overlapping accesses remain one byte object. Exact, consistently typed
-    // slots become scalar allocas, ready for mem2reg. Do not invent structs.
-    Type *Ty = A[Begin].Ty;
-    for (size_t J = Begin; J < End; ++J)
-      if (A[J].Offset != A[Begin].Offset || A[J].Ty != Ty)
+    Objects.back().Accesses.push_back(&X);
+  }
+  if (!E.empty()) {
+    // Each escape joins the object it points into, or starts one.
+    for (const Escape &X : E) {
+      uint64_t At = X.Offset;
+      auto It = llvm::partition_point(Objects, [&](const FrameObject &O) {
+        return O.Limit <= At;
+      });
+      if (It == Objects.end() || It->Begin > At)
+        It = Objects.insert(It, FrameObject{At, At + 1, {}, {}});
+      It->Escapes.push_back(&X);
+    }
+    // An escaped object takes the write-only objects that directly follow
+    // it (fields it initializes before handing it out), then reaches up to
+    // the next object.
+    SmallVector<FrameObject, 16> Merged;
+    for (size_t I = 0; I < Objects.size(); ++I) {
+      FrameObject O = std::move(Objects[I]);
+      if (!O.Escapes.empty()) {
+        auto WriteOnly = [](const FrameObject &N) {
+          return N.Escapes.empty() &&
+                 llvm::all_of(N.Accesses, [](const Access *X) {
+                   return isa<StoreInst>(X->I);
+                 });
+        };
+        while (I + 1 < Objects.size() && Objects[I + 1].Begin <= O.Limit &&
+               WriteOnly(Objects[I + 1])) {
+          FrameObject &N = Objects[++I];
+          O.Limit = std::max(O.Limit, N.Limit);
+          O.Accesses.append(N.Accesses.begin(), N.Accesses.end());
+        }
+        O.Limit = std::max(O.Limit, I + 1 < Objects.size()
+                                        ? Objects[I + 1].Begin
+                                        : FrameSize);
+      }
+      Merged.push_back(std::move(O));
+    }
+    Objects = std::move(Merged);
+    // A run of adjacent write-only slots of one type is an array this
+    // function fills and something else reads (an initializer list): one
+    // object, not dead scalars.
+    Merged.clear();
+    auto Element = [&](const FrameObject &O) -> Type * {
+      if (!O.Escapes.empty() || O.Accesses.empty())
+        return nullptr;
+      Type *T = O.Accesses.front()->Ty;
+      for (const Access *X : O.Accesses)
+        if (!isa<StoreInst>(X->I) || X->Ty != T ||
+            uint64_t(X->Offset) != O.Begin)
+          return nullptr;
+      return DL.getTypeStoreSize(T) == O.Limit - O.Begin ? T : nullptr;
+    };
+    for (size_t I = 0; I < Objects.size(); ++I) {
+      FrameObject O = std::move(Objects[I]);
+      Type *T = Element(O);
+      size_t N = 1;
+      while (T && I + 1 < Objects.size() &&
+             Objects[I + 1].Begin == O.Limit && Element(Objects[I + 1]) == T) {
+        FrameObject &Next = Objects[++I];
+        O.Limit = Next.Limit;
+        O.Accesses.append(Next.Accesses.begin(), Next.Accesses.end());
+        ++N;
+      }
+      if (N > 1)
+        O.Ty = ArrayType::get(T, N);
+      Merged.push_back(std::move(O));
+    }
+    Objects = std::move(Merged);
+  }
+  IRBuilder<> Entry(&Frame);
+  for (const FrameObject &O : Objects) {
+    Type *Ty = O.Ty;
+    if (!Ty && !O.Accesses.empty()) {
+      Ty = O.Accesses.front()->Ty;
+      for (const Access *X : O.Accesses)
+        if (uint64_t(X->Offset) != O.Begin || X->Ty != Ty)
+          Ty = nullptr;
+      if (Ty && DL.getTypeStoreSize(Ty) != O.Limit - O.Begin)
         Ty = nullptr;
+    }
+    bool Scalar = Ty && !Ty->isAggregateType() && O.Escapes.empty();
     if (!Ty)
-      Ty = ArrayType::get(Entry.getInt8Ty(), Limit - A[Begin].Offset);
-    auto *Slot = Entry.CreateAlloca(Ty, nullptr,
-                                  "stack_" + Twine(A[Begin].Offset));
+      Ty = ArrayType::get(Entry.getInt8Ty(), O.Limit - O.Begin);
+    auto *Slot = Entry.CreateAlloca(Ty, nullptr, "stack_" + Twine(O.Begin));
     Slot->setAlignment(Frame.getAlign());
     provenance(Slot, Frame);
-    for (size_t J = Begin; J < End; ++J) {
-      IRBuilder<> B(A[J].I);
+    if (Scalar && ScalarSlots)
+      ScalarSlots->push_back(Slot);
+    for (const Access *X : O.Accesses) {
+      IRBuilder<> B(X->I);
       Value *P = Slot;
-      if (A[J].Offset != A[Begin].Offset)
+      if (uint64_t(X->Offset) != O.Begin)
         P = B.CreateGEP(B.getInt8Ty(), Slot,
-                       B.getInt64(A[J].Offset - A[Begin].Offset));
-      provenance(P, *A[J].I);
-      if (auto *L = dyn_cast<LoadInst>(A[J].I))
+                       B.getInt64(uint64_t(X->Offset) - O.Begin));
+      provenance(P, *X->I);
+      if (auto *L = dyn_cast<LoadInst>(X->I))
         L->setOperand(0, P);
       else
-        cast<StoreInst>(A[J].I)->setOperand(1, P);
+        cast<StoreInst>(X->I)->setOperand(1, P);
     }
-    Begin = End;
+    for (const Escape *X : O.Escapes) {
+      Value *P = Slot;
+      if (uint64_t(X->Offset) != O.Begin) {
+        auto *UserI = cast<Instruction>(X->U->getUser());
+        IRBuilder<> B(UserI);
+        P = B.CreateGEP(B.getInt8Ty(), Slot,
+                        B.getInt64(uint64_t(X->Offset) - O.Begin));
+        provenance(P, *UserI);
+      }
+      X->U->set(P);
+    }
   }
   // Delete the old address tree bottom-up once all memory users moved.
   SmallVector<Instruction *, 32> Dead;
@@ -620,6 +755,29 @@ bool mergeTwins(Function &F, const DataLayout &DL,
   return true;
 }
 } // namespace
+PreservedAnalyses FrameSlotsPass::run(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  if (F.isDeclaration())
+    return PreservedAnalyses::all();
+  const DataLayout &DL = F.getDataLayout();
+  SmallVector<AllocaInst *, 4> Frames;
+  for (Instruction &I : F.getEntryBlock())
+    if (auto *A = dyn_cast<AllocaInst>(&I))
+      Frames.push_back(A);
+  bool Changed = false;
+  SmallVector<AllocaInst *, 16> Scalars;
+  for (AllocaInst *A : Frames)
+    Changed |= splitFrame(*A, DL, /*AllowEscapes=*/true, &Scalars);
+  if (!Changed)
+    return PreservedAnalyses::all();
+  // The scalars no escape reaches are compiler temporaries and spills, the
+  // values a pre-optimization IR keeps in SSA form, as the cleanup does for
+  // a closed frame. The escaped objects and the write-only arrays stay.
+  llvm::erase_if(Scalars, [](AllocaInst *A) { return !isAllocaPromotable(A); });
+  if (!Scalars.empty())
+    PromoteMemToReg(Scalars, FAM.getResult<DominatorTreeAnalysis>(F));
+  return PreservedAnalyses::none();
+}
 PreservedAnalyses LiftNormalizePass::run(Function &F,
                                          FunctionAnalysisManager &) {
   if (F.isDeclaration())

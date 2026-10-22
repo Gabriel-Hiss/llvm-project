@@ -114,6 +114,10 @@ void registerRevenantPasses(PassBuilder &PB) {
           FPM.addPass(LiftNormalizePass());
           return true;
         }
+        if (Name == "revenant-frame-slots") {
+          FPM.addPass(FrameSlotsPass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
         if (Name == "revenant-devectorize") {
           FPM.addPass(DevectorizePass());
