@@ -69,6 +69,9 @@ struct Param {
   /// Lives in an xmm register.
   bool Float = false;
   std::optional<std::string> Name;
+  /// Source-level type spelling when the signature recovery knows it
+  /// ("int", "void *", ...). Empty when the type was only inferred.
+  std::string Type;
 };
 
 struct RetLoc {
@@ -82,6 +85,8 @@ struct Signature {
   std::vector<Param> Params;
   std::optional<RetLoc> Ret;
   bool NoReturn = false;
+  /// The function takes a variadic argument list after its fixed prefix.
+  bool VarArgs = false;
   SigSource Source = SigSource::Default;
 };
 
