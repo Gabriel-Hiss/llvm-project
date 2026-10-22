@@ -315,7 +315,14 @@ Expr *ExprBuilderImpl::castCalleeToCallType(llvm::CallInst &I,
   EPI.Variadic = Wanted->isVarArg();
   QualType WantedPtr = AST->getPointerType(
       AST->getFunctionType(RetQT, ParamQTs, EPI));
-  return makeCStyleCast(WantedPtr, CK_BitCast, Callee);
+  // The cast is unconditional: makeCStyleCast drops a cast whose types
+  // already match, and this cast is what keeps the value use well-typed
+  // when the compiled unit sees a different declaration of the import.
+  Expr *Op = parenIfNeeded(Callee, Prec::Unary);
+  TypeSourceInfo *TSI = AST->getTrivialTypeSourceInfo(WantedPtr);
+  return clang::CStyleCastExpr::Create(
+      *AST, WantedPtr, VK_PRValue, CK_BitCast, Op, nullptr,
+      FPOptionsOverride(), TSI, SourceLocation(), SourceLocation());
 }
 
 Expr *ExprBuilderImpl::buildCallExpr(llvm::CallInst &I, ExprScope &Scope,
