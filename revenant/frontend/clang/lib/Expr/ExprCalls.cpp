@@ -433,6 +433,17 @@ Expr *ExprBuilderImpl::buildCallValue(llvm::CallInst &I, ExprScope &Scope) {
           *AST, AST->getTranslationUnitDecl(), SourceLocation(),
           SourceLocation(), Id, FT, AST->getTrivialTypeSourceInfo(FT),
           SC_Extern);
+      // The printer walks the type's parameters and asks for their
+      // declarations, so the declaration needs one per parameter.
+      {
+        SmallVector<ParmVarDecl *, 3> FDParams;
+        for (unsigned A = 0; A != 3; ++A)
+          FDParams.push_back(ParmVarDecl::Create(
+              *AST, FD, SourceLocation(), SourceLocation(),
+              Ctx.ident("a" + std::to_string(A + 1)), Params[A], nullptr,
+              SC_None, nullptr));
+        FD->setParams(FDParams);
+      }
       Ctx.requireInclude("string.h");
       Expr *Ref = declRef(FD);
       SmallVector<Expr *, 4> Args;
