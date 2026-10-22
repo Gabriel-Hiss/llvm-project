@@ -89,10 +89,7 @@ std::string freshBlockName(const Function &F) {
 bool splitAfterCalls(Function &F, unsigned &Changed) {
   // A function with a single block has no control flow: rustc spells
   // such a function as one block too, so there is nothing to restore.
-  unsigned BlockCount = 0;
-  for (const BasicBlock &BB : F)
-    ++BlockCount;
-  if (BlockCount < 2)
+  if (F.size() < 2)
     return false;
 
   SmallVector<CallBase *, 8> Calls;
@@ -136,12 +133,25 @@ bool splitAfterCalls(Function &F, unsigned &Changed) {
     Instruction *Next = CB->getNextNode();
     BasicBlock *BB = CB->getParent();
     // The tail moves into the new block; the successor PHIs follow.
-    BasicBlock *NewBB =
-        BB->splitBasicBlock(Next->getIterator(), freshBlockName(F));
+    BB->splitBasicBlock(Next->getIterator(), freshBlockName(F));
     // The new branch stands where the call was: it keeps the call's
-    // provenance, as the contract requires of every instruction.
-    if (MDNode *VA = CB->getMetadata("revenant.va"))
-      NewBB->getTerminator()->setMetadata("revenant.va", VA);
+    // provenance, as the contract requires of every instruction. A call
+    // without provenance (a deopt pass rebuilt it) lends it to the
+    // closest instruction that has one.
+    MDNode *VA = CB->getMetadata("revenant.va");
+    if (!VA) {
+      for (Instruction *Prev = CB->getPrevNode(); Prev; Prev = Prev->getPrevNode()) {
+        if ((VA = Prev->getMetadata("revenant.va")))
+          break;
+      }
+      if (!VA)
+        for (Instruction *Next = CB->getNextNode(); Next; Next = Next->getNextNode()) {
+          if ((VA = Next->getMetadata("revenant.va")))
+            break;
+        }
+    }
+    if (VA)
+      BB->getTerminator()->setMetadata("revenant.va", VA);
     ++Changed;
     Any = true;
   }
