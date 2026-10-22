@@ -5,6 +5,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/LocalSlots/LocalSlots.h"
+#include "revenant/Transforms/SsaOut/PhiCopies.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -35,8 +37,12 @@ Instruction *firstNonAlloca(BasicBlock &Entry) {
   return It == Entry.end() ? Entry.getTerminator() : &*It;
 }
 
+// Provenance only: the source's other metadata (`!nonnull`, `!range`,
+// `!noundef` on a load) describes that instruction's value and is invalid
+// or wrong on a new store or load.
 void copyProvenance(const Instruction &From, Instruction &To) {
-  To.copyMetadata(From);
+  if (MDNode *VA = From.getMetadata("revenant.va"))
+    To.setMetadata("revenant.va", VA);
   To.setDebugLoc(From.getDebugLoc());
 }
 
@@ -119,6 +125,13 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     }
     return I;
   };
+  // A phi whose only use is another phi shares that phi's local, unless
+  // the two hold live values at once (`x = phi [y]` next to `y = phi
+  // [i + 1]` in one loop header: x lags y by an iteration).
+  PhiLiveness Liveness;
+  SmallVector<SmallVector<PHINode *, 2>, 32> Members;
+  for (PHINode *PN : Phis)
+    Members.push_back({PN});
   for (unsigned I = 0; I != Phis.size(); ++I) {
     PHINode *PN = Phis[I];
     for (Value *V : PN->incoming_values()) {
@@ -135,8 +148,11 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
       if (!OnlyUseIsThisPhi)
         continue;
       unsigned A = Root(I), B = Root(It->second);
-      if (A != B)
-        Parent[B] = A;
+      if (A == B || Liveness.interferes(Members[A], Members[B]))
+        continue;
+      Parent[B] = A;
+      Members[A].append(Members[B].begin(), Members[B].end());
+      Members[B].clear();
     }
   }
 
@@ -187,6 +203,37 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     DIB.finalize();
   }
 
+  // The local of web R still holds a value some path reads at the start
+  // of BB: a member is live there, or a member is defined there (its
+  // copy can be skipped as a same-local copy that relies on the value).
+  auto SlotLiveAt = [&](unsigned R, BasicBlock *BB) {
+    for (PHINode *M : Members[R])
+      if (M->getParent() == BB || Liveness.liveIn(M).count(BB))
+        return true;
+    return false;
+  };
+  // An incoming value defined in its predecessor is stored right after
+  // its definition, as clang -O0 stores an assignment, when nothing reads
+  // the local between that point and the edge and no other successor of
+  // the predecessor still needs the old value.
+  auto EarlyStoreSafe = [&](unsigned R, Instruction *Def, BasicBlock *Succ) {
+    BasicBlock *Pred = Def->getParent();
+    for (PHINode *M : Members[R])
+      for (Use &U : M->uses()) {
+        auto *UserI = cast<Instruction>(U.getUser());
+        if (auto *UserPhi = dyn_cast<PHINode>(UserI)) {
+          if (UserPhi->getIncomingBlock(U) == Pred)
+            return false;
+        } else if (UserI->getParent() == Pred && Def->comesBefore(UserI)) {
+          return false;
+        }
+      }
+    for (BasicBlock *Other : successors(Pred))
+      if (Other != Succ && SlotLiveAt(R, Other))
+        return false;
+    return true;
+  };
+
   SmallVector<CopyPlan, 64> EdgeCopies;
   for (unsigned I = 0; I != Phis.size(); ++I) {
     PHINode *PN = Phis[I];
@@ -199,8 +246,12 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
           continue;
       auto *Def = dyn_cast<Instruction>(V);
       if (Def && Def->getParent() == Pred && !Def->isTerminator() &&
-          !isa<PHINode>(Def)) {
-        IRBuilder<> B(Def->getNextNode());
+          !isa<PHINode>(Def) && EarlyStoreSafe(Root(I), Def, PN->getParent())) {
+        // An alloca incoming sits among the entry allocas, before the
+        // slots: its store goes after them.
+        IRBuilder<> B(isa<AllocaInst>(Def) && Def->getParent() == &Entry
+                          ? firstNonAlloca(Entry)
+                          : Def->getNextNode());
         StoreInst *Store = B.CreateStore(V, Slot);
         copyProvenance(*Def, *Store);
         continue;
@@ -209,10 +260,21 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     }
   }
 
+  // A copy goes on its own edge block when the predecessor branches
+  // elsewhere too and the successor has other predecessors, or when
+  // another successor still reads the local the copy writes.
   SmallVector<SplitEdgeMap, 16> SplitEdges;
   for (const CopyPlan &P : EdgeCopies) {
-    if (succ_size(P.Pred) < 2 || pred_size(P.Succ) < 2)
+    if (succ_size(P.Pred) < 2)
       continue;
+    if (pred_size(P.Succ) < 2) {
+      unsigned R = Root(PhiIndex.lookup(P.Phi));
+      bool OtherReads = false;
+      for (BasicBlock *Other : successors(P.Pred))
+        OtherReads |= Other != P.Succ && SlotLiveAt(R, Other);
+      if (!OtherReads)
+        continue;
+    }
     bool Seen = false;
     for (const SplitEdgeMap &E : SplitEdges)
       Seen |= E.Pred == P.Pred && E.Succ == P.Succ;
@@ -226,6 +288,9 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
     Edge->moveAfter(&F.back());
     SplitEdges.push_back({P.Pred, P.Succ, Edge});
   }
+  // The copies that land in one block are one parallel set: each reads the
+  // old value of the local it reads, so they are sequenced on those reads.
+  MapVector<BasicBlock *, SmallVector<EdgeCopy, 4>> CopiesByBlock;
   for (const CopyPlan &P : EdgeCopies) {
     BasicBlock *StoreBlock = P.Pred;
     for (const SplitEdgeMap &E : SplitEdges)
@@ -233,24 +298,39 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
         StoreBlock = E.Edge;
         break;
       }
-    Instruction *At = StoreBlock->getTerminator();
-    IRBuilder<> B(At);
-    Value *Stored = P.Incoming;
-    if (auto *Arg = dyn_cast<Argument>(Stored)) {
-      unsigned ArgNo = Arg->getArgNo();
-      LoadInst *Load = B.CreateLoad(Arg->getType(), ParamSlots[ArgNo]);
-      copyProvenance(*P.Phi, *Load);
-      Stored = Load;
+    AllocaInst *ReadSlot = nullptr;
+    if (auto *IncomingPhi = dyn_cast<PHINode>(P.Incoming))
+      if (auto It = PhiIndex.find(IncomingPhi); It != PhiIndex.end())
+        ReadSlot = Slots.lookup(Root(It->second));
+    CopiesByBlock[StoreBlock].push_back({P.Slot, P.Incoming, ReadSlot, P.Phi});
+  }
+  DenseMap<Type *, AllocaInst *> SpillByType;
+  auto SpillFor = [&](Type *Ty) {
+    AllocaInst *&Spill = SpillByType[Ty];
+    if (!Spill) {
+      IRBuilder<> B(firstNonAlloca(Entry));
+      Spill = B.CreateAlloca(Ty, nullptr, "v_spill");
     }
-    if (auto *IncomingPhi = dyn_cast<PHINode>(Stored))
-      if (auto It = PhiIndex.find(IncomingPhi); It != PhiIndex.end()) {
+    return Spill;
+  };
+  for (auto &[StoreBlock, Copies] : CopiesByBlock) {
+    IRBuilder<> B(StoreBlock->getTerminator());
+    for (const EdgeCopy &C : sequenceEdgeCopies(std::move(Copies), SpillFor)) {
+      Value *Stored = C.V;
+      if (C.ReadSlot) {
         LoadInst *Load =
-            B.CreateLoad(IncomingPhi->getType(), Slots.lookup(Root(It->second)));
-        copyProvenance(*P.Phi, *Load);
+            B.CreateLoad(C.ReadSlot->getAllocatedType(), C.ReadSlot);
+        copyProvenance(*C.Origin, *Load);
+        Stored = Load;
+      } else if (auto *Arg = dyn_cast<Argument>(Stored)) {
+        LoadInst *Load =
+            B.CreateLoad(Arg->getType(), ParamSlots[Arg->getArgNo()]);
+        copyProvenance(*C.Origin, *Load);
         Stored = Load;
       }
-    StoreInst *Store = B.CreateStore(Stored, P.Slot);
-    copyProvenance(*P.Phi, *Store);
+      StoreInst *Store = B.CreateStore(Stored, C.Dst);
+      copyProvenance(*C.Origin, *Store);
+    }
   }
 
   for (PHINode *PN : Phis) {

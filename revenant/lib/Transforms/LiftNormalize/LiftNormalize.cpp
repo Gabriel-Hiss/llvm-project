@@ -1,12 +1,17 @@
 //===- LiftNormalize.cpp - machine state to compiler IR ------------------===//
 #include "revenant/Transforms/LiftNormalize/LiftNormalize.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
@@ -27,22 +32,31 @@ struct Access {
   uint64_t Size;
   Type *Ty;
 };
+// A use of a frame address that leaves the frame (a call argument, a
+// ptrtoint, a stored pointer) at a constant byte offset.
+struct Escape {
+  Use *U;
+  int64_t Offset;
+};
 // The lifter has already resolved StackPtr's instruction-dependent deltas
-// into constant byte GEPs. Only split a closed, nonescaping frame. Replacing
-// an escaped byte range with independent objects would change aliasing.
+// into constant byte GEPs. Without `Escapes` only a closed, nonescaping
+// frame qualifies: replacing an escaped byte range with independent objects
+// changes aliasing. With it, escaping uses are recorded instead.
 bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
                   SmallVectorImpl<Access> &Accesses,
-                  SmallPtrSetImpl<Value *> &Seen) {
+                  SmallPtrSetImpl<Value *> &Seen,
+                  SmallVectorImpl<Escape> *Escapes = nullptr) {
   if (!Seen.insert(P).second)
     return false;
-  for (User *U : P->users()) {
+  for (Use &Use : P->uses()) {
+    User *U = Use.getUser();
     if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
       APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
       if (!G->accumulateConstantOffset(DL, O))
         return false;
       int64_t Next;
       if (AddOverflow(Offset, O.getSExtValue(), Next) ||
-          !collectFrame(G, Next, DL, Accesses, Seen))
+          !collectFrame(G, Next, DL, Accesses, Seen, Escapes))
         return false;
       continue;
     }
@@ -51,11 +65,14 @@ bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
       if (L->getPointerOperand() != P || L->isVolatile() || L->isAtomic())
         return false;
       Ty = L->getType();
-    } else if (auto *S = dyn_cast<StoreInst>(U)) {
-      if (S->getPointerOperand() != P || S->getValueOperand() == P ||
-          S->isVolatile() || S->isAtomic())
+    } else if (auto *S = dyn_cast<StoreInst>(U);
+               S && Use.getOperandNo() == StoreInst::getPointerOperandIndex()) {
+      if (S->getValueOperand() == P || S->isVolatile() || S->isAtomic())
         return false;
       Ty = S->getValueOperand()->getType();
+    } else if (Escapes && !isa<PHINode>(U) && !isa<SelectInst>(U)) {
+      Escapes->push_back({&Use, Offset});
+      continue;
     } else {
       return false;
     }
@@ -66,55 +83,176 @@ bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
   }
   return true;
 }
-bool splitFrame(AllocaInst &Frame, const DataLayout &DL) {
+// One object of the split frame: the bytes [Begin, Limit), the accesses
+// and escapes that land in them, and its type when it is an array of
+// write-only elements.
+struct FrameObject {
+  uint64_t Begin;
+  uint64_t Limit;
+  SmallVector<const Access *, 4> Accesses;
+  SmallVector<const Escape *, 2> Escapes;
+  Type *Ty = nullptr;
+};
+// Splits the lifted frame into one alloca per object. Overlapping accesses
+// stay one byte object; exact, consistently typed slots become scalar
+// allocas, ready for mem2reg; no structs are invented. With
+// `AllowEscapes`, a frame whose addresses escape splits too: an escaped
+// address starts an object that takes the write-only objects directly
+// after it (the fields this function initializes before handing the
+// object out) and reaches up to the next directly accessed offset (the
+// callee may read anything up to there). Escaped objects never overlap.
+// The object bounds are inferred, not proven: a callee that reads past the
+// next accessed offset, or a field this function also reads, would land
+// in another object. Only the ir-final storage tail asks for this.
+// `ScalarSlots` receives the scalar allocas no escape reaches.
+bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
+                bool AllowEscapes = false,
+                SmallVectorImpl<AllocaInst *> *ScalarSlots = nullptr) {
   auto *AT = dyn_cast<ArrayType>(Frame.getAllocatedType());
   if (!AT || !AT->getElementType()->isIntegerTy(8) ||
       !Frame.getName().contains("frame") || !Frame.isStaticAlloca())
     return false;
+  const uint64_t FrameSize = AT->getNumElements();
   SmallVector<Access, 32> A;
+  SmallVector<Escape, 8> E;
   SmallPtrSet<Value *, 32> Seen;
-  if (!collectFrame(&Frame, 0, DL, A, Seen) || A.empty())
+  if (!collectFrame(&Frame, 0, DL, A, Seen, AllowEscapes ? &E : nullptr) ||
+      (A.empty() && E.empty()))
     return false;
   for (const Access &X : A)
-    if (X.Offset < 0 || uint64_t(X.Offset) > AT->getNumElements() ||
-        X.Size > AT->getNumElements() - uint64_t(X.Offset))
+    if (X.Offset < 0 || uint64_t(X.Offset) > FrameSize ||
+        X.Size > FrameSize - uint64_t(X.Offset))
       return false;
-  llvm::sort(A, [](const Access &X, const Access &Y) {
+  for (const Escape &X : E)
+    if (X.Offset < 0 || uint64_t(X.Offset) >= FrameSize)
+      return false;
+  llvm::stable_sort(A, [](const Access &X, const Access &Y) {
     return X.Offset < Y.Offset;
   });
-  IRBuilder<> Entry(&Frame);
-  for (size_t Begin = 0; Begin < A.size();) {
-    size_t End = Begin + 1;
-    uint64_t Limit = uint64_t(A[Begin].Offset) + A[Begin].Size;
-    while (End < A.size() && uint64_t(A[End].Offset) < Limit) {
-      Limit = std::max(Limit, uint64_t(A[End].Offset) + A[End].Size);
-      ++End;
+  llvm::stable_sort(E, [](const Escape &X, const Escape &Y) {
+    return X.Offset < Y.Offset;
+  });
+  // Objects from overlapping direct accesses.
+  SmallVector<FrameObject, 16> Objects;
+  for (const Access &X : A) {
+    uint64_t End = uint64_t(X.Offset) + X.Size;
+    if (!Objects.empty() && uint64_t(X.Offset) < Objects.back().Limit) {
+      Objects.back().Limit = std::max(Objects.back().Limit, End);
+    } else {
+      Objects.push_back({uint64_t(X.Offset), End, {}, {}});
     }
-    // Overlapping accesses remain one byte object. Exact, consistently typed
-    // slots become scalar allocas, ready for mem2reg. Do not invent structs.
-    Type *Ty = A[Begin].Ty;
-    for (size_t J = Begin; J < End; ++J)
-      if (A[J].Offset != A[Begin].Offset || A[J].Ty != Ty)
+    Objects.back().Accesses.push_back(&X);
+  }
+  if (!E.empty()) {
+    // Each escape joins the object it points into, or starts one.
+    for (const Escape &X : E) {
+      uint64_t At = X.Offset;
+      auto It = llvm::partition_point(Objects, [&](const FrameObject &O) {
+        return O.Limit <= At;
+      });
+      if (It == Objects.end() || It->Begin > At)
+        It = Objects.insert(It, FrameObject{At, At + 1, {}, {}});
+      It->Escapes.push_back(&X);
+    }
+    // An escaped object takes the write-only objects that directly follow
+    // it (fields it initializes before handing it out), then reaches up to
+    // the next object.
+    SmallVector<FrameObject, 16> Merged;
+    for (size_t I = 0; I < Objects.size(); ++I) {
+      FrameObject O = std::move(Objects[I]);
+      if (!O.Escapes.empty()) {
+        auto WriteOnly = [](const FrameObject &N) {
+          return N.Escapes.empty() &&
+                 llvm::all_of(N.Accesses, [](const Access *X) {
+                   return isa<StoreInst>(X->I);
+                 });
+        };
+        while (I + 1 < Objects.size() && Objects[I + 1].Begin <= O.Limit &&
+               WriteOnly(Objects[I + 1])) {
+          FrameObject &N = Objects[++I];
+          O.Limit = std::max(O.Limit, N.Limit);
+          O.Accesses.append(N.Accesses.begin(), N.Accesses.end());
+        }
+        O.Limit = std::max(O.Limit, I + 1 < Objects.size()
+                                        ? Objects[I + 1].Begin
+                                        : FrameSize);
+      }
+      Merged.push_back(std::move(O));
+    }
+    Objects = std::move(Merged);
+    // A run of adjacent write-only slots of one type is an array this
+    // function fills and something else reads (an initializer list): one
+    // object, not dead scalars.
+    Merged.clear();
+    auto Element = [&](const FrameObject &O) -> Type * {
+      if (!O.Escapes.empty() || O.Accesses.empty())
+        return nullptr;
+      Type *T = O.Accesses.front()->Ty;
+      for (const Access *X : O.Accesses)
+        if (!isa<StoreInst>(X->I) || X->Ty != T ||
+            uint64_t(X->Offset) != O.Begin)
+          return nullptr;
+      return DL.getTypeStoreSize(T) == O.Limit - O.Begin ? T : nullptr;
+    };
+    for (size_t I = 0; I < Objects.size(); ++I) {
+      FrameObject O = std::move(Objects[I]);
+      Type *T = Element(O);
+      size_t N = 1;
+      while (T && I + 1 < Objects.size() &&
+             Objects[I + 1].Begin == O.Limit && Element(Objects[I + 1]) == T) {
+        FrameObject &Next = Objects[++I];
+        O.Limit = Next.Limit;
+        O.Accesses.append(Next.Accesses.begin(), Next.Accesses.end());
+        ++N;
+      }
+      if (N > 1)
+        O.Ty = ArrayType::get(T, N);
+      Merged.push_back(std::move(O));
+    }
+    Objects = std::move(Merged);
+  }
+  IRBuilder<> Entry(&Frame);
+  for (const FrameObject &O : Objects) {
+    Type *Ty = O.Ty;
+    if (!Ty && !O.Accesses.empty()) {
+      Ty = O.Accesses.front()->Ty;
+      for (const Access *X : O.Accesses)
+        if (uint64_t(X->Offset) != O.Begin || X->Ty != Ty)
+          Ty = nullptr;
+      if (Ty && DL.getTypeStoreSize(Ty) != O.Limit - O.Begin)
         Ty = nullptr;
+    }
+    bool Scalar = Ty && !Ty->isAggregateType() && O.Escapes.empty();
     if (!Ty)
-      Ty = ArrayType::get(Entry.getInt8Ty(), Limit - A[Begin].Offset);
-    auto *Slot = Entry.CreateAlloca(Ty, nullptr,
-                                  "stack_" + Twine(A[Begin].Offset));
+      Ty = ArrayType::get(Entry.getInt8Ty(), O.Limit - O.Begin);
+    auto *Slot = Entry.CreateAlloca(Ty, nullptr, "stack_" + Twine(O.Begin));
     Slot->setAlignment(Frame.getAlign());
     provenance(Slot, Frame);
-    for (size_t J = Begin; J < End; ++J) {
-      IRBuilder<> B(A[J].I);
+    if (Scalar && ScalarSlots)
+      ScalarSlots->push_back(Slot);
+    for (const Access *X : O.Accesses) {
+      IRBuilder<> B(X->I);
       Value *P = Slot;
-      if (A[J].Offset != A[Begin].Offset)
+      if (uint64_t(X->Offset) != O.Begin)
         P = B.CreateGEP(B.getInt8Ty(), Slot,
-                       B.getInt64(A[J].Offset - A[Begin].Offset));
-      provenance(P, *A[J].I);
-      if (auto *L = dyn_cast<LoadInst>(A[J].I))
+                       B.getInt64(uint64_t(X->Offset) - O.Begin));
+      provenance(P, *X->I);
+      if (auto *L = dyn_cast<LoadInst>(X->I))
         L->setOperand(0, P);
       else
-        cast<StoreInst>(A[J].I)->setOperand(1, P);
+        cast<StoreInst>(X->I)->setOperand(1, P);
     }
-    Begin = End;
+    for (const Escape *X : O.Escapes) {
+      Value *P = Slot;
+      if (uint64_t(X->Offset) != O.Begin) {
+        auto *UserI = cast<Instruction>(X->U->getUser());
+        IRBuilder<> B(UserI);
+        P = B.CreateGEP(B.getInt8Ty(), Slot,
+                        B.getInt64(uint64_t(X->Offset) - O.Begin));
+        provenance(P, *UserI);
+      }
+      X->U->set(P);
+    }
   }
   // Delete the old address tree bottom-up once all memory users moved.
   SmallVector<Instruction *, 32> Dead;
@@ -368,7 +506,278 @@ bool narrowPhi(PHINode &P) {
   P.eraseFromParent();
   return true;
 }
+// Integer phi -> pointer phi of the same block that holds the same address
+// on every edge. Lifting gives a register that holds a pointer across a
+// loop a pointer phi next to its integer phi (`rax.0.ptr` next to `rax.0`)
+// while the integer one still feeds a compare, and both step every
+// iteration (`add i64 %rax.0, 8` and `getelementptr i8, ptr %rax.0.ptr, 8`).
+using TwinPairs = DenseSet<std::pair<PHINode *, PHINode *>>;
+
+// Whether integer A and pointer B hold the same address, given the twin
+// pairs: B converts A, A converts B, both are twin phis, or both step
+// same-address bases by one byte offset.
+bool sameAddress(Value *A, Value *B, const TwinPairs &Pairs,
+                 const DataLayout &DL, unsigned Depth = 0) {
+  if (auto *IP = dyn_cast<PHINode>(A))
+    if (auto *PP = dyn_cast<PHINode>(B))
+      return Pairs.count({IP, PP});
+  if (auto *C = dyn_cast<IntToPtrInst>(B))
+    if (C->getOperand(0) == A)
+      return true;
+  if (auto *P = dyn_cast<PtrToIntOperator>(A))
+    if (P->getPointerOperand() == B)
+      return true;
+  if (Depth > 4)
+    return false;
+  auto *Step = dyn_cast<BinaryOperator>(A);
+  auto *G = dyn_cast<GEPOperator>(B);
+  if (!Step || !G || Step->getOpcode() != Instruction::Add)
+    return false;
+  for (unsigned K = 0; K < 2; ++K) {
+    Value *Offset = Step->getOperand(1 - K);
+    if (!sameAddress(Step->getOperand(K), G->getPointerOperand(), Pairs, DL,
+                     Depth + 1))
+      continue;
+    // `getelementptr i8, ptr B, Offset`, or a typed form with the same
+    // constant byte offset.
+    if (G->getNumIndices() == 1 && G->getSourceElementType()->isIntegerTy(8) &&
+        G->getOperand(1) == Offset)
+      return true;
+    APInt Bytes(DL.getIndexTypeSizeInBits(G->getType()), 0);
+    auto *CI = dyn_cast<ConstantInt>(Offset);
+    if (CI && G->accumulateConstantOffset(DL, Bytes) &&
+        Bytes.getSExtValue() == CI->getSExtValue())
+      return true;
+  }
+  return false;
+}
+
+// The twin pairs of F: every pointer-sized integer phi with uses against
+// the pointer phis of its block (only the one this run built, when there
+// is one), then pairs whose edges disagree are dropped until the remaining
+// pairs hold each other up (twin phis feed twin phis across blocks).
+MapVector<PHINode *, PHINode *>
+findTwins(Function &F, const DataLayout &DL,
+          const DenseMap<Value *, PHINode *> &PointerPhis) {
+  SmallVector<std::pair<PHINode *, PHINode *>, 16> Order;
+  TwinPairs Pairs;
+  for (BasicBlock &BB : F) {
+    SmallVector<PHINode *, 8> Ptrs;
+    for (PHINode &Phi : BB.phis())
+      if (Phi.getType()->isPointerTy() &&
+          Phi.getType()->getPointerAddressSpace() == 0)
+        Ptrs.push_back(&Phi);
+    if (Ptrs.empty())
+      continue;
+    for (PHINode &Phi : BB.phis()) {
+      if (Phi.use_empty() || !Phi.getType()->isIntegerTy(
+                                 DL.getPointerTypeSizeInBits(Ptrs[0]->getType())))
+        continue;
+      if (PHINode *Own = PointerPhis.lookup(&Phi)) {
+        Order.push_back({&Phi, Own});
+        continue;
+      }
+      for (PHINode *P : Ptrs)
+        if (P->getNumIncomingValues() == Phi.getNumIncomingValues())
+          Order.push_back({&Phi, P});
+    }
+  }
+  Pairs.insert(Order.begin(), Order.end());
+  auto EdgesAgree = [&](PHINode *I, PHINode *P) {
+    for (unsigned J = 0; J < I->getNumIncomingValues(); ++J) {
+      int K = P->getBasicBlockIndex(I->getIncomingBlock(J));
+      if (K < 0 || !sameAddress(I->getIncomingValue(J), P->getIncomingValue(K),
+                                Pairs, DL))
+        return false;
+    }
+    return true;
+  };
+  for (bool Dropped = true; Dropped;) {
+    Dropped = false;
+    for (auto &Pair : Order)
+      if (Pairs.count(Pair) && !EdgesAgree(Pair.first, Pair.second)) {
+        Pairs.erase(Pair);
+        Dropped = true;
+      }
+  }
+  MapVector<PHINode *, PHINode *> Twins;
+  for (auto &Pair : Order)
+    if (Pairs.count(Pair))
+      Twins.insert(Pair);
+  return Twins;
+}
+
+// Integer twin webs go when nothing but compares reads them: the compares
+// take the pointers, so a loop keeps one pointer variable, as the source
+// has. The web is the twin phis plus `add`/`sub` steps of a twin phi by
+// an offset. A member stays while any reader outside the web is not a
+// compare that can take a pointer (a store, a call, a constant bound).
+bool mergeTwins(Function &F, const DataLayout &DL,
+                DenseMap<Value *, PHINode *> &PointerPhis) {
+  MapVector<PHINode *, PHINode *> Twins = findTwins(F, DL, PointerPhis);
+  if (Twins.empty())
+    return false;
+  // Step -> the twin phi it steps, its offset, and the pointer twin the
+  // step already has when it feeds a twin phi (that phi's incoming).
+  struct StepOf {
+    PHINode *Base;
+    Value *Offset;
+    Value *Twin = nullptr;
+  };
+  MapVector<Instruction *, StepOf> Steps;
+  for (auto &[I, P] : Twins)
+    for (User *U : I->users()) {
+      auto *S = dyn_cast<BinaryOperator>(U);
+      if (!S || (S->getOpcode() != Instruction::Add &&
+                 S->getOpcode() != Instruction::Sub))
+        continue;
+      Value *Offset = S->getOperand(S->getOperand(0) == I ? 1 : 0);
+      if (S->getOpcode() == Instruction::Sub && S->getOperand(0) != I)
+        continue;
+      auto *OffsetPhi = dyn_cast<PHINode>(Offset);
+      if (Offset == I || (OffsetPhi && Twins.count(OffsetPhi)))
+        continue;
+      Steps.insert({S, {I, Offset}});
+    }
+  for (auto &[I, P] : Twins)
+    for (unsigned J = 0; J < I->getNumIncomingValues(); ++J)
+      if (auto *S = dyn_cast<Instruction>(I->getIncomingValue(J))) {
+        auto It = Steps.find(S);
+        if (It != Steps.end() && !It->second.Twin)
+          It->second.Twin = P->getIncomingValueForBlock(I->getIncomingBlock(J));
+      }
+  auto IsMember = [&](Value *V) {
+    auto *Phi = dyn_cast<PHINode>(V);
+    return (Phi && Twins.count(Phi)) ||
+           (isa<Instruction>(V) && Steps.count(cast<Instruction>(V)));
+  };
+  // A compare can take pointers unless one side is a constant other than
+  // null: that would invent a pointer.
+  auto PointerCompare = [&](User *U) {
+    auto *C = dyn_cast<ICmpInst>(U);
+    if (!C)
+      return false;
+    for (Value *Op : C->operands())
+      if (!IsMember(Op) && isa<Constant>(Op) && !isa<PtrToIntOperator>(Op) &&
+          !(isa<ConstantInt>(Op) && cast<ConstantInt>(Op)->isZero()))
+        return false;
+    return true;
+  };
+  SetVector<Instruction *> Dead;
+  for (auto &[I, P] : Twins)
+    Dead.insert(I);
+  for (auto &[S, Of] : Steps)
+    Dead.insert(S);
+  for (bool Dropped = true; Dropped;) {
+    SmallVector<Instruction *, 8> Drop;
+    for (Instruction *M : Dead)
+      if (any_of(M->users(), [&](User *U) {
+            return !Dead.count(cast<Instruction>(U)) && !PointerCompare(U);
+          }))
+        Drop.push_back(M);
+    for (Instruction *M : Drop)
+      Dead.remove(M);
+    Dropped = !Drop.empty();
+  }
+  if (Dead.empty())
+    return false;
+  // The pointer form of member M at compare C. A twin phi sits next to its
+  // integer phi, which dominates C. A step reuses its twin when that is
+  // before C or can move up to C (it was built at the end of its block),
+  // and is rebuilt from its base's twin otherwise.
+  auto Available = [&](Value *Twin, ICmpInst *C) {
+    auto *TI = dyn_cast<Instruction>(Twin);
+    if (!TI)
+      return true;
+    if (TI->getParent() != C->getParent() || isa<PHINode>(TI))
+      return false;
+    if (TI->comesBefore(C))
+      return true;
+    for (Value *Op : TI->operands())
+      if (auto *OI = dyn_cast<Instruction>(Op))
+        if (OI->getParent() == C->getParent() && !isa<PHINode>(OI) &&
+            !OI->comesBefore(C))
+          return false;
+    TI->moveBefore(C->getIterator());
+    return true;
+  };
+  auto TwinAt = [&](Value *M, ICmpInst *C) -> Value * {
+    if (auto *Phi = dyn_cast<PHINode>(M))
+      return Twins.lookup(Phi);
+    const StepOf &Of = Steps.find(cast<Instruction>(M))->second;
+    if (Of.Twin && Available(Of.Twin, C))
+      return Of.Twin;
+    IRBuilder<> B(C);
+    Value *Offset = Of.Offset;
+    if (cast<BinaryOperator>(M)->getOpcode() == Instruction::Sub)
+      Offset = B.CreateNeg(Offset);
+    Value *G = B.CreateGEP(B.getInt8Ty(), Twins.lookup(Of.Base), Offset,
+                           "address");
+    provenance(Offset, *cast<Instruction>(M));
+    provenance(G, *cast<Instruction>(M));
+    return G;
+  };
+  SmallVector<ICmpInst *, 8> Cmps;
+  for (Instruction *M : Dead)
+    for (User *U : M->users())
+      if (auto *C = dyn_cast<ICmpInst>(U))
+        if (!is_contained(Cmps, C))
+          Cmps.push_back(C);
+  for (ICmpInst *C : Cmps) {
+    Type *PT = Twins.front().second->getType();
+    IRBuilder<> B(C);
+    Value *Ops[2];
+    for (unsigned K = 0; K < 2; ++K) {
+      Value *Op = C->getOperand(K);
+      if (IsMember(Op)) {
+        Ops[K] = TwinAt(Op, C);
+      } else if (isa<ConstantInt>(Op)) {
+        Ops[K] = ConstantPointerNull::get(cast<PointerType>(PT));
+      } else if (Value *Ptr = pointerFor(Op, PT, B, DL, PointerPhis)) {
+        Ops[K] = Ptr;
+      } else {
+        Ops[K] = B.CreateIntToPtr(Op, PT, Op->getName() + ".ptr");
+        provenance(Ops[K], *C);
+      }
+    }
+    Value *New = B.CreateICmp(C->getPredicate(), Ops[0], Ops[1]);
+    provenance(New, *C);
+    New->takeName(C);
+    C->replaceAllUsesWith(New);
+    C->eraseFromParent();
+  }
+  for (Instruction *M : Dead)
+    M->replaceAllUsesWith(PoisonValue::get(M->getType()));
+  for (Instruction *M : Dead) {
+    PointerPhis.erase(M);
+    M->eraseFromParent();
+  }
+  return true;
+}
 } // namespace
+PreservedAnalyses FrameSlotsPass::run(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  if (F.isDeclaration())
+    return PreservedAnalyses::all();
+  const DataLayout &DL = F.getDataLayout();
+  SmallVector<AllocaInst *, 4> Frames;
+  for (Instruction &I : F.getEntryBlock())
+    if (auto *A = dyn_cast<AllocaInst>(&I))
+      Frames.push_back(A);
+  bool Changed = false;
+  SmallVector<AllocaInst *, 16> Scalars;
+  for (AllocaInst *A : Frames)
+    Changed |= splitFrame(*A, DL, /*AllowEscapes=*/true, &Scalars);
+  if (!Changed)
+    return PreservedAnalyses::all();
+  // The scalars no escape reaches are compiler temporaries and spills, the
+  // values a pre-optimization IR keeps in SSA form, as the cleanup does for
+  // a closed frame. The escaped objects and the write-only arrays stay.
+  llvm::erase_if(Scalars, [](AllocaInst *A) { return !isAllocaPromotable(A); });
+  if (!Scalars.empty())
+    PromoteMemToReg(Scalars, FAM.getResult<DominatorTreeAnalysis>(F));
+  return PreservedAnalyses::none();
+}
 PreservedAnalyses LiftNormalizePass::run(Function &F,
                                          FunctionAnalysisManager &) {
   if (F.isDeclaration())
@@ -399,6 +808,19 @@ PreservedAnalyses LiftNormalizePass::run(Function &F,
     } else if (auto *T = dyn_cast<TruncInst>(&I))
       Changed |= narrow(*T);
   }
+  // Twins this run made, and those an earlier run left (cleanup runs this
+  // pass three times).
+  Changed |= mergeTwins(F, DL, PointerPhis);
+  // A register phi whose value only feeds its own step (`rax.0` and
+  // `add i64 %rax.0, 8` after its address uses moved to the pointer twin)
+  // is a dead cycle that DCE keeps; storage passes would give it a local.
+  SmallVector<WeakTrackingVH, 16> Phis;
+  for (BasicBlock &BB : F)
+    for (PHINode &Phi : BB.phis())
+      Phis.push_back(&Phi);
+  for (WeakTrackingVH &VH : Phis)
+    if (auto *Phi = dyn_cast_or_null<PHINode>(VH))
+      Changed |= RecursivelyDeleteDeadPHINode(Phi);
   for (Instruction &I : make_early_inc_range(instructions(F)))
     if (auto *G = dyn_cast<GetElementPtrInst>(&I))
       Changed |= typeGEP(*G, DL);

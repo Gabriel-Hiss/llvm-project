@@ -1,10 +1,11 @@
 //==- lib/CAPI/Stages.cpp - the decompile stage pipeline ------------------==//
 //
 // Per run: asm -> sigs -> lift (ir-raw) -> cleanup + idioms (ir-clean) ->
-// unopt + structure + types + ssaout (ir-final) -> source. Every stage is the
-// real implementation; a stage that cannot run fails the whole run. Each
-// stage reports its status and elapsed time into StageReport, and writes its
-// artifact next to the output when `DecompileOpts::ArtifactBase` is set.
+// unopt + types, then locals-to-slots + structure (ir-final) or ssaout +
+// structure (source). Every stage is the real implementation; a stage that
+// cannot run fails the whole run. Each stage reports its status and elapsed
+// time into StageReport, and writes its artifact next to the output when
+// `DecompileOpts::ArtifactBase` is set.
 //
 //  - sigs:   revenant::analyzeSignatures (RevenantAnalysis), converted to the
 //            lifter's mirror type.
@@ -664,22 +665,134 @@ std::string cleanPipeline(bool EnableStructDI) {
       .str();
 }
 
-/// ir-final: deoptimization, type recovery, SSA-out, then control-flow shape.
-/// `revenant-unhotcold` is a module pass (the cold-chunk search looks at
-/// sibling functions), so it sits between the two function blocks: the pass
-/// order is unchanged. `revenant-rustblocks` and `revenant-gscookie` run at
-/// the end of the deopt block: both change the CFG or the instruction set,
-/// and both have to run before `revenant-structure`, which names the blocks
-/// and records the region indices of the final CFG.
-std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
+/// ir-final, the part the ir-final artifact and the source share:
+/// deoptimization, then type recovery. `revenant-unhotcold` is a module pass
+/// (the cold-chunk search looks at sibling functions), so it sits between
+/// the two function blocks. `revenant-rustblocks` and `revenant-gscookie` run
+/// at the end of the deopt block: both change the CFG or the instruction set,
+/// and both have to run before `revenant-structure` (in both storage tails),
+/// which names the blocks and records the region indices of the final CFG.
+std::string deoptPipeline(bool IncludeUncxx) {
   return formatv("function({0}{1},revenant-rustblocks,revenant-gscookie),"
-                 "revenant-unhotcold,"
-                 "function(revenant-types,revenant-ssaout,"
-                 "revenant-structure{2})",
-                 IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,
+                 "revenant-unhotcold,function(revenant-types)",
+                 IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline)
+      .str();
+}
+
+/// The storage the ir-final artifact ends with for clang, MSVC and GCC
+/// binaries: one alloca per frame object even where frame addresses escape
+/// (the object bounds are inferred, so only ir-final takes this), then one
+/// stack slot per parameter, phi web and multi-return value, as clang lays
+/// out an unoptimized function, then the control-flow shape.
+std::string finalStoragePipeline(bool Patterns) {
+  return formatv("function(revenant-frame-slots,revenant-locals-to-slots,"
+                 "revenant-structure{0})",
                  Patterns ? ",revenant-patterns" : "")
       .str();
 }
+
+/// The storage the source emitters read: SSA-out locals, which become the
+/// C/C++/Rust variables, then the control-flow shape.
+std::string sourceStoragePipeline(bool Patterns) {
+  return formatv("function(revenant-ssaout,revenant-structure{0})",
+                 Patterns ? ",revenant-patterns" : "")
+      .str();
+}
+
+/// A module after the shared ir-final passes, as bitcode plus the name
+/// counters bitcode drops, so another LLVMContext can rebuild it exactly.
+/// Later passes name new values from those counters (`bb_X558`).
+struct ModuleSnapshot {
+  std::string Bitcode;
+  uint32_t GlobalCounter = 0;
+  std::vector<std::pair<std::string, uint32_t>> Counters;
+};
+
+ModuleSnapshot snapshotModule(Module &M) {
+  ModuleSnapshot S;
+  S.GlobalCounter = lastUnique(M.getValueSymbolTable());
+  for (llvm::Function &F : M)
+    if (!F.isDeclaration())
+      S.Counters.emplace_back(F.getName().str(),
+                              lastUnique(*F.getValueSymbolTable()));
+  raw_string_ostream OS(S.Bitcode);
+  // Use-list order drives pass iteration over users; keep it.
+  WriteBitcodeToFile(M, OS, /*ShouldPreserveUseListOrder=*/true);
+  OS.flush();
+  return S;
+}
+
+Expected<std::unique_ptr<Module>> restoreSnapshot(const ModuleSnapshot &S,
+                                                  LLVMContext &Ctx) {
+  auto MOrErr =
+      parseBitcodeFile(MemoryBufferRef(S.Bitcode, "ir-final-input"), Ctx);
+  if (!MOrErr)
+    return MOrErr.takeError();
+  Module &M = **MOrErr;
+  lastUnique(M.getValueSymbolTable()) = S.GlobalCounter;
+  for (const auto &[Name, Counter] : S.Counters)
+    if (llvm::Function *F = M.getFunction(Name))
+      lastUnique(*F->getValueSymbolTable()) = Counter;
+  return MOrErr;
+}
+
+/// The ir-final storage passes and print on a worker thread, in their own
+/// LLVMContext, while the main thread runs the source storage passes and
+/// the source emit on the shared module. The two never touch one context.
+/// The snapshot must outlive the worker.
+class FinalStorageWorker {
+public:
+  void start(const ModuleSnapshot &Snapshot, std::string Pipeline) {
+    Input = &Snapshot;
+    Thread = std::thread([this, Pipeline = std::move(Pipeline)] {
+      auto Start = StageClock::now();
+      run(Pipeline);
+      Micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                   StageClock::now() - Start)
+                   .count();
+    });
+  }
+  bool started() const { return Thread.joinable(); }
+  /// Waits for the worker. Its stage records go to `Stages`, then one
+  /// record with the worker's own duration.
+  Expected<std::string> take(std::vector<StageReport> &Stages) {
+    Thread.join();
+    Stages.insert(Stages.end(), Reports.begin(), Reports.end());
+    if (!Err.empty())
+      return createStringError("ir-final storage: " + Err);
+    Stages.push_back({"ir-final", "ok", "locals-to-slots + structure (worker)",
+                      "", static_cast<uint64_t>(Micros)});
+    return std::move(Text);
+  }
+  ~FinalStorageWorker() {
+    if (Thread.joinable())
+      Thread.join();
+  }
+
+private:
+  void run(StringRef Pipeline) {
+    LLVMContext Ctx;
+    auto M = restoreSnapshot(*Input, Ctx);
+    if (!M) {
+      Err = toString(M.takeError());
+      return;
+    }
+    auto Rebuild = [&]() { return restoreSnapshot(*Input, Ctx); };
+    if (Error E = runPipelineText("ir-final", *M, Pipeline, Reports,
+                                  CxxFlavor::Auto, nullptr, "", Rebuild)) {
+      Err = toString(std::move(E));
+      return;
+    }
+    Text = moduleText(**M);
+  }
+
+  const ModuleSnapshot *Input = nullptr;
+  std::thread Thread;
+  std::vector<StageReport> Reports;
+  std::string Text;
+  std::string Err;
+  int64_t Micros = 0;
+};
 
 //==--------------------------------------------------------------------==//
 // Source emit
@@ -830,6 +943,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   // Each stage below runs only when a later artifact was asked for: `break`
   // leaves the block once the requested emit kind is produced.
   std::string RawText, CleanText, FinalText;
+  // The worker reads the snapshot, so it is declared after it: on an early
+  // return the worker joins before the snapshot is freed.
+  ModuleSnapshot FinalInput;
+  FinalStorageWorker FinalWorker;
   do {
     if (Opts.Emit == EmitKind::Asm)
       break;
@@ -2319,21 +2436,94 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
 
     // ---- ir-final ----------------------------------------------------------
+    // Deoptimization and type recovery run once. The ir-final artifact then
+    // keeps one stack slot per variable (locals-to-slots), the way clang
+    // lays out unoptimized IR, and the source stage reads SSA-out locals.
+    // When both are wanted, the ir-final storage runs on a worker thread
+    // over a bitcode copy in its own context while the source stage runs
+    // here. rustc's unoptimized IR keeps scalar locals in SSA values, and
+    // SSA-out is the closer ir-final for it (rust-o0 0.656 against 0.614
+    // with slots), so a rustc binary uses one storage for both.
+    const bool SlotStorage = Compiler.Producer != revenant::Compiler::Rustc;
+    const std::string FinalStorage = SlotStorage
+                                         ? finalStoragePipeline(Opts.Patterns)
+                                         : sourceStoragePipeline(Opts.Patterns);
+    const std::string Deopt = deoptPipeline(Out == Lang::Cpp);
     if (auto E = runPipelineText(
-            "ir-final", M, finalPipeline(Opts.Patterns, Out == Lang::Cpp),
-            R.Stages, uncxxFlavor(Compiler.Producer), &UserFunctionNames,
+            "ir-final", M, Deopt, R.Stages, uncxxFlavor(Compiler.Producer),
+            &UserFunctionNames,
             ParallelClean ? StringRef() : StringRef(CleanText),
             ParallelClean ? ModuleBuilder(RebuildClean) : nullptr))
       return std::move(E);
+    record(R.Stages, "ir-final", "ok", "Uncxx (C++ only) + unopt + types");
+    // The input of both storage stages, which a failed storage stage is
+    // restored from: the snapshot when there is one, else ir-clean again
+    // through the shared passes.
+    auto RebuildDeopt = [&]() -> Expected<std::unique_ptr<Module>> {
+      if (!FinalInput.Bitcode.empty())
+        return restoreSnapshot(FinalInput, Ctx);
+      std::unique_ptr<Module> Input;
+      if (ParallelClean) {
+        auto Clean = RebuildClean();
+        if (!Clean)
+          return Clean.takeError();
+        Input = std::move(*Clean);
+      } else {
+        SMDiagnostic ParseErr;
+        Input = parseIR(MemoryBufferRef(CleanText, "ir-clean"), ParseErr, Ctx);
+        if (!Input)
+          return createStringError("failed to parse ir-clean: " +
+                                   ParseErr.getMessage().str());
+      }
+      std::vector<StageReport> Repeated;
+      if (Error E = runPipelineText(
+              "ir-final", Input, Deopt, Repeated,
+              uncxxFlavor(Compiler.Producer), &UserFunctionNames,
+              ParallelClean ? StringRef() : StringRef(CleanText),
+              ParallelClean ? ModuleBuilder(RebuildClean) : nullptr))
+        return std::move(E);
+      return std::move(Input);
+    };
+    if (Opts.Emit == EmitKind::IrFinal) {
+      if (auto E = runPipelineText("ir-final", M, FinalStorage, R.Stages,
+                                   CxxFlavor::Auto, nullptr, "",
+                                   ModuleBuilder(RebuildDeopt)))
+        return std::move(E);
+      MergeShards = nullptr;
+      record(R.Stages, "ir-final", "ok",
+             SlotStorage ? "locals-to-slots + structure"
+                         : "ssaout + structure");
+      auto PrintStart = StageClock::now();
+      FinalText = moduleText(*M);
+      reportArtifactTiming(
+          "print-ir-final",
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              StageClock::now() - PrintStart)
+              .count());
+      R.Text = FinalText;
+      break;
+    }
+    if (SlotStorage && !Opts.ArtifactBase.empty()) {
+      auto SnapshotStart = StageClock::now();
+      FinalInput = snapshotModule(*M);
+      reportArtifactTiming(
+          "snapshot-ir-final",
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              StageClock::now() - SnapshotStart)
+              .count());
+      FinalWorker.start(FinalInput, FinalStorage);
+    }
+
+    // ---- source ------------------------------------------------------------
+    if (auto E = runPipelineText("source", M,
+                                 sourceStoragePipeline(Opts.Patterns),
+                                 R.Stages, CxxFlavor::Auto, nullptr, "",
+                                 ModuleBuilder(RebuildDeopt)))
+      return std::move(E);
     MergeShards = nullptr;
-    record(R.Stages, "ir-final", "ok",
-           "Uncxx (C++ only) + unopt + structure + types + ssaout");
-    // The Clang source emitter can mutate the module, so finish printing
-    // ir-final before handing the module to it.
-    const bool NeedFinalText = Opts.Emit == EmitKind::IrFinal ||
-                               Out == Lang::Rust ||
-                               !Opts.ArtifactBase.empty();
-    if (NeedFinalText) {
+    // One storage for both: the ir-final artifact is this module. The
+    // Clang source emitter can mutate the module, so print it first.
+    if (!SlotStorage && !Opts.ArtifactBase.empty()) {
       auto PrintStart = StageClock::now();
       FinalText = moduleText(*M);
       reportArtifactTiming(
@@ -2342,19 +2532,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               StageClock::now() - PrintStart)
               .count());
     }
-    if (Opts.Emit == EmitKind::IrFinal) {
-      R.Text = FinalText;
-      break;
-    }
-
-    // ---- source ------------------------------------------------------------
-    if (Opts.Emit == EmitKind::Source) {
+    {
       FunctionStageTrace Trace("source", Out == Lang::Rust ? "rustc" : "clang",
                                "module");
-      Expected<EmitResult> Em = Out == Lang::Rust
-                                    ? emitRustcSource(FinalText)
-                                    : emitClangSource(*M, Out == Lang::Cpp,
-                                                      Opts.UserBodiesOnly);
+      Expected<EmitResult> Em =
+          Out == Lang::Rust
+              ? emitRustcSource(FinalText.empty() ? moduleText(*M) : FinalText)
+              : emitClangSource(*M, Out == Lang::Cpp, Opts.UserBodiesOnly);
       if (!Em)
         return Em.takeError();
       record(R.Stages, "source", "ok",
@@ -2363,6 +2547,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                 : "Clang frontend (C)");
       R.Text = std::move(Em->Text);
       R.LineVas = std::move(Em->LineVas);
+    }
+    if (FinalWorker.started()) {
+      auto Text = FinalWorker.take(R.Stages);
+      if (!Text)
+        return Text.takeError();
+      FinalText = std::move(*Text);
     }
   } while (false);
 

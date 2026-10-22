@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/SsaOut/SsaOut.h"
+#include "revenant/Transforms/SsaOut/PhiCopies.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -22,6 +23,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Casting.h"
@@ -34,56 +36,63 @@ using namespace llvm;
 namespace revenant {
 namespace {
 // A phi web: phi destinations that feed each other through phi incoming
-// edges share one local. `canon` resolves an SSA name to its web's
-// canonical member (hop-bounded; a cycle means a missed coalesce, never
-// a hang).
+// edges share one local. Two webs merge only when no member of one is live
+// where a member of the other is defined: `x = phi [y]`, `y = phi [x + y]`
+// (a Fibonacci step) or a swap keep both values alive in the loop, and one
+// local for both would lose one of them. A web is named after a named
+// member when it has one; a web of unnamed phis gets a temporary.
 class PhiWebs {
 public:
   void build(Function &F) {
-    for (BasicBlock &BB : F) {
+    for (BasicBlock &BB : F)
       for (PHINode &PN : BB.phis()) {
-        PhiDsts[PN.getName().str()] = 1;
+        Parent[&PN] = &PN;
+        Members[&PN].push_back(&PN);
       }
-    }
     for (BasicBlock &BB : F) {
       for (PHINode &PN : BB.phis()) {
-        std::string Dst = PN.getName().str();
         for (Value *V : PN.incoming_values()) {
-          if (!V->hasName())
+          auto *Src = dyn_cast<PHINode>(V);
+          if (!Src || !Parent.count(Src))
             continue;
-          std::string N = V->getName().str();
-          if (!PhiDsts.count(N))
+          PHINode *D = root(&PN);
+          PHINode *S = root(Src);
+          if (D == S || Liveness.interferes(Members[D], Members[S]))
             continue;
-          std::string D = canon(Dst);
-          std::string S = canon(N);
-          if (D != S)
-            Alias[S] = D;
+          // The web keeps the destination's root, unless only the source
+          // web has a name to give.
+          if (!D->hasName() && S->hasName())
+            std::swap(D, S);
+          Parent[S] = D;
+          Members[D].append(Members[S].begin(), Members[S].end());
+          Members.erase(S);
         }
       }
     }
   }
 
-  std::string canon(StringRef N) const { return canon(N.str()); }
-  std::string canon(const std::string &N) const {
-    std::string C = N;
-    for (unsigned I = 0; I < 64; ++I) {
-      auto It = Alias.find(C);
-      if (It == Alias.end())
-        break;
-      C = It->second;
+  PHINode *root(PHINode *PN) {
+    PHINode *R = PN;
+    while (Parent.lookup(R) != R)
+      R = Parent.lookup(R);
+    while (PN != R) {
+      PHINode *Next = Parent.lookup(PN);
+      Parent[PN] = R;
+      PN = Next;
     }
-    return C;
+    return R;
   }
 
-  bool isPhiDst(StringRef N) const {
-    return PhiDsts.count(N.str()) != 0;
+  ArrayRef<PHINode *> members(PHINode *Root) { return Members[Root]; }
+  bool interferes(ArrayRef<PHINode *> A, ArrayRef<PHINode *> B) {
+    return Liveness.interferes(A, B);
   }
 
 private:
-  // Small-string-keyed sets: phi names are short; std::map keeps this
-  // header-free (no DenseMapInfo<StringRef> specialization needed).
-  std::map<std::string, char> PhiDsts;
-  std::map<std::string, std::string> Alias;
+  DenseMap<PHINode *, PHINode *> Parent;
+  // Web root -> the phis in that web.
+  DenseMap<PHINode *, SmallVector<PHINode *, 4>> Members;
+  PhiLiveness Liveness;
 };
 
 // Use counts over the function (phi incoming edges count as uses, as do
@@ -280,11 +289,11 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     Changed = true;
     return AI;
   };
-  // Web key: the canonical name, qualified by type when the same web name
-  // already holds a slot of another type (`rax.0` i64 next to `rax.1` i32
-  // must not share one alloca).
+  // Key: the value's name (a web's root name), qualified by type when the
+  // same name already holds a slot of another type (`rax.0` i64 next to
+  // `rax.1` i32 must not share one alloca).
   auto keyFor = [&](StringRef Name, Type *Ty) -> std::string {
-    std::string Base = Webs.canon(Name);
+    std::string Base = Name.str();
     auto It = LocalByName.find(Base);
     if (It == LocalByName.end() || It->second->getAllocatedType() == Ty)
       return Base;
@@ -316,11 +325,46 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     Materialized[I] = AI;
   }
 
-  // Phi webs always get a local, even before uses are rewritten.
+  // Phi webs always get a local, even before uses are rewritten. A web of
+  // unnamed phis has no name to key on: it shares the first temporary of
+  // its type whose webs are never live together with it, and takes a fresh
+  // one otherwise, so two unnamed accumulators never write the same local.
+  auto freshTmpKey = [&]() {
+    std::string Key;
+    do
+      Key = "tmp" + std::to_string(TmpN++);
+    while (LocalByName.count(Key) || F.getValueSymbolTable()->lookup(Key));
+    return Key;
+  };
+  struct Temporary {
+    AllocaInst *AI;
+    SmallVector<PHINode *, 8> Phis;
+  };
+  std::map<std::string, SmallVector<Temporary, 2>> Temporaries;
+  DenseMap<PHINode *, AllocaInst *> WebLocal;
   for (BasicBlock &BB : F) {
     for (PHINode &PN : BB.phis()) {
-      std::string Key = keyFor(PN.getName(), PN.getType());
-      AllocaInst *AI = getOrCreateLocal(Key, PN.getType(), &PN);
+      PHINode *Root = Webs.root(&PN);
+      AllocaInst *&AI = WebLocal[Root];
+      if (!AI && Root->hasName()) {
+        AI = getOrCreateLocal(keyFor(Root->getName(), PN.getType()),
+                              PN.getType(), &PN);
+      } else if (!AI) {
+        ArrayRef<PHINode *> Web = Webs.members(Root);
+        std::string Key = keyFor("", PN.getType());
+        SmallVector<Temporary, 2> &Shared = Temporaries[Key];
+        for (Temporary &T : Shared)
+          if (!Webs.interferes(T.Phis, Web)) {
+            AI = T.AI;
+            T.Phis.append(Web.begin(), Web.end());
+            break;
+          }
+        if (!AI) {
+          AI = getOrCreateLocal(Shared.empty() ? Key : freshTmpKey(),
+                                PN.getType(), &PN);
+          Shared.push_back({AI, SmallVector<PHINode *, 8>(Web)});
+        }
+      }
       Materialized[&PN] = AI;
     }
   }
@@ -445,6 +489,31 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
   // order them: a copy is safe once no other pending copy reads its
   // destination; cycles spill through a temporary.
   // Batch per successor block: gather (pred, incoming) pairs per phi.
+  // One spill local per type, made on the first cycle that needs it.
+  std::map<Type *, AllocaInst *> SpillByType;
+  auto spillFor = [&](Type *Ty) {
+    AllocaInst *&Spill = SpillByType[Ty];
+    if (Spill)
+      return Spill;
+    IRBuilder<> B(&F.getEntryBlock(), F.getEntryBlock().begin());
+    Spill = B.CreateAlloca(Ty, nullptr, "v_spill");
+    DIType *SpillTy = nullptr;
+    if (Ty->isFloatingPointTy())
+      SpillTy = DIB.createBasicType("double", 64, dwarf::DW_ATE_float);
+    else if (Ty->isIntegerTy(1))
+      SpillTy = DIB.createBasicType("bool", 1, dwarf::DW_ATE_boolean);
+    else if (Ty->isIntegerTy())
+      SpillTy = DIB.createBasicType("long", Ty->getIntegerBitWidth(),
+                                    dwarf::DW_ATE_signed);
+    else
+      SpillTy = DIB.createBasicType("ptr", 64, dwarf::DW_ATE_address);
+    DILocalVariable *SpillVar =
+        DIB.createAutoVariable(SP, Spill->getName(), File, 1, SpillTy);
+    DIB.insertDeclare(Spill, SpillVar, DIB.createExpression(),
+                      DILocation::get(Ctx, 1, 0, SP), Spill->getNextNode());
+    Changed = true;
+    return Spill;
+  };
   for (BasicBlock &Succ : F) {
     if (Succ.phis().empty())
       continue;
@@ -452,11 +521,9 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
     std::map<BasicBlock *, SmallVector<std::pair<AllocaInst *, Value *>, 4>>
         EdgeCopies;
     for (PHINode &PN : Succ.phis()) {
-      std::string Key = keyFor(PN.getName(), PN.getType());
-      auto LIt = LocalByName.find(Key);
-      if (LIt == LocalByName.end())
+      AllocaInst *AI = Materialized.lookup(&PN);
+      if (!AI)
         continue;
-      AllocaInst *AI = LIt->second;
       for (unsigned I = 0, E = PN.getNumIncomingValues(); I != E; ++I) {
         BasicBlock *Pred = PN.getIncomingBlock(I);
         Value *V = PN.getIncomingValue(I);
@@ -482,67 +549,22 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
       });
     }
     for (BasicBlock *Pred : EdgeOrder) {
-      auto &Copies = EdgeCopies[Pred];
-      // Order: repeatedly emit a copy whose destination no other pending
-      // copy reads; on a cycle, spill one destination through a temp.
-      SmallVector<std::pair<AllocaInst *, Value *>, 4> Pending = Copies;
-      SmallVector<std::pair<AllocaInst *, Value *>, 4> Ordered;
-      AllocaInst *Spill = nullptr;
-      Value *SpilledVal = nullptr;
-      while (!Pending.empty()) {
-        bool Progress = false;
-        for (size_t I = 0; I < Pending.size(); ++I) {
-          AllocaInst *Dst = Pending[I].first;
-          bool Read = false;
-          for (size_t J = 0; J < Pending.size(); ++J) {
-            if (I == J)
-              continue;
-            if (Pending[J].second == Dst) {
-              Read = true;
-              break;
-            }
-          }
-          if (!Read) {
-            Ordered.push_back(Pending[I]);
-            Pending.erase(Pending.begin() + I);
-            Progress = true;
-            break;
-          }
+      // A copy reads a web local at the copy site only when its incoming
+      // value is a phi; every other incoming value was computed, or stored
+      // to its own local, before the edge. A phi copied into its own web's
+      // local is a no-op (the latch value is already there).
+      SmallVector<EdgeCopy, 4> Pending;
+      for (auto &[Dst, V] : EdgeCopies[Pred]) {
+        AllocaInst *ReadSlot = nullptr;
+        if (auto *PN = dyn_cast<PHINode>(V)) {
+          ReadSlot = Materialized.lookup(PN);
+          if (!ReadSlot || ReadSlot == Dst)
+            continue;
         }
-        if (!Progress) {
-          // Cycle: spill Pending[0]'s destination first.
-          AllocaInst *Dst = Pending[0].first;
-          if (!Spill) {
-            IRBuilder<> B(&F.getEntryBlock(), F.getEntryBlock().begin());
-            Spill = B.CreateAlloca(Dst->getAllocatedType(), nullptr,
-                                   "v_spill");
-            DIType *SpillTy = nullptr;
-            if (Dst->getAllocatedType()->isFloatingPointTy())
-              SpillTy = DIB.createBasicType("double", 64, dwarf::DW_ATE_float);
-            else if (Dst->getAllocatedType()->isIntegerTy(1))
-              SpillTy = DIB.createBasicType("bool", 1, dwarf::DW_ATE_boolean);
-            else if (Dst->getAllocatedType()->isIntegerTy())
-              SpillTy = DIB.createBasicType("long",
-                                           Dst->getAllocatedType()->getIntegerBitWidth(),
-                                           dwarf::DW_ATE_signed);
-            else
-              SpillTy = DIB.createBasicType("ptr", 64, dwarf::DW_ATE_address);
-            DILocalVariable *SpillVar =
-                DIB.createAutoVariable(SP, Spill->getName(), File, 1, SpillTy);
-            DIB.insertDeclare(Spill, SpillVar, DIB.createExpression(),
-                              DILocation::get(Ctx, 1, 0, SP), Spill->getNextNode());
-          }
-          SpilledVal = Dst;
-          Ordered.push_back({Spill, Pending[0].second});
-          Pending.erase(Pending.begin());
-          // Retarget remaining reads of Dst to the spill slot.
-          for (auto &P : Pending) {
-            if (P.second == Dst)
-              P.second = Spill;
-          }
-          (void)SpilledVal;
-        }
+        Pending.push_back({Dst, V, ReadSlot});
       }
+      SmallVector<EdgeCopy, 4> Ordered =
+          sequenceEdgeCopies(std::move(Pending), spillFor);
       Instruction *Term = Pred->getTerminator();
       // A catchswitch must be the first non-PHI instruction in its block.
       // Its handler choice also makes a pre-switch copy incorrect for all
@@ -558,44 +580,34 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
           continue;
       }
       IRBuilder<> B(InsertBefore);
-      for (auto &C : Ordered) {
-        Value *V = C.second;
-        // An incoming value that was itself materialized (non-phi def)
-        // is read through a load so the copy sees the stored value.
-        if (Instruction *DI = dyn_cast<Instruction>(V)) {
+      for (EdgeCopy &C : Ordered) {
+        Value *V = C.V;
+        if (C.ReadSlot) {
+          // A phi-to-phi edge (or a spill) reads the source local's
+          // current value at the copy site.
+          auto *PPN = dyn_cast_or_null<PHINode>(V);
+          B.SetCurrentDebugLocation(PPN ? PPN->getDebugLoc()
+                                        : Term->getDebugLoc());
+          V = B.CreateLoad(C.ReadSlot->getAllocatedType(), C.ReadSlot,
+                           "v_phiread");
+        } else if (Instruction *DI = dyn_cast<Instruction>(V)) {
+          // An incoming value that was itself materialized (non-phi def)
+          // is read through a load so the copy sees the stored value.
           auto MIt = Materialized.find(DI);
-          if (MIt != Materialized.end() && !isa<PHINode>(DI)) {
+          if (MIt != Materialized.end()) {
             B.SetCurrentDebugLocation(DI->getDebugLoc());
             V = B.CreateLoad(MIt->second->getAllocatedType(), MIt->second);
           }
         }
-        // Web members resolve to the shared local's current value: a
-        // phi-to-phi edge reads the source web's slot.
-        if (Instruction *PI = dyn_cast<Instruction>(V)) {
-          if (PHINode *PPN = dyn_cast<PHINode>(PI)) {
-            std::string SKey = keyFor(PPN->getName(), PPN->getType());
-            auto SLIt = LocalByName.find(SKey);
-            if (SLIt != LocalByName.end() && SLIt->second != C.first) {
-              B.SetCurrentDebugLocation(PPN->getDebugLoc());
-              V = B.CreateLoad(SLIt->second->getAllocatedType(),
-                               SLIt->second, "v_phiread");
-            } else {
-              // Self-edge (latch): value already in the slot; skip.
-              continue;
-            }
-          }
-        }
         B.SetCurrentDebugLocation(Term->getDebugLoc());
-        StoreInst *ST = B.CreateStore(V, C.first);
+        StoreInst *ST = B.CreateStore(V, C.Dst);
         if (Term->hasMetadata("revenant.va")) {
           MDNode *MD = Term->getMetadata("revenant.va");
           ST->setMetadata("revenant.va", MD);
         } else {
           // Fall back to the phi's own provenance.
           for (PHINode &PN : Succ.phis()) {
-            std::string K = keyFor(PN.getName(), PN.getType());
-            auto LIt = LocalByName.find(K);
-            if (LIt != LocalByName.end() && LIt->second == C.first) {
+            if (Materialized.lookup(&PN) == C.Dst) {
               copyProvenance(&PN, ST);
               break;
             }
