@@ -10,16 +10,19 @@
 
 #include "LiftTestUtil.h"
 #include "revenant/Analysis/Analysis.h"
+#include "revenant/Analysis/Signatures.h"
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 #include "revenant/Lift/LiftFunction.h"
 #include "revenant/Object/PeFile.h"
 #include "revenant/Target/TargetHooks.h"
+#include "X86MCTargetDesc.h"
 
 #include "gtest/gtest.h"
 
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -444,6 +447,174 @@ TEST(LiftFunction, WhileLoopKeepsDistinctSuccessors) {
       << "loop block branches to the same block twice";
   ASSERT_FALSE(llvm::isa<llvm::UndefValue>(BI->getCondition()))
       << "loop exit condition is undef";
+}
+
+/// Analysis signatures in the lifter's form, as the driver feeds them.
+static lift::Signatures toLiftSigs(const Signatures &Full) {
+  auto Convert = [](const auto &S) {
+    lift::Signature LS;
+    for (const Param &Pm : S.Params)
+      LS.Params.push_back({lift::ParamLoc::reg(Pm.Loc.Reg), Pm.Bits,
+                           Pm.Float, std::nullopt});
+    if (S.HasRet)
+      LS.Ret = lift::RetLoc{S.Ret.Float, S.Ret.Bits};
+    LS.Source = lift::SigSource::Inferred;
+    return LS;
+  };
+  lift::Signatures Sigs;
+  for (const auto &[At, S] : Full.Funcs)
+    Sigs.Funcs.emplace(At, Convert(S));
+  for (const auto &[At, S] : Full.Externs)
+    Sigs.Externs.emplace(At, Convert(S));
+  for (const auto &[At, N] : Full.CallsiteArgs)
+    Sigs.CallsiteArgs.emplace(At, N);
+  for (const auto &[At, N] : Full.IndirectArgs)
+    Sigs.IndirectArgs.emplace(At, N);
+  return Sigs;
+}
+
+TEST(LiftFunction, CondBranchToTailCallKeepsBothArms) {
+  // c-o2gl 0x14003fc90 is `cmp [rcx+0x28],0; je sub_14003FCA0; ret`:
+  // the taken edge is a TailCall edge to a foreign function start. The
+  // CondBranch handler used to skip TailCall edges, so only the
+  // fall-through arm survived and the lifted body always fell through
+  // (WRONG CODE). Both arms must be kept: a condbr whose taken side
+  // calls the tail-call target and returns.
+  auto Fx = open(REVENANT_TEST_PARITY "/c-o2gl/c-o2gl.exe");
+  ASSERT_TRUE(Fx.has_value()) << "c-o2gl binary missing";
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  auto It = P.Functions.find(Va(0x14003FC90));
+  ASSERT_NE(It, P.Functions.end()) << "0x14003fc90 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("cond_tailcall", C);
+  Signatures Full = analyzeSignatures(P, *Fx->Dis);
+  lift::Signatures Sigs = toLiftSigs(Full);
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                   nullptr, /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::BranchInst *Cond = nullptr;
+  const llvm::CallInst *Tail = nullptr;
+  for (const llvm::BasicBlock &BB : *Lifted->Fn) {
+    if (const auto *BI =
+            llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator()))
+      if (BI->isConditional())
+        Cond = BI;
+    for (const llvm::Instruction &Ins : BB)
+      if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(&Ins))
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "sub_14003FCA0")
+          Tail = CI;
+  }
+  ASSERT_NE(Cond, nullptr) << "jcc lowered to an unconditional branch";
+  ASSERT_NE(Tail, nullptr)
+      << "tail-call arm lost: je target never called";
+  EXPECT_TRUE(Tail->getParent()->getTerminator() &&
+              llvm::isa<llvm::ReturnInst>(
+                  Tail->getParent()->getTerminator()))
+      << "tail-call arm must return, not fall through";
+}
+
+
+TEST(LiftFunction, RecursiveLeafPreservesSiblingRegs) {
+  // c-gcc-o2 main calls fib (0x140001af0, directly recursive) then call_ptr
+  // (0x140001b40). gcc passes edx=9/r8d=4 through fib, which never writes
+  // them. The clobber scan must tolerate the self-call instead of
+  // undefining every volatile register, or call_ptr loses two arguments.
+  auto Fx = open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Va Start(0x140003b00);
+  auto It = P.Functions.find(Start);
+  ASSERT_NE(It, P.Functions.end()) << "main 0x140003b00 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("recursive_clobber", C);
+  // call_ptr's production signature (3x i32, i64 return): with null Sigs
+  // the decl comes back zero-param and coerceArgs truncates every argument
+  // away, which would make the loop below vacuous.
+  lift::Signatures Sigs;
+  lift::Signature B40;
+  B40.Params = {{lift::ParamLoc::reg(llvm::X86::RCX), 32, false, std::nullopt},
+                {lift::ParamLoc::reg(llvm::X86::RDX), 32, false, std::nullopt},
+                {lift::ParamLoc::reg(llvm::X86::R8), 32, false, std::nullopt}};
+  B40.Ret = lift::RetLoc{false, 64};
+  Sigs.Funcs.emplace(Va(0x140001b40), B40);
+  // Cleanup (mem2reg) must run: without it clobbered registers read back
+  // as loads of undef stores, and the undef below is invisible.
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                   nullptr, /*RunPasses=*/true);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::Function *CallPtr = M.getFunction("sub_140001B40");
+  ASSERT_NE(CallPtr, nullptr) << "no call_ptr declaration";
+  bool FoundCall = false;
+  for (const llvm::User *U : CallPtr->users())
+    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U)) {
+      FoundCall = true;
+      for (const llvm::Value *A : CI->args())
+        EXPECT_FALSE(llvm::isa<llvm::UndefValue>(A))
+            << "call_ptr lost a live-through-fib register argument";
+    }
+  EXPECT_TRUE(FoundCall) << "no call_ptr call in main";
+}
+
+TEST(LiftFunction, WritableDataGlobalIsNotConstant) {
+  // Writable image data (a stored-to slot such as the security cookie) keeps
+  // the file's bytes as its initializer but must not be `constant`, or the
+  // cleanup folds its loads to the file's bytes.
+  auto Fx = open(REVENANT_TEST_C_O0);
+  ASSERT_TRUE(Fx.has_value());
+  ASSERT_FALSE(Fx->Pe->Pdata.empty());
+
+  // Absolute VAs each function's linear prefix touches.
+  std::map<uint64_t, std::set<Va>> Refs;
+  for (const auto &Pe : Fx->Pe->Pdata) {
+    std::vector<Instr> Block = linearBlock(*Fx->Dis, Pe.Begin, 64);
+    for (const Instr &I : Block)
+      if (I.HasMemTarget)
+        Refs[I.MemTarget.Value].insert(Pe.Begin);
+  }
+  Program P = emptyProgram(Fx->Pe->Img);
+  Va Writable;
+  for (const auto &[Va_, Fns] : Refs)
+    if (!Fns.empty() && P.Img->isWritable(Va(Va_))) {
+      Writable = Va(Va_);
+      break;
+    }
+  ASSERT_NE(Writable.Value, 0u)
+      << "fixture has no writable data VA referenced by a function";
+
+  llvm::LLVMContext C;
+  llvm::Module M("lift_writable_global", C);
+  bool Lifted = false;
+  for (Va Start : Refs[Writable.Value]) {
+    std::vector<Instr> Block = linearBlock(*Fx->Dis, Start, 64);
+    FuncRecord R = singleBlockFunc(P, Block);
+    auto L = lift::liftFunction(M, P, R, *Fx->Dis, nullptr, nullptr,
+                                /*RunPasses=*/false);
+    if (!L) {
+      consumeError(L.takeError());
+      continue;
+    }
+    Lifted = true;
+    break;
+  }
+  ASSERT_TRUE(Lifted);
+  bool Found = false;
+  for (llvm::GlobalVariable &G : M.globals())
+    if (auto VA = ir::getGlobalVA(G); VA && *VA == Writable.Value) {
+      Found = true;
+      EXPECT_TRUE(G.hasInitializer()) << "image bytes must stay the initializer";
+      EXPECT_FALSE(G.isConstant())
+          << "writable data global must not be constant";
+    }
+  EXPECT_TRUE(Found) << "writable VA never materialized as a global";
 }
 
 } // end anonymous namespace

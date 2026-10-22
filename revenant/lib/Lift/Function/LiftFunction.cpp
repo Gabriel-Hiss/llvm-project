@@ -196,15 +196,29 @@ static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
     for (const EdgeRec &E : F.edgesOf(BR)) {
       size_t Idx = &E - F.Edges.data();
       Va To = F.edgeTo(Img, Idx);
-      if (E.Kind == EdgeTag::TailCall)
-        continue;
       if (I.HasTarget && To == I.Target)
         Taken = Idx;
       else if (!Other)
         Other = Idx;
     }
-    llvm::BasicBlock *T = Taken ? edgeBlock(LS, F, Img, *Taken) : nullptr;
-    llvm::BasicBlock *O = Other ? edgeBlock(LS, F, Img, *Other) : nullptr;
+    auto ArmFor = [&](std::optional<size_t> Idx) -> llvm::BasicBlock * {
+      if (!Idx)
+        return nullptr;
+      if (llvm::BasicBlock *To = edgeBlock(LS, F, Img, *Idx))
+        return To;
+      if (F.Edges[*Idx].Kind != EdgeTag::TailCall)
+        return nullptr;
+      // jcc targets a tail call: emit a one-off block that tail-calls
+      // the target and returns in the caller's own shape.
+      llvm::BasicBlock *Arm =
+          llvm::BasicBlock::Create(LS.Mod.getContext(), "", &LS.Fn);
+      llvm::IRBuilder<>::InsertPointGuard Guard(LS.B);
+      LS.B.SetInsertPoint(Arm);
+      LS.emitTailCall(F.edgeTo(Img, *Idx));
+      return Arm;
+    };
+    llvm::BasicBlock *T = ArmFor(Taken);
+    llvm::BasicBlock *O = ArmFor(Other);
     if (T && O) {
       auto *BI = LS.B.CreateCondBr(Cond, T, O);
       attachVa(BI, I.Addr.Value);

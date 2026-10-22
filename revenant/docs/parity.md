@@ -57,6 +57,10 @@ Latest Rust scan (`recovered-rust`): 28 binaries, 28 clean; missing=0, conflicts
 
 
 
+## Rust reference difference
+
+The fork intentionally does not reproduce a small false-positive orphan-sweep behavior in the Rust reference. On `c-o2`, Rust-vs-fork item lists differ by 63 tuples: Rust-only entries include a bogus decode of the 4-byte relative switch table at RVA `0x1dc0` (e.g. `0x1dd0`) and `int3` table slack at `0x1e90`; the fork marks those bytes as table data/unknown instead of code. LLVM-only entries are primarily padding instructions where Rust's file map leaves the gap unknown. This is a deliberate semantic difference from the Rust implementation; the oracle remains the correctness target, and the full C/C++ corpus scan has zero missing items, conflicts, and ASM-text mismatches.
+
 ## Metrics
 
 - **Missing / conflicts / extra** are the boundary results from `compare.py`. `extra_on_padding` distinguishes extra instructions that overlap oracle padding runs.

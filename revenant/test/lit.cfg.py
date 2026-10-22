@@ -15,6 +15,7 @@
 # revenant-<name> pass, so no RUN line needs -load-pass-plugin.
 
 import os
+import sys
 import lit.formats
 
 config.name = "Revenant"
@@ -149,6 +150,9 @@ if revenant_clang:
     config.available_features.add("revenant-clang")
 config.substitutions.append(("%{rv-structure-tool}", rv_structure_tool))
 config.substitutions.append(("%{rv-structure-tool-exe}", rv_structure_tool))
+# Script-driven checks (the meta-mode invariant runs its own corruption
+# fixtures) need the interpreter that runs lit itself.
+config.substitutions.append(("%python", sys.executable))
 
 missing = [
     name

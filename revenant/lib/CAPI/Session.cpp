@@ -222,6 +222,42 @@ std::optional<Va> Session::functionByName(StringRef Name) const {
   return std::nullopt;
 }
 
+namespace {
+/// One id per general register, shared by its 64-bit and 32-bit spellings so
+/// a value moved between widths still matches. Narrower spellings never carry
+/// a 32-bit argument, so they stay unmatched.
+std::optional<unsigned> regId(StringRef Name) {
+  static const char *const Wide[][2] = {
+      {"rax", "eax"}, {"rcx", "ecx"}, {"rdx", "edx"}, {"rbx", "ebx"},
+      {"rsp", "esp"}, {"rbp", "ebp"}, {"rsi", "esi"}, {"rdi", "edi"},
+      {"r8", "r8d"},   {"r9", "r9d"},   {"r10", "r10d"}, {"r11", "r11d"},
+      {"r12", "r12d"}, {"r13", "r13d"}, {"r14", "r14d"}, {"r15", "r15d"},
+  };
+  for (unsigned I = 0; I != 16; ++I)
+    if (Name == Wide[I][0] || Name == Wide[I][1])
+      return I;
+  return std::nullopt;
+}
+
+/// Opcode and operands of one instruction, as printed by the disassembler.
+/// The returned references point into `Text`, which must outlive them.
+struct InstrParts {
+  StringRef Opcode;
+  StringRef Dest;
+  StringRef Src;
+};
+
+InstrParts splitInstr(StringRef Text) {
+  StringRef Assembly = Text.trim();
+  size_t Sep = Assembly.find_first_of(" \t");
+  if (Sep == StringRef::npos)
+    return {Assembly, "", ""};
+  auto Split = Assembly.drop_front(Sep).trim().split(',');
+  return {Assembly.take_front(Sep).trim(), Split.first.trim(),
+          Split.second.trim()};
+}
+} // namespace
+
 Expected<FunctionClassification>
 Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
   FunctionClassification Result;
@@ -282,6 +318,69 @@ Session::classifyFunctions(Lang Out, StringRef LibraryDBPath) const {
         }
       if (Result.UserEntry)
         break;
+    }
+  }
+  // The CRT reaches the user entry by passing argc, argv and envp to it in
+  // ecx/edx/r8 and feeding its result to the exit path. `/OPT:ICF` folds
+  // `invoke_main` into its caller, so the name route above can miss the user
+  // entry entirely: the folded startup then swallows it as CRT code and the
+  // tail heuristic lands on an unrelated user helper. The argument setup is
+  // the shape that survives, so match it.
+  if (!Result.UserEntry && Out != Lang::Rust && !Result.LibraryNames.empty()) {
+    auto Entry = Prog.Functions.upper_bound(Pe->EntryPoint);
+    if (Entry != Prog.Functions.begin()) {
+      --Entry;
+      std::queue<Va> Pending;
+      std::set<Va> Seen;
+      Pending.push(Entry->first);
+      while (!Pending.empty() && !Result.UserEntry) {
+        Va At = Pending.front();
+        Pending.pop();
+        if (!Seen.insert(At).second)
+          continue;
+        auto FOrErr = materialize(At);
+        if (!FOrErr) {
+          consumeError(FOrErr.takeError());
+          continue;
+        }
+        const Function &F = *FOrErr;
+        for (size_t Idx = 0; Idx != F.Instrs.size(); ++Idx) {
+          const Instr &Call = F.Instrs[Idx];
+          if (Call.Flow != FlowKind::Call || !Call.HasTarget ||
+              !Prog.Functions.count(Call.Target) || Call.Target == At)
+            continue;
+          auto Callee = Prog.Functions.find(Call.Target);
+          if (Callee->second.InstrRvas.size() <= 8 ||
+              Result.LibraryStarts.count(Call.Target))
+            continue;
+          // ecx, edx and r8d are each assigned in the run of instructions
+          // right before the call: the argc/argv/envp setup.
+          unsigned ArgsSeen = 0;
+          for (size_t Back = 1; Back <= 4 && Idx >= Back; ++Back) {
+            std::string Text = Dis->format(F.Instrs[Idx - Back]);
+            InstrParts Parts = splitInstr(Text);
+            if (Parts.Opcode != "mov")
+              continue;
+            auto DestId = regId(Parts.Dest);
+            if (!DestId)
+              continue;
+            if (*DestId == regId("ecx"))
+              ArgsSeen |= 1;
+            else if (*DestId == regId("edx"))
+              ArgsSeen |= 2;
+            else if (*DestId == regId("r8d"))
+              ArgsSeen |= 4;
+          }
+          if (ArgsSeen != 7)
+            continue;
+          Result.UserEntry = Call.Target;
+          break;
+        }
+        for (const Instr &I : F.Instrs)
+          if (I.HasTarget && Prog.Functions.count(I.Target) &&
+              (I.Flow == FlowKind::Call || I.Flow == FlowKind::Branch))
+            Pending.push(I.Target);
+      }
     }
   }
   // MinGW's CRT passes argc, argv, and envp to main from stored startup

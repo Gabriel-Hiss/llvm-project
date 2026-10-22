@@ -304,6 +304,16 @@ std::vector<Case> cases() {
                                               " xmm0, xmmword ptr [rsp+0x20]")
             .xmm(0, A0, A1).stack({B0, B1}));
   }
+  for (const char *Op : {"phaddd", "phaddw"}) {
+    add(Case(std::string(Op) + " xmm,xmm", std::string(Op) + " xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1));
+  }
+  for (const char *Op : {"vphaddd", "vphaddw"}) {
+    add(Case(std::string(Op) + " xmm", std::string(Op) + " xmm2, xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1).xmm(2, 1, 2));
+    add(Case(std::string(Op) + " ymm", std::string(Op) + " ymm2, ymm0, ymm1")
+            .ymm(0, A0, A1, B0, B1).ymm(1, B0, B1, A0, A1).ymm(2, 1, 2, 3, 4));
+  }
   for (const char *Op : {"psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq",
                          "psraw", "psrad"}) {
     add(Case(std::string(Op) + " xmm,imm", std::string(Op) + " xmm0, 3")
@@ -348,6 +358,19 @@ std::vector<Case> cases() {
           .ymm(0, A0, A1, B0, B1).ymm(1, 5, 6, 7, 8).ymm(2, 9, 9, 9, 9));
   add(Case("vpxor xmm zeroes upper", "vpxor xmm0, xmm0, xmm1")
           .ymm(0, A0, A1, B0, B1).ymm(1, 1, 2, 3, 4));
+
+  // VEX-128 PS bitwise ops (vxorps xmm,xmm,xmm is the canonical zero idiom
+  // that used to lift opaque) plus their ymm PD twins.
+  for (const char *Op : {"vxorps", "vandps", "vorps", "vandnps"}) {
+    add(Case(std::string(Op) + " xmm", std::string(Op) + " xmm2, xmm0, xmm1")
+            .xmm(0, A0, A1).xmm(1, B0, B1).xmm(2, 1, 2));
+  }
+  for (const char *Op : {"vxorpd", "vandpd", "vorpd", "vandnpd"}) {
+    add(Case(std::string(Op) + " ymm", std::string(Op) + " ymm2, ymm0, ymm1")
+            .ymm(0, A0, A1, B0, B1).ymm(1, B0, B1, A0, A1).ymm(2, 1, 2, 3, 4));
+  }
+  add(Case("vxorps xmm self-zero", "vxorps xmm0, xmm0, xmm0")
+          .ymm(0, A0, A1, B0, B1));
 
   // Scalar and packed float.
   add(Case("xorps self", "xorps xmm0, xmm0").xmm(0, A0, A1));
@@ -569,6 +592,235 @@ std::vector<Case> cases() {
            "fnstcw word ptr [rsp+0x40]\n"
            "mov ax, word ptr [rsp+0x40]")
           .stack({0x027f}));
+  // Packed float/integer conversions, including the SSE2 integer-to-double
+  // form exercised by compiler-generated vectorized initialization.
+  add(Case("sse cvtdq2pd reg", "cvtdq2pd xmm0, xmm1")
+          .xmm(1, 0xffffffff00000002ULL, 0)
+          .xmm(0, 0, 0));
+  add(Case("sse cvtdq2pd mem", "cvtdq2pd xmm0, qword ptr [rsp+0x20]")
+          .stack({0xffffffff00000002ULL})
+          .xmm(0, 0, 0));
+  add(Case("sse cvtdq2pd packed store chain",
+           "cvtdq2pd xmm0, xmm1\n"
+           "addpd xmm0, xmm2\n"
+           "paddd xmm1, xmm3\n"
+           "movups xmmword ptr [rsp+0x30], xmm0\n"
+           "movups xmmword ptr [rsp+0x40], xmm1")
+          .xmm(1, 0xffffffff00000002ULL, 0)
+          .xmm(2, 0x3ff0000000000000ULL, 0x4000000000000000ULL)
+          .xmm(3, 0x0000000100000001ULL, 0x0000000100000001ULL)
+          .stack({0, 0, 0, 0, 0, 0}));
+  add(Case("sse cvtdq2ps reg", "cvtdq2ps xmm0, xmm1")
+          .xmm(1, 0xffffffff00000002ULL, 0x7fffffff00000001ULL)
+          .xmm(0, 0, 0));
+  add(Case("sse cvtdq2ps mem", "cvtdq2ps xmm0, xmmword ptr [rsp+0x20]")
+          .stack({0xffffffff00000002ULL, 0x7fffffff00000001ULL})
+          .xmm(0, 0, 0));
+  for (const char *Op : {"cvtps2dq", "cvttps2dq"}) {
+    add(Case(std::string("sse ") + Op + " reg",
+             std::string(Op) + " xmm0, xmm1")
+            .xmm(1, 0xbfc000003fc00000ULL, 0xc098000040500000ULL)
+            .xmm(0, 0, 0));
+    add(Case(std::string("sse ") + Op + " mem",
+             std::string(Op) + " xmm0, xmmword ptr [rsp+0x20]")
+            .stack({0xbfc000003fc00000ULL, 0xc098000040500000ULL})
+            .xmm(0, 0, 0));
+  }
+  struct InvalidFP {
+    const char *Name;
+    uint32_t SingleBits;
+    uint64_t DoubleBits;
+  };
+  for (const InvalidFP &V :
+       {InvalidFP{"nan", 0x7fc00000U, 0x7ff8000000000000ULL},
+        InvalidFP{"infinity", 0x7f800000U, 0x7ff0000000000000ULL},
+        InvalidFP{"out of range", 0x7149f2caU, 0x46293e5939a08ceaULL}}) {
+    std::string SetSingle =
+        "mov eax, " + hexQ(V.SingleBits) + "\nmovd xmm1, eax\n";
+    for (const char *Op : {"cvtps2dq", "cvttps2dq"})
+      add(Case(std::string("sse ") + Op + " invalid " + V.Name,
+               SetSingle + std::string(Op) + " xmm0, xmm1")
+              .xmm(0, 0, 0));
+    add(Case(std::string("sse cvttpd2dq invalid ") + V.Name,
+             "mov rax, " + hexQ(V.DoubleBits) + "\n"
+             "movq xmm1, rax\n"
+             "cvttpd2dq xmm0, xmm1")
+            .xmm(0, 0, 0));
+  }
+  add(Case("sse cvttpd2dq reg", "cvttpd2dq xmm0, xmm1")
+          .xmm(1, 0x4004000000000000ULL, 0xC014000000000000ULL)
+          .xmm(0, 0xaaaaaaaaaaaaaaaaULL, 0xbbbbbbbbbbbbbbbbULL));
+  add(Case("sse cvttpd2dq mem", "cvttpd2dq xmm0, xmmword ptr [rsp+0x20]")
+          .stack({0x4004000000000000ULL, 0xC014000000000000ULL})
+          .xmm(0, 0xaaaaaaaaaaaaaaaaULL, 0xbbbbbbbbbbbbbbbbULL));
+  add(Case("sse4.1 cvtps2pd reg", "cvtps2pd xmm0, xmm1")
+          .xmm(1, 0x40490FDB3F800000ULL, 0)
+          .xmm(0, 0, 0));
+  add(Case("sse4.1 cvtps2pd mem",
+           "cvtps2pd xmm0, qword ptr [rsp+0x20]")
+          .stack({0x40490FDB3F800000ULL})
+          .xmm(0, 0, 0));
+  add(Case("sse4.1 cvtpd2ps reg", "cvtpd2ps xmm0, xmm1")
+          .xmm(1, 0x400921FB54442D18ULL, 0)
+          .xmm(0, 0, 0));
+  add(Case("sse4.1 cvtpd2ps mem",
+           "cvtpd2ps xmm0, xmmword ptr [rsp+0x20]")
+          .stack({0x400921FB54442D18ULL, 0})
+          .xmm(0, 0, 0));
+  for (unsigned Mode = 0; Mode < 4; ++Mode) {
+    std::string M = std::to_string(Mode);
+    add(Case("sse4.1 roundsd mode " + M,
+             "roundsd xmm0, xmm1, " + M)
+            .xmm(1, 0x4059200000000000ULL, 0x4053400000000000ULL)
+            .xmm(0, 0x3fe0000000000000ULL, 0xbff0000000000000ULL));
+    add(Case("sse4.1 roundss mode " + M,
+             "roundss xmm0, xmm1, " + M)
+            .xmm(1, 0x429a000042c90000ULL, 0)
+            .xmm(0, 0xbf8000003f000000ULL, 0xaaaaaaaaaaaaaaaaULL));
+  }
+  add(Case("sse4.1 roundsd memory mode 1",
+           "roundsd xmm0, qword ptr [rsp+0x20], 1")
+          .stack({0x4059200000000000ULL})
+          .xmm(0, 0x3fe0000000000000ULL, 0xbff0000000000000ULL));
+  add(Case("sse4.1 roundss memory mode 2",
+           "roundss xmm0, dword ptr [rsp+0x20], 2")
+          .stack({0x0000000042c90000ULL})
+          .xmm(0, 0xbf8000003f000000ULL, 0xaaaaaaaaaaaaaaaaULL));
+  // AVX/AVX2 masked moves suppress masked-off memory accesses and stores.
+  add(Case("avx vmaskmovps xmm load",
+           "vmaskmovps xmm0, xmm1, xmmword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL})
+          .xmm(1, 0x0000000080000000ULL, 0x0000000080000000ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx vmaskmovps xmm store",
+           "vmaskmovps xmmword ptr [rsp+0x20], xmm1, xmm2")
+          .needs("avx")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .xmm(1, 0x0000000080000000ULL, 0x0000000080000000ULL)
+          .xmm(2, 0x2222222211111111ULL, 0x4444444433333333ULL));
+  add(Case("avx vmaskmovpd xmm load",
+           "vmaskmovpd xmm0, xmm1, xmmword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL})
+          .xmm(1, 0x8000000000000000ULL, 0)
+          .xmm(0, 0, 0));
+  add(Case("avx vmaskmovpd xmm store",
+           "vmaskmovpd xmmword ptr [rsp+0x20], xmm1, xmm2")
+          .needs("avx")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .xmm(1, 0x8000000000000000ULL, 0)
+          .xmm(2, 0x2222222211111111ULL, 0x4444444433333333ULL));
+  add(Case("avx2 vpmaskmovd xmm load",
+           "vpmaskmovd xmm0, xmm1, xmmword ptr [rsp+0x20]")
+          .needs("avx2")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL})
+          .xmm(1, 0x0000000080000000ULL, 0x0000000080000000ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx2 vpmaskmovd xmm store",
+           "vpmaskmovd xmmword ptr [rsp+0x20], xmm1, xmm2")
+          .needs("avx2")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .xmm(1, 0x0000000080000000ULL, 0x0000000080000000ULL)
+          .xmm(2, 0x2222222211111111ULL, 0x4444444433333333ULL));
+  add(Case("avx vptest xmm", "vptest xmm0, xmm1")
+          .needs("avx")
+          .xmm(0, 1, 2)
+          .xmm(1, 1, 0)
+          .flags(AllFlags));
+  add(Case("avx vptest xmm memory", "vptest xmm0, xmmword ptr [rsp+0x20]")
+          .needs("avx")
+          .xmm(0, 1, 2)
+          .stack({1, 0})
+          .flags(AllFlags));
+  add(Case("avx vmaskmovps ymm load",
+           "vmaskmovps ymm0, ymm1, ymmword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL,
+                  0x6666666655555555ULL, 0x8888888877777777ULL})
+          .ymm(1, 0xFFFFFFFF80000000ULL, 0x0000000080000000ULL,
+               0xFFFFFFFF80000000ULL, 0x0000000080000000ULL)
+          .ymm(0, 0, 0, 0, 0));
+  add(Case("avx vmaskmovps ymm store",
+           "vmaskmovps ymmword ptr [rsp+0x20], ymm1, ymm2")
+          .needs("avx")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL,
+                  0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .ymm(1, 0xFFFFFFFF80000000ULL, 0x0000000080000000ULL,
+               0xFFFFFFFF80000000ULL, 0x0000000080000000ULL)
+          .ymm(2, 0x2222222211111111ULL, 0x4444444433333333ULL,
+               0x6666666655555555ULL, 0x8888888877777777ULL));
+  add(Case("avx vmaskmovpd ymm load",
+           "vmaskmovpd ymm0, ymm1, ymmword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL,
+                  0x6666666655555555ULL, 0x8888888877777777ULL})
+          .ymm(1, 0x8000000000000000ULL, 0, 0x8000000000000000ULL, 0)
+          .ymm(0, 0, 0, 0, 0));
+  add(Case("avx vmaskmovpd ymm store",
+           "vmaskmovpd ymmword ptr [rsp+0x20], ymm1, ymm2")
+          .needs("avx")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL,
+                  0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .ymm(1, 0x8000000000000000ULL, 0, 0x8000000000000000ULL, 0)
+          .ymm(2, 0x2222222211111111ULL, 0x4444444433333333ULL,
+               0x6666666655555555ULL, 0x8888888877777777ULL));
+  add(Case("avx2 vpmaskmovd ymm load",
+           "vpmaskmovd ymm0, ymm1, ymmword ptr [rsp+0x20]")
+          .needs("avx2")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL,
+                  0x6666666655555555ULL, 0x8888888877777777ULL})
+          .ymm(1, 0x0000000080000000ULL, 0x0000000080000000ULL,
+               0x0000000080000000ULL, 0x0000000080000000ULL)
+          .ymm(0, 0, 0, 0, 0));
+  add(Case("avx2 vpmaskmovd ymm store",
+           "vpmaskmovd ymmword ptr [rsp+0x20], ymm1, ymm2")
+          .needs("avx2")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL,
+                  0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .ymm(1, 0x0000000080000000ULL, 0x0000000080000000ULL,
+               0x0000000080000000ULL, 0x0000000080000000ULL)
+          .ymm(2, 0x2222222211111111ULL, 0x4444444433333333ULL,
+               0x6666666655555555ULL, 0x8888888877777777ULL));
+  for (const char *Op : {"vpbroadcastb", "vpbroadcastw", "vpbroadcastd",
+                         "vpbroadcastq"}) {
+    std::string O = Op;
+    unsigned EB = O.back() == 'b' ? 8 : O.back() == 'w' ? 16
+                                     : O.back() == 'd'   ? 32
+                                                         : 64;
+    const char *MemTy = EB == 8  ? "byte ptr"
+                        : EB == 16 ? "word ptr"
+                        : EB == 32 ? "dword ptr"
+                                   : "qword ptr";
+    const uint64_t Scalar = 0x8877665544332211ULL;
+    for (bool Y : {false, true}) {
+      std::string RegName =
+          "avx2 " + O + (Y ? " ymm register" : " xmm register");
+      Case Reg(RegName, O + (Y ? " ymm0, xmm1" : " xmm0, xmm1"));
+      Reg.needs("avx2").xmm(1, Scalar, 0);
+      if (Y)
+        Reg.ymm(0, 0, 0, 0, 0);
+      else
+        Reg.xmm(0, 0, 0);
+      add(Reg);
+
+      std::string MemName =
+          "avx2 " + O + (Y ? " ymm memory" : " xmm memory");
+      Case Mem(MemName, O + (Y ? " ymm0, " : " xmm0, ") + MemTy +
+                           " [rsp+0x20]");
+      Mem.needs("avx2").stack({Scalar});
+      if (Y)
+        Mem.ymm(0, 0, 0, 0, 0);
+      else
+        Mem.xmm(0, 0, 0);
+      add(Mem);
+    }
+  }
+  add(Case("avx vptest ymm", "vptest ymm0, ymm1")
+          .needs("avx")
+          .ymm(0, 1, 2, 4, 8)
+          .ymm(1, 1, 0, 4, 0)
+          .flags(AllFlags));
   return V;
 }
 

@@ -851,13 +851,23 @@ Value *LiftState::globalPtr(Va Addr) {
     if (auto It = P.Strings->find(Addr); It != P.Strings->end())
       Init = std::vector<uint8_t>(It->second.begin(), It->second.end());
   }
-  if (!Init && !P.Functions.count(Addr))
+  // True when Init came straight from the image, i.e. the bytes are the
+  // program's data, not an analyzer-recognized string.
+  bool FromImage = false;
+  if (!Init && !P.Functions.count(Addr)) {
     Init = P.Img->readAtMost(Addr, 4096);
+    FromImage = true;
+  }
   unsigned Sz = Init ? (unsigned)Init->size() : 16;
   if (Sz == 0)
     Sz = 16;
+  // Writable image data (the security cookie, mutable tables) carries the
+  // file's bytes as its initializer but must not be `constant`: the program
+  // stores to it, and a constant global lets the optimizer fold its loads to
+  // the file's bytes. The IR contract keeps analyzer strings constant.
+  bool Writable = FromImage && P.Img->isWritable(Addr);
   auto *G = new GlobalVariable(
-      Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/!!Init,
+      Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/Init && !Writable,
       Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
       nullptr, Name);
   if (Init) {
@@ -1196,6 +1206,13 @@ void LiftState::clobberCallee(llvm::Function *Callee, std::optional<Va> Target) 
       break;
     }
     const MCInstrDesc &Desc = MC.MII->get(DI->Inst.getOpcode());
+    // A direct recursive call adds no writes beyond this same body scan
+    // (whatever the recursion disturbs is collected here), so it is
+    // skipped instead of bailing to the conservative set. This keeps
+    // caller registers that a recursive leaf preserves (c-gcc-o2 fib
+    // preserves edx across its self-call).
+    if (Desc.isCall() && DI->HasTarget && DI->Target == Rec->Start)
+      continue;
     // A nested call, an indirect jump, a trap, or a direct jump whose target
     // is another function (a tail call) can transfer to code outside this
     // record, whose register effects are unknown: stay conservative.
