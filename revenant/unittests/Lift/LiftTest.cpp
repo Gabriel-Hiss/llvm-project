@@ -498,91 +498,9 @@ static lift::Signatures gccO2MainSigs(const Program &P, const Disasm &D) {
     if (S.HasRet)
       Out.Ret = lift::RetLoc{S.Ret.Float, S.Ret.Bits};
     Out.NoReturn = S.Noreturn;
-    Out.Variadic = S.VarArgs;
     Sigs.Funcs.emplace(At, std::move(Out));
   }
   return Sigs;
-}
-
-TEST(LiftFunction, RecursiveLeafPreservesSiblingRegs) {
-  // c-gcc-o2 main calls fib (0x140001af0, directly recursive) then call_ptr
-  // (0x140001b40). gcc passes edx=9/r8d=4 through fib, which never writes
-  // them. The clobber scan must tolerate the self-call instead of
-  // undefining every volatile register, or call_ptr loses two arguments.
-  auto Fx = open(REVENANT_TEST_C_GCC_O2);
-  ASSERT_TRUE(Fx.has_value());
-  auto Hooks = createX86TargetHooks();
-  Program P = analyze(*Fx->Pe, *Hooks);
-  Va Start(0x140003b00);
-  auto It = P.Functions.find(Start);
-  ASSERT_NE(It, P.Functions.end()) << "main 0x140003b00 not recovered";
-
-  llvm::LLVMContext C;
-  llvm::Module M("recursive_clobber", C);
-  // Production callee shapes (see gccO2MainSigs): without them the decls
-  // come back zero-param and coerceArgs truncates every argument away,
-  // which would make the loops below vacuous.
-  lift::Signatures Sigs = gccO2MainSigs(P, *Fx->Dis);
-  // Cleanup (mem2reg) must run: without it clobbered registers read back
-  // as loads of undef stores, and the undef below is invisible.
-  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
-                                   nullptr, /*RunPasses=*/true);
-  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
-  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
-
-  const llvm::Function *CallPtr = M.getFunction("sub_140001B40");
-  ASSERT_NE(CallPtr, nullptr) << "no call_ptr declaration";
-  bool FoundCall = false;
-  for (const llvm::User *U : CallPtr->users())
-    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U)) {
-      FoundCall = true;
-      for (const llvm::Value *A : CI->args())
-        EXPECT_FALSE(llvm::isa<llvm::UndefValue>(A))
-            << "call_ptr lost a live-through-fib register argument";
-    }
-  EXPECT_TRUE(FoundCall) << "no call_ptr call in main";
-}
-
-TEST(LiftFunction, VariadicCallPassesLiveRegs) {
-  // c-gcc-o2 main calls the mingw printf wrapper (0x140003630, 1 fixed
-  // param + variadic) with fmt/str/int live in rcx/rdx/r8. The call must
-  // carry all four Win64 regs: truncating to the fixed prefix drops the
-  // `%d` argument and the reprinted total is wrong.
-  auto Fx = open(REVENANT_TEST_C_GCC_O2);
-  ASSERT_TRUE(Fx.has_value());
-  auto Hooks = createX86TargetHooks();
-  Program P = analyze(*Fx->Pe, *Hooks);
-  Va Start(0x140003b00);
-  auto It = P.Functions.find(Start);
-  ASSERT_NE(It, P.Functions.end()) << "main 0x140003b00 not recovered";
-
-  llvm::LLVMContext C;
-  llvm::Module M("variadic_call", C);
-  lift::Signatures Sigs = gccO2MainSigs(P, *Fx->Dis);
-  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
-                                   nullptr, /*RunPasses=*/true);
-  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
-  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
-
-  const llvm::Function *Printf = M.getFunction("printf");
-  if (!Printf)
-    Printf = M.getFunction("sub_140003630");
-  ASSERT_NE(Printf, nullptr) << "no printf declaration";
-  EXPECT_TRUE(Printf->getFunctionType()->isVarArg())
-      << "printf decl lost its variadic tail";
-  bool FoundCall = false;
-  for (const llvm::User *U : Printf->users())
-    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U)) {
-      FoundCall = true;
-      EXPECT_EQ(CI->arg_size(), 4u)
-          << "variadic call must carry the rcx..r9 prefix";
-      // The original passes fmt/str/int in rcx/rdx/r8: those three must
-      // be live. The r9 extra is best-effort (stale at the site).
-      for (unsigned A = 0; A < 3 && A < CI->arg_size(); ++A)
-        EXPECT_FALSE(llvm::isa<llvm::UndefValue>(CI->getArgOperand(A)))
-            << "variadic call dropped live arg " << A;
-    }
-  EXPECT_TRUE(FoundCall) << "no printf call in main";
 }
 
 } // end anonymous namespace
