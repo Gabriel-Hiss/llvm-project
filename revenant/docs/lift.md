@@ -24,11 +24,27 @@ symbols. The differential cases live in `LiftSemanticsCases.cpp`.
 
 ## AVX masked moves and broadcasts
 
-`VMASKMOVPS`, `VMASKMOVPD`, and `VPMASKMOVD` use each mask lane's sign bit.
-Masked loads zero inactive lanes. Masked stores touch only active lanes and
-use byte alignment because their base address need not be naturally aligned.
-`PTEST`/`VPTEST` calculate CF and ZF across the full 128- or 256-bit value.
-`VPBROADCASTB/W/D/Q` splat the selected scalar element across the destination.
+`VMASKMOVPS`, `VMASKMOVPD`, `VPMASKMOVD` and `VPMASKMOVQ` use each mask
+lane's sign bit. Masked loads zero inactive lanes. Masked stores touch only
+active lanes and use byte alignment because their base address need not be
+naturally aligned. `PTEST`/`VPTEST` calculate CF and ZF across the full 128-
+or 256-bit value. `VPBROADCASTB/W/D/Q` splat the selected scalar element
+across the destination. `VBROADCASTSS` and `VBROADCASTSD` replicate one
+scalar cell (memory source) to every lane of the destination.
+
+The scalar float min/max ops (`VMINSS`, `VMINSD`, `VMAXSS`, `VMAXSD`) lift
+in both the generic VEX spelling and the intrinsic twin, with a register or
+a memory source. `VROUNDSS`/`VROUNDSD` round the second source and keep the
+upper lanes of the first one, like the VEX encoding; the legacy form keeps
+the destination's.
+
+## Traps
+
+`ud2` never returns, so the block it sits in ends with `unreachable`. It is
+not an opaque `revenant.asm.ud2` call: the call would mark every register
+volatile, and the cleanup pass would then drop the rest of the function. A
+trap in the middle of a block ends the block there; the code behind it is
+dead and is not lifted.
 
 Build the generated dispatcher and context implementations, then run the provenance test:
 

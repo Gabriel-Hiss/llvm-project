@@ -42,6 +42,10 @@ struct Case {
   /// Host CPU feature the case needs ("avx512f"); the runner skips it when
   /// the host lacks the feature (the bytes would fault natively).
   const char *Requires = nullptr;
+  /// Lift-only case: the bytes trap, so they are assembled and lifted but
+  /// never executed. The runner then checks that the lift did not fall back
+  /// to an opaque `revenant.asm.*` stub.
+  bool LiftOnly = false;
   unsigned RegMask = 0x3FF;
   unsigned FlagMask = 0;
 
@@ -86,6 +90,11 @@ struct Case {
   /// Host CPU feature this case needs; skipped when absent.
   Case &needs(const char *Feature) {
     Requires = Feature;
+    return *this;
+  }
+  /// Lift the case but never execute it (the bytes trap).
+  Case &liftOnly() {
+    LiftOnly = true;
     return *this;
   }
   Case &flags(unsigned M) {

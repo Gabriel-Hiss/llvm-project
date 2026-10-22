@@ -617,4 +617,58 @@ TEST(LiftFunction, WritableDataGlobalIsNotConstant) {
   EXPECT_TRUE(Found) << "writable VA never materialized as a global";
 }
 
+TEST(LiftFunction, RecoveredSignatureIsPublishedForUnabi) {
+  // The Unabi pass rewrites the flat ABI back toward the source shape, but
+  // it only fires on a function that carries the "revenant.sig" attribute.
+  // The lifter is the only place that holds the recovered signature, so it
+  // publishes it there.
+  auto Fx = open(REVENANT_TEST_C_O0);
+  ASSERT_TRUE(Fx.has_value());
+  ASSERT_FALSE(Fx->Pe->Pdata.empty());
+  Va Start = Fx->Pe->Pdata.front().Begin;
+  std::vector<Instr> Block = linearBlock(*Fx->Dis, Start);
+  ASSERT_GE(Block.size(), 2u);
+  Program P = emptyProgram(Fx->Pe->Img);
+  FuncRecord R = singleBlockFunc(P, Block);
+
+  // A signature that names a pointer parameter: the attribute must carry
+  // it, because the flat ABI lifted the parameter as an integer.
+  lift::Signatures Sigs;
+  lift::Signature PtrSig;
+  lift::Param PtrParam;
+  PtrParam.Loc = lift::ParamLoc::reg(llvm::X86::RCX);
+  PtrParam.Bits = 64;
+  PtrParam.Type = "void *";
+  PtrSig.Params.push_back(PtrParam);
+  PtrSig.Ret = lift::RetLoc{false, 64};
+  Sigs.Funcs[Start] = PtrSig;
+
+  llvm::LLVMContext C;
+  llvm::Module M("lift_sig", C);
+  auto Lifted = lift::liftFunction(M, P, R, *Fx->Dis, &Sigs, nullptr,
+                                   /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  EXPECT_EQ(Lifted->Fn->getFnAttribute("revenant.sig").getValueAsString(),
+            "p => r64");
+
+  // A signature that says nothing the flat ABI does not already say
+  // carries no attribute: the Unabi pass would have nothing to rewrite.
+  lift::Signatures Plain;
+  lift::Signature IntSig;
+  lift::Param IntParam;
+  IntParam.Loc = lift::ParamLoc::reg(llvm::X86::RCX);
+  IntParam.Bits = 64;
+  IntParam.Type = "int";
+  IntSig.Params.push_back(IntParam);
+  IntSig.Ret = lift::RetLoc{false, 64};
+  Plain.Funcs[Start] = IntSig;
+
+  llvm::LLVMContext C2;
+  llvm::Module M2("lift_sig_plain", C2);
+  auto Lifted2 = lift::liftFunction(M2, P, R, *Fx->Dis, &Plain, nullptr,
+                                    /*RunPasses=*/false);
+  ASSERT_FALSE(!Lifted2) << toString(Lifted2.takeError());
+  EXPECT_FALSE(Lifted2->Fn->hasFnAttribute("revenant.sig"));
+}
+
 } // end anonymous namespace

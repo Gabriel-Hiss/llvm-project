@@ -214,11 +214,14 @@ lift::Signature convertSig(const revenant::Signature &S) {
     LP.Float = P.Float;
     if (!P.Name.empty())
       LP.Name = P.Name;
+    if (!P.Type.empty())
+      LP.Type = P.Type;
     Out.Params.push_back(std::move(LP));
   }
   if (S.HasRet)
     Out.Ret = lift::RetLoc{S.Ret.Float, S.Ret.Bits};
   Out.NoReturn = S.Noreturn;
+  Out.VarArgs = S.VarArgs;
   switch (S.SigSource) {
   case revenant::Signature::Source::Pdb:
     Out.Source = lift::SigSource::Pdb;

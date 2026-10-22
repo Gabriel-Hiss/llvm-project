@@ -84,6 +84,69 @@ def : RVMatch {
   dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
     (rv_fmaxnum (rv_xlane0f64 (rv_op 0)), (rv_xlane0f64 (rv_op 1)))));
 }
+// The same four scalar min/max ops in their generic VEX spelling (the
+// disassembler's name for the encoding) and with a memory source. Both
+// spellings share the operand names, so one body covers each form.
+def : RVMatch {
+  string Glob = "VMINSSrr";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_fminnum (rv_xlane0f32 (rv_op 0)), (rv_xlane0f32 (rv_op 1)))));
+}
+def : RVMatch {
+  string Glob = "VMINSSrm";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_fminnum (rv_xlane0f32 (rv_op 0)), (rv_floadf32 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMINSSrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_fminnum (rv_xlane0f32 (rv_op 0)), (rv_floadf32 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMINSDrr";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_fminnum (rv_xlane0f64 (rv_op 0)), (rv_xlane0f64 (rv_op 1)))));
+}
+def : RVMatch {
+  string Glob = "VMINSDrm";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_fminnum (rv_xlane0f64 (rv_op 0)), (rv_floadf64 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMINSDrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_fminnum (rv_xlane0f64 (rv_op 0)), (rv_floadf64 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMAXSSrr";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_fmaxnum (rv_xlane0f32 (rv_op 0)), (rv_xlane0f32 (rv_op 1)))));
+}
+def : RVMatch {
+  string Glob = "VMAXSSrm";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_fmaxnum (rv_xlane0f32 (rv_op 0)), (rv_floadf32 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMAXSSrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_fmaxnum (rv_xlane0f32 (rv_op 0)), (rv_floadf32 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMAXSDrr";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_fmaxnum (rv_xlane0f64 (rv_op 0)), (rv_xlane0f64 (rv_op 1)))));
+}
+def : RVMatch {
+  string Glob = "VMAXSDrm";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_fmaxnum (rv_xlane0f64 (rv_op 0)), (rv_floadf64 (rv_addr $src2)))));
+}
+def : RVMatch {
+  string Glob = "VMAXSDrm_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_fmaxnum (rv_xlane0f64 (rv_op 0)), (rv_floadf64 (rv_addr $src2)))));
+}
 def : RVMatch {
   string Glob = "VSQRTSSr_Int";
   dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
@@ -443,6 +506,24 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "VBROADCASTI128rm";
   dag Body = (rv_setz $dst, (rv_op 0));
+}
+
+// ---- VBROADCASTSS / VBROADCASTSD ---------------------------------------------------------
+// One scalar replicated to every lane. The scalar is a 32-bit (ss) or
+// 64-bit (sd) cell; the bit pattern is what gets replicated, so the float
+// type never matters. Only the memory forms are spelled out here: the
+// register forms already come out of the inverted ISel pattern.
+def : RVMatch {
+  string Glob = "VBROADCASTSSrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 32, (rv_load 32, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VBROADCASTSSYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 32, (rv_load 32, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VBROADCASTSDYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 64, (rv_load 64, (rv_addr $src))));
 }
 
 // ---- full-vector moves (xmm and ymm) ------------------------------------------

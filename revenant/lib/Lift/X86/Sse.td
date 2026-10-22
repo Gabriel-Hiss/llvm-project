@@ -620,6 +620,19 @@ def : RVMatch {
   dag Body = (rv_setz $dst, (rv_xroundss
     (rv_zext 128, (rv_load 32, (rv_addr $src))), (rv_op 1)));
 }
+// The VEX spelling rounds the second source and keeps the upper lanes of
+// the first one, unlike the legacy form which keeps the destination's.
+// The rounding mode is the instruction's immediate (the third input).
+def : RVMatch {
+  string Glob = "VROUNDSSri_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f32 (rv_op 0),
+    (rv_xlane0f32 (rv_xroundss (rv_op 1), (rv_op 2)))));
+}
+def : RVMatch {
+  string Glob = "VROUNDSDri_Int";
+  dag Body = (rv_setz $dst, (rv_xsetlane0f64 (rv_op 0),
+    (rv_xlane0f64 (rv_xroundsd (rv_op 1), (rv_op 2)))));
+}
 // Internal variants are direct RVLift entries because RVMatch does not see
 // these codegen-only forms.
 def : RVLift {
@@ -1006,6 +1019,23 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "VPMASKMOVDYmr";
   dag Body = (rv_maskstore 256, 32, (rv_addr $dst), $src1, $src2);
+}
+// AVX2 64-bit masked moves: the same shape as VPMASKMOVD with qword lanes.
+def : RVMatch {
+  string Glob = "VPMASKMOVQrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 64, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVQYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 64, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVQmr";
+  dag Body = (rv_maskstore 128, 64, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVQYmr";
+  dag Body = (rv_maskstore 256, 64, (rv_addr $dst), $src1, $src2);
 }
 // AVX2 scalar broadcasts from XMM sources or scalar memory cells.
 def : RVMatch {

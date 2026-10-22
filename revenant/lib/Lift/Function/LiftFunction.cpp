@@ -32,6 +32,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Metadata.h"
 
@@ -181,6 +182,57 @@ static std::pair<CmpOperand, int64_t> switchLoc(const FuncRecord &F,
     Loc.Reg = (unsigned)llvm::X86::RAX;
   }
   return {Loc, Off};
+}
+
+/// True for the trap instructions (ud0/ud1/ud2, the `TRAP` opcode): they
+/// never return, so the block they sit in ends with `unreachable`.
+static bool isTrapInsn(const Instr &I) {
+  return I.Inst.getOpcode() == llvm::X86::TRAP;
+}
+
+/// The source-level signature in the grammar the Unabi pass reads:
+/// "<param> ... => <ret>", with "p" for a pointer, "f32"/"f64" for a
+/// float, "rN" for an integer of N bits and "v" for a void return. The
+/// recovered signature is the only place the source shape of a function
+/// is known, so the lifter publishes it: without the attribute the Unabi
+/// pass has no input and never fires.
+///
+/// An empty result means the recovered signature says nothing the flat
+/// ABI does not already say (the widths and the float kinds are the ones
+/// the lifter built the function type from). Such a signature would give
+/// the Unabi pass nothing to rewrite, and carrying it on every function
+/// costs the whole pipeline an attribute list per function, so it is left
+/// out.
+static std::string sigString(const Signature &S) {
+  auto IntBits = [](unsigned Bits) {
+    return (Bits == 8 || Bits == 16 || Bits == 32) ? Bits : 64;
+  };
+  bool Pointer = false;
+  for (const Param &P : S.Params)
+    if (P.Type.find('*') != std::string::npos)
+      Pointer = true;
+  if (!Pointer && !S.VarArgs)
+    return "";
+  std::string Out;
+  for (const Param &P : S.Params) {
+    if (P.Type.find('*') != std::string::npos)
+      Out += "p";
+    else if (P.Float)
+      Out += (P.Bits == 32 ? "f32" : "f64");
+    else
+      Out += "r" + std::to_string(IntBits(P.Bits));
+    Out += " ";
+  }
+  if (S.VarArgs)
+    Out += "... ";
+  Out += "=> ";
+  if (!S.Ret)
+    Out += "v";
+  else if (S.Ret->Float)
+    Out += (S.Ret->Bits == 32 ? "f32" : "f64");
+  else
+    Out += "r" + std::to_string(IntBits(S.Ret->Bits));
+  return Out;
 }
 
 static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
@@ -421,6 +473,13 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
                                    "function already defined: %s",
                                    Name.c_str());
   ir::setFunctionVA(*Fn, F.Start.Value);
+  // Publish the recovered signature for the Unabi pass, the only consumer
+  // of the source-level shape of a function.
+  if (Sig) {
+    std::string SigText = sigString(*Sig);
+    if (!SigText.empty())
+      Fn->addFnAttr("revenant.sig", SigText);
+  }
   if (auto It = P.Embedded.find(F.Start); It != P.Embedded.end()) {
     const EmbeddedFunctionMetadata &Meta = It->second;
     if (!Meta.SourceFile.empty()) {
@@ -682,14 +741,37 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
       (void)SOff;
       SwitchEntry = LS.evalCmpOperand(SLoc, Start);
     }
+    // Set when a trap instruction ended the block before its last
+    // instruction; the rest of the block is dead code.
+    bool Trapped = false;
     for (size_t N = BR.InstrsBegin; N + 1 < BR.InstrsEnd; ++N) {
       const Instr &I = Instrs[N];
+      // ud2 (and its ud0/ud1 siblings) never returns. Lifting it as an
+      // opaque `revenant.asm.ud2` call would make every instruction after
+      // it depend on a clobbered register, and the cleanup pass then drops
+      // the rest of the function. The trap ends the block instead, and the
+      // dead code behind it is not lifted at all.
+      if (isTrapInsn(I)) {
+        LS.setVA(I.Addr);
+        auto *UI = LS.B.CreateUnreachable();
+        attachVa(UI, I.Addr.Value);
+        Trapped = true;
+        break;
+      }
       if (llvm::Error E = LS.liftInstr(I)) {
         Fn->deleteBody();
         return std::move(E);
       }
     }
+    if (Trapped)
+      continue;
     const Instr &Last = Instrs[BR.InstrsEnd - 1];
+    if (isTrapInsn(Last)) {
+      LS.setVA(Last.Addr);
+      auto *UI = LS.B.CreateUnreachable();
+      attachVa(UI, Last.Addr.Value);
+      continue;
+    }
     LS.setVA(Last.Addr);
     if (Last.Flow == FlowKind::Call) {
       if (llvm::Error E = LS.liftInstr(Last)) {
