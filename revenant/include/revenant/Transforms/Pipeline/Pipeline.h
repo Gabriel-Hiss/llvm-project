@@ -51,7 +51,7 @@ inline constexpr llvm::StringLiteral CleanupPipeline =
 /// compacts further; `unrotate`/`untailrec` normalize loop structure.
 
 inline constexpr llvm::StringLiteral UnoptPipeline =
-    "revenant-devectorize,revenant-unloopvec,revenant-unloopvecwidths,revenant-reroll,"
+    "revenant-devectorize,revenant-unloopvec,revenant-reroll,"
     "revenant-unrotate,revenant-untailrec";
 
 /// The IR-level idiom stage, ported from `crates/idioms/src/lib.rs`
