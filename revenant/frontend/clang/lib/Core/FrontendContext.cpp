@@ -119,18 +119,25 @@ FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
     return D;
   clang::QualType FT = Types.functionType(F);
   // Normalize main/wmain signature for MSVC/clang-cl compatibility.
-  // Keep the lifted arity (argc/argv, plus envp when recovered): only the
-  // spellings are normalized, so the decl always matches the definition.
-  // The lifted IR may carry fewer arguments (e.g. argc-only `i32 @main(i32)`);
-  // buildFunction pads ParmVarDecls to the declared arity below.
+  // A hosted main (argc/argv, plus envp when recovered) keeps the hosted
+  // spelling, and the lifted arity: only the spellings are normalized, so
+  // the decl always matches the definition. A main that carries fewer
+  // arguments keeps its lifted types: the emitter declares one
+  // ParmVarDecl per IR argument, so a hosted spelling would add a
+  // parameter the definition lacks.
   if (F.getName() == "main" || F.getName() == "wmain") {
     clang::ASTContext &A = AST;
     clang::QualType IntTy = A.IntTy;
     clang::QualType CharPtrTy = A.getPointerType(A.CharTy);
     clang::QualType CharPtrPtrTy = A.getPointerType(CharPtrTy);
     llvm::SmallVector<clang::QualType, 4> Params;
-    for (size_t I = 0; I < F.arg_size(); ++I)
-      Params.push_back(I == 0 ? IntTy : CharPtrPtrTy);
+    if (F.arg_size() >= 2) {
+      for (size_t I = 0; I < F.arg_size(); ++I)
+        Params.push_back(I == 0 ? IntTy : CharPtrPtrTy);
+    } else {
+      for (llvm::Argument &Arg : F.args())
+        Params.push_back(Types.typeOf(Arg.getType(), nullptr));
+    }
     FT = A.getFunctionType(IntTy, Params, clang::FunctionProtoType::ExtProtoInfo());
   }
   auto *FD = clang::FunctionDecl::Create(
