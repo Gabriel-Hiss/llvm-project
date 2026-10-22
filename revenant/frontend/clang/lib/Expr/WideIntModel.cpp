@@ -471,8 +471,9 @@ clang::Expr *wideIntArithmetic(clang::ASTContext &A, clang::QualType ResTy,
                    /*ShiftCount=*/IsShift);
   // Constants and narrow operands conform to the declared parameter
   // types: the record for value operands, `unsigned` for shift counts
-  // (IsShift comes from the narrow-preserving block above).
-  LHS = conformWideOperand(A, ResTy, LHS);
+  // (IsShift comes from the narrow-preserving block above). AShr built its
+  // proto over the signed record, so the value operand conforms there.
+  LHS = conformWideOperand(A, IsArithmeticShift ? SignedTy : ResTy, LHS);
   RHS = conformWideOperand(A, IsShift ? A.UnsignedIntTy : ResTy, RHS);
   Expr *Call = wrapperCall(A, FD, LHS, RHS);
   // When the record is unsigned but AShr dispatched to the signed helper,
