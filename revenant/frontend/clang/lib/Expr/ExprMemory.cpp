@@ -281,6 +281,32 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
     }
   }
   if (CanCompound) {
+    // A step of one spells as `++`/`--`, and a negative step spells as the
+    // opposite compound assignment: `i + -2` is `i -= 2`.
+    if (DestType->isIntegerType())
+      if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(UpdateRHS)) {
+        const llvm::APInt &Amount = CI->getValue();
+        bool IsAdd = Update->getOpcode() == llvm::Instruction::Add;
+        bool IsSub = Update->getOpcode() == llvm::Instruction::Sub;
+        if ((IsAdd && Amount.isOne()) ||
+            (IsSub && Amount.isOne()) ||
+            (IsAdd && Amount.isAllOnes()) ||
+            (IsSub && Amount.isAllOnes())) {
+          bool Increment = (IsAdd && Amount.isOne()) ||
+                           (IsSub && Amount.isAllOnes());
+          return UnaryOperator::Create(
+              *AST, Dst, Increment ? UO_PreInc : UO_PreDec, DestType,
+              Ctx.isCPlusPlus() ? VK_LValue : VK_PRValue, OK_Ordinary,
+              SourceLocation(), false, FPOptionsOverride());
+        }
+        if (IsAdd && Amount.isNegative()) {
+          CompoundOp = BO_SubAssign;
+          UpdateRHS = llvm::ConstantInt::get(UpdateRHS->getType(), -Amount);
+        } else if (IsSub && Amount.isNegative()) {
+          CompoundOp = BO_AddAssign;
+          UpdateRHS = llvm::ConstantInt::get(UpdateRHS->getType(), -Amount);
+        }
+      }
     Expr *RHS = value(UpdateRHS, Scope);
     return clang::CompoundAssignOperator::Create(
         *AST, Dst, RHS, CompoundOp, DestType, VK_PRValue, OK_Ordinary,
