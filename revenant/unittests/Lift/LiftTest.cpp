@@ -16,6 +16,7 @@
 #include "revenant/Lift/LiftFunction.h"
 #include "revenant/Object/PeFile.h"
 #include "revenant/Target/TargetHooks.h"
+#include "X86MCTargetDesc.h"
 
 #include "gtest/gtest.h"
 
@@ -514,6 +515,52 @@ TEST(LiftFunction, CondBranchToTailCallKeepsBothArms) {
               llvm::isa<llvm::ReturnInst>(
                   Tail->getParent()->getTerminator()))
       << "tail-call arm must return, not fall through";
+}
+
+
+TEST(LiftFunction, RecursiveLeafPreservesSiblingRegs) {
+  // c-gcc-o2 main calls fib (0x140001af0, directly recursive) then call_ptr
+  // (0x140001b40). gcc passes edx=9/r8d=4 through fib, which never writes
+  // them. The clobber scan must tolerate the self-call instead of
+  // undefining every volatile register, or call_ptr loses two arguments.
+  auto Fx = open(REVENANT_TEST_C_GCC_O2);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Va Start(0x140003b00);
+  auto It = P.Functions.find(Start);
+  ASSERT_NE(It, P.Functions.end()) << "main 0x140003b00 not recovered";
+
+  llvm::LLVMContext C;
+  llvm::Module M("recursive_clobber", C);
+  // call_ptr's production signature (3x i32, i64 return): with null Sigs
+  // the decl comes back zero-param and coerceArgs truncates every argument
+  // away, which would make the loop below vacuous.
+  lift::Signatures Sigs;
+  lift::Signature B40;
+  B40.Params = {{lift::ParamLoc::reg(llvm::X86::RCX), 32, false, std::nullopt},
+                {lift::ParamLoc::reg(llvm::X86::RDX), 32, false, std::nullopt},
+                {lift::ParamLoc::reg(llvm::X86::R8), 32, false, std::nullopt}};
+  B40.Ret = lift::RetLoc{false, 64};
+  Sigs.Funcs.emplace(Va(0x140001b40), B40);
+  // Cleanup (mem2reg) must run: without it clobbered registers read back
+  // as loads of undef stores, and the undef below is invisible.
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                   nullptr, /*RunPasses=*/true);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+
+  const llvm::Function *CallPtr = M.getFunction("sub_140001B40");
+  ASSERT_NE(CallPtr, nullptr) << "no call_ptr declaration";
+  bool FoundCall = false;
+  for (const llvm::User *U : CallPtr->users())
+    if (const auto *CI = llvm::dyn_cast<llvm::CallInst>(U)) {
+      FoundCall = true;
+      for (const llvm::Value *A : CI->args())
+        EXPECT_FALSE(llvm::isa<llvm::UndefValue>(A))
+            << "call_ptr lost a live-through-fib register argument";
+    }
+  EXPECT_TRUE(FoundCall) << "no call_ptr call in main";
 }
 
 } // end anonymous namespace
