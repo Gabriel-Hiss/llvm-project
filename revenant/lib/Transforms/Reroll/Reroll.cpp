@@ -2069,48 +2069,6 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
         }
         if (!WinDelta)
           break;
-        // Re-derive every lane's stride against the window's own delta:
-        // window w must sit exactly w strides past window 0. `WSets` holds
-        // windows 0..K-1 here and `WJ` is the candidate at index K, so the
-        // bounds are 1..K inclusive.
-        for (size_t w = 1; w <= K && ScanOK; ++w) {
-          auto &WW = (w == K) ? WJ : WSets[w];
-          auto &W0 = WSets[0];
-          for (size_t p = 0; p < M && ScanOK; ++p) {
-            Instruction *A = W0[p], *C = WW[p];
-            if (A->getNumOperands() != C->getNumOperands()) {
-              ScanOK = false;
-              break;
-            }
-            for (unsigned o = 0; o < A->getNumOperands(); ++o) {
-              Value *VA = A->getOperand(o), *VC = C->getOperand(o);
-              if (VA == VC)
-                continue;
-              auto *IA = dyn_cast<ConstantInt>(VA);
-              auto *IC = dyn_cast<ConstantInt>(VC);
-              if (!IA || !IC)
-                continue;
-              auto Difference = constantDifference(IA, IC);
-              if (!Difference) {
-                ScanOK = false;
-                break;
-              }
-              int64_t D = *Difference;
-              if (D == 0)
-                continue;
-              // A lane that is not exactly w strides out (a truncated
-              // offset such as 7 with a stride of 3) would make the
-              // synthesized loop visit elements the original never
-              // touched.
-              if (D != (int64_t)w * *WinDelta) {
-                ScanOK = false;
-                break;
-              }
-            }
-          }
-        }
-        if (!ScanOK)
-          break;
         if (!Delta)
           Delta = WinDelta;
         else if (*Delta != *WinDelta)
@@ -2132,40 +2090,6 @@ unsigned trySynthesize(Function &F, BasicBlock &B,
         continue; // independent windows: vector work, not a loop
       if (!Delta)
         continue;
-      // Exactness, second layer: re-derive every accepted lane's offset
-      // from window 0 and require D_w == w * Delta for all w. The scan
-      // compares each window against window 0 with division; this check
-      // closes any truncated or periodic-multiple lane that slipped
-      // through, at every K, with or without evidence.
-      {
-        bool Exact = true;
-        auto &W0 = WSets[0];
-        llvm::APInt WDelta(65, (uint64_t)*Delta, true);
-        for (size_t w = 1; w < WSets.size() && Exact; ++w) {
-          auto &WJ = WSets[w];
-          llvm::APInt Want = llvm::APInt(65, (uint64_t)w) * WDelta;
-          for (size_t p = 0; p < W0.size() && Exact; ++p) {
-            Instruction *A = W0[p], *C = WJ[p];
-            for (unsigned o = 0; o < A->getNumOperands() && Exact; ++o) {
-              auto *IA = dyn_cast<ConstantInt>(A->getOperand(o));
-              auto *IC = dyn_cast<ConstantInt>(C->getOperand(o));
-              if (!IA || !IC)
-                continue;
-              auto Diff = constantDifference(IA, IC);
-              if (!Diff)
-                Exact = false;
-              else if (*Diff != 0) {
-                llvm::APInt Got = IC->getValue().sextOrTrunc(65) -
-                                  IA->getValue().sextOrTrunc(65);
-                if (Got != Want)
-                  Exact = false;
-              }
-            }
-          }
-        }
-        if (!Exact)
-          continue;
-      }
       // An earlier window's value read outside the run blocks synthesis
       // (no single loop value exists for it).
       size_t RunEnd = Start + K * M;
