@@ -118,21 +118,11 @@ conservative bail-outs: ymm/zmm upper lanes, cross-lane ops, unrecognized
 vector phis, i128 arithmetic webs, and shared copy webs stay vector.
 
 **revenant-reroll (owner: MuseTxReroll).** Expects scalarized loops.
-Folds partial unrolls when the exit lattice and minimum trip count are proven.
-Synthesizes loops for full straight-line unrolls, including strength-reduced
-affine lanes with uniform address strides and instruction-address evidence.
-Ambiguous copies and unproved short-trip loops stay put.
-
-The full pass also rerolls a constant-fill run of four or more contiguous,
-same-value stores through one base into a counted store loop. It requires
-matching widths and alignment, no intervening operations, and monotonic
-`!revenant.va` anchors; the loop preserves the original store width.
-
-The full pass can also rebuild a scalar integer reduction that rustc fully
-unrolled into one basic block: contiguous indexed loads, a single-use add tree
-that consumes every load exactly once, and monotonic `!revenant.va` evidence
-are required. The loop visits all indices in order and preserves wrapping-add
-semantics; other operations or shapes veto the rewrite.
+Folds unrolled iteration copies back into one induction-variable step
+(partial: keep one copy, divide step) only when the exit lattice is preserved
+and a latch-tested loop is proven to execute at least the fold factor.
+Synthesizes loops for fully-unrolled straight-line runs (full). Ambiguous
+copies and unproved short-trip loops stay put.
 
 **revenant-unrotate (owner: MuseTxUnrotate).** Expects rerolled loops.
 Rewrites `if (c) { do { body } while (c); }` to while shape when guard and

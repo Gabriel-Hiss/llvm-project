@@ -39,7 +39,6 @@
 
 #include "revenant/Transforms/Reroll/Reroll.h"
 #include "revenant/Evidence/Evidence.h"
-#include "revenant/Transforms/Reroll/RerollFull.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -2340,23 +2339,10 @@ PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
   // don't miss headers that tryFoldLoop would consume.
   if (unrollAccumFold(F, Notes))
     Changed = true;
-  // Full/partial straight-line re-rolling (RerollFull.cpp) runs before the
-  // constant-shift synth: affine-value windows subsume no existing shape,
-  // and trying them first keeps the cheaper structural synth as fallback.
   SmallVector<BasicBlock *, 16> Blocks;
   for (BasicBlock &B : F)
     Blocks.push_back(&B);
   for (BasicBlock *B : Blocks)
-    if (tryRerollFull(F, *B, Notes))
-      Changed = true;
-  // Chained-region full unrolls (Rust vec_ops family) run after the
-  // straight-line lanes: multi-block CFG shape, disjoint matcher.
-  if (tryRerollRegions(F, Notes))
-    Changed = true;
-  SmallVector<BasicBlock *, 16> SynthBlocks;
-  for (BasicBlock &B : F)
-    SynthBlocks.push_back(&B);
-  for (BasicBlock *B : SynthBlocks)
     if (trySynthesize(F, *B, Notes))
       Changed = true;
 

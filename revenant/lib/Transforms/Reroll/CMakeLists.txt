@@ -28,7 +28,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
 endif()
 
-set(REROLL_SOURCES Reroll.cpp UnrollAccum.cpp RerollFull.cpp)
+set(REROLL_SOURCES Reroll.cpp UnrollAccum.cpp)
 
 if(COMMAND add_llvm_library)
   add_llvm_library(RevenantTransformReroll STATIC ${REROLL_SOURCES}
