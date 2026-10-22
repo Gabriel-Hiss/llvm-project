@@ -898,6 +898,10 @@ TEST_F(ExprTest, DirectCallCastsToDeclParams) {
   // IR call-site types are often opaque (i8*); the callee declaration
   // carries recovered struct* params. Args must cast to the declaration
   // (C++ rejects implicit void* -> struct*).
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
   llvm::FunctionType *FT = FunctionType::get(
       Type::getInt32Ty(LLCtx), {Type::getInt8Ty(LLCtx)->getPointerTo()}, false);
   llvm::Function *Callee =
