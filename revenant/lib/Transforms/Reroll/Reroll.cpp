@@ -2335,10 +2335,6 @@ PreservedAnalyses RerollPass::run(Function &F, FunctionAnalysisManager &) {
     if (!RoundChanged)
       break;
   }
-  // Multi-accumulator fold: try before single-accumulator rounds so we
-  // don't miss headers that tryFoldLoop would consume.
-  if (unrollAccumFold(F, Notes))
-    Changed = true;
   SmallVector<BasicBlock *, 16> Blocks;
   for (BasicBlock &B : F)
     Blocks.push_back(&B);
