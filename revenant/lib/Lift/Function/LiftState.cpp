@@ -847,69 +847,17 @@ Value *LiftState::globalPtr(Va Addr) {
     return It->second;
   std::string Name = globalNameFor(P, Addr);
   std::optional<std::vector<uint8_t>> Init;
-  // True when Init came straight from the image (readAtMost), i.e. the bytes
-  // are the program's data, not an analyzer-recognized string.
-  bool FromImage = false;
-  // True for a data reference to a function start: the object is the
-  // function's address, so it stays an extern the harness resolves.
-  bool FuncRef = false;
-  if (P.Functions.count(Addr)) {
-    // Keep the extern spelling here: a data reference to a function start
-    // is the function's address, which the semantic harness resolves by
-    // deleting these declarations and aliasing the uses to the function.
-    // Defining a byte array under the same name collides with the function
-    // after that rename.
-    FuncRef = true;
-  }
   if (P.Strings) {
     if (auto It = P.Strings->find(Addr); It != P.Strings->end())
       Init = std::vector<uint8_t>(It->second.begin(), It->second.end());
   }
   if (!Init && !P.Functions.count(Addr))
     Init = P.Img->readAtMost(Addr, 4096);
-  // The initializer came from the image unless the analyzer recognized a
-  // string: those keep the IR contract's constant shape.
-  if (!P.Strings || !P.Strings->count(Addr))
-    FromImage = true;
-  // The Globals cache is per-function, so a whole-module run lifts the same
-  // address once per referencing function and LLVM renames the extras to
-  // `<name>.N`. One image VA is one object: reuse the global an earlier lift
-  // already materialized. Separate copies break aliasing (a store through
-  // one copy is invisible to the loads through the others), duplicate the
-  // initializer once per user, and reprint as extern declarations nothing
-  // defines. The name lookup is the fast path; the scan catches an object
-  // another lift spelled differently.
-  if (auto *ByName = llvm::dyn_cast_or_null<llvm::GlobalVariable>(
-          Mod.getNamedValue(Name)))
-    if (auto ByNameVa = ir::getGlobalVA(*ByName))
-      if (*ByNameVa == Addr.Value) {
-        Globals[Addr] = ByName;
-        return ByName;
-      }
-  for (llvm::GlobalVariable &GV : Mod.globals())
-    if (ir::getGlobalVA(GV) == Addr.Value) {
-      Globals[Addr] = &GV;
-      return &GV;
-    }
-  // No file-backed bytes on a plain data address (pure .bss): the object
-  // still starts zero-filled, so define it rather than emit an extern
-  // nothing can resolve.
-  bool Bss = !Init.has_value() && !FuncRef;
-  if (Bss)
-    Init = std::vector<uint8_t>(16, 0);
-  // Writable image data (the security cookie, mutable tables) carries the
-  // file's bytes as its initializer but must not be `constant`: the program
-  // stores to it, and a constant global makes those stores undefined. The
-  // exception is scoped to image-read initializers so analyzer-recognized
-  // string globals keep the IR contract's constant shape. A .bss object is
-  // uninitialized data, so it is writable by definition (and sectionOf does
-  // not map it, so isWritable cannot answer for it).
-  bool Writable = Bss || (FromImage && P.Img && P.Img->isWritable(Addr));
   unsigned Sz = Init ? (unsigned)Init->size() : 16;
   if (Sz == 0)
     Sz = 16;
   auto *G = new GlobalVariable(
-      Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/Init && !Writable,
+      Mod, ArrayType::get(iN(8), Sz), /*isConstant=*/!!Init,
       Init ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage,
       nullptr, Name);
   if (Init) {
@@ -1248,13 +1196,6 @@ void LiftState::clobberCallee(llvm::Function *Callee, std::optional<Va> Target) 
       break;
     }
     const MCInstrDesc &Desc = MC.MII->get(DI->Inst.getOpcode());
-    // A direct recursive call adds no writes beyond this same body scan
-    // (whatever the recursion disturbs is collected here), so it is
-    // skipped instead of bailing to the conservative set. This keeps
-    // caller registers that a recursive leaf preserves (c-gcc-o2 fib
-    // preserves edx across its self-call).
-    if (Desc.isCall() && DI->HasTarget && DI->Target == Rec->Start)
-      continue;
     // A nested call, an indirect jump, a trap, or a direct jump whose target
     // is another function (a tail call) can transfer to code outside this
     // record, whose register effects are unknown: stay conservative.
