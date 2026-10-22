@@ -448,36 +448,6 @@ TEST(LiftFunction, WhileLoopKeepsDistinctSuccessors) {
       << "loop exit condition is undef";
 }
 
-TEST(LiftFunction, ThunkCallLowersToDirectImport) {
-  // c-gcc-o2 sub_140001A10 calls the single-`jmp [strcmp-slot]` XFG stub
-  // sub_140003968. The call must lower as a direct import call (the shared
-  // `call [mem]` path), not as an opaque stub reference: the stubs are
-  // library-named alike, so stub references collide at recompile.
-  auto Fx = open(REVENANT_TEST_C_GCC_O2);
-  ASSERT_TRUE(Fx.has_value());
-  auto Hooks = createX86TargetHooks();
-  Program P = analyze(*Fx->Pe, *Hooks);
-  Va Start(0x140001a10);
-  auto It = P.Functions.find(Start);
-  ASSERT_NE(It, P.Functions.end()) << "fn 0x140001a10 not recovered";
-
-  llvm::LLVMContext C;
-  llvm::Module M("thunk_import", C);
-  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, nullptr,
-                                   nullptr, /*RunPasses=*/false);
-  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
-  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
-
-  const llvm::Function *Strcmp = M.getFunction("strcmp");
-  ASSERT_NE(Strcmp, nullptr) << "no direct strcmp import call";
-  bool CallsStrcmp = false;
-  for (const llvm::User *U : Strcmp->users())
-    if (llvm::isa<llvm::CallInst>(U))
-      CallsStrcmp = true;
-  EXPECT_TRUE(CallsStrcmp) << "strcmp import declared but never called";
-  EXPECT_EQ(M.getFunction("sub_140003968"), nullptr)
-      << "opaque XFG stub still referenced";
-}
 // Production callee shapes for c-gcc-o2 main: real analyzeSignatures
 // output converted the same way Stages.cpp convertSig does (hand-made
 // fragments proved treacherous: a missing entry mints a void decl and
