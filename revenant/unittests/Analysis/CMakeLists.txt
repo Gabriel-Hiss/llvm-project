@@ -35,7 +35,7 @@ target_link_libraries(RevenantClassifyTests PRIVATE
 
 target_compile_definitions(RevenantClassifyTests PRIVATE
   REVENANT_TEST_C_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-o2/c-o2.exe"
-  REVENANT_TEST_CPP_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-o2/cpp-o2.exe")
+  REVENANT_TEST_CPP_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/cpp-o2/cpp-o2.exe"
   REVENANT_TEST_C_GCC_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/c-gcc-o2/c-gcc-o2.exe"
   REVENANT_TEST_JSON_CL_O2="C:/Users/User/RustroverProjects/Revenant/target/parity/json-cl-o2/json-cl-o2.exe")
 target_compile_definitions(RevenantAnalysisTests PRIVATE
