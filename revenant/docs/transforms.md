@@ -87,6 +87,10 @@ Signed three-way compare flag chains become source-level comparisons/selects.
 Source-level Kernighan popcount, rotate and byte-swap operations remain
 arithmetic/loop IR; source builtin intrinsics such as llvm.bswap pass through.
 Bit tests retain direct `and`/`icmp`. Ambiguous arithmetic remains intact.
+The interrupt marker a compiler leaves behind a noreturn call (`int3` after
+a throw, `__fastfail` after a panic) is not part of the source: an
+`llvm.x86.int` call that ends a dead block is dropped, an interrupt inside a
+live block stays.
 AST-level idioms (rust-panic-check, loop-rotation, mem-loop, minmax) run after
 structuring, outside this LLVM pipeline.
 
@@ -193,7 +197,13 @@ ignores annotations still emits correct code with labels and `goto`.
 function signatures, snapshotting the function list first so erasure is safe.
 Runs explicitly via `-passes=revenant-unabi`, not in the default pipeline.
 Guarantees `!revenant.va` preserved, `!revenant.opaque` never dropped, LLVM
-22 parseable output.
+22 parseable output. The pass reads the source-level signature from the
+`"revenant.sig"` function attribute (`"<param> ... => <ret>"`, with `p` for a
+pointer, `f32`/`f64` for a float, `rN` for an integer of N bits and `v` for a
+void return). The lifter publishes that attribute: the recovered signature is
+the only place the source shape of a function is known, and the lifter is the
+only stage that holds it. The attribute is inert until the pass is wired into
+a pipeline.
 
 **revenant-unloopvec (owner: MuseDeoptVecLoops).** Expects devectorize output
 (or raw vectorizer skeletons). Collapses vector body + scalar remainder +
