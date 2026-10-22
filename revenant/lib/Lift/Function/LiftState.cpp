@@ -1196,13 +1196,6 @@ void LiftState::clobberCallee(llvm::Function *Callee, std::optional<Va> Target) 
       break;
     }
     const MCInstrDesc &Desc = MC.MII->get(DI->Inst.getOpcode());
-    // A direct recursive call adds no writes beyond this same body scan
-    // (whatever the recursion disturbs is collected here), so it is
-    // skipped instead of bailing to the conservative set. This keeps
-    // caller registers that a recursive leaf preserves (c-gcc-o2 fib
-    // preserves edx across its self-call).
-    if (Desc.isCall() && DI->HasTarget && DI->Target == Rec->Start)
-      continue;
     // A nested call, an indirect jump, a trap, or a direct jump whose target
     // is another function (a tail call) can transfer to code outside this
     // record, whose register effects are unknown: stay conservative.

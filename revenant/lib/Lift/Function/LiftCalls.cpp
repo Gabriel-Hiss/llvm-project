@@ -81,30 +81,6 @@ static bool isGuardDispatch(const LiftState &LS, const Instr &I,
   std::optional<Va> H = cfgHandler(LS, LS.P.GuardCFDispatchPtr);
   return Target && H && *Target == *H;
 }
-/// IAT slot behind a single-`jmp [slot]` thunk: Target must name a function
-/// of exactly one instruction, an indirect jump through a known import slot
-/// (MinGW `_guard_xfg_dispatch_icall_nop` stubs). Multi-instruction bodies
-/// may carry side effects, so only the single-jump shape resolves. Guard
-/// slots are excluded: those lower through the rax-tailcall/nop paths above.
-static std::optional<Va> thunkImportSlot(const LiftState &LS, Va Target) {
-  if (!LS.P.Externs || !LS.P.Img)
-    return std::nullopt;
-  auto FR = LS.P.Functions.find(Target);
-  if (FR == LS.P.Functions.end() || FR->second.InstrRvas.size() != 1)
-    return std::nullopt;
-  auto DI = LS.D.decodeOne(LS.P.Img->vaOfRva(FR->second.InstrRvas.front()));
-  if (!DI)
-    return std::nullopt;
-  if (DI->Flow != FlowKind::IndirectBranch || !DI->HasMemTarget)
-    return std::nullopt;
-  if ((LS.P.GuardCFCheckPtr && DI->MemTarget == *LS.P.GuardCFCheckPtr) ||
-      (LS.P.GuardCFDispatchPtr && DI->MemTarget == *LS.P.GuardCFDispatchPtr))
-    return std::nullopt;
-  if (LS.P.Externs->find(DI->MemTarget) == LS.P.Externs->end())
-    return std::nullopt;
-  return DI->MemTarget;
-}
-
 
 /// `ret` shaped to the caller's recovered signature. `_guard_check_icall`
 /// is a nop here: `call [check]` is dropped outright and `jmp [check]`
@@ -304,17 +280,9 @@ void LiftState::emitCall(const Instr &I) {
     // `call _guard_check_icall_nop` (a ret): same as `call [check]`, drop.
     return;
   }
-  // Import through `call qword [rip+slot]`: MemTarget is the IAT slot. A
-  // call to a single-`jmp [slot]` thunk (MinGW XFG dispatch stub) carries
-  // the same slot behind one indirection: lower it identically so callers
-  // reference the import instead of an opaque stub.
-  std::optional<Va> Slot;
-  if (I.HasMemTarget)
-    Slot = I.MemTarget;
-  else if (I.HasTarget)
-    Slot = thunkImportSlot(*this, I.Target);
-  if (Slot && P.Externs) {
-    if (auto It = P.Externs->find(*Slot); It != P.Externs->end()) {
+  // Import through `call qword [rip+slot]`: MemTarget is the IAT slot.
+  if (I.HasMemTarget && P.Externs) {
+    if (auto It = P.Externs->find(I.MemTarget); It != P.Externs->end()) {
       const Extern &E = It->second;
       std::string Sym = E.Name;
       if (auto Bang = Sym.find('!'); Bang != std::string::npos)
@@ -324,7 +292,7 @@ void LiftState::emitCall(const Instr &I) {
       const Signature *Sig = nullptr;
       Signature Default;
       if (Sigs) {
-        if (auto S2 = Sigs->Externs.find(*Slot);
+        if (auto S2 = Sigs->Externs.find(I.MemTarget);
             S2 != Sigs->Externs.end())
           Sig = &S2->second;
       }
@@ -337,7 +305,7 @@ void LiftState::emitCall(const Instr &I) {
       llvm::Function *Callee = calleeByName(Sym, Sig);
       // Imports carry the IAT slot VA per the contract.
       Callee->addFnAttr(ir::FnAttrVA,
-                         llvm::formatv("0x{0:x}", Slot->Value).str());
+                         llvm::formatv("0x{0:x}", I.MemTarget.Value).str());
       std::vector<llvm::Value *> Args = callArgs(Sig, std::nullopt);
       coerceArgs(Callee, Args);
       llvm::CallInst *Call =
