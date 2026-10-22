@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Lifted select chain: a range pre-check in the head branches to a chain
 ; block holding the `icmp eq; select` pairs, which falls into the join.
 ; Corpus: c-clang-o2 @switch_sparse (sub_1400012A0) — the compiler's

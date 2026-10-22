@@ -1,4 +1,4 @@
-; RUN: opt -load-pass-plugin=%shlibdir/RevenantTransformUnswitch.dll -passes=revenant-unswitch -S %s | FileCheck %s
+; RUN: %revenant-opt -passes=revenant-unswitch -S %s | %FileCheck %s
 ; Lifted lookup table: the compiler's switch table survives as a constant
 ; byte array global (g_*) addressed with a typed GEP, guarded by a `ugt`
 ; range check. Corpus: c-clang-o2 @switch_twolevel (sub_140001270),

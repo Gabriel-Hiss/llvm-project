@@ -1,8 +1,8 @@
 ; Two independent i32 reduction accumulators with separate reduces and an
-; outer scalar add must NOT merge: giving both reduces the same merged
-; chain would double the total (sum(a)+sum(b) -> 2*sum(a+b)). The loop
-; stays fully vector. Found by LunaReviewDeopt (miscompile: 110 -> 220).
-; RUN: %opt -load-pass-plugin=%plugin -passes=revenant-devectorize -S %s | %FileCheck %s
+; outer scalar add must retain separate scalar chains. A shared chain would
+; double the total (sum(a)+sum(b) -> 2*sum(a+b)).
+; Found by LunaReviewDeopt (miscompile: 110 -> 220).
+; RUN: %revenant-opt -passes=revenant-devectorize -S %s | %FileCheck %s
 
 declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
 
@@ -31,9 +31,9 @@ exit:
   ret i32 %sum
 }
 
-; CHECK: %acc.a = phi <4 x i32>
-; CHECK: %acc.b = phi <4 x i32>
-; CHECK: %red.a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %next.a)
-; CHECK: %red.b = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %next.b)
-; CHECK: %sum = add i32 %red.a, %red.b
-; CHECK-NOT: s.unopt
+; CHECK-LABEL: define i32 @sum2(
+; CHECK: %[[B:s\.unopt[0-9]*]] = phi i32 [ 0, %entry ], [ %[[BN:s\.unopt\.n[0-9]+]], %loop ]
+; CHECK: %[[A:s\.unopt[0-9]*]] = phi i32 [ 0, %entry ], [ %[[AN:s\.unopt\.n[0-9]+]], %loop ]
+; CHECK: %[[AN]] = add i32
+; CHECK: %[[BN]] = add i32
+; CHECK: %sum = add i32 %[[AN]], %[[BN]]
