@@ -574,7 +574,10 @@ TEST_F(ExprTest, DirectCallByName) {
       clang::SC_Extern);
   FCtx->bindDecl(Callee, FD);
   llvm::Value *C = B.CreateCall(FT, Callee, {H.A}, "c");
-  clang::Expr *E = Exprs->value(C, Scope);
+  // The result is read, so this is a value use and not a dead call.
+  llvm::Value *Masked =
+      B.CreateAnd(C, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0xFF00));
+  clang::Expr *E = Exprs->value(Masked, Scope);
   std::string S = print(E);
   // Imports (declaration-only callees) are read through the call's own
   // function type: a system header or a recovered signature can shadow the
@@ -607,17 +610,19 @@ TEST_F(ExprTest, ValueCallToVoidImportReadsThroughCast) {
       ACtx->getTrivialTypeSourceInfo(FQT), clang::SC_Extern);
   FCtx->bindDecl(Callee, FD);
   llvm::Value *C = B.CreateCall(FT, Callee, {}, "c");
+  // The call's value keeps the IR type: a mask over it is well-formed.
+  // The mask comes first: a call whose result nobody reads is a dead
+  // call, and a dead import call keeps the plain spelling.
+  llvm::Value *Masked = B.CreateAnd(C, llvm::ConstantInt::get(
+                                           Type::getInt64Ty(LLCtx), 0xFF00));
   clang::Expr *E = Exprs->value(C, Scope);
   std::string S = print(E);
   EXPECT_TRUE(S.find("((long long (*)(void))_invalid_parameter_noinfo)()") !=
               std::string::npos)
       << S;
-  // The call's value keeps the IR type: a mask over it is well-formed.
-  llvm::Value *Masked = B.CreateAnd(C, llvm::ConstantInt::get(
-                                           Type::getInt64Ty(LLCtx), 0xFF00));
   clang::Expr *E2 = Exprs->value(Masked, Scope);
   std::string S2 = print(E2);
-  EXPECT_TRUE(S2.find("& 0xFF00") != std::string::npos) << S2;
+  EXPECT_TRUE(S2.find("& 65280LL") != std::string::npos) << S2;
 }
 
 TEST_F(ExprTest, VoidImportCallStatementNeedsNoCast) {
@@ -638,14 +643,15 @@ TEST_F(ExprTest, VoidImportCallStatementNeedsNoCast) {
       clang::SourceLocation(), Id, FQT,
       ACtx->getTrivialTypeSourceInfo(FQT), clang::SC_Extern);
   FCtx->bindDecl(Callee, FD);
-  llvm::Value *C = B.CreateCall(FT, Callee, {}, "c");
-  clang::Stmt *S = Exprs->buildCallStmt(*llvm::cast<llvm::CallInst>(C), Scope);
+  // A void call carries no result, so it gets no name.
+  llvm::Value *C = B.CreateCall(FT, Callee, {});
+  clang::Stmt *S = Exprs->instr(*llvm::cast<llvm::CallInst>(C), Scope);
   clang::PrintingPolicy Policy(LangOpts);
   llvm::SmallString<128> Buf;
   llvm::raw_svector_ostream OS(Buf);
   S->printPretty(OS, nullptr, Policy);
   std::string Text = std::string(OS.str());
-  EXPECT_TRUE(Text.find("import_noreturn();") != std::string::npos) << Text;
+  EXPECT_TRUE(Text.find("import_noreturn()") != std::string::npos) << Text;
   EXPECT_TRUE(Text.find("(*)(void)") == std::string::npos) << Text;
 }
 
