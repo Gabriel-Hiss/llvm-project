@@ -12,6 +12,6 @@
 ; C: char g_140004108[56] = "\364@\000@\001\000\000\000
 ; C: char ahello_20world[11] = "hello world";
 
-; CPP: unsigned char aorigin[6] = {111Ui8, 114Ui8, 105Ui8, 103Ui8, 105Ui8, 110Ui8};
+; CPP: unsigned char aorigin[6] = {111, 114, 105, 103, 105, 110};
 ; CPP: char g_140004108[56] = "\364@\000@\001\000\000\000
-; CPP: unsigned char ahello_20world[11] = {104Ui8, 101Ui8, 108Ui8, 108Ui8, 111Ui8,
+; CPP: unsigned char ahello_20world[11] = {104, 101, 108, 108, 111,
