@@ -207,7 +207,8 @@ static std::vector<uint64_t> runNative(llvm::ArrayRef<uint8_t> Code) {
 }
 
 static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
-                      std::string &Err, bool Execute = true) {
+                      std::string &Err, bool Execute = true,
+                      bool CheckOpaque = false) {
   auto Img = std::make_shared<Image>();
   Img->Base = Va(0x140000000);
   Section Sec;
@@ -247,8 +248,18 @@ static bool runLifted(llvm::ArrayRef<uint8_t> Code, std::vector<uint64_t> &Out,
     return false;
   }
   std::string Name = Lifted->Fn->getName().str();
-  if (!Execute)
+  if (!Execute) {
+    // Lift-only case: the instruction must have real semantics, not an
+    // opaque `revenant.asm.*` stub (the stub is a declaration nobody
+    // calls only when the lift never reached the instruction).
+    if (CheckOpaque)
+      for (llvm::Function &Fn : *M)
+        if (Fn.getName().starts_with("revenant.asm.") && !Fn.use_empty()) {
+          Err = "lifted to an opaque stub: " + Fn.getName().str();
+          return false;
+        }
     return true;
+  }
   // COFF constant-pool symbols (__ymm@...) do not link in the JIT, so compile
   // the lifted module as ELF for the host CPU. One JIT serves every case,
   // each in its own dylib, because a JIT per case exhausts the host.
@@ -316,7 +327,8 @@ TEST(LiftSemantics, MatchesNativeExecution) {
     // A case the host CPU cannot run still has to lift: assemble it and run
     // the lifter so a wrong lowering fails to lift. Only the execution and
     // the native-vs-lifted comparison are skipped.
-    bool RunNative = !C.Requires || HostFeatures.lookup(C.Requires);
+    bool RunNative = !C.LiftOnly &&
+                     (!C.Requires || HostFeatures.lookup(C.Requires));
     if (!RunNative) {
       ++Skipped;
       if (Verbose)
@@ -332,7 +344,8 @@ TEST(LiftSemantics, MatchesNativeExecution) {
         continue;
       }
       std::vector<uint64_t> Got;
-      if (!runLifted(Code, Got, Err, /*Execute=*/false)) {
+      if (!runLifted(Code, Got, Err, /*Execute=*/false,
+                     /*CheckOpaque=*/C.LiftOnly)) {
         ADD_FAILURE() << C.Name << ": lift: " << Err;
         ++Failures;
       }

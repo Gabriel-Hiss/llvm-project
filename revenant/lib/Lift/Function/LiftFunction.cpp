@@ -183,6 +183,12 @@ static std::pair<CmpOperand, int64_t> switchLoc(const FuncRecord &F,
   return {Loc, Off};
 }
 
+/// True for the trap instructions (ud0/ud1/ud2, the `TRAP` opcode): they
+/// never return, so the block they sit in ends with `unreachable`.
+static bool isTrapInsn(const Instr &I) {
+  return I.Inst.getOpcode() == llvm::X86::TRAP;
+}
+
 static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
                                   const BlockRec &BR, const Instr &I,
                                   const Image &Img) {
@@ -682,14 +688,37 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
       (void)SOff;
       SwitchEntry = LS.evalCmpOperand(SLoc, Start);
     }
+    // Set when a trap instruction ended the block before its last
+    // instruction; the rest of the block is dead code.
+    bool Trapped = false;
     for (size_t N = BR.InstrsBegin; N + 1 < BR.InstrsEnd; ++N) {
       const Instr &I = Instrs[N];
+      // ud2 (and its ud0/ud1 siblings) never returns. Lifting it as an
+      // opaque `revenant.asm.ud2` call would make every instruction after
+      // it depend on a clobbered register, and the cleanup pass then drops
+      // the rest of the function. The trap ends the block instead, and the
+      // dead code behind it is not lifted at all.
+      if (isTrapInsn(I)) {
+        LS.setVA(I.Addr);
+        auto *UI = LS.B.CreateUnreachable();
+        attachVa(UI, I.Addr.Value);
+        Trapped = true;
+        break;
+      }
       if (llvm::Error E = LS.liftInstr(I)) {
         Fn->deleteBody();
         return std::move(E);
       }
     }
+    if (Trapped)
+      continue;
     const Instr &Last = Instrs[BR.InstrsEnd - 1];
+    if (isTrapInsn(Last)) {
+      LS.setVA(Last.Addr);
+      auto *UI = LS.B.CreateUnreachable();
+      attachVa(UI, Last.Addr.Value);
+      continue;
+    }
     LS.setVA(Last.Addr);
     if (Last.Flow == FlowKind::Call) {
       if (llvm::Error E = LS.liftInstr(Last)) {

@@ -821,6 +821,97 @@ std::vector<Case> cases() {
           .ymm(0, 1, 2, 4, 8)
           .ymm(1, 1, 0, 4, 0)
           .flags(AllFlags));
+
+  // Scalar float broadcast from memory: one cell replicated to every lane.
+  // The register forms come out of the inverted ISel pattern; the memory
+  // forms are spelled out in Avx.td.
+  add(Case("avx vbroadcastss xmm memory",
+           "vbroadcastss xmm0, dword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x3f800000ULL})
+          .xmm(0, 0, 0));
+  add(Case("avx vbroadcastss ymm memory",
+           "vbroadcastss ymm0, dword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x3f800000ULL})
+          .ymm(0, 0, 0, 0, 0));
+  add(Case("avx2 vbroadcastsd ymm memory",
+           "vbroadcastsd ymm0, qword ptr [rsp+0x20]")
+          .needs("avx2")
+          .stack({0x3ff0000000000000ULL})
+          .ymm(0, 0, 0, 0, 0));
+
+  // AVX2 64-bit masked moves (vpmaskmovq).
+  add(Case("avx2 vpmaskmovq xmm load",
+           "vpmaskmovq xmm0, xmm1, xmmword ptr [rsp+0x20]")
+          .needs("avx2")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL})
+          .xmm(1, 0x0000000080000000ULL, 0x0000000080000000ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx2 vpmaskmovq xmm store",
+           "vpmaskmovq xmmword ptr [rsp+0x20], xmm1, xmm2")
+          .needs("avx2")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .xmm(1, 0x0000000080000000ULL, 0x0000000080000000ULL)
+          .xmm(2, 0x2222222211111111ULL, 0x4444444433333333ULL));
+  add(Case("avx2 vpmaskmovq ymm load",
+           "vpmaskmovq ymm0, ymm1, ymmword ptr [rsp+0x20]")
+          .needs("avx2")
+          .stack({0x2222222211111111ULL, 0x4444444433333333ULL,
+                  0x6666666655555555ULL, 0x8888888877777777ULL})
+          .ymm(1, 0x0000000080000000ULL, 0x0000000080000000ULL,
+               0x0000000080000000ULL, 0x0000000080000000ULL)
+          .ymm(0, 0, 0, 0, 0));
+  add(Case("avx2 vpmaskmovq ymm store",
+           "vpmaskmovq ymmword ptr [rsp+0x20], ymm1, ymm2")
+          .needs("avx2")
+          .stack({0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL,
+                  0xDEADDEADDEADDEADULL, 0xDEADDEADDEADDEADULL})
+          .ymm(1, 0x0000000080000000ULL, 0x0000000080000000ULL,
+               0x0000000080000000ULL, 0x0000000080000000ULL)
+          .ymm(2, 0x2222222211111111ULL, 0x4444444433333333ULL,
+               0x6666666655555555ULL, 0x8888888877777777ULL));
+
+  // Scalar float min/max: the register form and the memory-source form.
+  // The VEX encoding keeps the upper lanes of the first source.
+  add(Case("avx vminss register", "vminss xmm0, xmm1, xmm2")
+          .needs("avx")
+          .xmm(1, 0x40490fdbULL, 0x1111111122222222ULL)
+          .xmm(2, 0x3f800000ULL, 0x3333333344444444ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx vminss memory", "vminss xmm0, xmm1, dword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x3f800000ULL})
+          .xmm(1, 0x40490fdbULL, 0x1111111122222222ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx vmaxss memory", "vmaxss xmm0, xmm1, dword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x3f800000ULL})
+          .xmm(1, 0x40490fdbULL, 0x1111111122222222ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx vminsd memory", "vminsd xmm0, xmm1, qword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x3ff0000000000000ULL})
+          .xmm(1, 0x400921fb54442d18ULL, 0x1111111122222222ULL)
+          .xmm(0, 0, 0));
+  add(Case("avx vmaxsd memory", "vmaxsd xmm0, xmm1, qword ptr [rsp+0x20]")
+          .needs("avx")
+          .stack({0x3ff0000000000000ULL})
+          .xmm(1, 0x400921fb54442d18ULL, 0x1111111122222222ULL)
+          .xmm(0, 0, 0));
+
+  // VEX scalar round: the second source is rounded, the upper lanes come
+  // from the first source, the mode is the immediate.
+  add(Case("avx vroundss", "vroundss xmm0, xmm1, xmm2, 1")
+          .needs("avx")
+          .xmm(1, 0x429a000042c98000ULL, 0x1111111122222222ULL)
+          .xmm(2, 0x429a000042c98000ULL, 0)
+          .xmm(0, 0, 0x3333333344444444ULL));
+
+  // ud2 never returns: the block ends with `unreachable` instead of an
+  // opaque `revenant.asm.ud2` call (which would kill the rest of the
+  // function). Lift-only: the bytes trap natively.
+  add(Case("x86 trap ud2", "ud2").liftOnly());
   return V;
 }
 
