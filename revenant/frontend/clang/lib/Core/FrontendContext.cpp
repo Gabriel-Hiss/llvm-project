@@ -4,6 +4,8 @@
 #include "revenant/Clang/TypeBuilder.h"
 #include "clang/AST/Decl.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/IR/DebugProgramInstruction.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include <cctype>
 
@@ -113,6 +115,22 @@ clang::IdentifierInfo *FrontendContext::ident(StringRef Name) {
   return II;
 }
 
+/// DWARF arg number -> DILocalVariable, for the function's params.
+static llvm::DenseMap<unsigned, const llvm::DILocalVariable *>
+paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
+  llvm::DenseMap<unsigned, const llvm::DILocalVariable *> Out;
+  if (!SP)
+    return Out;
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto *DVI = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
+        const llvm::DILocalVariable *V = DVI->getVariable();
+        if (V && V->isParameter() && V->getArg())
+          Out[V->getArg()] = V;
+      }
+  return Out;
+}
+
 clang::FunctionDecl *
 FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
   if (auto *D = llvm::dyn_cast_or_null<clang::FunctionDecl>(lookupDecl(&F)))
@@ -145,6 +163,44 @@ FrontendContext::functionDecl(llvm::Function &F, TypeBuilder &Types) {
       clang::SourceLocation(),
       clang::DeclarationName(ident(F.getName())), FT, /*TInfo=*/nullptr,
       clang::SC_None);
+  // One ParmVarDecl per declared parameter, named after the debug info
+  // when it has one. Clang's printer walks the type's parameters and asks
+  // for their declarations, so a declaration without them overruns into
+  // garbage while printing.
+  if (auto *FPT = FT->getAs<clang::FunctionProtoType>()) {
+    llvm::DenseMap<unsigned, const llvm::DILocalVariable *> PV;
+    if (llvm::DISubprogram *SP = F.getSubprogram())
+      PV = paramVars(SP, F);
+    llvm::SmallVector<clang::ParmVarDecl *, 8> Params;
+    unsigned Idx = 1;
+    for (llvm::Argument &A : F.args()) {
+      clang::IdentifierInfo *II = nullptr;
+      if (auto *V = PV.lookup(Idx))
+        II = ident(V->getName());
+      if (!II)
+        II = ident("a" + std::to_string(Idx));
+      clang::QualType PT =
+          Idx <= FPT->getNumParams() ? FPT->getParamType(Idx - 1)
+                                      : Types.typeOf(A.getType(), nullptr);
+      clang::ParmVarDecl *PD = clang::ParmVarDecl::Create(
+          AST, FD, clang::SourceLocation(), clang::SourceLocation(), II, PT,
+          nullptr, clang::SC_None, nullptr);
+      bindDecl(&A, PD);
+      Params.push_back(PD);
+      ++Idx;
+    }
+    // The declared prototype can carry more parameters than the lifted IR
+    // (main/wmain normalization, a libdb prototype): pad so the count
+    // matches the type.
+    for (unsigned I = Params.size(); I < FPT->getNumParams(); ++I) {
+      clang::ParmVarDecl *PD = clang::ParmVarDecl::Create(
+          AST, FD, clang::SourceLocation(), clang::SourceLocation(),
+          ident("a" + std::to_string(I + 1)), FPT->getParamType(I), nullptr,
+          clang::SC_None, nullptr);
+      Params.push_back(PD);
+    }
+    FD->setParams(Params);
+  }
   AST.getTranslationUnitDecl()->addDecl(FD);
   bindDecl(&F, FD);
   return FD;

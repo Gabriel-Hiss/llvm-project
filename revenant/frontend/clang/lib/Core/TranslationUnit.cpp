@@ -140,22 +140,6 @@ static bool arrayDIShapeMatches(c::ASTContext &AST,
          AST.getTypeSize(DIArray) == ArrayBits.getFixedValue();
 }
 
-/// DWARF arg number -> DILocalVariable, for the function's params.
-static DenseMap<unsigned, const llvm::DILocalVariable *>
-paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
-  DenseMap<unsigned, const llvm::DILocalVariable *> Out;
-  if (!SP)
-    return Out;
-  for (auto &BB : F)
-    for (auto &I : BB)
-      if (auto *DVI = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
-        const llvm::DILocalVariable *V = DVI->getVariable();
-        if (V && V->isParameter() && V->getArg())
-          Out[V->getArg()] = V;
-      }
-  return Out;
-}
-
 static StringRef vtableClassName(StringRef Name) {
   if (!Name.starts_with("??_7"))
     return {};
@@ -308,6 +292,17 @@ static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
       AST, AST.getTranslationUnitDecl(), c::SourceLocation(),
       c::SourceLocation(), c::DeclarationName(FCtx.ident(F.getName())), FT,
       nullptr, c::SC_Extern);
+  // The printer walks the type's parameters and asks for their
+  // declarations, so the declaration needs one per parameter.
+  {
+    SmallVector<c::ParmVarDecl *, 4> FDParams;
+    for (unsigned I = 0, N = ParamTypes.size(); I != N; ++I)
+      FDParams.push_back(c::ParmVarDecl::Create(
+          AST, FD, c::SourceLocation(), c::SourceLocation(),
+          FCtx.ident("a" + std::to_string(I + 1)), ParamTypes[I], nullptr,
+          c::SC_None, nullptr));
+    FD->setParams(FDParams);
+  }
   AST.getTranslationUnitDecl()->addDecl(FD);
   FCtx.bindDecl(&F, FD);
   return FD;
@@ -332,46 +327,9 @@ static c::FunctionDecl *declareFunction(llvm::Function &F,
       FD->setStorageClass(c::SC_Extern);
   }
 
-  // Parameters: DI arg names when present, else a1..aN.
-  DenseMap<unsigned, const llvm::DILocalVariable *> PV;
-  if (llvm::DISubprogram *SP = F.getSubprogram())
-    PV = paramVars(SP, F);
-  SmallVector<c::ParmVarDecl *, 8> Params;
-  unsigned Idx = 1;
-  const c::FunctionProtoType *Prototype =
-      FD->getType()->getAs<c::FunctionProtoType>();
-  for (llvm::Argument &A : F.args()) {
-    c::QualType PT =
-        Prototype && Idx <= Prototype->getNumParams()
-            ? Prototype->getParamType(Idx - 1)
-            : Types.typeOf(A.getType(), nullptr);
-    c::IdentifierInfo *II = nullptr;
-    if (auto *V = PV.lookup(Idx))
-      II = FCtx.ident(V->getName());
-    if (!II)
-      II = FCtx.ident(("a" + Twine(Idx)).str());
-    c::ParmVarDecl *PD = c::ParmVarDecl::Create(AST, FD, c::SourceLocation(),
-                                                c::SourceLocation(), II, PT,
-                                                nullptr, c::SC_None, nullptr);
-    FCtx.bindDecl(&A, PD);
-    Params.push_back(PD);
-    ++Idx;
-  }
-  // The declared prototype can carry more parameters than the lifted IR
-  // (functionDecl normalizes main/wmain to (int, char**), and a libdb
-  // prototype may name parameters the lifted signature dropped). Pad with
-  // prototype-typed ParmVarDecls so setParams' count always matches.
-  if (Prototype) {
-    for (unsigned I = Params.size(); I < Prototype->getNumParams(); ++I) {
-      c::QualType PT = Prototype->getParamType(I);
-      c::IdentifierInfo *II = FCtx.ident(("a" + Twine(I + 1)).str());
-      c::ParmVarDecl *PD = c::ParmVarDecl::Create(
-          AST, FD, c::SourceLocation(), c::SourceLocation(), II, PT, nullptr,
-          c::SC_None, nullptr);
-      Params.push_back(PD);
-    }
-  }
-  FD->setParams(Params);
+  // The declaration carries its parameters already: the frontend creates
+  // them with the declaration, so a callee the frontend met at its call
+  // site first keeps the same declarations.
   return FD;
 }
 
