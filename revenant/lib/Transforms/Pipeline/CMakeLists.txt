@@ -26,6 +26,7 @@ add_llvm_library(RevenantTransformPipeline
   $<$<TARGET_EXISTS:RevenantTransformReroll>:RevenantTransformReroll>
   $<$<TARGET_EXISTS:RevenantTransformUnrotate>:RevenantTransformUnrotate>
   $<$<TARGET_EXISTS:RevenantTransformIdioms>:RevenantTransformIdioms>
+  $<$<TARGET_EXISTS:RevenantTransformGsCookie>:RevenantTransformGsCookie>
   $<$<TARGET_EXISTS:RevenantTransformPatterns>:RevenantTransformPatterns>
   $<$<TARGET_EXISTS:RevenantStructure>:RevenantStructure>
   $<$<TARGET_EXISTS:RevenantTransformTypeRecovery>:RevenantTransformTypeRecovery>
