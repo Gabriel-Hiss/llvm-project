@@ -97,6 +97,7 @@ done:
 ; The accumulator and IV backedge stores are real values.
 ; CHECK: acc0 = v8
 ; CHECK: acc1 = v9
-; CHECK: rax = v4
+; The IV backedge store is the real step, spelled as a compound update.
+; CHECK: rax{{( \+= 32ULL| = v4)}}
 ; And nothing in the loop is reset to a zero literal.
 ; CHECK-NOT: acc0 = (struct revenant_i128_u){0ULL, 0ULL}
