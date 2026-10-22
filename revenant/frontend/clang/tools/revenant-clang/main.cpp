@@ -11,12 +11,16 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
 
 #include "llvm/Support/FileSystem.h"
+#include "llvm/TargetParser/Triple.h"
 using namespace llvm;
 using namespace revenant::clangx;
 
@@ -71,9 +75,16 @@ int main(int argc, char **argv) {
       if (llvm::find(Inc, S) == Inc.end())
         Inc.insert(Inc.begin(), S);
   }
+  // __fastfail/__debugbreak are spelled as the MSVC intrinsics and live in
+  // <intrin.h>; on the MSVC ABI family that header is the only declaration
+  // that links (a plain prototype gives LNK2019).
+  if (llvm::Triple(M->getTargetTriple()).isKnownWindowsMSVCEnvironment() &&
+      llvm::find(Inc, StringRef("intrin.h")) == Inc.end())
+    Inc.push_back("intrin.h");
 
   if (Output.empty()) {
-    printTranslationUnit(T->tu(), outs(), Inc);
+    printTranslationUnit(T->tu(), outs(), Inc,
+                         T->frontend().requestedIncludes());
     return 0;
   }
   std::error_code EC;
@@ -82,7 +93,8 @@ int main(int argc, char **argv) {
     errs() << "revenant-clang: " << Output << ": " << EC.message() << "\n";
     return 1;
   }
-  printTranslationUnit(T->tu(), Out.os(), Inc);
+  printTranslationUnit(T->tu(), Out.os(), Inc,
+                       T->frontend().requestedIncludes());
   Out.keep();
   return 0;
 }

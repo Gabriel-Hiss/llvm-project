@@ -82,6 +82,8 @@ def _tool_in(build_dir, name):
         # <build>/frontend/clang (revenant-clang lives there).
         _join(build_dir, "frontend", "clang"),
     ]
+    if name == "revenant-clang":
+        bases.append(_join(build_dir, "frontend", "clang"))
     bases.extend(sorted(_join(build_dir, "lib", area, "tool")
                         for area in _lib_areas(build_dir)))
     for base in bases:
@@ -116,7 +118,23 @@ opt = _tool("opt", ("RV_OPT",))
 filecheck = _tool("FileCheck", ("RV_FILECHECK", "FILECHECK"))
 revenant_opt = _tool("revenant-opt", ("REVENANT_OPT", "RV_REVENANT_OPT"))
 revenant_decompile = _tool("revenant-decompile", ("REVENANT_DECOMPILE",))
-revenant_clang = _tool("revenant-clang", ("REVENANT_CLANG",))
+revenant_clang = _tool("revenant-clang", ("REVENANT_CLANG", "RV_REVENANT_CLANG"))
+revenant_detect = _tool("revenant-detect", ("REVENANT_DETECT",))
+
+# Parity corpus for the tests that need a real PE (producer detection).
+# Opt-in: set REVENANT_CORPUS to the corpus root; tests requiring it are
+# skipped (REQUIRES) when it is unset or absent.
+corpus = _first_env("REVENANT_CORPUS", "RV_CORPUS")
+if corpus and os.path.isdir(corpus):
+    config.substitutions.append(("%revenant-corpus", corpus.replace("\\", "/")))
+    config.available_features.add("revenant-corpus")
+lli = _tool("lli", ("RV_LLI", "LLVM_LLI"))
+clang_cl = _tool("clang-cl", ("RV_CLANG_CL", "CLANG_CL"))
+if revenant_clang and lli and clang_cl:
+    config.available_features.add("structured-source-run")
+    config.environment["REVENANT_CLANG"] = revenant_clang
+    config.environment["RV_LLI"] = lli
+    config.environment["RV_CLANG_CL"] = clang_cl
 
 # rv-structure-tool ships with the Structure slice build.
 rv_tool_dir = _first_env("RV_STRUCTURE_TOOL_DIR")
@@ -144,10 +162,17 @@ if revenant_opt:
 if revenant_decompile:
     config.substitutions.append(("%revenant-decompile", revenant_decompile))
     config.substitutions.append(("%{revenant-decompile}", revenant_decompile))
+if revenant_detect:
+    config.substitutions.append(("%revenant-detect", revenant_detect))
+    config.substitutions.append(("%{revenant-detect}", revenant_detect))
+    config.available_features.add("revenant-detect")
 if revenant_clang:
     config.substitutions.append(("%revenant-clang", revenant_clang))
     config.substitutions.append(("%{revenant-clang}", revenant_clang))
-    config.available_features.add("revenant-clang")
+    # Only a worktree that builds the frontend tool has it; the shared build
+    # does not, so tests that emit C are skipped there rather than failing.
+    if os.path.isfile(revenant_clang):
+        config.available_features.add("revenant-clang")
 config.substitutions.append(("%{rv-structure-tool}", rv_structure_tool))
 config.substitutions.append(("%{rv-structure-tool-exe}", rv_structure_tool))
 # Script-driven checks (the meta-mode invariant runs its own corruption
@@ -161,6 +186,7 @@ missing = [
         ("%FileCheck", filecheck),
         ("%revenant-opt", revenant_opt),
         ("%revenant-decompile", revenant_decompile),
+        ("%revenant-clang", revenant_clang),
     )
     if not path
 ]

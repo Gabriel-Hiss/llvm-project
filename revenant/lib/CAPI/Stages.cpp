@@ -38,6 +38,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -48,6 +49,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "X86BaseInfo.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -139,16 +141,6 @@ void reportArtifactTiming(StringRef What, int64_t Micros) {
          << formatv("{0:F1}", Micros / 1000.0) << " ms\n";
 }
 
-/// Set REVENANT_SERIAL_ARTIFACT_PRINT=1 to keep the artifact prints on the
-/// main thread. Useful to compare the timings and to rule the background
-/// print out when a run misbehaves.
-bool serialArtifactPrint() {
-  static const bool Serial = [] {
-    const char *V = std::getenv("REVENANT_SERIAL_ARTIFACT_PRINT");
-    return V && *V == '1';
-  }();
-  return Serial;
-}
 
 std::string moduleText(const Module &M) {
   std::string S;
@@ -157,44 +149,6 @@ std::string moduleText(const Module &M) {
   return S;
 }
 
-/// Printing the module text costs about as much as the source stage, and the
-/// source stage only reads the module. This prints the text on a background
-/// thread so the two run at the same time.
-class BackgroundModuleText {
-public:
-  BackgroundModuleText() = default;
-  BackgroundModuleText(const BackgroundModuleText &) = delete;
-  BackgroundModuleText &operator=(const BackgroundModuleText &) = delete;
-  ~BackgroundModuleText() { join(); }
-
-  /// Start printing `M`. The module must outlive the print.
-  void start(const Module &M) {
-    Worker = std::thread([this, &M]() {
-      auto Start = StageClock::now();
-      Text = moduleText(M);
-      reportArtifactTiming(
-          "print-ir-final",
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              StageClock::now() - Start)
-              .count());
-    });
-  }
-
-  /// Wait for the print and hand the text over.
-  std::string take() {
-    join();
-    return std::move(Text);
-  }
-
-private:
-  void join() {
-    if (Worker.joinable())
-      Worker.join();
-  }
-
-  std::thread Worker;
-  std::string Text;
-};
 
 Error writeText(StringRef Path, StringRef Text) {
   std::error_code EC;
@@ -234,9 +188,12 @@ void record(std::vector<StageReport> &Stages, StringRef Name, StringRef Status,
 
 /// Triple, datalayout and language flag. The lifter declares imports and
 /// callees itself, typed from the recovered signatures.
-std::unique_ptr<Module> moduleFor(LLVMContext &Ctx, Lang Out) {
+std::unique_ptr<Module> moduleFor(LLVMContext &Ctx, Lang Out,
+                                  Compiler Producer) {
   auto M = std::make_unique<Module>("revenant", Ctx);
-  M->setTargetTriple(Triple("x86_64-pc-windows-msvc"));
+  M->setTargetTriple(Triple(Producer == Compiler::MinGwGcc
+                                ? "x86_64-w64-windows-gnu"
+                                : "x86_64-pc-windows-msvc"));
   M->setDataLayout(
       "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:"
       "32:64-S128");
@@ -729,9 +686,10 @@ struct EmitResult {
 /// Contract IR -> C/C++ through the Clang frontend: Core builds the
 /// TranslationUnit and prints it with `printTranslationUnit`. The frontend
 /// does not attribute output lines to VAs, so `LineVas` stays empty.
-Expected<EmitResult> emitClangSource(Module &M, bool Cpp) {
+Expected<EmitResult> emitClangSource(Module &M, bool Cpp, bool UserBodiesOnly) {
   clangx::ClangFrontendOptions Opts;
   Opts.Lang = Cpp ? "cpp" : "c";
+  Opts.UserBodiesOnly = UserBodiesOnly;
   auto TOrErr = clangx::createASTContext(M, Opts);
   if (!TOrErr)
     return TOrErr.takeError();
@@ -739,11 +697,21 @@ Expected<EmitResult> emitClangSource(Module &M, bool Cpp) {
   auto Types = clangx::createTypeBuilder(T->frontend());
   auto Stmts = clangx::createStmtBuilder(T->frontend(), *Types);
   auto Exprs = clangx::createExprBuilder(T->frontend(), *Types);
-  clangx::fillTranslationUnit(*T, M, *Types, *Stmts, *Exprs);
+  clangx::fillTranslationUnit(*T, M, *Types, *Stmts, *Exprs,
+                              Opts.UserBodiesOnly);
   EmitResult R;
   raw_string_ostream OS(R.Text);
   SmallVector<StringRef, 4> Inc = {"stdint.h", "stddef.h", "stdbool.h"};
-  clangx::printTranslationUnit(T->tu(), OS, Inc);
+  // The emitter spells `llvm.x86.int 0x29`/`llvm.trap` as the MSVC
+  // intrinsics __fastfail/__debugbreak; those live in <intrin.h>, which
+  // only the MSVC ABI family has, so pull it in there (a bare prototype
+  // does not link: LNK2019). MinGW targets keep the plain three.
+  if (llvm::Triple(M.getTargetTriple()).isKnownWindowsMSVCEnvironment())
+    Inc.push_back("intrin.h");
+  // The frontend asks for a header when it lowers an IR form to a library
+  // call (e.g. `llvm.memset` -> `memset`, which needs <string.h>).
+  clangx::printTranslationUnit(T->tu(), OS, Inc,
+                               T->frontend().requestedIncludes());
   return R;
 }
 
@@ -855,8 +823,6 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   // Each stage below runs only when a later artifact was asked for: `break`
   // leaves the block once the requested emit kind is produced.
   std::string RawText, CleanText, FinalText;
-  BackgroundModuleText FinalPrinter;
-  bool FinalPrintRunning = false;
   do {
     if (Opts.Emit == EmitKind::Asm)
       break;
@@ -891,8 +857,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // finds it (narrow CRT handoff, MinGW argc/argv setup, PE-entry tail
     // chain). Spell it `main` while the record still has a generic name so
     // the C/C++ emitter applies the hosted argc/argv signature; Rust output
-    // has no hosted entry.
-    if (Classification.UserEntry && (Out == Lang::C || Out == Lang::Cpp)) {
+    // has no hosted entry, and a DLL's traced entry is DllMain, not main.
+    if (Classification.UserEntry && (Out == Lang::C || Out == Lang::Cpp) &&
+        pe().Exports.empty()) {
       auto It = Prog.Functions.find(*Classification.UserEntry);
       if (It != Prog.Functions.end() &&
           It->second.Name.rfind("sub_", 0) == 0)
@@ -905,7 +872,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- lift -> ir-raw ----------------------------------------------------
     LLVMContext Ctx;
-    auto M = moduleFor(Ctx, Out);
+    auto M = moduleFor(Ctx, Out, Compiler.Producer);
     // Decode the image's EH metadata once, then associate each lifted function
     // with its table entry. The EH vector owns these entries through the loop.
     std::vector<FunctionEH> EHFunctions = decodeEHTables(pe());
@@ -1461,7 +1428,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             return;
           }
           St.Ctx = std::make_unique<LLVMContext>();
-          St.Mod = moduleFor(*St.Ctx, Out);
+          St.Mod = moduleFor(*St.Ctx, Out, Compiler.Producer);
           St.KindSeen = kindCount(St);
           // The lifter creates the EH personality declaration lazily, at
           // the first function whose EH conversion fires, and serial has it
@@ -1963,10 +1930,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // destination per shard, which made merging quadratic.
           MergeShards =
               [&Ctx, &Todo, &GlobalOrder, &SerialGlobalCounter, Out, StateOwner,
-               SharedGlobals,
+               SharedGlobals, this,
                PersonalityNames]() -> Expected<std::unique_ptr<Module>> {
             std::vector<ShardState> &State = *StateOwner;
-            std::unique_ptr<Module> M = moduleFor(Ctx, Out);
+            std::unique_ptr<Module> M = moduleFor(Ctx, Out, Compiler.Producer);
             auto mergeShard = [&](Module &Src) -> std::string {
               for (llvm::Function &F : make_early_inc_range(Src)) {
                 llvm::Function *Dst = M->getFunction(F.getName());
@@ -2192,7 +2159,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         if (!ParallelClean) {
           errs() << "[note] parallel clean fell back to serial: " << Why
                  << "\n";
-          M = moduleFor(Ctx, Out);
+          M = moduleFor(Ctx, Out, Compiler.Producer);
           CleanSlots.assign(Todo.size(), CleanSlot{});
           CleanRemainder.clear();
         }
@@ -2354,20 +2321,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     MergeShards = nullptr;
     record(R.Stages, "ir-final", "ok",
            "Uncxx (C++ only) + unopt + structure + types + ssaout");
-    // The text feeds the ir-final emit, the rustc fork and the artifact.
-    // The source emit does not need it, so when only the artifact wants it
-    // the print runs on a background thread while the source stage reads
-    // the same module. Both only read the module.
+    // The Clang source emitter can mutate the module, so finish printing
+    // ir-final before handing the module to it.
     const bool NeedFinalText = Opts.Emit == EmitKind::IrFinal ||
                                Out == Lang::Rust ||
                                !Opts.ArtifactBase.empty();
-    const bool BackgroundFinalText =
-        NeedFinalText && Opts.Emit == EmitKind::Source &&
-        Out != Lang::Rust && !serialArtifactPrint();
-    if (BackgroundFinalText) {
-      FinalPrinter.start(*M);
-      FinalPrintRunning = true;
-    } else if (NeedFinalText) {
+    if (NeedFinalText) {
       auto PrintStart = StageClock::now();
       FinalText = moduleText(*M);
       reportArtifactTiming(
@@ -2387,7 +2346,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                "module");
       Expected<EmitResult> Em = Out == Lang::Rust
                                     ? emitRustcSource(FinalText)
-                                    : emitClangSource(*M, Out == Lang::Cpp);
+                                    : emitClangSource(*M, Out == Lang::Cpp,
+                                                      Opts.UserBodiesOnly);
       if (!Em)
         return Em.takeError();
       record(R.Stages, "source", "ok",
@@ -2399,9 +2359,6 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
   } while (false);
 
-  // The background print of the ir-final module is the artifact text.
-  if (FinalPrintRunning)
-    FinalText = FinalPrinter.take();
 
   // ---- artifacts -----------------------------------------------------------
   if (!Opts.ArtifactBase.empty()) {

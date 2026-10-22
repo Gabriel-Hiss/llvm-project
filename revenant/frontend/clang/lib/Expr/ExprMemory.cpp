@@ -13,6 +13,8 @@
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -30,6 +32,30 @@ using namespace clang;
 using namespace llvm::dwarf;
 
 // ---- memory: loads, stores, GEPs ------------------------------------------
+
+static bool isOrderIndependentCompoundRHS(llvm::Value *Root) {
+  llvm::SmallVector<llvm::Value *, 16> Worklist{Root};
+  llvm::SmallPtrSet<llvm::Value *, 16> Visited;
+  while (!Worklist.empty()) {
+    llvm::Value *V = Worklist.pop_back_val();
+    if (!Visited.insert(V).second)
+      continue;
+    auto *I = llvm::dyn_cast<llvm::Instruction>(V);
+    if (!I)
+      continue;
+    if (llvm::isa<llvm::CallBase>(I))
+      return false;
+    if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(I)) {
+      if (Load->isVolatile() || Load->isAtomic())
+        return false;
+    } else if (I->mayHaveSideEffects()) {
+      return false;
+    }
+    for (llvm::Use &Operand : I->operands())
+      Worklist.push_back(Operand.get());
+  }
+  return true;
+}
 
 Expr *ExprBuilderImpl::decayToPointer(Expr *E, QualType Pointee) {
   QualType T = E->getType();
@@ -93,9 +119,14 @@ ExprBuilderImpl::compositeBehindPointer(const llvm::DIType *DI) {
 }
 
 FieldDecl *ExprBuilderImpl::fieldAtOffset(RecordDecl *Rec, uint64_t BitOff) {
-  if (!Rec || !Rec->getDefinitionOrSelf())
+  if (!Rec)
     return nullptr;
   Rec = Rec->getDefinitionOrSelf();
+  // Records under construction (no definition yet, e.g. while Core is
+  // still declaring fields) have no layout; getASTRecordLayout asserts
+  // on them, so bail out and let the caller use the byte-offset path.
+  if (!Rec || !Rec->getDefinitionOrSelf() || !Rec->isCompleteDefinition())
+    return nullptr;
   const ASTRecordLayout &Layout = AST->getASTRecordLayout(Rec);
   for (FieldDecl *FD : Rec->fields()) {
     if (Layout.getFieldOffset(FD->getFieldIndex()) == BitOff)
@@ -115,7 +146,15 @@ Expr *ExprBuilderImpl::buildLoadValue(llvm::LoadInst &I, ExprScope &Scope) {
   if (llvm::isa<clang::ArraySubscriptExpr>(Ptr) ||
       llvm::isa<clang::MemberExpr>(Ptr) ||
       isStoredVar(I.getPointerOperand(), Ptr)) {
-    Expr *Use = makeImplicit(Pointee, CK_LValueToRValue, Ptr);
+    QualType UseType = Pointee;
+    // In opaque-pointer IR, the load does not retain the declared pointee
+    // type. Prefer the bound variable/member type when it is more specific.
+    if (Pointee->isPointerType() && Ptr->getType()->isPointerType()) {
+      auto *PT = Ptr->getType()->getAs<clang::PointerType>();
+      if (PT && !PT->getPointeeType()->isVoidType())
+        UseType = Ptr->getType();
+    }
+    Expr *Use = makeImplicit(UseType, CK_LValueToRValue, Ptr);
     return ensureTemp(&I, Scope, Use);
   }
   Expr *D = derefPointer(Ptr, Pointee);
@@ -124,7 +163,6 @@ Expr *ExprBuilderImpl::buildLoadValue(llvm::LoadInst &I, ExprScope &Scope) {
 }
 
 Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
-  Expr *Val = value(I.getValueOperand(), Scope);
   Expr *Ptr = value(I.getPointerOperand(), Scope);
   QualType Pointee = Types.typeOf(I.getValueOperand()->getType(),
                                   debugTypeOf(I.getValueOperand()));
@@ -136,6 +174,151 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
   else
     Dst = derefPointer(Ptr, Pointee);
   QualType DestType = Dst->getType();
+
+  auto *Update = llvm::dyn_cast<llvm::BinaryOperator>(I.getValueOperand());
+  llvm::Value *UpdateRHS = Update ? Update->getOperand(1) : nullptr;
+  auto *OldValue =
+      Update ? llvm::dyn_cast<llvm::LoadInst>(Update->getOperand(0)) : nullptr;
+  bool IsCommutativeInt = Update && Update->getType()->isIntegerTy() &&
+                          (Update->getOpcode() == llvm::Instruction::Add ||
+                           Update->getOpcode() == llvm::Instruction::Mul ||
+                           Update->getOpcode() == llvm::Instruction::And ||
+                           Update->getOpcode() == llvm::Instruction::Or ||
+                           Update->getOpcode() == llvm::Instruction::Xor);
+  if ((!OldValue ||
+       OldValue->getPointerOperand() != I.getPointerOperand()) &&
+      IsCommutativeInt) {
+    OldValue = llvm::dyn_cast<llvm::LoadInst>(Update->getOperand(1));
+    if (OldValue &&
+        OldValue->getPointerOperand() == I.getPointerOperand())
+      UpdateRHS = Update->getOperand(0);
+  }
+  BinaryOperatorKind CompoundOp = BO_Assign;
+  bool SameDestinationType = AST->hasSameType(DestType, Pointee);
+  if (!SameDestinationType && DestType->isIntegerType() &&
+      Pointee->isIntegerType())
+    SameDestinationType =
+        AST->getTypeSize(DestType) == AST->getTypeSize(Pointee) &&
+        DestType->isSignedIntegerType() == Pointee->isSignedIntegerType();
+  bool CanCompound =
+      OldValue && OldValue->getPointerOperand() == I.getPointerOperand() &&
+      !OldValue->isVolatile() && !OldValue->isAtomic() && !I.isVolatile() &&
+      !I.isAtomic() && !I.getValueOperand()->getType()->isAggregateType() &&
+      !I.getValueOperand()->getType()->isVectorTy() &&
+      Update->getOperand(0)->getType() == I.getValueOperand()->getType() &&
+      Update->getOperand(1)->getType() == I.getValueOperand()->getType() &&
+      SameDestinationType && !Dst->HasSideEffects(*AST) &&
+      isOrderIndependentCompoundRHS(UpdateRHS);
+  if (CanCompound) {
+    switch (Update->getOpcode()) {
+    case llvm::Instruction::Add:
+    case llvm::Instruction::FAdd:
+      CompoundOp = BO_AddAssign;
+      break;
+    case llvm::Instruction::Sub:
+    case llvm::Instruction::FSub:
+      CompoundOp = BO_SubAssign;
+      break;
+    case llvm::Instruction::Mul:
+    case llvm::Instruction::FMul:
+      CompoundOp = BO_MulAssign;
+      break;
+    case llvm::Instruction::SDiv:
+      if (!DestType->isSignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_DivAssign;
+      break;
+    case llvm::Instruction::UDiv:
+      if (!DestType->isUnsignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_DivAssign;
+      break;
+    case llvm::Instruction::FDiv:
+      CompoundOp = BO_DivAssign;
+      break;
+    case llvm::Instruction::SRem:
+      if (!DestType->isSignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_RemAssign;
+      break;
+    case llvm::Instruction::URem:
+      if (!DestType->isUnsignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_RemAssign;
+      break;
+    case llvm::Instruction::And:
+      CompoundOp = BO_AndAssign;
+      break;
+    case llvm::Instruction::Or:
+      CompoundOp = BO_OrAssign;
+      break;
+    case llvm::Instruction::Xor:
+      CompoundOp = BO_XorAssign;
+      break;
+    case llvm::Instruction::Shl:
+      CompoundOp = BO_ShlAssign;
+      break;
+    case llvm::Instruction::LShr:
+      if (!DestType->isUnsignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_ShrAssign;
+      break;
+    case llvm::Instruction::AShr:
+      if (!DestType->isSignedIntegerType()) {
+        CanCompound = false;
+        break;
+      }
+      CompoundOp = BO_ShrAssign;
+      break;
+    default:
+      CanCompound = false;
+      break;
+    }
+  }
+  if (CanCompound) {
+    // A step of one spells as `++`/`--`, and a negative step spells as the
+    // opposite compound assignment: `i + -2` is `i -= 2`.
+    if (DestType->isIntegerType())
+      if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(UpdateRHS)) {
+        const llvm::APInt &Amount = CI->getValue();
+        bool IsAdd = Update->getOpcode() == llvm::Instruction::Add;
+        bool IsSub = Update->getOpcode() == llvm::Instruction::Sub;
+        if ((IsAdd && Amount.isOne()) ||
+            (IsSub && Amount.isOne()) ||
+            (IsAdd && Amount.isAllOnes()) ||
+            (IsSub && Amount.isAllOnes())) {
+          bool Increment = (IsAdd && Amount.isOne()) ||
+                           (IsSub && Amount.isAllOnes());
+          return UnaryOperator::Create(
+              *AST, Dst, Increment ? UO_PreInc : UO_PreDec, DestType,
+              Ctx.isCPlusPlus() ? VK_LValue : VK_PRValue, OK_Ordinary,
+              SourceLocation(), false, FPOptionsOverride());
+        }
+        if (IsAdd && Amount.isNegative()) {
+          CompoundOp = BO_SubAssign;
+          UpdateRHS = llvm::ConstantInt::get(UpdateRHS->getType(), -Amount);
+        } else if (IsSub && Amount.isNegative()) {
+          CompoundOp = BO_AddAssign;
+          UpdateRHS = llvm::ConstantInt::get(UpdateRHS->getType(), -Amount);
+        }
+      }
+    Expr *RHS = value(UpdateRHS, Scope);
+    return clang::CompoundAssignOperator::Create(
+        *AST, Dst, RHS, CompoundOp, DestType, VK_PRValue, OK_Ordinary,
+        SourceLocation(), FPOptionsOverride(), DestType, DestType);
+  }
+
+  Expr *Val = value(I.getValueOperand(), Scope);
   if (Val->getType() != DestType && !DestType.isNull()) {
     // A wide destination has no cast rule of its own.
     if (isWideIntRecord(DestType) || isWideIntRecord(Val->getType()))
@@ -152,14 +335,52 @@ Stmt *ExprBuilderImpl::buildStore(llvm::StoreInst &I, ExprScope &Scope) {
     else if (Val->getType()->isPointerType() && DestType->isIntegerType())
       Val = makeCStyleCast(DestType, CK_PointerToIntegral, Val);
   }
-  clang::BinaryOperator *Assign = BinaryOperator::Create(
-      *AST, Dst, Val, BO_Assign, Dst->getType(), VK_PRValue, OK_Ordinary,
-      SourceLocation(), FPOptionsOverride());
-  return Assign;
+  return BinaryOperator::Create(*AST, Dst, Val, BO_Assign, Dst->getType(),
+                                VK_PRValue, OK_Ordinary, SourceLocation(),
+                                FPOptionsOverride());
 }
 
 Expr *ExprBuilderImpl::buildGEPValue(llvm::GetElementPtrInst &I, ExprScope &Scope) {
   llvm::SmallVector<llvm::Value *, 4> Idxs(I.indices());
+  llvm::Type *ElemTy = I.getSourceElementType();
+  if (Idxs.size() == 1 && I.hasOneUse() &&
+      !ElemTy->isAggregateType() && !ElemTy->isVectorTy()) {
+    llvm::Value *Use = *I.user_begin();
+    llvm::LoadInst *Load = nullptr;
+    llvm::StoreInst *Store = nullptr;
+    if (auto *L = llvm::dyn_cast<llvm::LoadInst>(Use))
+      if (L->getPointerOperand() == &I)
+        Load = L;
+    if (auto *S = llvm::dyn_cast<llvm::StoreInst>(Use))
+      if (S->getPointerOperand() == &I)
+        Store = S;
+    auto *IndexConstant = llvm::dyn_cast<llvm::ConstantInt>(Idxs[0]);
+    if ((Load || Store) && !(IndexConstant && IndexConstant->isZero())) {
+      QualType AccessType =
+          Load ? Types.typeOf(Load->getType(), debugTypeOf(Load))
+               : Types.typeOf(Store->getValueOperand()->getType(),
+                              debugTypeOf(Store->getValueOperand()));
+      if (!AccessType.isNull() && !AccessType->isVoidType() &&
+          !AccessType->isAggregateType() && !AccessType->isVectorType()) {
+        unsigned long long ElementSize =
+            CurF->getParent()->getDataLayout().getTypeAllocSize(ElemTy);
+        unsigned long long AccessSize =
+            AST->getTypeSize(AccessType) / AST->getCharWidth();
+        if (ElementSize == AccessSize) {
+          Expr *Base = value(I.getPointerOperand(), Scope);
+          Expr *TypedBase = decayToPointer(Base, AccessType);
+          QualType WantPointer = AST->getPointerType(AccessType);
+          if (!AST->hasSameType(TypedBase->getType(), WantPointer))
+            TypedBase = makeCStyleCast(WantPointer, CK_BitCast, TypedBase);
+          Expr *Index = value(Idxs[0], Scope);
+          return new (*AST) clang::ArraySubscriptExpr(
+              parenIfNeeded(TypedBase, Prec::Postfix),
+              parenIfNeeded(Index, Prec::Ternary), AccessType, VK_LValue,
+              OK_Ordinary, SourceLocation());
+        }
+      }
+    }
+  }
   return buildGEPFrom(value(I.getPointerOperand(), Scope),
                       I.getSourceElementType(), I.getPointerOperand(), Idxs,
                       Scope);

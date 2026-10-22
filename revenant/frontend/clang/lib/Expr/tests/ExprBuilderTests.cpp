@@ -269,6 +269,27 @@ TEST_F(ExprTest, AddNegativeBecomesSub) {
   EXPECT_EQ(print(E), "a - 5");
 }
 
+TEST_F(ExprTest, SignedDivisionNegativeConstantUsesNegativeLiteral) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Div = B.CreateSDiv(
+      H.A, ConstantInt::get(Type::getInt32Ty(LLCtx), (uint64_t)-3, true));
+  EXPECT_EQ(print(Exprs->value(Div, Scope)), "a / -3");
+}
+
+TEST_F(ExprTest, SignedDivisionDoesNotCastSignedBitwiseOperands) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *Bits = B.CreateOr(H.A, H.B);
+  llvm::Value *Div = B.CreateSDiv(
+      Bits, ConstantInt::get(Type::getInt32Ty(LLCtx), (uint64_t)-3, true));
+  EXPECT_EQ(print(Exprs->value(Div, Scope)), "(a | b) / -3");
+}
+
 TEST_F(ExprTest, SelectBecomesTernary) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
@@ -335,6 +356,20 @@ TEST_F(ExprTest, SignedArithmeticCastsUnsignedOperands) {
             std::string::npos);
 }
 
+TEST_F(ExprTest, ConditionUsesDirectTruthTestForZeroCompare) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Value *IsNonzero =
+      B.CreateICmpNE(H.A, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0));
+  EXPECT_EQ(print(Exprs->cond(IsNonzero, Scope)), "a");
+
+  llvm::Value *IsZero =
+      B.CreateICmpEQ(H.A, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0));
+  EXPECT_EQ(print(Exprs->cond(IsZero, Scope)), "a == 0");
+}
+
 TEST_F(ExprTest, TruncIsCast) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
@@ -368,7 +403,86 @@ TEST_F(ExprTest, LoadStoreDeref) {
   clang::PrintingPolicy Policy(LangOpts);
   St->printPretty(OS, nullptr, Policy);
   EXPECT_EQ(std::string(OS.str()), "v = a");
+
+  StoreInst *Update = B.CreateStore(
+      B.CreateAdd(B.CreateLoad(Type::getInt32Ty(LLCtx), All), H.A), All);
+  St = Exprs->instr(*Update, Scope);
+  ASSERT_NE(St, nullptr);
+  Buf.clear();
+  clang::PrintingPolicy UpdatePolicy(LangOpts);
+  llvm::raw_svector_ostream UpdateOS(Buf);
+  St->printPretty(UpdateOS, nullptr, UpdatePolicy);
+  EXPECT_EQ(std::string(UpdateOS.str()), "v += a");
+
+  StoreInst *Reversed = B.CreateStore(
+      B.CreateAdd(H.A, B.CreateLoad(Type::getInt32Ty(LLCtx), All)), All);
+  St = Exprs->instr(*Reversed, Scope);
+  ASSERT_NE(St, nullptr);
+  Buf.clear();
+  llvm::raw_svector_ostream ReversedOS(Buf);
+  St->printPretty(ReversedOS, nullptr, UpdatePolicy);
+  EXPECT_EQ(std::string(ReversedOS.str()), "v += a");
+  auto PrintUpdate = [&](llvm::Value *Updated) {
+    StoreInst *Store = B.CreateStore(Updated, All);
+    clang::Stmt *UpdateStmt = Exprs->instr(*Store, Scope);
+    EXPECT_NE(UpdateStmt, nullptr);
+    if (!UpdateStmt)
+      return std::string();
+    llvm::SmallString<256> UpdateBuffer;
+    llvm::raw_svector_ostream UpdateStream(UpdateBuffer);
+    UpdateStmt->printPretty(UpdateStream, nullptr, UpdatePolicy);
+    return std::string(UpdateStream.str());
+  };
+  llvm::Value *Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateAdd(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 1))),
+            "++v");
+  Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateSub(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 1))),
+            "--v");
+  Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateAdd(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx),
+                                             (uint64_t)-2, true))),
+            "v -= 2");
+  Load = B.CreateLoad(Type::getInt32Ty(LLCtx), All);
+  EXPECT_EQ(PrintUpdate(B.CreateSub(
+                Load, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx),
+                                             (uint64_t)-2, true))),
+            "v += 2");
 }
+
+TEST_F(ExprTest, CompoundStoreKeepsSideEffectingRhsSequenced) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I32 = Type::getInt32Ty(LLCtx);
+  AllocaInst *All = B.CreateAlloca(I32, nullptr, "v");
+  clang::VarDecl *VD = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("v"), ACtx->IntTy, ACtx->getTrivialTypeSourceInfo(ACtx->IntTy),
+      clang::SC_None);
+  FCtx->bindDecl(All, VD);
+  llvm::Function *SideEffect = llvm::Function::Create(
+      llvm::FunctionType::get(I32, false), llvm::GlobalValue::ExternalLinkage,
+      "side_effect", M.get());
+  llvm::Value *OldValue = B.CreateLoad(I32, All, "old");
+  llvm::Value *RHS = B.CreateCall(SideEffect, {}, "rhs");
+  llvm::Value *Sum = B.CreateAdd(OldValue, RHS, "sum");
+  StoreInst *Update = B.CreateStore(Sum, All);
+  clang::Stmt *St = Exprs->instr(*Update, Scope);
+  ASSERT_NE(St, nullptr);
+  llvm::SmallString<256> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  clang::PrintingPolicy Policy(LangOpts);
+  St->printPretty(OS, nullptr, Policy);
+  std::string Printed = OS.str().str();
+  EXPECT_EQ(Printed.find("v +="), std::string::npos);
+  EXPECT_NE(Printed.find("v ="), std::string::npos);
+}
+
 
 TEST_F(ExprTest, GepArraySubscript) {
   FuncHost H = makeFunc();
@@ -394,6 +508,51 @@ TEST_F(ExprTest, GepArraySubscript) {
   EXPECT_TRUE(S.find("[a]") != std::string::npos);
 }
 
+TEST_F(ExprTest, PointerGepLoadsUseSubscripts) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I32 = Type::getInt32Ty(LLCtx);
+  llvm::PointerType *I32Ptr = llvm::PointerType::getUnqual(I32);
+  AllocaInst *PtrSlot = B.CreateAlloca(I32Ptr, nullptr, "p.slot");
+  clang::QualType PtrQT = ACtx->getPointerType(ACtx->IntTy);
+  clang::VarDecl *PtrDecl = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("p"), PtrQT, ACtx->getTrivialTypeSourceInfo(PtrQT),
+      clang::SC_None);
+  FCtx->bindDecl(PtrSlot, PtrDecl);
+
+  llvm::Value *P = B.CreateLoad(I32Ptr, PtrSlot, "p.value");
+  llvm::Value *Element =
+      B.CreateGEP(I32, P, {H.A}, "element");
+  llvm::Value *Loaded = B.CreateLoad(I32, Element, "loaded");
+  EXPECT_EQ(print(Exprs->value(Loaded, Scope)), "p[a]");
+}
+
+TEST_F(ExprTest, PointerGepLoadPreservesAccessType) {
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *I8 = Type::getInt8Ty(LLCtx);
+  llvm::Type *I64 = Type::getInt64Ty(LLCtx);
+  AllocaInst *Bytes =
+      B.CreateAlloca(ArrayType::get(I8, 16), nullptr, "bytes");
+  clang::QualType BytesType = ACtx->getConstantArrayType(
+      ACtx->UnsignedCharTy, llvm::APInt(64, 16), nullptr,
+      clang::ArraySizeModifier::Normal, 0);
+  clang::VarDecl *BytesDecl = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("bytes"), BytesType, ACtx->getTrivialTypeSourceInfo(BytesType),
+      clang::SC_None);
+  FCtx->bindDecl(Bytes, BytesDecl);
+  llvm::Value *Element = B.CreateGEP(I64, Bytes, {H.A}, "element");
+  llvm::Value *Loaded =
+      B.CreateLoad(llvm::PointerType::get(LLCtx, 0), Element, "loaded");
+  EXPECT_EQ(print(Exprs->value(Loaded, Scope)), "((void **)bytes)[a]");
+}
+
 TEST_F(ExprTest, DirectCallByName) {
   FuncHost H = makeFunc();
   revenant::clangx::ExprScope Scope;
@@ -415,9 +574,85 @@ TEST_F(ExprTest, DirectCallByName) {
       clang::SC_Extern);
   FCtx->bindDecl(Callee, FD);
   llvm::Value *C = B.CreateCall(FT, Callee, {H.A}, "c");
+  // The result is read, so this is a value use and not a dead call.
+  llvm::Value *Masked =
+      B.CreateAnd(C, llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0xFF00));
+  clang::Expr *E = Exprs->value(Masked, Scope);
+  std::string S = print(E);
+  // Imports (declaration-only callees) are read through the call's own
+  // function type: a system header or a recovered signature can shadow the
+  // prototype with a `void` return, and a value use must still compile.
+  EXPECT_TRUE(S.find("((int (*)(int))helper)(a)") != std::string::npos)
+      << S;
+}
+
+TEST_F(ExprTest, ValueCallToVoidImportReadsThroughCast) {
+  // corecrt.h declares `void _invalid_parameter_noinfo(void)`; the emitted
+  // prototype can be shadowed by it, and a recovered signature says void
+  // just as often, while the lifted IR still reads the return register.
+  // The value use must be typed by the call, not the declaration.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT =
+      FunctionType::get(Type::getInt64Ty(LLCtx), {}, false);
+  llvm::Function *Callee =
+      Function::Create(FT, GlobalValue::ExternalLinkage,
+                       "_invalid_parameter_noinfo", M.get());
+  // Bind the import with the prototype a system header wins with: void.
+  clang::IdentifierInfo *Id = FCtx->ident("_invalid_parameter_noinfo");
+  clang::FunctionProtoType::ExtProtoInfo EPI;
+  clang::QualType FQT = ACtx->getFunctionType(ACtx->VoidTy, {}, EPI);
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      *ACtx, ACtx->getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FQT,
+      ACtx->getTrivialTypeSourceInfo(FQT), clang::SC_Extern);
+  FCtx->bindDecl(Callee, FD);
+  llvm::Value *C = B.CreateCall(FT, Callee, {}, "c");
+  // The call's value keeps the IR type: a mask over it is well-formed.
+  // The mask comes first: a call whose result nobody reads is a dead
+  // call, and a dead import call keeps the plain spelling.
+  llvm::Value *Masked = B.CreateAnd(C, llvm::ConstantInt::get(
+                                           Type::getInt64Ty(LLCtx), 0xFF00));
   clang::Expr *E = Exprs->value(C, Scope);
   std::string S = print(E);
-  EXPECT_TRUE(S.find("helper(a)") != std::string::npos);
+  EXPECT_TRUE(S.find("((long long (*)(void))_invalid_parameter_noinfo)()") !=
+              std::string::npos)
+      << S;
+  clang::Expr *E2 = Exprs->value(Masked, Scope);
+  std::string S2 = print(E2);
+  EXPECT_TRUE(S2.find("& 65280LL") != std::string::npos) << S2;
+}
+
+TEST_F(ExprTest, VoidImportCallStatementNeedsNoCast) {
+  // Dead-result and void calls stay plain statements.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT =
+      FunctionType::get(Type::getVoidTy(LLCtx), {}, false);
+  llvm::Function *Callee = Function::Create(
+      FT, GlobalValue::ExternalLinkage, "import_noreturn", M.get());
+  clang::IdentifierInfo *Id = FCtx->ident("import_noreturn");
+  clang::FunctionProtoType::ExtProtoInfo EPI;
+  clang::QualType FQT = ACtx->getFunctionType(ACtx->VoidTy, {}, EPI);
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      *ACtx, ACtx->getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FQT,
+      ACtx->getTrivialTypeSourceInfo(FQT), clang::SC_Extern);
+  FCtx->bindDecl(Callee, FD);
+  // A void call carries no result, so it gets no name.
+  llvm::Value *C = B.CreateCall(FT, Callee, {});
+  clang::Stmt *S = Exprs->instr(*llvm::cast<llvm::CallInst>(C), Scope);
+  clang::PrintingPolicy Policy(LangOpts);
+  llvm::SmallString<128> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  S->printPretty(OS, nullptr, Policy);
+  std::string Text = std::string(OS.str());
+  EXPECT_TRUE(Text.find("import_noreturn()") != std::string::npos) << Text;
+  EXPECT_TRUE(Text.find("(*)(void)") == std::string::npos) << Text;
 }
 
 TEST_F(ExprTest, CondFlipsNotCmp) {
@@ -477,6 +712,20 @@ TEST_F(ExprTest, StringGlobalBecomesLiteral) {
   Exprs->beginFunction(*H.F, H.FD, Scope);
   clang::Expr *E = Exprs->value(GV, Scope);
   EXPECT_EQ(print(E), "\"hi\"");
+}
+
+TEST_F(ExprTest, CppBooleanConstantsPrintAsKeywords) {
+  LangOpts.CPlusPlus = 1;
+  FCtx = std::make_unique<revenant::clangx::FrontendContext>(
+      *ACtx, *M, revenant::clangx::SourceLang::CPlusPlus);
+  Types = std::make_unique<TestTypes>(FCtx.get());
+  Exprs = std::make_unique<ExprBuilderImpl>(*FCtx, *Types);
+
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  EXPECT_EQ(print(Exprs->value(ConstantInt::getTrue(LLCtx), Scope)), "true");
+  EXPECT_EQ(print(Exprs->value(ConstantInt::getFalse(LLCtx), Scope)), "false");
 }
 
 TEST_F(ExprTest, VirtualCallThroughVfptrSlot) {
@@ -721,5 +970,88 @@ TEST_F(ExprTest, WideShiftCountIsNarrowed) {
   EXPECT_TRUE(S.find(".lo") != std::string::npos) << S;
 }
 
+TEST_F(ExprTest, DirectCallCastsToDeclParams) {
+  // IR call-site types are often opaque (i8*); the callee declaration
+  // carries recovered struct* params. Args must cast to the declaration
+  // (C++ rejects implicit void* -> struct*).
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT = FunctionType::get(
+      Type::getInt32Ty(LLCtx), {Type::getInt8Ty(LLCtx)->getPointerTo()}, false);
+  llvm::Function *Callee =
+      Function::Create(FT, GlobalValue::ExternalLinkage, "taker", M.get());
+  clang::IdentifierInfo *Id = FCtx->ident("taker");
+  clang::QualType FQT = ACtx->getFunctionType(
+      ACtx->IntTy, {ACtx->UnsignedLongLongTy},
+      clang::FunctionProtoType::ExtProtoInfo());
+  clang::FunctionDecl *FD = clang::FunctionDecl::Create(
+      *ACtx, ACtx->getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), Id, FQT, ACtx->getTrivialTypeSourceInfo(FQT),
+      clang::SC_Extern);
+  FCtx->bindDecl(Callee, FD);
+  llvm::Value *PtrArg =
+      B.CreateIntToPtr(H.A, Type::getInt8Ty(LLCtx)->getPointerTo(), "p");
+  llvm::Value *C = B.CreateCall(FT, Callee, {PtrArg}, "c");
+  std::string S = print(Exprs->value(C, Scope));
+  EXPECT_TRUE(S.find("unsigned long long") != std::string::npos) << S;
+}
+
+TEST_F(ExprTest, PtrCompareCastsToU64) {
+  // `icmp ugt ptr` with differently-typed struct* operands does not
+  // compile in C++ (C2446); the addresses compare as integers.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::Type *S0 = llvm::StructType::create(LLCtx, "rv_s0");
+  llvm::Type *S1 = llvm::StructType::create(LLCtx, "rv_s1");
+  llvm::cast<llvm::StructType>(S0)->setBody(Type::getInt8Ty(LLCtx));
+  llvm::cast<llvm::StructType>(S1)->setBody(Type::getInt32Ty(LLCtx));
+  llvm::AllocaInst *A0 = B.CreateAlloca(S0, nullptr, "p0");
+  llvm::AllocaInst *A1 = B.CreateAlloca(S1, nullptr, "p1");
+  clang::VarDecl *V0 = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("p0"), ACtx->getPointerType(ACtx->UnsignedCharTy),
+      ACtx->getTrivialTypeSourceInfo(
+          ACtx->getPointerType(ACtx->UnsignedCharTy)),
+      clang::SC_None);
+  clang::VarDecl *V1 = clang::VarDecl::Create(
+      *ACtx, H.FD, clang::SourceLocation(), clang::SourceLocation(),
+      FCtx->ident("p1"), ACtx->getPointerType(ACtx->UnsignedIntTy),
+      ACtx->getTrivialTypeSourceInfo(
+          ACtx->getPointerType(ACtx->UnsignedIntTy)),
+      clang::SC_None);
+  FCtx->bindDecl(A0, V0);
+  FCtx->bindDecl(A1, V1);
+  llvm::Value *C = B.CreateICmpUGT(A0, A1, "c");
+  std::string S = print(Exprs->value(C, Scope));
+  EXPECT_TRUE(S.find("unsigned long long") != std::string::npos) << S;
+}
+
+TEST_F(ExprTest, FastfailCallDeclaresPrototype) {
+  // __fastfail lowering must leave a TU-visible prototype behind, or
+  // every use is C3861.
+  FuncHost H = makeFunc();
+  revenant::clangx::ExprScope Scope;
+  Exprs->beginFunction(*H.F, H.FD, Scope);
+  llvm::IRBuilder<> B(H.BB);
+  llvm::FunctionType *FT = FunctionType::get(
+      Type::getVoidTy(LLCtx), {Type::getInt32Ty(LLCtx)}, false);
+  llvm::Function *Trap =
+      Function::Create(FT, GlobalValue::ExternalLinkage, "llvm.x86.int",
+                       M.get());
+  llvm::Value *C = B.CreateCall(
+      FT, Trap, {llvm::ConstantInt::get(Type::getInt32Ty(LLCtx), 0x29)});
+  clang::Expr *E = Exprs->value(C, Scope);
+  EXPECT_TRUE(print(E).find("__fastfail") != std::string::npos);
+  clang::IdentifierInfo *Id = FCtx->ident("__fastfail");
+  bool Found = false;
+  for (clang::NamedDecl *D : ACtx->getTranslationUnitDecl()->lookup(Id))
+    if (llvm::isa<clang::FunctionDecl>(D))
+      Found = true;
+  EXPECT_TRUE(Found);
+}
 
 } // namespace

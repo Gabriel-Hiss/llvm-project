@@ -18,6 +18,7 @@
 #include "clang/AST/Decl.h"
 #include "revenant/Clang/TypeBuilder.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/Module.h"
 #include <string>
@@ -69,6 +70,17 @@ public:
   /// The temporary must live in the current function's scope.
   void bindTemp(llvm::Value *V, clang::VarDecl *D) { bindDecl(V, D); }
 
+  /// Request a system header for the emitted translation unit; the builder
+  /// asks for one when it lowers an IR form to a C library call (e.g.
+  /// `llvm.memset` -> `memset`, which needs `<string.h>`). Duplicate
+  /// requests are ignored and the first request wins.
+  void requireInclude(llvm::StringRef Header);
+
+  /// Headers requested through `requireInclude`, in request order.
+  llvm::ArrayRef<std::string> requestedIncludes() const {
+    return RequestedIncludes;
+  }
+
 
   /// Function declaration for `F`, creating a declaration-only FunctionDecl
   /// on first use (used for imports and for callees referenced before their
@@ -84,6 +96,7 @@ private:
   SourceLang Lang;
   llvm::DenseMap<const llvm::Value *, clang::ValueDecl *> ValueDecls;
   llvm::StringMap<clang::IdentifierInfo *> Sanitized;
+  llvm::SmallVector<std::string, 4> RequestedIncludes;
 };
 
 /// Read the `revenant.lang` module flag; defaults to C when absent or

@@ -137,13 +137,16 @@ Self-loop headers get a dedicated latch split out first, then the same
 rewrite. Guarantees vetoes on any existing self-call, impure latch, or
 non-covering phis; anything vetoed stays as-is.
 
-**revenant-unswitch (owner: StepUnswitchTables, opt-in).** Recovers
-lookup tables, linear maps, bitmaps, range checks, select chains and
-compare trees as switches when their matched values are proven. This pass
-is not in the default unopt pipeline: enabling it on the integration corpus
-produced invalid PHI predecessor counts in sqlite and imgui. Its standalone
-fixtures exercise the supported shapes; default use remains disabled until
-the control-flow rewrites preserve every successor PHI.
+**revenant-unswitch (owner: StepUnswitchTables, opt-in).** Recovers lookup
+tables (including merged lifted `.rdata` blobs), linear maps, bitmaps,
+range checks, select chains, switch-of-select, default-block merges, and
+compare trees across both arms of a range check. It preserves proven case
+values and copies `!revenant.va` onto new instructions; opaque regions and
+unreadable tables stay unchanged. The pass is available explicitly but is
+not in the default or unopt pipeline. Enabling it on the integration corpus
+produced invalid PHI predecessor counts in sqlite and imgui; another
+unswitch configuration took 104 seconds on one target and broke parallel
+versus serial output. Its standalone fixtures cover the supported shapes.
 
 **revenant-patterns (owner: MuseTxPatterns, opt-in).** Expects unopt
 output. Matches oracle-generated library-idiom patterns (anchor-seeded
@@ -172,8 +175,12 @@ expressed as DI (`DILocalVariable`, `DISubroutineType`, `DIBasicType`,
 used only through explicit truncations can recover the narrower width. Field
 types come from the widest access at each constant offset. Guarantees region
 annotations and provenance survive; types only refine.
+Variable-index scalar GEP loads/stores supply element-pointee evidence without
+inventing a struct offset; the Clang emitter applies DI types to array locals.
 The Clang emitter uses recovered parameter-variable types and names when a
 lifted `DISubroutineType` still carries placeholder parameter types.
+Return signedness follows ordered comparison predicates across `zext`, and
+unsigned division/remainder/logical-shift results retain unsigned evidence.
 
 **revenant-structure (owner: LunaShapeCtrlR, terminal).** Expects typed SSA-out
 IR and runs after critical-edge splitting so descriptors use indices into the

@@ -158,112 +158,242 @@ OffsetSplit splitOffset(Value *V) {
   return OffsetSplit();
 }
 
-// Match `icmp ult Base(+Off), Size` or `icmp ugt Base(+Off), Size-1` (a
-// plain range check). On success fills Base (the switch condition value),
-// Min (the absolute case minimum), Size, and Negated: false when the true
-// edge is in range (ult), true when the false edge is in range (ugt, the
-// spelling lifted MSVC/clang guard code prefers).
+// Match `icmp ult Base(+Off), Size` or `icmp ult Base, Size` (plain range
+// check). On success fills Base (the switch condition value), Min (the
+// absolute case minimum) and Size. `Reversed` is set when the in-range
+// edge is the jcc's false successor (`ugt`, `uge`), which is how MSVC and
+// clang flip the bound check when the default is the taken edge.
 bool matchRangeCheck(Value *Cond, Value *&OutBase, APInt &OutMin,
-                     uint64_t &OutSize, bool &Negated) {
+                     uint64_t &OutSize, bool &OutReversed) {
   auto *Cmp = dyn_cast<ICmpInst>(Cond);
-  if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_ULT &&
-               Cmp->getPredicate() != ICmpInst::ICMP_UGT))
+  if (!Cmp)
     return false;
-  Negated = Cmp->getPredicate() == ICmpInst::ICMP_UGT;
-  auto *SizeC = dyn_cast<ConstantInt>(Cmp->getOperand(1));
-  if (!SizeC || SizeC->isZero())
+  CmpInst::Predicate Pred = Cmp->getPredicate();
+  bool Reversed = false;
+  switch (Pred) {
+  case CmpInst::ICMP_ULT:
+  case CmpInst::ICMP_ULE:
+  case CmpInst::ICMP_UGT:
+  case CmpInst::ICMP_UGE:
+    break;
+  default:
+    return false;
+  }
+  auto *BoundC = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+  if (!BoundC)
     return false;
   Value *Sub = Cmp->getOperand(0);
   OffsetSplit OS = splitOffset(Sub);
+  uint64_t Size;
+  if (Pred == CmpInst::ICMP_ULT) {
+    // in range iff Sub < K on the true edge.
+    if (BoundC->isZero())
+      return false;
+    Size = BoundC->getValue().getLimitedValue();
+    Reversed = false;
+  } else if (Pred == CmpInst::ICMP_UGT) {
+    // in range iff Sub <= K on the false edge.
+    Size = BoundC->getValue().getLimitedValue();
+    if (Size == UINT64_MAX)
+      return false;
+    ++Size;
+    Reversed = true;
+  } else if (Pred == CmpInst::ICMP_ULE) {
+    Size = BoundC->getValue().getLimitedValue();
+    if (Size == UINT64_MAX)
+      return false;
+    ++Size;
+    Reversed = false;
+  } else {
+    // UGE: in range iff Sub < K on the false edge.
+    if (BoundC->isZero())
+      return false;
+    Size = BoundC->getValue().getLimitedValue();
+    Reversed = true;
+  }
   if (OS.Found) {
     OutBase = OS.Base;
     // Sub == Base + Off with Off == -Min, so Min == -Off.
     OutMin = -OS.Off;
   } else {
     OutBase = Sub;
-    OutMin = APInt(SizeC->getValue().getBitWidth(), 0);
+    OutMin = APInt(BoundC->getValue().getBitWidth(), 0);
   }
-  if (Negated) {
-    // ugt Base(+Off), Max: in range is [Min, Min + Max]; size = Max + 1.
-    if (SizeC->isMaxValue(false))
-      return false;
-    OutSize = SizeC->getValue().getLimitedValue() + 1;
-  } else {
-    OutSize = SizeC->getValue().getLimitedValue();
-  }
+  OutSize = Size;
+  OutReversed = Reversed;
   return OutSize > 0 && OutSize <= 1000000;
 }
 
-// Collect constant entries of a `@switch.table.*` global. Returns the
-// element constants in order, or nullopt when the global is unsuitable
-// (non-constant initializer, wrong size, poison/undef entries). For lifted
-// IR the compiler's lookup table survives as a constant byte array the
-// load indexes by element (`getelementptr i32` on `[N*4 x i8]`); in that
-// mode ElemTy is the loaded element type and the bytes are decoded
-// little-endian (x86-64).
+
+// The table entry index walks through GEPs, casts and, for Revenant's own
+// lifted data blobs, a byte-granular view of a wider constant global.
+struct TableRef {
+  GlobalVariable *GV = nullptr; ///< global holding the entries
+  uint64_t ByteOffset = 0;      ///< offset of entry 0 inside the global
+  Type *EntryTy = nullptr;      ///< type of one table entry
+};
+
+/// Resolve `Ptr` (the loaded address) to the constant global that backs
+/// the table. All indices but the last must be constants, so the walk is
+/// fully static; the last index is the table index itself.
+std::optional<TableRef> resolveTableRef(Value *Ptr, const DataLayout &DL) {
+  Value *Cur = Ptr->stripPointerCasts();
+  uint64_t Off = 0;
+  Type *EntryTy = nullptr;
+  for (unsigned Steps = 0; Steps < 8; ++Steps) {
+    if (auto *G = dyn_cast<GlobalVariable>(Cur)) {
+      if (!EntryTy)
+        return std::nullopt;
+      return TableRef{G, Off, EntryTy};
+    }
+    auto *GV = dyn_cast<GEPOperator>(Cur);
+    if (!GV)
+      return std::nullopt;
+    Type *Src = GV->getSourceElementType();
+    unsigned NumIdx = GV->getNumIndices();
+    if (NumIdx == 0)
+      return std::nullopt;
+    for (unsigned I = 0; I + 1 < NumIdx; ++I) {
+      auto *C = dyn_cast<ConstantInt>(GV->getOperand(I + 1));
+      if (!C)
+        return std::nullopt;
+      uint64_t Idx = C->getZExtValue();
+      if (auto *ST = dyn_cast<StructType>(Src))
+        Src = ST->getTypeAtIndex(Idx);
+      else if (auto *AT = dyn_cast<ArrayType>(Src))
+        Src = AT->getElementType();
+      else
+        return std::nullopt;
+      Off += Idx * DL.getTypeAllocSize(Src->getScalarType());
+    }
+    // The entry type is the last source element, one level under an
+    // array base (`gep [N x i32], @t, 0, %i` selects an `i32`).
+    EntryTy = Src;
+    if (auto *AT = dyn_cast<ArrayType>(Src))
+      EntryTy = AT->getElementType();
+    if (!EntryTy || !EntryTy->isIntegerTy())
+      return std::nullopt;
+    Cur = GV->getPointerOperand();
+  }
+  return std::nullopt;
+}
+
+// Read `Count` entries of `EntryTy` from the constant global at
+// `Ref.ByteOffset`. Two storage layouts appear in lifted IR:
+//   * an array of the entry type (`@switch.table.*`, from SimplifyCFG)
+//   * a byte soup (`@g_<addr>`, the lifter's view of a merged .rdata
+//     blob that holds the table among other constants)
+// Anything else is left alone.
 std::optional<std::vector<Constant *>>
-readTable(GlobalVariable *GV, uint64_t ExpectSize, IntegerType *ElemTy) {
+readTableEntries(GlobalVariable *GV, uint64_t ByteOffset, uint64_t Count,
+                 IntegerType *EntryTy, const DataLayout &DL,
+                 LLVMContext &Ctx) {
   if (!GV || !GV->isConstant() || !GV->hasInitializer())
     return std::nullopt;
-  auto *Init = GV->getInitializer();
-  auto *ArrayTy = dyn_cast<ArrayType>(Init->getType());
-  if (!ArrayTy)
+  if (Count == 0 || Count > 1000000)
+    return std::nullopt;
+  Constant *Init = GV->getInitializer();
+  unsigned Width = EntryTy->getBitWidth();
+  if (Width == 0 || Width > 64)
+    return std::nullopt;
+  uint64_t EntryBytes = Width / 8;
+  if (EntryBytes * 8 != Width)
+    return std::nullopt;
+
+  // Exact-element array storage (`@switch.table.*`).
+  if (auto *AT = dyn_cast<ArrayType>(Init->getType())) {
+    Type *Elt = AT->getElementType();
+    if (Elt == EntryTy) {
+      if (ByteOffset != 0 || Count > AT->getNumElements())
+        return std::nullopt;
+      auto *Data = dyn_cast<ConstantDataSequential>(Init);
+      auto *Arr = dyn_cast<ConstantArray>(Init);
+      if (!Data && !Arr)
+        return std::nullopt;
+      std::vector<Constant *> Elems;
+      Elems.reserve((size_t)Count);
+      for (uint64_t I = 0; I < Count; ++I) {
+        Constant *C = Data ? Data->getElementAsConstant((unsigned)I)
+                           : cast<Constant>(Arr->getOperand((unsigned)I));
+        if (isa<PoisonValue>(C) || isa<UndefValue>(C))
+          return std::nullopt;
+        Elems.push_back(C);
+      }
+      return Elems;
+    }
+  }
+
+  // A wider integer element type: index it in units of that element and
+  // truncate. A narrower element type is a byte soup, handled below.
+  if (auto *AT = dyn_cast<ArrayType>(Init->getType())) {
+    auto *Wide = dyn_cast<IntegerType>(AT->getElementType());
+    if (Wide && Wide->getBitWidth() >= Width) {
+      if (ByteOffset % (Wide->getBitWidth() / 8) != 0)
+        return std::nullopt;
+      uint64_t WideBytes = Wide->getBitWidth() / 8;
+      uint64_t BaseIdx = ByteOffset / WideBytes;
+      if (BaseIdx + Count > AT->getNumElements())
+        return std::nullopt;
+      auto *Data = dyn_cast<ConstantDataSequential>(Init);
+      auto *Arr = dyn_cast<ConstantArray>(Init);
+      if (!Data && !Arr)
+        return std::nullopt;
+      std::vector<Constant *> Elems;
+      Elems.reserve((size_t)Count);
+      for (uint64_t I = 0; I < Count; ++I) {
+        Constant *C =
+            Data ? Data->getElementAsConstant((unsigned)(BaseIdx + I))
+                 : cast<Constant>(Arr->getOperand((unsigned)(BaseIdx + I)));
+        if (isa<PoisonValue>(C) || isa<UndefValue>(C))
+          return std::nullopt;
+        Elems.push_back(ConstantInt::get(
+            Ctx, cast<ConstantInt>(C)->getValue().trunc(Width)));
+      }
+      return Elems;
+    }
+  }
+
+  // Byte soup: the lifter's `@g_<addr>` view of a merged .rdata island.
+  auto *Soup = dyn_cast<ConstantDataSequential>(Init);
+  if (!Soup || !Soup->getElementType()->isIntegerTy(8))
+    return std::nullopt;
+  uint64_t Total = DL.getTypeAllocSize(Init->getType());
+  if (ByteOffset % EntryBytes != 0)
+    return std::nullopt;
+  if (ByteOffset / EntryBytes + Count > Total / EntryBytes)
     return std::nullopt;
   std::vector<Constant *> Elems;
-  Elems.reserve((size_t)ExpectSize);
-  auto *Bytes = dyn_cast<ConstantDataSequential>(Init);
-  if (Bytes && ArrayTy->getElementType()->isIntegerTy(8) && ElemTy) {
-    // Lifted byte table: ExpectSize elements of ElemTy, little-endian.
-    unsigned EW = ElemTy->getBitWidth();
-    if (EW == 0 || EW % 8 || EW > 64)
-      return std::nullopt;
-    uint64_t EBytes = EW / 8;
-    uint64_t Off0 = 0;
-    if (ArrayTy->getNumElements() < ExpectSize * EBytes)
-      return std::nullopt;
-    for (uint64_t I = 0; I < ExpectSize; ++I) {
-      APInt V(EW, 0);
-      for (uint64_t B = 0; B < EBytes; ++B) {
-        auto *C = dyn_cast<ConstantInt>(
-            Bytes->getElementAsConstant((unsigned)(Off0 + I * EBytes + B)));
-        if (!C)
-          return std::nullopt;
-        V |= C->getValue().zext(EW) << (B * 8);
-      }
-      Elems.push_back(ConstantInt::get(ElemTy->getContext(), V));
+  Elems.reserve((size_t)Count);
+  for (uint64_t I = 0; I < Count; ++I) {
+    uint64_t FirstByte = ByteOffset + I * EntryBytes;
+    APInt V(Width, 0);
+    for (unsigned B = 0; B < EntryBytes; ++B) {
+      Constant *BC = Soup->getElementAsConstant((unsigned)(FirstByte + B));
+      if (isa<PoisonValue>(BC) || isa<UndefValue>(BC))
+        return std::nullopt;
+      uint64_t Byte = cast<ConstantInt>(BC)->getZExtValue();
+      V |= APInt(Width, Byte) << (8 * B);
     }
-    return Elems;
-  }
-  if (ArrayTy->getNumElements() != ExpectSize)
-    return std::nullopt;
-  auto *Data = dyn_cast<ConstantDataSequential>(Init);
-  auto *Array = dyn_cast<ConstantArray>(Init);
-  if (!Data && !Array)
-    return std::nullopt;
-  for (uint64_t I = 0; I < ExpectSize; ++I) {
-    Constant *C = Data ? Data->getElementAsConstant((unsigned)I)
-                       : cast<Constant>(Array->getOperand((unsigned)I));
-    if (isa<PoisonValue>(C) || isa<UndefValue>(C))
-      return std::nullopt;
-    Elems.push_back(C);
+    Elems.push_back(ConstantInt::get(Ctx, V));
   }
   return Elems;
 }
 
-// Convention check: only rebuild switches from globals SimplifyCFG itself
-// created (`switch.table.<func>`), or from lifted constant byte arrays
-// whose contents came straight from the binary's read-only data (the
-// `g_<va>` / section-array globals the lifter emits).
+// Two table storages appear in lifted IR:
+//   * `@switch.table.<func>`: the table SimplifyCFG created itself.
+//   * a lifted `.rdata` island (`@g_<addr>` / `@str_<addr>`): the table
+//     shares a merged constant blob, so the loader sees a byte soup
+//     instead of a dedicated array.
+// The lookup shape (single-predecessor lookup block, range-checked index,
+// join phi merging the load with a constant default) is what separates a
+// table from program data: the range check bounds the index by the table's
+// own entry count and the join's other edge is the switch default.
 bool isSwitchTable(GlobalVariable *GV) {
-  if (!GV)
+  if (!GV || !GV->isConstant())
     return false;
-  if (GV->getName().starts_with("switch.table."))
-    return true;
-  if (!GV->isConstant() || !GV->hasInitializer())
-    return false;
-  auto *Init = dyn_cast<ConstantDataSequential>(GV->getInitializer());
-  auto *ArrayTy = Init ? dyn_cast<ArrayType>(Init->getType()) : nullptr;
-  return ArrayTy && ArrayTy->getElementType()->isIntegerTy(8);
+  StringRef Name = GV->getName();
+  return Name.starts_with("switch.table.") || Name.starts_with("g_") ||
+         Name.starts_with("str_");
 }
 
 //===----------------------------------------------------------------------===//
@@ -303,13 +433,16 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
   Value *Base = nullptr;
   APInt Min(32, 0);
   uint64_t Size = 0;
-  bool Negated = false;
-  if (!matchRangeCheck(Cmp, Base, Min, Size, Negated))
+  bool Reversed = false;
+  if (!matchRangeCheck(Cmp, Base, Min, Size, Reversed))
     return std::nullopt;
 
-  // ult: the true edge is in range (the lookup). ugt: the false edge is.
-  BasicBlock *Lookup = BI->getSuccessor(Negated ? 1 : 0);
-  BasicBlock *Default = BI->getSuccessor(Negated ? 0 : 1);
+  // `ugt`/`uge` checks put the in-range edge on the false successor: the
+  // default is the taken one (clang and MSVC both emit this when the
+  // bound check reads `cmp; ja default`).
+  BasicBlock *Lookup =
+      BI->getSuccessor(Reversed ? 1 : 0);
+  BasicBlock *Default = BI->getSuccessor(Reversed ? 0 : 1);
   if (Lookup->getSinglePredecessor() != Head)
     return std::nullopt;
   auto *LookupBr = dyn_cast<BranchInst>(Lookup->getTerminator());
@@ -405,14 +538,31 @@ std::optional<LookupShape> matchLookup(BasicBlock *Head) {
 }
 
 bool buildSwitchFromTable(LookupShape &S) {
-  auto Elems = readTable(S.Table, S.TableSize, S.ElemTy);
-  if (!Elems)
-    return false;
+
   if (!regionIsPure({S.Lookup}))
     return false;
 
   LLVMContext &Ctx = S.Head->getContext();
   Function *F = S.Head->getParent();
+  const DataLayout &DL = F->getDataLayout();
+
+  // The load address is a GEP walk over a constant global; resolve it to
+  // the global, the static byte offset of entry 0 and the entry type so
+  // both the `@switch.table.*` array form and the lifted byte-soup form
+  // read the same entries.
+  auto *GEP = dyn_cast<GetElementPtrInst>(S.Load->getPointerOperand());
+  if (!GEP)
+    return false;
+  auto Ref = resolveTableRef(GEP, DL);
+  if (!Ref)
+    return false;
+  auto *EntryTy = dyn_cast<IntegerType>(Ref->EntryTy);
+  if (!EntryTy)
+    return false;
+  auto Elems = readTableEntries(Ref->GV, Ref->ByteOffset, S.TableSize,
+                                EntryTy, DL, Ctx);
+  if (!Elems)
+    return false;
 
   Type *CondTy = S.CondBase->getType();
   if (!CondTy->isIntegerTy())
@@ -524,10 +674,10 @@ bool tryLinearMap(Function &F, BasicBlock &BB) {
       continue;
     APInt Min = (-OS.Off).sextOrTrunc(CW);
 
-    // True value: add(mul(sub-or-cond, K), B). The compiler emits
-    // mul((cond-min), K)+B; the lifter may instead fold the offset into
-    // the multiply and compute mul(cond, K) directly (same in-range
-    // values, the index base is -Min).
+    // True value: add(mul(base, K), B) where `base` is either the
+    // range-checked offset (`sub`) or the switch value itself. clang's
+    // `switch_offset` maps the case value directly (`mul %c, 10`), while
+    // SimplifyCFG's own affine map scales the offset.
     Value *T = Sel->getTrueValue();
     // Allow an intcast around the arithmetic (SimplifyCFG inserts
     // switch.idx.cast when index width differs).
@@ -537,44 +687,37 @@ bool tryLinearMap(Function &F, BasicBlock &BB) {
     ConstantInt *K = nullptr;
     ConstantInt *Bc = nullptr;
     Value *AddOp0 = nullptr;
-    bool MulOnCond = false; // mul uses Cond, not Sub
+    bool FromCond = false;
     auto *ResTy = dyn_cast<IntegerType>(Sel->getType());
     if (!ResTy)
       continue;
-    auto mulBase = [&](Value *M) -> Value * {
-      auto *BO = dyn_cast<BinaryOperator>(M);
-      if (!BO || BO->getOpcode() != Instruction::Mul)
-        return nullptr;
-      auto *KC = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (!KC)
-        return nullptr;
-      return BO->getOperand(0);
+    auto isBase = [&](Value *V) {
+      if (V == Sub)
+        return true;
+      // The switch value itself: only legal when the offset is a plain
+      // subtraction of the minimum, so the case value is recoverable.
+      if (V == Cond) {
+        FromCond = true;
+        return true;
+      }
+      return false;
     };
     if (match(T, m_Add(m_Value(AddOp0), m_ConstantInt(Bc)))) {
-      Value *MulOp = mulBase(AddOp0);
-      if (MulOp) {
-        K = dyn_cast<ConstantInt>(cast<BinaryOperator>(AddOp0)->getOperand(1));
-        if (MulOp == Sub) {
-        } else if (MulOp == Cond) {
-          MulOnCond = true;
-        } else {
+      if (match(AddOp0, m_Mul(m_Value(), m_ConstantInt(K)))) {
+        Value *MulOp = cast<BinaryOperator>(AddOp0)->getOperand(0);
+        if (!isBase(MulOp))
           continue;
-        }
-      } else if (AddOp0 == Sub) {
+      } else if (isBase(AddOp0)) {
         K = ConstantInt::get(F.getContext(), APInt(CW, 1));
       } else {
         continue;
       }
-    } else if (Value *MulOp = mulBase(T)) {
-      K = dyn_cast<ConstantInt>(cast<BinaryOperator>(T)->getOperand(1));
-      if (MulOp == Sub) {
-      } else if (MulOp == Cond) {
-        MulOnCond = true;
-      } else {
+    } else if (match(T, m_Mul(m_Value(), m_ConstantInt(K)))) {
+      Value *MulOp = cast<BinaryOperator>(T)->getOperand(0);
+      if (!isBase(MulOp))
         continue;
-      }
       Bc = ConstantInt::get(F.getContext(), APInt(CW, 0));
-    } else if (T == Sub) {
+    } else if (isBase(T)) {
       K = ConstantInt::get(F.getContext(), APInt(CW, 1));
       Bc = ConstantInt::get(F.getContext(), APInt(CW, 0));
     } else {
@@ -599,19 +742,20 @@ bool tryLinearMap(Function &F, BasicBlock &BB) {
     if (!FeedsEnd)
       continue;
 
-    // Verify each case value exactly: res(i) = B + K*i when the mul runs
-    // on the offset, or B + K*(min+i) when it runs on the condition.
+    // Verify each case value exactly. For the offset form the source
+    // index is `v - Min`; for the value form it is `v` itself. Either way
+    // res = B + K * idx is computed in wide arithmetic and must survive
+    // the truncation to the result type unchanged.
     APInt Kv = K->getValue().sextOrTrunc(64);
     APInt Bv = Bc->getValue().sextOrTrunc(64);
-    if (MulOnCond)
-      Bv += Kv * Min.sextOrTrunc(64);
     unsigned RW = ResTy->getBitWidth();
     LLVMContext &Ctx = F.getContext();
     std::vector<Constant *> CaseVals;
     CaseVals.reserve((size_t)N);
     bool Ok = true;
     for (uint64_t Idx = 0; Idx < N; ++Idx) {
-      APInt R = Bv + Kv * APInt(64, Idx);
+      APInt IdxVal(64, FromCond ? (Min.getZExtValue() + Idx) : Idx);
+      APInt R = Bv + Kv * IdxVal;
       if (RW < 64) {
         if (!R.isIntN(RW) && !R.isSignedIntN(RW)) {
           // Truncation would change the value; bail.
@@ -851,10 +995,10 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
   Value *Base = nullptr;
   APInt Min(32, 0);
   uint64_t Size = 0;
+  bool Reversed = false;
   if (Cmp->getPredicate() != ICmpInst::ICMP_ULT)
-    return false;
-  bool Negated = false;
-  if (!matchRangeCheck(Cmp, Base, Min, Size, Negated))
+    return false; // `ugt`/`ule`/`uge` bounds stay plain interval checks
+  if (!matchRangeCheck(Cmp, Base, Min, Size, Reversed))
     return false;
   if (!Base->getType()->isIntegerTy())
     return false;
@@ -878,9 +1022,9 @@ bool tryRangeToSwitch(Function &F, BasicBlock &BB) {
       break; // only inspect the first instruction
     }
   }
-  // In-range destination first: ult's true edge, ugt's false edge.
-  BasicBlock *Dest = BI->getSuccessor(Negated ? 1 : 0);
-  BasicBlock *Other = BI->getSuccessor(Negated ? 0 : 1);
+  // Only ULT reaches this rewrite, so the true successor is in range.
+  BasicBlock *Dest = BI->getSuccessor(0);
+  BasicBlock *Other = BI->getSuccessor(1);
   // A range check guarding another dispatch (jump-table switch, select
   // chain) is structural, not a folded switch: expanding it would stack a
   // duplicate switch in front of the real one.
@@ -1174,19 +1318,19 @@ bool trySelectToSwitch(Function &F, BasicBlock &BB) {
       continue;
     if (!Cond->getType()->isIntegerTy())
       continue;
-  // All compares and selects must live in BB (single-block chain, the
-  // shape foldSwitchToSelect produces) or in the chain block holding the
-  // root select (lifted diamond: range pre-check in BB, selects next).
-  BasicBlock *ChainBB = R.Sel->getParent();
-  bool AllInBB = true;
-  for (auto &Row : Rows) {
-    if (Row.Cmp->getParent() != &BB && Row.Cmp->getParent() != ChainBB) {
-      AllInBB = false;
-      break;
+    // All compares and selects must live in BB (single-block chain, the
+    // shape foldSwitchToSelect produces) or in the chain block holding the
+    // root select (lifted diamond: range pre-check in BB, selects next).
+    BasicBlock *ChainBB = R.Sel->getParent();
+    bool AllInBB = true;
+    for (auto &Row : Rows) {
+      if (Row.Cmp->getParent() != &BB && Row.Cmp->getParent() != ChainBB) {
+        AllInBB = false;
+        break;
+      }
     }
-  }
-  if (!AllInBB)
-    continue;
+    if (!AllInBB)
+      continue;
     // At least two eq rows, or a mask row (foldSwitchToSelect needs >= 2
     // cases or a mask row; a lone eq+select is InstCombine's, not a
     // switch).

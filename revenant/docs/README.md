@@ -100,6 +100,11 @@ return value before branching there. Volatile, atomic, or escaped return slots
 keep their ordinary memory operations. Shared switch destinations emit one
 body under all matching case labels, including `default`.
 
+The frontend keeps recognizable source forms when the IR supports them. It
+prints canonical `for`-loop updates as `++`, `--`, or compound assignments,
+uses array subscripts for indexed GEPs, and emits C++ boolean constants as
+`true` and `false`. Explicit IR casts remain explicit where their type
+conversion matters.
 
 
 ## Driver

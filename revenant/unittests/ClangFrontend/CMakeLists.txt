@@ -4,7 +4,7 @@ revenant_add_unittest(RevenantUnitTests StructuredStmtBuilderTests
   ${CMAKE_SOURCE_DIR}/frontend/clang/lib/Expr/tests/ExprBuilderTests.cpp
   )
 
-target_link_libraries(StructuredStmtBuilderTests PRIVATE RevenantClangCore)
+target_link_libraries(StructuredStmtBuilderTests PRIVATE RevenantClangCore RevenantIR)
 target_include_directories(StructuredStmtBuilderTests PRIVATE
   ${CMAKE_SOURCE_DIR}/frontend/clang/include
   ${CMAKE_SOURCE_DIR}/frontend/clang/lib/Expr)

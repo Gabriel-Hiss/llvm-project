@@ -171,6 +171,29 @@ static bool hasMsvcRtti(const Image &Img) {
   }
   return false;
 }
+/// MinGW section names are exact: MSVC embeds `.CRT$X`/`.tls$` *strings* in
+/// .rdata but never a section with that name, while MinGW links `.CRT`/`.tls`
+/// sections. clang-cl links `.tls` too, so it only counts with `.CRT`.
+static bool hasSectionNamed(const Image &Img, StringRef Name) {
+  for (const Section &S : Img.Sections)
+    if (StringRef(S.Name).equals_insensitive(Name))
+      return true;
+  return false;
+}
+
+/// Raw byte search over every section: the MinGW `.comment` (`GCC:
+/// (MinGW-W64 ...)`) and runtime strings (`Mingw-w64 ...`, `.eh_frame`,
+/// `__register_frame_info`) survive `-static-libgcc -s` stripping.
+static bool imageContains(const Image &Img, StringRef Needle) {
+  for (const Section &S : Img.Sections) {
+    if (S.Data.empty())
+      continue;
+    if (StringRef(reinterpret_cast<const char *>(S.Data.data()), S.Data.size())
+            .contains_insensitive(Needle))
+      return true;
+  }
+  return false;
+}
 
 /// User C++ exception tables surviving the link: for each .pdata unwind
 /// record with UNW_FLAG_EHANDLER, the language-handler data is either a
@@ -353,17 +376,60 @@ CompilerInfo detectProducer(const PeFile &Pe,
     }
   }
 
-  // MinGW: mingw-specific imports or GCC-style init symbols.
-  bool Mingw = llvm::any_of(Pe.Imports, [](const Import &I) {
-    std::string Dll = I.Dll;
-    std::transform(Dll.begin(), Dll.end(), Dll.begin(),
-                   [](unsigned char C) { return toLower(C); });
-    return Dll.find("mingw") != std::string::npos ||
-           Dll.find("libgcc") != std::string::npos;
+  // MinGW, including stripped `-static-libgcc -s` images with no mingw
+  // import DLLs left: score independent evidence, MinGW at >= 2. `.CRT` is
+  // MinGW-only as a section name (MSVC/clang link `.CRT$X` strings, never
+  // the section); `.tls` alone is shared with clang-cl so it only counts
+  // with `.CRT`.
+  bool HasCrtSection = hasSectionNamed(Img, ".CRT");
+  bool HasTlsSection = hasSectionNamed(Img, ".tls");
+  bool HasGccComment = imageContains(Img, "GCC: (MinGW");
+  bool HasMingwRuntime = imageContains(Img, "Mingw-w64");
+  bool HasEhFrame =
+      imageContains(Img, ".eh_frame") && imageContains(Img, "__register_frame");
+  bool HasMingwImport = llvm::any_of(Pe.Imports, [](const Import &I) {
+    StringRef Dll(I.Dll);
+    if (Dll.contains_insensitive("mingw") || Dll.contains_insensitive("libgcc"))
+      return true;
+    StringRef N = I.Name ? StringRef(*I.Name) : StringRef();
+    return N.starts_with("__gxx_personality") || N == "__register_frame_info" ||
+           N == "__deregister_frame_info" ||
+           Dll.starts_with_insensitive("libstdc++");
   });
-  if (Mingw) {
+  bool HasMingwSymbol = llvm::any_of(SymbolNames, [](const std::string &S) {
+    StringRef N(S);
+    return N.contains_insensitive("__mingw") || N.contains_insensitive("_mingw") ||
+           N.contains_insensitive("gcc_except") ||
+           N.starts_with("__gxx_personality");
+  });
+  unsigned MingwScore = (HasCrtSection && (HasTlsSection || HasGccComment ||
+                                           HasMingwRuntime || HasEhFrame ||
+                                           HasMingwImport || HasMingwSymbol))
+                            ? 2
+                            : 0;
+  MingwScore += HasGccComment ? 2 : 0;
+  MingwScore += HasMingwRuntime ? 2 : 0;
+  MingwScore += HasMingwImport ? 2 : 0;
+  MingwScore += HasEhFrame ? 1 : 0;
+  MingwScore += HasMingwSymbol ? 1 : 0;
+  if (MingwScore >= 2) {
     CompCompiler = Compiler::MinGwGcc;
-    Info.Evidence.push_back("MinGW/libgcc imports");
+    std::string Hits;
+    if (HasCrtSection)
+      Hits += ".CRT section; ";
+    if (HasCrtSection && HasTlsSection)
+      Hits += ".tls section; ";
+    if (HasGccComment)
+      Hits += "GCC MinGW comment; ";
+    if (HasMingwRuntime)
+      Hits += "Mingw-w64 runtime strings; ";
+    if (HasEhFrame)
+      Hits += ".eh_frame/register_frame; ";
+    if (HasMingwImport)
+      Hits += "MinGW imports; ";
+    if (HasMingwSymbol)
+      Hits += "MinGW symbols; ";
+    Info.Evidence.push_back("MinGW (" + Hits + ")");
     if (!CompLang)
       CompLang = Lang::C;
   }

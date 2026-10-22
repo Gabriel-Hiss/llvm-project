@@ -50,6 +50,10 @@ public:
     const llvm::Value *Base = nullptr;
     // Offset in bits -> widest access cell.
     llvm::MapVector<uint64_t, FieldCell> Fields;
+    // One scalar access through a variable-index GEP provides element type
+    // evidence without establishing a constant struct-field offset.
+    FieldCell DynamicAccess;
+    bool HasDynamicAccess = false;
     uint64_t MaxEndBits = 0;
   };
   const FieldAccess *fieldsFor(const llvm::Value *Base) const;

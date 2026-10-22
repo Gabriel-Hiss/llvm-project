@@ -37,8 +37,8 @@
 // Structs come from constant-offset field access patterns: GEPs with all
 // constant indices (via accumulateConstantOffset) plus constant-offset
 // load/store users through one base pointer each contribute (offset, size,
-// access type). Two or more distinct offsets make a struct; a single offset
-// stays a scalar pointer.
+// access type). Two or more distinct offsets make a struct. Variable-index
+// scalar accesses contribute a pointee type, but never a guessed field offset.
 //
 //===----------------------------------------------------------------------===//
 
@@ -276,11 +276,12 @@ void TypeInference::collect() {
         continue;
       }
       // Unsigned/signed arithmetic votes on the LHS (mirrors the
-      // unsigned-arith cast insertion in the reference emitter).
+      // unsigned-arith cast insertion in the reference emitter) and result.
       if (I.getOpcode() == Instruction::UDiv ||
           I.getOpcode() == Instruction::URem ||
           I.getOpcode() == Instruction::LShr) {
         voteUnsigned(I.getOperand(0));
+        voteUnsigned(&I);
         voteIntOf(&I);
         continue;
       }
@@ -288,13 +289,21 @@ void TypeInference::collect() {
           I.getOpcode() == Instruction::SDiv ||
           I.getOpcode() == Instruction::SRem) {
         voteSigned(I.getOperand(0));
+        voteSigned(&I);
         voteIntOf(&I);
         continue;
       }
       if (const auto *CI = dyn_cast<CastInst>(&I)) {
         switch (CI->getOpcode()) {
         case Instruction::ZExt:
-          voteUnsigned(&I);
+          if (const auto *Cmp = dyn_cast<ICmpInst>(CI->getOperand(0))) {
+            if (Cmp->isUnsigned())
+              voteUnsigned(&I);
+            else if (Cmp->isSigned())
+              voteSigned(&I);
+          } else {
+            voteUnsigned(&I);
+          }
           voteIntOf(&I);
           break;
         case Instruction::SExt:
@@ -427,18 +436,21 @@ void TypeInference::collect() {
 void TypeInference::recordFieldAccess(const Value *Ptr, uint64_t BaseOffset,
                                       bool DirectMemOp, const Instruction *I) {
   const Value *Base = skipCopies(Ptr);
-  // Walk through a constant GEP to the ultimate base.
+  const DataLayout &DL = F.getParent()->getDataLayout();
   uint64_t GepOff = 0;
-  if (const auto *GEP = dyn_cast<GetElementPtrInst>(Base)) {
-    const DataLayout &DL = F.getParent()->getDataLayout();
+  bool HasDynamicGEP = false;
+  while (const auto *GEP = dyn_cast<GetElementPtrInst>(Base)) {
     APInt Off(64, 0);
     if (GEP->accumulateConstantOffset(DL, Off)) {
-      GepOff = Off.getZExtValue();
-      Base = skipCopies(GEP->getPointerOperand());
+      GepOff += Off.getZExtValue();
     } else {
-      // Non-constant GEP: the base is still a pointer, but no field.
-      return;
+      // A scalar element access through a variable-index GEP informs the
+      // base's pointee type, but not a constant field offset.
+      if (!DirectMemOp || GEP->getSourceElementType()->isStructTy())
+        return;
+      HasDynamicGEP = true;
     }
+    Base = skipCopies(GEP->getPointerOperand());
   }
   if (!DirectMemOp)
     return; // GEP alone is not an access; the load/store records it.
@@ -448,7 +460,6 @@ void TypeInference::recordFieldAccess(const Value *Ptr, uint64_t BaseOffset,
   uint64_t OffBits = (GepOff + BaseOffset) * 8;
   uint64_t SizeBits = 0;
   const Value *Access = nullptr;
-  const DataLayout &DL = F.getParent()->getDataLayout();
   if (const auto *LI = dyn_cast<LoadInst>(I)) {
     SizeBits = DL.getTypeStoreSizeInBits(LI->getType());
     Access = LI;
@@ -460,6 +471,21 @@ void TypeInference::recordFieldAccess(const Value *Ptr, uint64_t BaseOffset,
   }
   if (SizeBits == 0)
     return;
+  if (HasDynamicGEP) {
+    Type *AccessTy = Access->getType();
+    if (!AccessTy->isIntegerTy() && !AccessTy->isFloatingPointTy() &&
+        !AccessTy->isPointerTy())
+      return;
+    ensureValue(Base);
+    FieldAccess &FA = Bases[Base];
+    FA.Base = Base;
+    if (!FA.HasDynamicAccess || FA.DynamicAccess.SizeBits < SizeBits) {
+      FA.DynamicAccess =
+          FieldCell{SizeBits, I->getDebugLoc().get(), Access};
+      FA.HasDynamicAccess = true;
+    }
+    return;
+  }
 
   // Find the base's access record (create on first field access).
   ensureValue(Base);
@@ -481,6 +507,21 @@ bool TypeInference::isUnsigned(const Value *V) const {
   // Unsigned-sticky join: any unsigned witness wins (mirrors expr_signed).
   if (N.UnsignedVotes > 0)
     return true;
+  const Value *Slot = nullptr;
+  if (const auto *LI = dyn_cast<LoadInst>(V))
+    Slot = skipCopies(LI->getPointerOperand());
+  else if (isa<AllocaInst>(V))
+    Slot = V;
+  if (!Slot || !Slot->hasUseList())
+    return false;
+  for (const User *U : Slot->users()) {
+    const auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || skipCopies(SI->getPointerOperand()) != Slot)
+      continue;
+    auto ValueIt = Index.find(skipCopies(SI->getValueOperand()));
+    if (ValueIt != Index.end() && Nodes[find(ValueIt->second)].UnsignedVotes)
+      return true;
+  }
   return false;
 }
 

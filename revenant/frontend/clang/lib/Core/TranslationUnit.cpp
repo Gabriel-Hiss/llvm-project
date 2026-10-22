@@ -27,6 +27,7 @@
 #include "clang/Basic/TargetOptions.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -106,20 +107,37 @@ static const llvm::DILocalVariable *dbgVarFor(llvm::AllocaInst &AI) {
   return nullptr;
 }
 
-/// DWARF arg number -> DILocalVariable, for the function's params.
-static DenseMap<unsigned, const llvm::DILocalVariable *>
-paramVars(const llvm::DISubprogram *SP, llvm::Function &F) {
-  DenseMap<unsigned, const llvm::DILocalVariable *> Out;
-  if (!SP)
-    return Out;
-  for (auto &BB : F)
-    for (auto &I : BB)
-      if (auto *DVI = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
-        const llvm::DILocalVariable *V = DVI->getVariable();
-        if (V && V->isParameter() && V->getArg())
-          Out[V->getArg()] = V;
-      }
-  return Out;
+
+/// Use a recovered array DI type only when its extent and element storage
+/// shape agree with the LLVM alloca. A wrong element stride changes every
+/// GEP-based access, even when total byte size happens to match.
+static bool arrayDIShapeMatches(c::ASTContext &AST,
+                                const llvm::DataLayout &DL,
+                                llvm::Type *IRTy, c::QualType DIQT) {
+  auto *IRArray = llvm::dyn_cast<llvm::ArrayType>(IRTy);
+  auto *DIArray =
+      llvm::dyn_cast<c::ConstantArrayType>(DIQT.getTypePtr());
+  if (!IRArray || !DIArray ||
+      DIArray->getSize().getZExtValue() != IRArray->getNumElements())
+    return false;
+
+  llvm::Type *IRElem = IRArray->getElementType();
+  c::QualType DIElem = DIArray->getElementType();
+  bool SameCategory =
+      (IRElem->isIntegerTy() && DIElem->isIntegerType()) ||
+      (IRElem->isFloatingPointTy() && DIElem->isFloatingType()) ||
+      (IRElem->isPointerTy() && DIElem->isPointerType()) ||
+      (IRElem->isStructTy() && DIElem->isRecordType()) ||
+      (IRElem->isArrayTy() && DIElem->isArrayType()) ||
+      (IRElem->isVectorTy() && DIElem->isVectorType());
+  if (!SameCategory)
+    return false;
+
+  llvm::TypeSize ElemBits = DL.getTypeStoreSizeInBits(IRElem);
+  llvm::TypeSize ArrayBits = DL.getTypeAllocSizeInBits(IRArray);
+  return !ElemBits.isScalable() && !ArrayBits.isScalable() &&
+         AST.getTypeSize(DIElem) == ElemBits.getFixedValue() &&
+         AST.getTypeSize(DIArray) == ArrayBits.getFixedValue();
 }
 
 static StringRef vtableClassName(StringRef Name) {
@@ -144,27 +162,42 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
     auto *CDS = llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(Init);
     if (!CDS)
       continue;
-    // C allows a string literal that exactly fills the array; C++ always
-    // counts the terminator, so there only a NUL-terminated array prints as a
-    // literal (without its last byte) and the rest as a byte list.
-    if (CDS->isString() && (!FCtx.isCPlusPlus() || CDS->isCString())) {
+    // A string literal carries an implicit NUL, so it only fits an array of
+    // N bytes when its stored data leaves room for it (C++) or exactly fills
+    // the array without it (C). Drop a redundant trailing NUL from the data
+    // and otherwise fall back to a braced initializer.
+    if (CDS->isString()) {
       StringRef S = CDS->getRawDataValues();
-      c::QualType ArrTy = AST.getConstantArrayType(
-          AST.CharTy, APInt(64, S.size()), nullptr,
-          c::ArraySizeModifier::Normal, 0);
-      if (FCtx.isCPlusPlus())
-        S = S.drop_back();
-      VD->setType(ArrTy);
-      VD->setInit(c::StringLiteral::Create(
-          AST, S, c::StringLiteralKind::Ordinary, false, ArrTy, L));
-      VD->setInitStyle(c::VarDecl::CInit);
-    } else if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
+      const bool DropsNul = !S.empty() && S.back() == '\0';
+      StringRef Lit = DropsNul ? S.drop_back() : S;
+      const bool Fits = FCtx.isCPlusPlus()
+                            ? Lit.size() + 1 <= CDS->getNumElements()
+                            : Lit.size() <= CDS->getNumElements();
+      if (Fits) {
+        c::QualType ArrTy = AST.getConstantArrayType(
+            AST.CharTy, APInt(64, CDS->getNumElements()), nullptr,
+            c::ArraySizeModifier::Normal, 0);
+        VD->setType(ArrTy);
+        VD->setInit(c::StringLiteral::Create(
+            AST, Lit, c::StringLiteralKind::Ordinary, false, ArrTy, L));
+        VD->setInitStyle(c::VarDecl::CInit);
+        continue;
+      }
+    }
+    if (auto *CDA = llvm::dyn_cast<llvm::ConstantDataArray>(CDS)) {
       SmallVector<c::Expr *, 64> Elems;
       c::QualType ElemTy = Types.typeOf(CDA->getElementType(), nullptr);
+      // A literal typed narrower than `int` prints with the Ui8/Ui16 numeric
+      // literal suffix, which gcc and clang-cl do not understand
+      // ("operator\"\"Ui8\"" not found). Spell the same value with the
+      // promoted literal type; the InitListExpr and the global keep ElemTy.
+      c::QualType LitTy = ElemTy;
+      if (LitTy->isIntegerType() && AST.getIntWidth(LitTy) < 32)
+        LitTy = AST.IntTy;
       for (unsigned I = 0, E = CDA->getNumElements(); I != E; ++I)
         Elems.push_back(c::IntegerLiteral::Create(
-            AST, APInt(AST.getIntWidth(ElemTy), CDA->getElementAsInteger(I)),
-            ElemTy, L));
+            AST, APInt(AST.getIntWidth(LitTy), CDA->getElementAsInteger(I)),
+            LitTy, L));
       c::Expr *ILE = new (AST) c::InitListExpr(AST, L, Elems, L);
       ILE->setType(VD->getType());
       VD->setInit(ILE);
@@ -174,42 +207,132 @@ static void buildGlobals(llvm::Module &M, FrontendContext &FCtx,
 }
 
 
+namespace {
+/// Prototype shape for a CRT/SDK function name, spelled with the one-letter
+/// types `crtPrim` maps to Clang types.
+struct CrtShape {
+  llvm::StringRef Name;
+  char Ret;
+  llvm::StringRef Params;
+};
+
+/// One entry per CRT/SDK function name the headers this translation unit
+/// already includes declare (MSVC `<stdint.h>` reaches vcruntime.h and
+/// corecrt.h). `V` void, `I` int, `U` unsigned long long. Each shape is
+/// checked against those headers: declaring the lifted guess instead
+/// redefines the header's function and the recompile dies on C2371/C2556.
+const CrtShape CrtShapes[] = {
+    {"_invalid_parameter_noinfo", 'V', ""},
+    {"__security_init_cookie", 'V', ""},
+    {"_purecall", 'I', ""},
+    {"__security_check_cookie", 'V', "U"},
+    {"__report_gsfailure", 'V', ""},
+    {"_amsg_exit", 'V', "I"},
+};
+
+
+} // namespace
+
+std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name) {
+  for (const CrtShape &Shape : CrtShapes) {
+    if (Name != Shape.Name)
+      continue;
+    CrtPrototype Proto;
+    Proto.Ret = Shape.Ret;
+    for (char Kind : Shape.Params)
+      Proto.Params.push_back(Kind);
+    return Proto;
+  }
+  return std::nullopt;
+}
+
+/// The clang spelling for one of the CRT shapes. Hand-written rather than
+/// routed through `Types.typeOf`, whose fallback for an unsigned-less integer
+/// is `unsigned int`: the header declares `int _purecall(void)` and a signed
+/// spelling that comes out unsigned still redefines it.
+c::QualType crtClangType(char Kind, c::ASTContext &AST) {
+  switch (Kind) {
+  case 'V':
+    return AST.VoidTy;
+  case 'I':
+    return AST.IntTy;
+  case 'U':
+    return AST.UnsignedLongLongTy;
+  }
+  return AST.VoidTy;
+}
+
+/// Declaration for a library function whose name a CRT/SDK header already
+/// declares, carrying the header's prototype instead of the lifted guess.
+/// Nullptr when no override applies and the caller uses the lifted type.
+static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
+                                               FrontendContext &FCtx) {
+  if (!F.hasFnAttribute("revenant.lib"))
+    return nullptr;
+  std::optional<CrtPrototype> Proto = crtPrototypeFor(F.getName());
+  if (!Proto || Proto->Params.size() != F.arg_size())
+    return nullptr;
+  c::ASTContext &AST = FCtx.ast();
+  SmallVector<c::QualType, 4> ParamTypes;
+  for (char Kind : Proto->Params)
+    ParamTypes.push_back(crtClangType(Kind, AST));
+  c::QualType FT = AST.getFunctionType(crtClangType(Proto->Ret, AST),
+                                       ParamTypes,
+                                       c::FunctionProtoType::ExtProtoInfo());
+  auto *FD = c::FunctionDecl::Create(
+      AST, AST.getTranslationUnitDecl(), c::SourceLocation(),
+      c::SourceLocation(), c::DeclarationName(FCtx.ident(F.getName())), FT,
+      nullptr, c::SC_Extern);
+  // The printer walks the type's parameters and asks for their
+  // declarations, so the declaration needs one per parameter.
+  {
+    SmallVector<c::ParmVarDecl *, 4> FDParams;
+    for (unsigned I = 0, N = ParamTypes.size(); I != N; ++I)
+      FDParams.push_back(c::ParmVarDecl::Create(
+          AST, FD, c::SourceLocation(), c::SourceLocation(),
+          FCtx.ident("a" + std::to_string(I + 1)), ParamTypes[I], nullptr,
+          c::SC_None, nullptr));
+    FD->setParams(FDParams);
+  }
+  AST.getTranslationUnitDecl()->addDecl(FD);
+  FCtx.bindDecl(&F, FD);
+  return FD;
+}
+
+/// The FunctionDecl for `F` plus its ParmVarDecls: the declaration half of
+/// the emission, which every caller needs (bodies included).
+/// `LibraryDeclaration` asks for the declaration-only shape: no body will
+/// follow, so the storage class says the body comes from elsewhere at link
+/// time and a CRT/SDK name takes its header's prototype.
+static c::FunctionDecl *declareFunction(llvm::Function &F,
+                                        FrontendContext &FCtx,
+                                        TypeBuilder &Types,
+                                        bool LibraryDeclaration) {
+  c::ASTContext &AST = FCtx.ast();
+  c::FunctionDecl *FD = LibraryDeclaration
+                            ? headerPrototypeDeclFor(F, FCtx)
+                            : nullptr;
+  if (!FD) {
+    FD = FCtx.functionDecl(F, Types);
+    if (LibraryDeclaration && FD->getStorageClass() == c::SC_None)
+      FD->setStorageClass(c::SC_Extern);
+  }
+
+  // The declaration carries its parameters already: the frontend creates
+  // them with the declaration, so a callee the frontend met at its call
+  // site first keeps the same declarations.
+  return FD;
+}
+
 static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
                           TypeBuilder &Types, StmtBuilder &Stmts,
                           ExprBuilder &Exprs) {
-  c::ASTContext &AST = FCtx.ast();
-  c::FunctionDecl *FD = FCtx.functionDecl(F, Types);
-  // Declarations still need ParmVarDecls for Clang's printer, but have no body.
-
-  // Parameters: DI arg names when present, else a1..aN.
-  DenseMap<unsigned, const llvm::DILocalVariable *> PV;
-  if (llvm::DISubprogram *SP = F.getSubprogram())
-    PV = paramVars(SP, F);
-  SmallVector<c::ParmVarDecl *, 8> Params;
-  unsigned Idx = 1;
-  const c::FunctionProtoType *Prototype =
-      FD->getType()->getAs<c::FunctionProtoType>();
-  for (llvm::Argument &A : F.args()) {
-    c::QualType PT =
-        Prototype && Idx <= Prototype->getNumParams()
-            ? Prototype->getParamType(Idx - 1)
-            : Types.typeOf(A.getType(), nullptr);
-    c::IdentifierInfo *II = nullptr;
-    if (auto *V = PV.lookup(Idx))
-      II = FCtx.ident(V->getName());
-    if (!II)
-      II = FCtx.ident(("a" + Twine(Idx)).str());
-    c::ParmVarDecl *PD = c::ParmVarDecl::Create(AST, FD, c::SourceLocation(),
-                                                c::SourceLocation(), II, PT,
-                                                nullptr, c::SC_None, nullptr);
-    FCtx.bindDecl(&A, PD);
-    Params.push_back(PD);
-    ++Idx;
-  }
-  FD->setParams(Params);
+  c::FunctionDecl *FD = declareFunction(F, FCtx, Types,
+                                        /*LibraryDeclaration=*/false);
 
   if (F.isDeclaration())
     return;
+  c::ASTContext &AST = FCtx.ast();
   // Locals: one VarDecl per alloca, DI names/types when available.
   SmallVector<c::Stmt *, 16> LocalDecls;
   for (llvm::BasicBlock &BB : F)
@@ -217,9 +340,11 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
       if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
         const llvm::DILocalVariable *V = dbgVarFor(*AI);
         const llvm::DIType *DI = V ? V->getType() : nullptr;
-        c::QualType LT = AI->getAllocatedType()->isArrayTy()
-                             ? Types.typeOf(AI->getAllocatedType(), nullptr)
-                             : Types.typeOf(AI->getAllocatedType(), DI);
+        c::QualType LT = Types.typeOf(AI->getAllocatedType(), DI);
+        if (AI->getAllocatedType()->isArrayTy() &&
+            !arrayDIShapeMatches(AST, F.getParent()->getDataLayout(),
+                                 AI->getAllocatedType(), LT))
+          LT = Types.typeOf(AI->getAllocatedType(), nullptr);
         c::IdentifierInfo *II =
             FCtx.ident(V ? V->getName()
                          : (AI->getName().empty()
@@ -266,10 +391,32 @@ static void buildFunction(llvm::Function &F, FrontendContext &FCtx,
 
 void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
                          TypeBuilder &Types, StmtBuilder &Stmts,
-                         ExprBuilder &Exprs) {
+                         ExprBuilder &Exprs, bool UserBodiesOnly) {
   buildGlobals(M, *T.FCtx, Types);
-  for (llvm::Function &F : M)
-    buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
+  for (llvm::Function &F : M) {
+    // An llvm.* intrinsic has no C name of its own: the builders lower the
+    // ones the C library or a TU-level helper covers, and an unlowered one
+    // must surface as an unknown identifier rather than a declaration the
+    // linker could never resolve. Declaring `llvm_2e...` would do exactly
+    // that, so skip them.
+    if (F.getName().starts_with("llvm."))
+      continue;
+    // A library body is code the real CRT/SDK ships: emitting ours as well
+    // redefines the header's function (MSVC C2371/C2556) and duplicates the
+    // definition at link. The declaration stays so calls still resolve, and
+    // its prototype follows the header when one declares the name.
+    // A user-reachable function keeps its body even when it also matches a
+    // database record: the classifier reached it from the user entry, so it
+    // is the program's own code. ICF folding can land a CRT body on the
+    // traced entry, and a body-less entry does not link at all.
+    bool LibraryDeclaration = UserBodiesOnly &&
+                              F.hasFnAttribute("revenant.lib") &&
+                              !F.hasFnAttribute("revenant.user");
+    if (LibraryDeclaration)
+      declareFunction(F, *T.FCtx, Types, /*LibraryDeclaration=*/true);
+    else
+      buildFunction(F, *T.FCtx, Types, Stmts, Exprs);
+  }
 }
 
 
@@ -292,11 +439,14 @@ static c::FunctionDecl *prototypeFor(c::FunctionDecl *Definition,
 }
 
 void printTranslationUnit(c::TranslationUnitDecl *TU, llvm::raw_ostream &OS,
-                          ArrayRef<StringRef> Includes) {
+                          ArrayRef<StringRef> Includes,
+                          ArrayRef<std::string> ExtraIncludes) {
   c::PrintingPolicy Policy = TU->getASTContext().getPrintingPolicy();
   for (StringRef Inc : Includes)
     OS << "#include <" << Inc << ">\n";
-  if (!Includes.empty())
+  for (const std::string &Inc : ExtraIncludes)
+    OS << "#include <" << Inc << ">\n";
+  if (!Includes.empty() || !ExtraIncludes.empty())
     OS << "\n";
   emitWideIntPreamble(OS, TU->getASTContext());
   std::unordered_set<std::string> PrintedRecords;

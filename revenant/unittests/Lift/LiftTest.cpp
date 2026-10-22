@@ -18,7 +18,7 @@
 #include "revenant/Target/TargetHooks.h"
 #include "X86MCTargetDesc.h"
 
-#include "gtest/gtest.h"
+ #include "gtest/gtest.h"
 
 #include <cstdlib>
 #include <map>
