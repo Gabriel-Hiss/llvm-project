@@ -1471,7 +1471,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             return;
           }
           St.Ctx = std::make_unique<LLVMContext>();
-          St.Mod = moduleFor(*St.Ctx, Out);
+          St.Mod = moduleFor(*St.Ctx, Out, Compiler.Producer);
           St.KindSeen = kindCount(St);
           // The lifter creates the EH personality declaration lazily, at
           // the first function whose EH conversion fires, and serial has it
@@ -1973,10 +1973,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // destination per shard, which made merging quadratic.
           MergeShards =
               [&Ctx, &Todo, &GlobalOrder, &SerialGlobalCounter, Out, StateOwner,
-               SharedGlobals,
+               SharedGlobals, this,
                PersonalityNames]() -> Expected<std::unique_ptr<Module>> {
             std::vector<ShardState> &State = *StateOwner;
-            std::unique_ptr<Module> M = moduleFor(Ctx, Out);
+            std::unique_ptr<Module> M = moduleFor(Ctx, Out, Compiler.Producer);
             auto mergeShard = [&](Module &Src) -> std::string {
               for (llvm::Function &F : make_early_inc_range(Src)) {
                 llvm::Function *Dst = M->getFunction(F.getName());
@@ -2202,7 +2202,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         if (!ParallelClean) {
           errs() << "[note] parallel clean fell back to serial: " << Why
                  << "\n";
-          M = moduleFor(Ctx, Out);
+          M = moduleFor(Ctx, Out, Compiler.Producer);
           CleanSlots.assign(Todo.size(), CleanSlot{});
           CleanRemainder.clear();
         }
