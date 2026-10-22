@@ -19,8 +19,8 @@ failed stage and skips that function while the remaining functions continue.
 | sigs | `analyzeSignatures` over the whole program, cached per session, converted to the lifter's `lift::Signatures` |
 | lift (ir-raw) | `lift::liftFunction`, then the module verifier |
 | ir-clean | `CleanupPipeline` + `revenant-idioms`, then the verifier |
-| ir-final | `revenant-uncxx` (C++ output), unopt passes, `revenant-unhotcold` (module pass), `revenant-structure`, `revenant-types`, `revenant-ssaout` (and `revenant-patterns` with `--patterns`), then the verifier |
-| source | C/C++: `RevenantClangCore` + `printTranslationUnit`; Rust: the rustc fork |
+| ir-final | shared: `revenant-uncxx` (C++ output), unopt passes, `revenant-unhotcold` (module pass), `revenant-types`; then the storage tail `revenant-locals-to-slots`, `revenant-structure` (and `revenant-patterns` with `--patterns`), then the verifier. A rustc binary takes the source tail here too: rustc's unoptimized IR keeps scalar locals in SSA values |
+| source | the storage tail `revenant-ssaout`, `revenant-structure` (and `revenant-patterns`) over the shared ir-final input, then C/C++: `RevenantClangCore` + `printTranslationUnit`; Rust: the rustc fork. With artifacts on, the ir-final tail runs on a worker thread over a bitcode copy of the shared input, in its own LLVMContext, while the source tail and emit run on the main module |
 
 The verifier runs after lift and after each individual cleanup or final
 function pass. Invalid pass output restores the function's previous valid
