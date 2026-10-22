@@ -82,3 +82,30 @@ X:
 ; CHECK: %bound = ptrtoint ptr %end to i32
 ; CHECK: %g1 = getelementptr i32, ptr %g0, i32 1
 ; CHECK: %inext = add i32 %i, 4
+
+; The pointer advances by two bytes but the loop executes once. Replacing
+; two stores by one and halving the pointer step would lose the second store.
+define void @pointer_store_one_trip(ptr %base, i8 %byte) {
+entry:
+  br label %L
+
+L:
+  %p = phi ptr [ %base, %entry ], [ %next, %L ]
+  %count = phi i32 [ 0, %entry ], [ %count.next, %L ]
+  store i8 %byte, ptr %p, align 1
+  %second = getelementptr i8, ptr %p, i64 1
+  store i8 %byte, ptr %second, align 1
+  %next = getelementptr i8, ptr %p, i64 2
+  %count.next = add i32 %count, 1
+  %done = icmp eq i32 %count.next, 1
+  br i1 %done, label %exit, label %L
+
+exit:
+  ret void
+}
+
+; CHECK-LABEL: define void @pointer_store_one_trip
+; CHECK: store i8 %byte, ptr %p, align 1
+; CHECK: %second = getelementptr i8, ptr %p, i64 1
+; CHECK: store i8 %byte, ptr %second, align 1
+; CHECK: %next = getelementptr i8, ptr %p, i64 2
