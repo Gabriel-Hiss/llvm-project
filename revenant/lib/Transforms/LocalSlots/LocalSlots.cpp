@@ -37,8 +37,12 @@ Instruction *firstNonAlloca(BasicBlock &Entry) {
   return It == Entry.end() ? Entry.getTerminator() : &*It;
 }
 
+// Provenance only: the source's other metadata (`!nonnull`, `!range`,
+// `!noundef` on a load) describes that instruction's value and is invalid
+// or wrong on a new store or load.
 void copyProvenance(const Instruction &From, Instruction &To) {
-  To.copyMetadata(From);
+  if (MDNode *VA = From.getMetadata("revenant.va"))
+    To.setMetadata("revenant.va", VA);
   To.setDebugLoc(From.getDebugLoc());
 }
 
