@@ -818,6 +818,32 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
   bool Changed = false;
   LLVMContext &Ctx = F.getContext();
 
+  // Phase 0: the trap marker a compiler leaves behind a noreturn call
+  // (int3 after a throw, __fastfail after a panic) is not part of the
+  // source. The block already ends dead, so the interrupt call is noise
+  // the compiler's own IR does not carry: dropping it brings the two
+  // closer. An interrupt in the middle of a live block stays.
+  {
+    SmallVector<CallBase *, 4> Markers;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+        const Function *Callee = CB->getCalledFunction();
+        if (!Callee || Callee->getName() != "llvm.x86.int")
+          continue;
+        Instruction *Next = I.getNextNode();
+        if (!Next || !isa<UnreachableInst>(Next))
+          continue;
+        Markers.push_back(CB);
+      }
+    }
+    for (CallBase *CB : Markers)
+      CB->eraseFromParent();
+    Changed |= !Markers.empty();
+  }
+
   // Phase 1: verified magic division/modulo -> udiv/sdiv/urem/srem.
   // Scan each block in reverse so an outer root is matched before the
   // inner nodes of its own DAG.
