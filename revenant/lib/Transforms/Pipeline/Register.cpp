@@ -39,6 +39,12 @@
 #if __has_include("revenant/Transforms/Idioms/Idioms.h")
 #include "revenant/Transforms/Idioms/Idioms.h"
 #endif
+#if __has_include("revenant/Transforms/GsCookie/GsCookie.h")
+#include "revenant/Transforms/GsCookie/GsCookie.h"
+#endif
+#if __has_include("revenant/Transforms/RustBlocks/RustBlocks.h")
+#include "revenant/Transforms/RustBlocks/RustBlocks.h"
+#endif
 #if __has_include("revenant/Transforms/Patterns/Patterns.h")
 #include "revenant/Transforms/Patterns/Patterns.h"
 #endif
@@ -139,6 +145,18 @@ void registerRevenantPasses(PassBuilder &PB) {
 #if __has_include("revenant/Transforms/Idioms/Idioms.h")
         if (Name == "revenant-idioms") {
           FPM.addPass(IdiomsPass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/GsCookie/GsCookie.h")
+        if (Name == "revenant-gscookie") {
+          FPM.addPass(GsCookiePass());
+          return true;
+        }
+#endif
+#if __has_include("revenant/Transforms/RustBlocks/RustBlocks.h")
+        if (Name == "revenant-rustblocks") {
+          FPM.addPass(RustBlocksPass());
           return true;
         }
 #endif

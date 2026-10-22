@@ -667,9 +667,13 @@ std::string cleanPipeline(bool EnableStructDI) {
 /// ir-final: deoptimization, type recovery, SSA-out, then control-flow shape.
 /// `revenant-unhotcold` is a module pass (the cold-chunk search looks at
 /// sibling functions), so it sits between the two function blocks: the pass
-/// order is unchanged.
+/// order is unchanged. `revenant-rustblocks` and `revenant-gscookie` run at
+/// the end of the deopt block: both change the CFG or the instruction set,
+/// and both have to run before `revenant-structure`, which names the blocks
+/// and records the region indices of the final CFG.
 std::string finalPipeline(bool Patterns, bool IncludeUncxx) {
-  return formatv("function({0}{1}),revenant-unhotcold,"
+  return formatv("function({0}{1},revenant-rustblocks,revenant-gscookie),"
+                 "revenant-unhotcold,"
                  "function(revenant-types,revenant-ssaout,"
                  "revenant-structure{2})",
                  IncludeUncxx ? "revenant-uncxx," : "", UnoptPipeline,

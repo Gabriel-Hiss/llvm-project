@@ -371,6 +371,53 @@ free arm reads is remappable. Guarantees semantics-preserving rewrites only,
 `!revenant.va` preserved, `!revenant.opaque` untouched. Runs explicitly via
 `-passes=revenant-unrust`, not in the default pipeline.
 
+**revenant-rustblocks (owner: MinimaxIrRustGs).** Expects a module with
+`revenant.lang == "rust"` (any other module is a no-op). Restores the rustc
+MIR block shape: rustc ends a MIR block at every call whose result is
+dropped, so the compiler's ir-pre keeps one basic block per such call. The
+optimizer merges those blocks (SimplifyCFG folds the `br label` chain into
+the block that follows) and the decompiler's cleanup pipeline does the same,
+so the lifted IR ends up with several calls in one block. The pass splits a
+block right after every such call that is not the last instruction of its
+block: the tail moves into a new block reached by an unconditional branch.
+Guarantees: a pure block split, no value is redefined, no edge is added or
+removed, the call keeps its operands, its metadata and its position, and the
+new branch carries the call's `!revenant.va`. Calls whose result is used,
+intrinsics, the lifter's opaque trap calls and calls that already end their
+block are left alone. The pass fires only where more than one boundary is at
+stake: rustc keeps a single dropped-result call and the code after it in one
+block whenever the call is the last statement of its MIR block (the `start`
+block of a small function is exactly that shape), so a lone boundary is left
+to the compiler. Runs in the deopt block of the final pipeline, before
+`revenant-structure` (the structuring pass names the blocks and records the
+region indices, so the CFG must be final before it runs). Measured on the
+parity corpus (whole-program `ir-final`, 1:1 pairs): rust-o0 0.6789 ->
+0.6825, rust-o2avx2 0.5685 -> 0.5685. The block count of the forked IR moves
+toward the compiler's (rust-o0: -1.37 -> -1.07 blocks per function), but
+the remaining gap is not recoverable from the binary: the rustc `start`
+split and the empty MIR blocks leave no trace in the machine code, and the
+metric's block feature compares counts.
+
+**revenant-gscookie (owner: MinimaxIrRustGs).** Expects deoptimized IR.
+Removes the MSVC /GS stack cookie sequence: the prologue store of
+`cookie ^ stack pointer` into the frame, the epilogue compare of the
+reloaded cookie against the global, the branch on that compare and the
+`__security_check_cookie` call. The compiler's own ir-pre has none of it:
+the backend inserts the cookie after the frontend produced the IR, so the
+deoptimized IR has to drop it to read like the compiler's. The failure edge
+is folded into the success edge (the check calls `__report_gsfailure`, which
+aborts, so the edge never returns), and the instructions that only existed
+for the cookie go with it. The pattern is matched by shape, never by name
+(the lifted callee is `sub_<VA>`): the xor with the stack pointer, the
+compare against the cookie value, and the call that takes the compared
+value. The function carries the marker `"rv.gscookie"="1"` afterwards, so
+the source emitter can tell that the cookie was removed. Runs in the deopt
+block of the final pipeline. Measured on the parity corpus (whole-program
+`ir-final`, 1:1 pairs): c-clang-o0 0.7508 -> 0.7679, c-clang-o2 0.6269 ->
+0.6298, cpp-clang-o0 0.7113 -> 0.7250, cpp-clang-o2 0.6144 -> 0.6210; six
+functions in c-clang-o0, two in c-clang-o2 and two in cpp-clang-o2 lose
+their cookie sequence.
+
 ## Deopt evidence (owner: MuseDeoptEvidence)
 
 One evidence API that deopt passes query, built from embedded metadata and
