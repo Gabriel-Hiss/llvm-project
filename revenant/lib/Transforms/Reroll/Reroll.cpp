@@ -870,7 +870,10 @@ bool provedMultiple(Value *V, int64_t S, unsigned Depth = 0) {
     // Preserve (or widen) the low bits, so a multiple stays a multiple,
     // provided S still fits in the narrow type.
     Value *Op = I->getOperand(0);
-    unsigned Bits = Op->getType()->getIntegerBitWidth();
+    auto *IntegerTy = dyn_cast<IntegerType>(Op->getType());
+    if (!IntegerTy)
+      return false;
+    unsigned Bits = IntegerTy->getBitWidth();
     if (Bits == 0 || Bits >= 64)
       return false;
     if ((uint64_t)S >= (uint64_t{1} << (Bits - 1)))
