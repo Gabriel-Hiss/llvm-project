@@ -757,7 +757,10 @@ Expected<EmitResult> emitClangSource(Module &M, bool Cpp, bool UserBodiesOnly) {
   // does not link: LNK2019). MinGW targets keep the plain three.
   if (llvm::Triple(M.getTargetTriple()).isKnownWindowsMSVCEnvironment())
     Inc.push_back("intrin.h");
-  clangx::printTranslationUnit(T->tu(), OS, Inc);
+  // The frontend asks for a header when it lowers an IR form to a library
+  // call (e.g. `llvm.memset` -> `memset`, which needs <string.h>).
+  clangx::printTranslationUnit(T->tu(), OS, Inc,
+                               T->frontend().requestedIncludes());
   return R;
 }
 
