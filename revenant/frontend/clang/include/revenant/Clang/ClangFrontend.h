@@ -96,20 +96,22 @@ void fillTranslationUnit(TranslationUnit &T, llvm::Module &M,
                          ExprBuilder &Exprs, bool UserBodiesOnly = false);
 
 /// A CRT/SDK prototype the headers a translation unit includes already
-/// declare. `Ret`/`Params` hold the LLVM types the declaration is built
-/// from; `Params` may be shorter than the lifted function's argument list,
-/// which callers treat as "no override".
+/// declare. `Ret`/`Params` hold the one-letter type kinds the declaration
+/// is built from (`V` void, `I` int, `U` unsigned long long); `Params` may
+/// be shorter than the lifted function's argument list, which callers treat
+/// as "no override". The kinds are letters and not LLVM types on purpose:
+/// the source stage runs while the artifact printer walks the module's
+/// context, and creating a type in it from here would race with it.
 struct CrtPrototype {
-  llvm::Type *Ret;
-  llvm::SmallVector<llvm::Type *, 2> Params;
+  char Ret;
+  llvm::SmallVector<char, 2> Params;
 };
 
 /// Header prototype for a CRT/SDK function name, when the headers the
 /// emitter already includes declare that name (MSVC `<stdint.h>` reaches
 /// vcruntime.h and corecrt.h). `std::nullopt` means the name is not one of
 /// them and the lifted signature stands.
-std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name,
-                                            llvm::LLVMContext &Ctx);
+std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name);
 
 /// Print the translation unit as C/C++ source using Clang's own printer.
 /// `Includes` is emitted verbatim as `#include` lines first, followed by

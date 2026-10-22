@@ -231,43 +231,35 @@ const CrtShape CrtShapes[] = {
 };
 
 
-llvm::Type *crtPrim(llvm::LLVMContext &Ctx, char Kind) {
-  switch (Kind) {
-  case 'V':
-    return llvm::Type::getVoidTy(Ctx);
-  case 'I':
-    return llvm::Type::getInt32Ty(Ctx);
-  case 'U':
-    return llvm::Type::getInt64Ty(Ctx);
-  }
-  return llvm::Type::getVoidTy(Ctx);
-}
 } // namespace
 
-std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name,
-                                            llvm::LLVMContext &Ctx) {
+std::optional<CrtPrototype> crtPrototypeFor(llvm::StringRef Name) {
   for (const CrtShape &Shape : CrtShapes) {
     if (Name != Shape.Name)
       continue;
     CrtPrototype Proto;
-    Proto.Ret = crtPrim(Ctx, Shape.Ret);
+    Proto.Ret = Shape.Ret;
     for (char Kind : Shape.Params)
-      Proto.Params.push_back(crtPrim(Ctx, Kind));
+      Proto.Params.push_back(Kind);
     return Proto;
   }
   return std::nullopt;
 }
 
-/// The clang spelling for one of `crtPrim`'s shapes. Hand-written rather than
+/// The clang spelling for one of the CRT shapes. Hand-written rather than
 /// routed through `Types.typeOf`, whose fallback for an unsigned-less integer
 /// is `unsigned int`: the header declares `int _purecall(void)` and a signed
 /// spelling that comes out unsigned still redefines it.
-c::QualType crtClangType(llvm::Type *T, c::ASTContext &AST) {
-  if (T->isVoidTy())
+c::QualType crtClangType(char Kind, c::ASTContext &AST) {
+  switch (Kind) {
+  case 'V':
     return AST.VoidTy;
-  if (T->isIntegerTy(32))
+  case 'I':
     return AST.IntTy;
-  return AST.UnsignedLongLongTy;
+  case 'U':
+    return AST.UnsignedLongLongTy;
+  }
+  return AST.VoidTy;
 }
 
 /// Declaration for a library function whose name a CRT/SDK header already
@@ -277,14 +269,13 @@ static c::FunctionDecl *headerPrototypeDeclFor(llvm::Function &F,
                                                FrontendContext &FCtx) {
   if (!F.hasFnAttribute("revenant.lib"))
     return nullptr;
-  std::optional<CrtPrototype> Proto = crtPrototypeFor(F.getName(),
-                                                      F.getContext());
+  std::optional<CrtPrototype> Proto = crtPrototypeFor(F.getName());
   if (!Proto || Proto->Params.size() != F.arg_size())
     return nullptr;
   c::ASTContext &AST = FCtx.ast();
   SmallVector<c::QualType, 4> ParamTypes;
-  for (llvm::Type *T : Proto->Params)
-    ParamTypes.push_back(crtClangType(T, AST));
+  for (char Kind : Proto->Params)
+    ParamTypes.push_back(crtClangType(Kind, AST));
   c::QualType FT = AST.getFunctionType(crtClangType(Proto->Ret, AST),
                                        ParamTypes,
                                        c::FunctionProtoType::ExtProtoInfo());

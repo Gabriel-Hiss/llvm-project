@@ -494,11 +494,11 @@ TEST(TranslationUnitTest, LibraryDeclarationUsesCrtHeaderPrototype) {
 
   // The header prototype is the truth for this name; the lifted i64 return
   // would redefine vcruntime.h's void function (MSVC C2371/C2556).
-  auto Proto = crtPrototypeFor("__security_init_cookie", Context);
+  auto Proto = crtPrototypeFor("__security_init_cookie");
   ASSERT_TRUE(Proto.has_value());
-  EXPECT_TRUE(Proto->Ret->isVoidTy());
+  EXPECT_EQ(Proto->Ret, 'V');
   EXPECT_EQ(Proto->Params.size(), 0u);
-  EXPECT_FALSE(crtPrototypeFor("user_body", Context).has_value());
+  EXPECT_FALSE(crtPrototypeFor("user_body").has_value());
 
   ClangFrontendOptions Options;
   Options.Lang = "c";
