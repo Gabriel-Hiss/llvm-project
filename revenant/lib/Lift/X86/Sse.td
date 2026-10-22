@@ -48,8 +48,19 @@ def rv_pmovmskb     : RVOp; // (rv_pmovmskb x): i128 -> i32 sign mask
 def rv_movmskps     : RVOp; // (rv_movmskps x): i128 -> i32
 def rv_movmskpd     : RVOp; // (rv_movmskpd x): i128 -> i32
 def rv_ptest        : RVOp; // (rv_ptest a, b): flags-only
+def rv_maskload : RVOp; // (rv_maskload width, element bits, mask, address)
+def rv_maskstore : RVOp; // (rv_maskstore width, element bits, address, mask, data)
+def rv_vbroadcast : RVOp; // (rv_vbroadcast width, ebits, scalar): repeat scalar
 def rv_vbroadcastb  : RVOp; // (rv_vbroadcastb val): low byte splat -> i128
-def rv_vcvtdq2pd    : RVOp; // (rv_vcvtdq2pd x): low 2xi32 -> 2xf64 as i128
+def rv_vcvtdq2ps   : RVOp; // (rv_vcvtdq2ps x): signed 4xi32 -> 4xf32
+def rv_vcvtps2dq   : RVOp; // (rv_vcvtps2dq x): 4xf32 -> rounded 4xi32
+def rv_vcvttps2dq  : RVOp; // (rv_vcvttps2dq x): 4xf32 -> truncated 4xi32
+def rv_vcvttpd2dq  : RVOp; // (rv_vcvttpd2dq x): 2xf64 -> truncated 2xi32, zero high lanes
+def rv_vcvtdq2pd   : RVOp; // (rv_vcvtdq2pd x): low 2xi32 -> 2xf64 as i128
+def rv_vcvtps2pd   : RVOp; // (rv_vcvtps2pd x): low 2xf32 -> 2xf64 as i128
+def rv_vcvtpd2ps   : RVOp; // (rv_vcvtpd2ps x): low 2xf64 -> 2xf32 as i128
+def rv_xroundsd     : RVOp; // (rv_xroundsd x, imm): round lane 0 double
+def rv_xroundss     : RVOp; // (rv_xroundss x, imm): round lane 0 float
 def rv_pcmpextest   : RVOp; // (rv_pcmpextest kind, x, m, imm): pcmpestr flags-only
 def rv_pcmpistest   : RVOp; // (rv_pcmpistest kind, x, m, imm): pcmpistr flags-only
 
@@ -491,6 +502,144 @@ def : RVMatch {
   dag Body = (rv_set $dst, (rv_fptosi 64, (rv_xlane0f32 (rv_op 0))));
 }
 
+// SSE2 packed conversions used by vectorized compiler-generated code.
+def : RVMatch {
+  string Glob = "CVTDQ2PDrm";
+  dag Body = (rv_set $dst, (rv_vcvtdq2pd
+    (rv_zext 128, (rv_load 64, (rv_addr $src)))));
+}
+def : RVMatch {
+  string Glob = "CVTDQ2PDrr";
+  dag Body = (rv_set $dst, (rv_vcvtdq2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTDQ2PSrm";
+  dag Body = (rv_set $dst, (rv_vcvtdq2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTDQ2PSrr";
+  dag Body = (rv_set $dst, (rv_vcvtdq2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPS2DQrm";
+  dag Body = (rv_set $dst, (rv_vcvtps2dq (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPS2DQrr";
+  dag Body = (rv_set $dst, (rv_vcvtps2dq (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTTPS2DQrm";
+  dag Body = (rv_set $dst, (rv_vcvttps2dq (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTTPS2DQrr";
+  dag Body = (rv_set $dst, (rv_vcvttps2dq (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTTPD2DQrm";
+  dag Body = (rv_set $dst, (rv_vcvttpd2dq (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTTPD2DQrr";
+  dag Body = (rv_set $dst, (rv_vcvttpd2dq (rv_op 0)));
+}
+// ---- SSE4.1 packed conversions and scalar rounding ------------------------------
+// CVTPS2PD/CVTPD2PS: packed convert on the low 64 bits. Legacy forms keep
+// upper lanes; VEX forms zero them.
+def : RVMatch {
+  string Glob = "CVTPS2PDrr";
+  dag Body = (rv_set $dst, (rv_vcvtps2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPS2PDrm";
+  dag Body = (rv_set $dst, (rv_vcvtps2pd
+    (rv_zext 128, (rv_load 64, (rv_addr $src)))));
+}
+def : RVMatch {
+  string Glob = "VCVTPS2PDrr";
+  dag Body = (rv_setz $dst, (rv_vcvtps2pd (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPS2PDrm";
+  dag Body = (rv_setz $dst, (rv_vcvtps2pd
+    (rv_zext 128, (rv_load 64, (rv_addr $src)))));
+}
+def : RVMatch {
+  string Glob = "CVTPD2PSrr";
+  dag Body = (rv_set $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "CVTPD2PSrm";
+  dag Body = (rv_set $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPD2PSrr";
+  dag Body = (rv_setz $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VCVTPD2PSrm";
+  dag Body = (rv_setz $dst, (rv_vcvtpd2ps (rv_op 0)));
+}
+// ROUNDSD/ROUNDSS: scalar round with imm8 rounding mode. Legacy forms keep
+// upper lanes; VEX forms zero them.
+def : RVMatch {
+  string Glob = "ROUNDSDri";
+  dag Body = (rv_set $dst, (rv_xroundsd (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "ROUNDSDmi";
+  dag Body = (rv_set $dst, (rv_xroundsd
+    (rv_zext 128, (rv_load 64, (rv_addr $src))), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSDri";
+  dag Body = (rv_setz $dst, (rv_xroundsd (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSDmi";
+  dag Body = (rv_setz $dst, (rv_xroundsd
+    (rv_zext 128, (rv_load 64, (rv_addr $src))), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "ROUNDSSri";
+  dag Body = (rv_set $dst, (rv_xroundss (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "ROUNDSSmi";
+  dag Body = (rv_set $dst, (rv_xroundss
+    (rv_zext 128, (rv_load 32, (rv_addr $src))), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSSri";
+  dag Body = (rv_setz $dst, (rv_xroundss (rv_op 0), (rv_op 1)));
+}
+def : RVMatch {
+  string Glob = "VROUNDSSmi";
+  dag Body = (rv_setz $dst, (rv_xroundss
+    (rv_zext 128, (rv_load 32, (rv_addr $src))), (rv_op 1)));
+}
+// Internal variants are direct RVLift entries because RVMatch does not see
+// these codegen-only forms.
+def : RVLift {
+  let Insn = ROUNDSDri_Int;
+  dag Body = (rv_set $dst, (rv_xroundsd (rv_op 1), (rv_op 2)));
+}
+def : RVLift {
+  let Insn = ROUNDSDmi_Int;
+  dag Body = (rv_set $dst, (rv_xroundsd
+    (rv_zext 128, (rv_load 64, (rv_addr $src2))), (rv_op 2)));
+}
+def : RVLift {
+  let Insn = ROUNDSSri_Int;
+  dag Body = (rv_set $dst, (rv_xroundss (rv_op 1), (rv_op 2)));
+}
+def : RVLift {
+  let Insn = ROUNDSSmi_Int;
+  dag Body = (rv_set $dst, (rv_xroundss
+    (rv_zext 128, (rv_load 32, (rv_addr $src2))), (rv_op 2)));
+}
+
 // ---- scalar float compares (flags only) --------------------------------------
 def : RVMatch {
   string Glob = "COMISSrr";
@@ -768,6 +917,131 @@ def : RVMatch {
 def : RVMatch {
   string Glob = "VPTESTrr";
   dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VPTESTrm";
+  dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VPTESTYrr";
+  dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VPTESTYrm";
+  dag Body = (rv_ptest (rv_op 0), (rv_op 1));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 64, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 64, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSmr";
+  dag Body = (rv_maskstore 128, 32, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPSYmr";
+  dag Body = (rv_maskstore 256, 32, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDmr";
+  dag Body = (rv_maskstore 128, 64, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VMASKMOVPDYmr";
+  dag Body = (rv_maskstore 256, 64, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDrm";
+  dag Body = (rv_setz $dst, (rv_maskload 128, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDYrm";
+  dag Body = (rv_set $dst, (rv_maskload 256, 32, (rv_op 0), (rv_addr $src2)));
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDmr";
+  dag Body = (rv_maskstore 128, 32, (rv_addr $dst), $src1, $src2);
+}
+def : RVMatch {
+  string Glob = "VPMASKMOVDYmr";
+  dag Body = (rv_maskstore 256, 32, (rv_addr $dst), $src1, $src2);
+}
+// AVX2 scalar broadcasts from XMM sources or scalar memory cells.
+def : RVMatch {
+  string Glob = "VPBROADCASTBrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 8, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTBrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 8, (rv_load 8, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTBYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 8, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTBYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 8, (rv_load 8, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 16, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 16, (rv_load 16, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 16, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTWYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 16, (rv_load 16, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 32, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 32, (rv_load 32, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 32, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTDYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 32, (rv_load 32, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 64, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 128, 64, (rv_load 64, (rv_addr $src))));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQYrr";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 64, (rv_op 0)));
+}
+def : RVMatch {
+  string Glob = "VPBROADCASTQYrm";
+  dag Body = (rv_setz $dst, (rv_vbroadcast 256, 64, (rv_load 64, (rv_addr $src))));
 }
 // pblendvb selects per byte from xmm0's sign bits: (mask, if-set, if-clear).
 def rv_vec : RVOp; // (rv_vec "kind", ebits, args...): typed vecOp at the operand width

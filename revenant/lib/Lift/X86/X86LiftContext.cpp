@@ -967,6 +967,24 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     return FixedVectorType::get(Elt, 128 / Elt->getPrimitiveSizeInBits());
   };
   auto As = [&](Value *V, Type *T) { return B.CreateBitCast(V, T); };
+  auto FPToSI32 = [&](Value *F, FixedVectorType *FPTy,
+                      FixedVectorType *I32Ty) {
+    Type *F64Ty = FixedVectorType::get(F64, FPTy->getNumElements());
+    Value *D = FPTy->getElementType()->isFloatTy() ? B.CreateFPExt(F, F64Ty) : F;
+    auto Splat = [&](double V) {
+      return ConstantVector::getSplat(
+          cast<FixedVectorType>(F64Ty)->getElementCount(), ConstantFP::get(F64, V));
+    };
+    Value *Invalid = B.CreateFCmpUNO(D, D);
+    Invalid = B.CreateOr(Invalid,
+                         B.CreateFCmpOLT(D, Splat(-2147483648.0)));
+    Invalid = B.CreateOr(Invalid, B.CreateFCmpOGT(D, Splat(2147483647.0)));
+    Value *Converted = B.CreateFPToSI(F, I32Ty);
+    Constant *Indefinite = ConstantVector::getSplat(
+        I32Ty->getElementCount(),
+        ConstantInt::get(Type::getInt32Ty(B.getContext()), 0x80000000));
+    return B.CreateSelect(Invalid, Indefinite, Converted);
+  };
 
   if (Name == "xlane0f32")
     return B.CreateExtractElement(As(I128, Vec128(F32)), uint64_t(0));
@@ -1132,6 +1150,12 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     // Handled by ptestOp; fall through to undef.
     return nullptr;
   }
+  if (Name == "vbroadcast") {
+    unsigned W = static_cast<unsigned>(static_cast<uint64_t>(Imm) >> 8);
+    unsigned EB = static_cast<unsigned>(Imm) & 0xFF;
+    Value *Scalar = toInt(A, EB);
+    return B.CreateBitCast(B.CreateVectorSplat(W / EB, Scalar), iN(W));
+  }
   if (Name == "vbroadcastb") {
     Value *X = toInt(A, 8);
     // x * 0x0101010101010101 splats the low byte over 64 bits, then splat
@@ -1143,6 +1167,28 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
                           B.CreateZExt(Q, iN(128)));
     return D;
   }
+  if (Name == "vcvtdq2ps" || Name == "vcvtps2dq" ||
+      Name == "vcvttps2dq") {
+    auto *I32Vec = FixedVectorType::get(Type::getInt32Ty(B.getContext()), 4);
+    auto *F32Vec = FixedVectorType::get(F32, 4);
+    Value *Vec = As(I128, Name == "vcvtdq2ps" ? I32Vec : F32Vec);
+    if (Name == "vcvtdq2ps")
+      return B.CreateBitCast(B.CreateSIToFP(Vec, F32Vec), iN(128));
+    if (Name == "vcvttps2dq") {
+      Value *Truncated = B.CreateUnaryIntrinsic(Intrinsic::trunc, Vec);
+      return B.CreateBitCast(FPToSI32(Truncated, F32Vec, I32Vec), iN(128));
+    }
+    Value *Rounded = B.CreateUnaryIntrinsic(Intrinsic::nearbyint, Vec);
+    return B.CreateBitCast(FPToSI32(Rounded, F32Vec, I32Vec), iN(128));
+  }
+  if (Name == "vcvttpd2dq") {
+    auto *F64Vec = FixedVectorType::get(F64, 2);
+    auto *I32Vec = FixedVectorType::get(Type::getInt32Ty(B.getContext()), 2);
+    Value *Vec = As(I128, F64Vec);
+    Value *Truncated = B.CreateUnaryIntrinsic(Intrinsic::trunc, Vec);
+    Value *Converted = FPToSI32(Truncated, F64Vec, I32Vec);
+    return B.CreateZExt(B.CreateBitCast(Converted, iN(64)), iN(128));
+  }
   if (Name == "vcvtdq2pd") {
     Type *IVT = vecTyOf(B, iN(128), 32);
     Value *V = As(I128, IVT);
@@ -1150,14 +1196,70 @@ Value *X86LiftContext::vop(StringRef Name, Value *A, Value *Bv,
     return B.CreateBitCast(
         B.CreateSIToFP(Lo2, FixedVectorType::get(F64, 2)), iN(128));
   }
+  if (Name == "vcvtps2pd") {
+    Type *F32Vec = FixedVectorType::get(F32, 4);
+    Type *F64Vec = FixedVectorType::get(F64, 2);
+    Value *V = As(I128, F32Vec);
+    Value *Lo2 = B.CreateShuffleVector(V, V, {0, 1});
+    return B.CreateBitCast(B.CreateFPExt(Lo2, F64Vec), iN(128));
+  }
+  if (Name == "vcvtpd2ps") {
+    Type *F64Vec = FixedVectorType::get(F64, 2);
+    Value *V = As(I128, F64Vec);
+    Value *Lo2 = B.CreateShuffleVector(V, V, {0, 1});
+    Value *Truncated = B.CreateFPTrunc(Lo2, FixedVectorType::get(F32, 2));
+    return B.CreateZExt(B.CreateBitCast(Truncated, iN(64)), iN(128));
+  }
+  if (Name == "xroundsd") {
+    Type *F64Vec = FixedVectorType::get(F64, 2);
+    Value *Source = As(I128, F64Vec);
+    Value *Vec = As(Bv ? Bv : I128, F64Vec);
+    Value *Lane0 = B.CreateExtractElement(Source, uint64_t(0));
+    Intrinsic::ID IID;
+    if (Imm & 0x4) {
+      IID = Intrinsic::nearbyint;
+    } else {
+      switch (Imm & 0x3) {
+        case 0: IID = Intrinsic::nearbyint; break;
+        case 1: IID = Intrinsic::floor; break;
+        case 2: IID = Intrinsic::ceil; break;
+        default: IID = Intrinsic::trunc; break;
+      }
+    }
+    Value *Rounded = B.CreateUnaryIntrinsic(IID, Lane0);
+    return B.CreateBitCast(
+        B.CreateInsertElement(Vec, Rounded, uint64_t(0)), iN(128));
+  }
+  if (Name == "xroundss") {
+    Type *F32Vec = FixedVectorType::get(F32, 4);
+    Value *Source = As(I128, F32Vec);
+    Value *Vec = As(Bv ? Bv : I128, F32Vec);
+    Value *Lane0 = B.CreateExtractElement(Source, uint64_t(0));
+    Intrinsic::ID IID;
+    if (Imm & 0x4) {
+      IID = Intrinsic::nearbyint;
+    } else {
+      switch (Imm & 0x3) {
+        case 0: IID = Intrinsic::nearbyint; break;
+        case 1: IID = Intrinsic::floor; break;
+        case 2: IID = Intrinsic::ceil; break;
+        default: IID = Intrinsic::trunc; break;
+      }
+    }
+    Value *Rounded = B.CreateUnaryIntrinsic(IID, Lane0);
+    return B.CreateBitCast(
+        B.CreateInsertElement(Vec, Rounded, uint64_t(0)), iN(128));
+  }
   return nullptr;
 }
 
 void X86LiftContext::ptestOp(Value *A, Value *Bv) {
-  Value *X = toInt(A, 128), *Y = toInt(Bv, 128);
-  flagWrite(ZF, B.CreateICmpEQ(B.CreateAnd(X, Y), constI(0, 128)));
+  unsigned W = A->getType()->getIntegerBitWidth();
+  Value *X = toInt(A, W), *Y = toInt(Bv, W);
+  Value *Zero = constI(0, W);
+  flagWrite(ZF, B.CreateICmpEQ(B.CreateAnd(X, Y), Zero));
   flagWrite(CF,
-            B.CreateICmpEQ(B.CreateAnd(B.CreateNot(X), Y), constI(0, 128)));
+            B.CreateICmpEQ(B.CreateAnd(B.CreateNot(X), Y), Zero));
   flagWrite(OF, B.getFalse());
   flagWrite(SF, B.getFalse());
   flagWrite(AF, B.getFalse());

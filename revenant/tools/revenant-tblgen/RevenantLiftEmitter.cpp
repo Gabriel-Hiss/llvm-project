@@ -379,7 +379,10 @@ class RevenantLiftEmitter {
           Name == "rv_xnewlane0f32" || Name == "rv_xnewlane0f64" ||
           Name == "rv_pmovmskb" || Name == "rv_movmskps" ||
           Name == "rv_movmskpd" || Name == "rv_vbroadcastb" ||
-          Name == "rv_vcvtdq2pd" || Name == "rv_fsqrt" ||
+          Name == "rv_vcvtdq2pd" || Name == "rv_vcvtps2pd" ||
+          Name == "rv_vcvtpd2ps" || Name == "rv_vcvtdq2ps" ||
+          Name == "rv_vcvtps2dq" || Name == "rv_vcvttps2dq" ||
+          Name == "rv_vcvttpd2dq" || Name == "rv_fsqrt" ||
           Name == "rv_sitofpf32" || Name == "rv_sitofpf64" ||
           Name == "rv_fpext" || Name == "rv_fptrunc") {
         if (D->getNumArgs() != 1)
@@ -401,11 +404,54 @@ class RevenantLiftEmitter {
         if (A.empty())
           return {};
         StringRef Vop = Name.drop_front(3);
-        return NewLane ? (Twine("LC.vop(\"") + Vop +
-                          "\", nullptr, " + A + ")")
-                             .str()
-                       : (Twine("LC.vop(\"") + Vop + "\", " + A + ")")
-                             .str();
+        if (NewLane)
+          return (Twine("LC.vop(\"") + Vop + "\", nullptr, " + A + ")")
+              .str();
+        return (Twine("LC.vop(\"") + Vop + "\", " + A + ")").str();
+      }
+      if (Name == "rv_vbroadcast" && D->getNumArgs() == 3) {
+        const auto *W = dyn_cast<IntInit>(D->getArg(0));
+        const auto *EB = dyn_cast<IntInit>(D->getArg(1));
+        if (!W || !EB)
+          return {};
+        std::string A =
+            expression(D->getArg(2), Inst, EB->getValue(),
+                       D->getArgNameStr(2));
+        if (A.empty())
+          return {};
+        return (Twine("LC.vop(\"vbroadcast\", ") + A + ", nullptr, " +
+                Twine((W->getValue() << 8) | EB->getValue()) + ")")
+            .str();
+      }
+      if (Name == "rv_maskload" && D->getNumArgs() == 4) {
+        const auto *W = dyn_cast<IntInit>(D->getArg(0));
+        const auto *EB = dyn_cast<IntInit>(D->getArg(1));
+        if (!W || !EB)
+          return {};
+        std::string Mask =
+            expression(D->getArg(2), Inst, W->getValue(),
+                       D->getArgNameStr(2));
+        std::string Addr =
+            expression(D->getArg(3), Inst, 64, D->getArgNameStr(3));
+        if (Mask.empty() || Addr.empty())
+          return {};
+        return (Twine("LC.maskLoad(") + Mask + ", " + Addr + ", " +
+                Twine(W->getValue()) + ", " + Twine(EB->getValue()) + ")")
+            .str();
+      }
+      if (Name == "rv_xroundsd" || Name == "rv_xroundss") {
+        if (D->getNumArgs() != 2)
+          return {};
+        std::string A = expression(D->getArg(0), Inst, 128,
+                                   D->getArgNameStr(0));
+        if (A.empty())
+          return {};
+        std::string Imm = immediateExpr(D->getArg(1), Inst);
+        if (Imm.empty())
+          return {};
+        return (Twine("LC.vop(\"") + Name.drop_front(3) + "\", " + A +
+                ", LC.readOp(MI, 0, LC.iN(128)), " + Imm + ")")
+                   .str();
       }
       if ((Name == "rv_xsetlane0f32" || Name == "rv_xsetlane0f64") &&
           D->getNumArgs() == 2) {
@@ -2030,12 +2076,31 @@ class RevenantLiftEmitter {
     }
     if (Name == "rv_ptest" && Body.getNumArgs() == 2) {
       std::string A =
-          expression(Body.getArg(0), Inst, 128, Body.getArgNameStr(0));
+          expression(Body.getArg(0), Inst, Width, Body.getArgNameStr(0));
       std::string B =
-          expression(Body.getArg(1), Inst, 128, Body.getArgNameStr(1));
+          expression(Body.getArg(1), Inst, Width, Body.getArgNameStr(1));
       if (A.empty() || B.empty())
         return false;
       OS << "    LC.ptestOp(" << A << ", " << B << ");\n";
+      return true;
+    }
+    if (Name == "rv_maskstore" && Body.getNumArgs() == 5) {
+      const auto *W = dyn_cast<IntInit>(Body.getArg(0));
+      const auto *EB = dyn_cast<IntInit>(Body.getArg(1));
+      if (!W || !EB)
+        return false;
+      std::string Addr =
+          expression(Body.getArg(2), Inst, 64, Body.getArgNameStr(2));
+      std::string Mask =
+          expression(Body.getArg(3), Inst, W->getValue(),
+                     Body.getArgNameStr(3));
+      std::string Data =
+          expression(Body.getArg(4), Inst, W->getValue(),
+                     Body.getArgNameStr(4));
+      if (Addr.empty() || Mask.empty() || Data.empty())
+        return false;
+      OS << "    LC.maskStore(" << Mask << ", " << Data << ", " << Addr
+         << ", " << W->getValue() << ", " << EB->getValue() << ");\n";
       return true;
     }
 
