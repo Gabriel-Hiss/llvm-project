@@ -24,5 +24,28 @@ exit:
   ret ptr %next
 }
 
+; An entry alloca feeding a phi is stored after the slot allocas, not
+; right after itself (spdlog-gcc-o0 sub_140012480: the store came before
+; the slot it writes).
+; CHECK-LABEL: define ptr @scan(
+; CHECK: %buf = alloca [16 x i8]
+; CHECK-NEXT: %retval = alloca ptr
+; CHECK-NEXT: store ptr %buf, ptr %retval
+
+define ptr @scan(i64 %n) {
+entry:
+  %buf = alloca [16 x i8], align 8
+  br label %loop
+
+loop:
+  %cur = phi ptr [ %buf, %entry ], [ %step, %loop ]
+  %step = getelementptr i8, ptr %cur, i64 1
+  %c = icmp eq ptr %step, null
+  br i1 %c, label %exit, label %loop
+
+exit:
+  ret ptr %cur
+}
+
 !0 = !{}
 !1 = !{i64 5368713216}

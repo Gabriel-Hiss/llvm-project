@@ -247,7 +247,11 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
       auto *Def = dyn_cast<Instruction>(V);
       if (Def && Def->getParent() == Pred && !Def->isTerminator() &&
           !isa<PHINode>(Def) && EarlyStoreSafe(Root(I), Def, PN->getParent())) {
-        IRBuilder<> B(Def->getNextNode());
+        // An alloca incoming sits among the entry allocas, before the
+        // slots: its store goes after them.
+        IRBuilder<> B(isa<AllocaInst>(Def) && Def->getParent() == &Entry
+                          ? firstNonAlloca(Entry)
+                          : Def->getNextNode());
         StoreInst *Store = B.CreateStore(V, Slot);
         copyProvenance(*Def, *Store);
         continue;
