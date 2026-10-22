@@ -1106,19 +1106,6 @@ Stmt *StructuredStmtBuilder::emitIf(Region &R, const Region *Outer) {
     return CompoundStmt::Create(*AST, BS, FPOptionsOverride(),
                                 SourceLocation(), SourceLocation());
   }
-  // An if-region header still carries straight-line work: the allocas and
-  // definitions the frontend's SsaOut pass put there (the entry block in
-  // particular), plus the temporaries the test itself names. The
-  // condition folds into the test through ExprBuilder, but a multi-use
-  // operand becomes a `v<N>` local whose assignment has to run before the
-  // test, so the whole block's leaf code goes above the if.
-  SmallVector<Stmt *, 8> HeaderWork;
-  for (Instruction &I : *R.Header) {
-    if (I.isTerminator() || isa<PHINode>(I) || isa<DbgInfoIntrinsic>(&I))
-      continue;
-    if (Stmt *S = Exprs->instr(I, *Scope))
-      HeaderWork.push_back(S);
-  }
   BasicBlock *TS = BI->getSuccessor(0), *FS = BI->getSuccessor(1);
   auto armMembers = [&](BasicBlock *Arm) {
     SmallPtrSet<BasicBlock *, 8> Out;
