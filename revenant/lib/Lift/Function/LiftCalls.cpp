@@ -42,7 +42,7 @@ llvm::FunctionType *LiftState::fnType(const Signature *S) {
                      : llvm::Type::getDoubleTy(Mod.getContext()))
               : llvm::Type::getIntNTy(Mod.getContext(),
                                       std::max(1u, S->Ret->Bits));
-  return llvm::FunctionType::get(Ret, Params, S && S->Variadic);
+  return llvm::FunctionType::get(Ret, Params, false);
 }
 
 static const llvm::MCRegister Win64Regs[4] = {llvm::X86::RCX, llvm::X86::RDX,
@@ -179,20 +179,6 @@ std::vector<llvm::Value *> LiftState::callArgs(const Signature *S,
       }
       Args.push_back(V);
     }
-    // Variadic callees consume the live rcx..r9 prefix beyond the fixed
-    // parameters (Win64 varargs); extras are ignored by fixed-arity
-    // callees, so covering the prefix is safe-or-better everywhere.
-    if (S->Variadic) {
-      bool Covered[4] = {};
-      for (const Param &P : S->Params)
-        if (!P.Loc.IsStack)
-          for (int K = 0; K < 4; ++K)
-            if (P.Loc.Reg == Win64Regs[K])
-              Covered[K] = true;
-      for (int K = 0; K < 4; ++K)
-        if (!Covered[K])
-          Args.push_back(regRead(Win64Regs[K]));
-    }
     return Args;
   }
   size_t N = Prefix.value_or(4);
@@ -204,10 +190,7 @@ std::vector<llvm::Value *> LiftState::callArgs(const Signature *S,
 void LiftState::coerceArgs(llvm::Function *F,
                            std::vector<llvm::Value *> &Args) {
   unsigned Want = F->arg_size();
-  // Variadic declarations keep call-site extras past the fixed prefix;
-  // truncating them would drop live varargs (c-gcc-o2 printf int).
-  if (!F->getFunctionType()->isVarArg())
-    Args.resize(std::min<size_t>(Args.size(), Want));
+  Args.resize(std::min<size_t>(Args.size(), Want));
   while (Args.size() < Want)
     Args.push_back(llvm::UndefValue::get(i64()));
   unsigned K = 0;

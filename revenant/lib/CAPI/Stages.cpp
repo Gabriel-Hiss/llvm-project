@@ -267,7 +267,6 @@ lift::Signature convertSig(const revenant::Signature &S) {
   if (S.HasRet)
     Out.Ret = lift::RetLoc{S.Ret.Float, S.Ret.Bits};
   Out.NoReturn = S.Noreturn;
-  Out.Variadic = S.VarArgs;
   switch (S.SigSource) {
   case revenant::Signature::Source::Pdb:
     Out.Source = lift::SigSource::Pdb;

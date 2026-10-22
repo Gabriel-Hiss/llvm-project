@@ -83,10 +83,6 @@ struct Signature {
   std::optional<RetLoc> Ret;
   bool NoReturn = false;
   SigSource Source = SigSource::Default;
-  /// True when the callee consumes a variadic argument list (mirrors
-  /// analysis::Signature::VarArgs): call sites pass the live rcx..r9
-  /// prefix beyond the fixed parameters instead of truncating to them.
-  bool Variadic = false;
 };
 
 /// Function-start or IAT-slot keyed signatures (Rust `Signatures`).
