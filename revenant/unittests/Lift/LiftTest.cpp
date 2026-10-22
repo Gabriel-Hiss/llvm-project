@@ -617,4 +617,40 @@ TEST(LiftFunction, WritableDataGlobalIsNotConstant) {
   EXPECT_TRUE(Found) << "writable VA never materialized as a global";
 }
 
+TEST(LiftFunction, RecoveredSignatureIsPublishedForUnabi) {
+  // The Unabi pass rewrites the flat ABI back toward the source shape, but
+  // it only fires on a function that carries the "revenant.sig" attribute.
+  // The lifter is the only place that holds the recovered signature, so it
+  // publishes it there.
+  auto Fx = open(REVENANT_TEST_C_O0);
+  ASSERT_TRUE(Fx.has_value());
+  auto Hooks = createX86TargetHooks();
+  Program P = analyze(*Fx->Pe, *Hooks);
+  Signatures Full = analyzeSignatures(P, *Fx->Dis);
+  lift::Signatures Sigs = toLiftSigs(Full);
+  ASSERT_FALSE(Sigs.Funcs.empty());
+
+  bool Checked = false;
+  for (const auto &[Start, Sig] : Sigs.Funcs) {
+    auto It = P.Functions.find(Start);
+    if (It == P.Functions.end())
+      continue;
+    llvm::LLVMContext C;
+    llvm::Module M("lift_sig", C);
+    auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs,
+                                     nullptr, /*RunPasses=*/false);
+    if (!Lifted) {
+      consumeError(Lifted.takeError());
+      continue;
+    }
+    llvm::Attribute A = Lifted->Fn->getFnAttribute("revenant.sig");
+    EXPECT_TRUE(A.isStringAttribute());
+    llvm::StringRef V = A.getValueAsString();
+    EXPECT_TRUE(V.contains("=>")) << "sig: " << V;
+    Checked = true;
+    break;
+  }
+  EXPECT_TRUE(Checked) << "no function with a recovered signature";
+}
+
 } // end anonymous namespace

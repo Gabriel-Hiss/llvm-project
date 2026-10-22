@@ -32,6 +32,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Metadata.h"
 
@@ -187,6 +188,38 @@ static std::pair<CmpOperand, int64_t> switchLoc(const FuncRecord &F,
 /// never return, so the block they sit in ends with `unreachable`.
 static bool isTrapInsn(const Instr &I) {
   return I.Inst.getOpcode() == llvm::X86::TRAP;
+}
+
+/// The source-level signature in the grammar the Unabi pass reads:
+/// "<param> ... => <ret>", with "p" for a pointer, "f32"/"f64" for a
+/// float, "rN" for an integer of N bits and "v" for a void return. The
+/// recovered signature is the only place the source shape of a function
+/// is known, so the lifter publishes it: without the attribute the Unabi
+/// pass has no input and never fires.
+static std::string sigString(const Signature &S) {
+  auto IntBits = [](unsigned Bits) {
+    return (Bits == 8 || Bits == 16 || Bits == 32) ? Bits : 64;
+  };
+  std::string Out;
+  for (const Param &P : S.Params) {
+    if (P.Type.find('*') != std::string::npos)
+      Out += "p";
+    else if (P.Float)
+      Out += (P.Bits == 32 ? "f32" : "f64");
+    else
+      Out += "r" + std::to_string(IntBits(P.Bits));
+    Out += " ";
+  }
+  if (S.VarArgs)
+    Out += "... ";
+  Out += "=> ";
+  if (!S.Ret)
+    Out += "v";
+  else if (S.Ret->Float)
+    Out += (S.Ret->Bits == 32 ? "f32" : "f64");
+  else
+    Out += "r" + std::to_string(IntBits(S.Ret->Bits));
+  return Out;
 }
 
 static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
@@ -427,6 +460,10 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
                                    "function already defined: %s",
                                    Name.c_str());
   ir::setFunctionVA(*Fn, F.Start.Value);
+  // Publish the recovered signature for the Unabi pass, the only consumer
+  // of the source-level shape of a function.
+  if (Sig)
+    Fn->addFnAttr("revenant.sig", sigString(*Sig));
   if (auto It = P.Embedded.find(F.Start); It != P.Embedded.end()) {
     const EmbeddedFunctionMetadata &Meta = It->second;
     if (!Meta.SourceFile.empty()) {
