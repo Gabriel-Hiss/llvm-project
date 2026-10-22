@@ -22,6 +22,7 @@
 
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -561,6 +562,59 @@ TEST(LiftFunction, RecursiveLeafPreservesSiblingRegs) {
             << "call_ptr lost a live-through-fib register argument";
     }
   EXPECT_TRUE(FoundCall) << "no call_ptr call in main";
+}
+
+TEST(LiftFunction, WritableDataGlobalIsNotConstant) {
+  // Writable image data (a stored-to slot such as the security cookie) keeps
+  // the file's bytes as its initializer but must not be `constant`, or the
+  // cleanup folds its loads to the file's bytes.
+  auto Fx = open(REVENANT_TEST_C_O0);
+  ASSERT_TRUE(Fx.has_value());
+  ASSERT_FALSE(Fx->Pe->Pdata.empty());
+
+  // Absolute VAs each function's linear prefix touches.
+  std::map<uint64_t, std::set<Va>> Refs;
+  for (const auto &Pe : Fx->Pe->Pdata) {
+    std::vector<Instr> Block = linearBlock(*Fx->Dis, Pe.Begin, 64);
+    for (const Instr &I : Block)
+      if (I.HasMemTarget)
+        Refs[I.MemTarget.Value].insert(Pe.Begin);
+  }
+  Program P = emptyProgram(Fx->Pe->Img);
+  Va Writable;
+  for (const auto &[Va_, Fns] : Refs)
+    if (!Fns.empty() && P.Img->isWritable(Va(Va_))) {
+      Writable = Va(Va_);
+      break;
+    }
+  ASSERT_NE(Writable.Value, 0u)
+      << "fixture has no writable data VA referenced by a function";
+
+  llvm::LLVMContext C;
+  llvm::Module M("lift_writable_global", C);
+  bool Lifted = false;
+  for (Va Start : Refs[Writable.Value]) {
+    std::vector<Instr> Block = linearBlock(*Fx->Dis, Start, 64);
+    FuncRecord R = singleBlockFunc(P, Block);
+    auto L = lift::liftFunction(M, P, R, *Fx->Dis, nullptr, nullptr,
+                                /*RunPasses=*/false);
+    if (!L) {
+      consumeError(L.takeError());
+      continue;
+    }
+    Lifted = true;
+    break;
+  }
+  ASSERT_TRUE(Lifted);
+  bool Found = false;
+  for (llvm::GlobalVariable &G : M.globals())
+    if (auto VA = ir::getGlobalVA(G); VA && *VA == Writable.Value) {
+      Found = true;
+      EXPECT_TRUE(G.hasInitializer()) << "image bytes must stay the initializer";
+      EXPECT_FALSE(G.isConstant())
+          << "writable data global must not be constant";
+    }
+  EXPECT_TRUE(Found) << "writable VA never materialized as a global";
 }
 
 } // end anonymous namespace
