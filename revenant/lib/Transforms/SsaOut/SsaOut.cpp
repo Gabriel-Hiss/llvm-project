@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "revenant/Transforms/SsaOut/SsaOut.h"
+#include "revenant/Transforms/SsaOut/PhiCopies.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -69,7 +70,7 @@ public:
             continue;
           std::string D = canon(Dst);
           std::string S = canon(N);
-          if (D == S || interferes(Members[D], Members[S]))
+          if (D == S || Liveness.interferes(Members[D], Members[S]))
             continue;
           Alias[S] = D;
           Members[D].append(Members[S].begin(), Members[S].end());
@@ -92,52 +93,13 @@ public:
   }
 
 private:
-  // The blocks at whose start phi A is live: a use of A is reachable from
-  // there without passing A's own block, which redefines A. A phi use
-  // reads A at the end of its incoming block. Backward from the uses,
-  // computed once per phi.
-  const SmallPtrSet<BasicBlock *, 16> &liveIn(PHINode *A) {
-    auto [It, New] = LiveIn.try_emplace(A);
-    if (!New)
-      return It->second;
-    SmallPtrSet<BasicBlock *, 16> &Live = It->second;
-    BasicBlock *Def = A->getParent();
-    SmallVector<BasicBlock *, 16> Work;
-    auto Reach = [&](BasicBlock *BB) {
-      if (BB != Def && Live.insert(BB).second)
-        Work.push_back(BB);
-    };
-    for (Use &U : A->uses()) {
-      auto *I = cast<Instruction>(U.getUser());
-      if (auto *PN = dyn_cast<PHINode>(I))
-        Reach(PN->getIncomingBlock(U));
-      else
-        Reach(I->getParent());
-    }
-    while (!Work.empty())
-      for (BasicBlock *Pred : predecessors(Work.pop_back_val()))
-        Reach(Pred);
-    return Live;
-  }
-  // Two phis interfere when one is live where the other is defined (the
-  // start of its block). Phis of one block are defined together.
-  bool interferes(ArrayRef<PHINode *> A, ArrayRef<PHINode *> B) {
-    for (PHINode *X : A)
-      for (PHINode *Y : B)
-        if (X->getParent() == Y->getParent() ||
-            liveIn(X).count(Y->getParent()) ||
-            liveIn(Y).count(X->getParent()))
-          return true;
-    return false;
-  }
-
   // Small-string-keyed sets: phi names are short; std::map keeps this
   // header-free (no DenseMapInfo<StringRef> specialization needed).
   std::map<std::string, PHINode *> PhiDsts;
   std::map<std::string, std::string> Alias;
   // Web root name -> the phis in that web.
   std::map<std::string, SmallVector<PHINode *, 4>> Members;
-  DenseMap<PHINode *, SmallPtrSet<BasicBlock *, 16>> LiveIn;
+  PhiLiveness Liveness;
 };
 
 // Use counts over the function (phi incoming edges count as uses, as do
@@ -576,11 +538,6 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
       // value is a phi; every other incoming value was computed, or stored
       // to its own local, before the edge. A phi copied into its own web's
       // local is a no-op (the latch value is already there).
-      struct EdgeCopy {
-        AllocaInst *Dst;
-        Value *V;
-        AllocaInst *ReadSlot;
-      };
       SmallVector<EdgeCopy, 4> Pending;
       for (auto &[Dst, V] : EdgeCopies[Pred]) {
         AllocaInst *ReadSlot = nullptr;
@@ -591,32 +548,8 @@ PreservedAnalyses SsaOutPass::run(Function &F, FunctionAnalysisManager &) {
         }
         Pending.push_back({Dst, V, ReadSlot});
       }
-      // Order: repeatedly emit the first copy whose destination no other
-      // pending copy still reads. When every destination is still read
-      // (a cycle), save one destination's current value in a spill local
-      // and send its readers there; that copy is then safe.
-      SmallVector<EdgeCopy, 4> Ordered;
-      while (!Pending.empty()) {
-        size_t Safe = Pending.size();
-        for (size_t I = 0; I < Pending.size() && Safe == Pending.size(); ++I) {
-          bool Read = false;
-          for (size_t J = 0; J < Pending.size() && !Read; ++J)
-            Read = J != I && Pending[J].ReadSlot == Pending[I].Dst;
-          if (!Read)
-            Safe = I;
-        }
-        if (Safe == Pending.size()) {
-          AllocaInst *Dst = Pending[0].Dst;
-          AllocaInst *Spill = spillFor(Dst->getAllocatedType());
-          Ordered.push_back({Spill, nullptr, Dst});
-          for (EdgeCopy &C : Pending)
-            if (C.ReadSlot == Dst)
-              C.ReadSlot = Spill;
-          continue;
-        }
-        Ordered.push_back(Pending[Safe]);
-        Pending.erase(Pending.begin() + Safe);
-      }
+      SmallVector<EdgeCopy, 4> Ordered =
+          sequenceEdgeCopies(std::move(Pending), spillFor);
       Instruction *Term = Pred->getTerminator();
       // A catchswitch must be the first non-PHI instruction in its block.
       // Its handler choice also makes a pre-switch copy incorrect for all
