@@ -1087,8 +1087,13 @@ TEST(StructuredStmtBuilderTest, GenericLoopLatchWithStoresIsJumpedTo) {
       << S;
   size_t LatchLabel = S.find("f_generic_loop_latch_steps_L_bb_s150:");
   ASSERT_NE(LatchLabel, std::string::npos) << S;
-  EXPECT_NE(S.find("i =", LatchLabel), std::string::npos) << S;
-  EXPECT_NE(S.find("j =", LatchLabel), std::string::npos) << S;
+  // The latch's updates print after the label, in whichever spelling the
+  // emitter picks: `++i` for a step of one, `j += 2` for the other.
+  std::string LatchBody = S.substr(LatchLabel);
+  EXPECT_TRUE(LatchBody.find("++i") != std::string::npos ||
+              LatchBody.find("i +=") != std::string::npos) << S;
+  EXPECT_TRUE(LatchBody.find("j +=") != std::string::npos ||
+              LatchBody.find("j =") != std::string::npos) << S;
 }
 TEST(StructuredStmtBuilderTest, GenericLoopEmitsUnboundedLoop) {
   LLVMContext &C = ctx();
