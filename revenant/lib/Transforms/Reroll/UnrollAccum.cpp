@@ -34,6 +34,8 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 
+#include <optional>
+
 using namespace llvm;
 
 namespace revenant {
@@ -76,12 +78,12 @@ bool matchStrideIV(PHINode *Phi, BasicBlock *Header, int64_t &StepOut,
   auto *C = dyn_cast<ConstantInt>(Other);
   if (!C)
     return false;
-  int64_t SignedStep = C->getSExtValue();
-  if (SignedStep == INT64_MIN)
+  std::optional<int64_t> SignedStep = C->getValue().trySExtValue();
+  if (!SignedStep || *SignedStep == INT64_MIN)
     return false;
-  if (SignedStep < 0)
+  if (*SignedStep < 0)
     return false;
-  int64_t Step = SignedStep;
+  int64_t Step = *SignedStep;
   if (Step < 2 || Step > 4096)
     return false;
   StepOut = (uint64_t)Step;
