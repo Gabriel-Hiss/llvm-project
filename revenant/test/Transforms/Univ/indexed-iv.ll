@@ -63,7 +63,8 @@ exit:
 ; CHECK: br i1 %done.idx, label %loop, label %exit
 
 ; Minimal reproduction of the independent-base address pair in lifted
-; c-clang-o2 `copy_vec`; source and destination share one integer IV.
+; c-clang-o2 `copy_vec`; source and destination share one integer IV. Without
+; a proof that `%n` is non-negative the loop is left alone.
 define void @copy_vec(ptr %dst, ptr %src, i32 %n) {
 entry:
   %wide = zext i32 %n to i64
@@ -82,6 +83,30 @@ exit:
 }
 
 ; CHECK-LABEL: define void @copy_vec(
+; CHECK-NOT: .idx
+; CHECK: %done = icmp eq i64 %next, %wide
+
+; The lifted form carries the `%n < 1` guard, which proves `%n >= 1`; with
+; that proof the exit becomes signed and the addresses become typed.
+define void @copy_vec_guarded(ptr %dst, ptr %src, i32 %n) {
+entry:
+  %wide = zext i32 %n to i64
+  %empty = icmp slt i32 %n, 1
+  br i1 %empty, label %exit, label %loop
+loop:
+  %iv = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %src.addr = getelementptr i32, ptr %src, i64 %iv, !revenant.va !0
+  %value = load i32, ptr %src.addr, align 4
+  %dst.addr = getelementptr i32, ptr %dst, i64 %iv, !revenant.va !0
+  store i32 %value, ptr %dst.addr, align 4
+  %next = add i64 %iv, 1
+  %done = icmp eq i64 %next, %wide
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+
+; CHECK-LABEL: define void @copy_vec_guarded(
 ; CHECK: %iv.idx = phi i32 [ 0, %entry ], [ %next.idx, %loop ]
 ; CHECK: %src.addr.idx = getelementptr inbounds i32, ptr %src, i32 %iv.idx, !revenant.va !0
 ; CHECK: %dst.addr.idx = getelementptr inbounds i32, ptr %dst, i32 %iv.idx, !revenant.va !0

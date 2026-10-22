@@ -112,8 +112,6 @@
 
 using namespace llvm;
 
-namespace {
-
 void copyVA(const Instruction *Src, Instruction *Dst) {
   if (!Src || !Dst)
     return;
@@ -143,6 +141,172 @@ static bool reachable(BasicBlock *From, BasicBlock *To) {
   }
   return false;
 }
+
+// ---------------------------------------------------------------------------
+// Non-negativity of the narrowed bound.
+//
+// Rewriting a widened equality exit (`icmp eq %next, zext %n`) into
+// `icmp slt i32 %i, %n` preserves the trip count only when `%n >= 0`: for
+// `%n < 0` the widened form runs `zext %n - zext %start` iterations (a
+// count near 2^32) while the signed form exits immediately. So the rewrite
+// needs a proof, and without one the loop keeps its widened exit.
+//
+// Two proofs are recognized from the function's own shape: a non-negative
+// constant or an `and`/`select`/phi construction whose sign bit is clear,
+// and a guard on the header's entry chain that orders `%n` against 0 or a
+// small positive constant on the side that reaches the header.
+// ---------------------------------------------------------------------------
+
+// Is `V` (an i32) provably non-negative on its own, without a guard?
+static bool selfNonNegative(Value *V, unsigned Depth) {
+  if (!V || !V->getType()->isIntegerTy(32) || Depth > 8)
+    return false;
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return !C->isNegative();
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return false;
+  switch (I->getOpcode()) {
+  case Instruction::And: {
+    // `and %n, K` with K < 2^31 clears the sign bit.
+    for (unsigned K = 0; K < 2; ++K) {
+      auto *C = dyn_cast<ConstantInt>(I->getOperand(K));
+      if (C && !C->isNegative() && C->getValue().getActiveBits() < 32)
+        return true;
+    }
+    return false;
+  }
+  case Instruction::Select: {
+    auto *T = dyn_cast<ConstantInt>(I->getOperand(1));
+    auto *F = dyn_cast<ConstantInt>(I->getOperand(2));
+    return T && F && !T->isNegative() && !F->isNegative();
+  }
+  case Instruction::PHI: {
+    // A merge of proven-non-negative values is non-negative.
+    auto *PN = cast<PHINode>(I);
+    if (PN->getNumIncomingValues() == 0)
+      return false;
+    for (unsigned K = 0, E = PN->getNumIncomingValues(); K != E; ++K)
+      if (!selfNonNegative(PN->getIncomingValue(K), Depth + 1))
+        return false;
+    return true;
+  }
+  case Instruction::ZExt: {
+    // `zext nneg i32 %n to i64` asserts the narrow value is non-negative.
+    auto *Z = cast<ZExtInst>(I);
+    if (Z->hasNonNeg() && Depth == 0)
+      return true;
+    return false;
+  }
+  default:
+    return false;
+  }
+}
+
+// Does `Cmp` prove `V > 0` on the side of the branch that keeps going?
+// Only the two shapes the lifter emits count: `icmp sgt/ugt %n, 0`, where
+// the true side continues, and `icmp slt/ult %n, 1`, where the false side
+// does (the empty-loop guard).
+static bool comparesAgainstZero(ICmpInst *Cmp, Value *V) {
+  if (!Cmp || V->getType() != Cmp->getOperand(0)->getType())
+    return false;
+  auto IsZero = [](Value *Op) {
+    auto *C = dyn_cast<ConstantInt>(Op);
+    return C && C->isZero();
+  };
+  auto IsSmallPositive = [](Value *Op) {
+    auto *C = dyn_cast<ConstantInt>(Op);
+    return C && !C->isNegative() && C->getValue().getActiveBits() < 32;
+  };
+  switch (Cmp->getPredicate()) {
+  case ICmpInst::ICMP_SGT:
+  case ICmpInst::ICMP_UGT:
+    return (Cmp->getOperand(0) == V && IsZero(Cmp->getOperand(1))) ||
+           (Cmp->getOperand(1) == V && IsZero(Cmp->getOperand(0)));
+  case ICmpInst::ICMP_SLT:
+  case ICmpInst::ICMP_ULT:
+    return (Cmp->getOperand(0) == V && IsSmallPositive(Cmp->getOperand(1))) ||
+           (Cmp->getOperand(1) == V && IsSmallPositive(Cmp->getOperand(0)));
+  default:
+    return false;
+  }
+}
+
+// The side of `Cmp` that implies `V > 0`: the true successor for
+// `sgt/ugt`, the false one for `slt/ult` (whose true side is the exit).
+static bool provingSideIsTrue(ICmpInst *Cmp) {
+  return Cmp->getPredicate() == ICmpInst::ICMP_SGT ||
+         Cmp->getPredicate() == ICmpInst::ICMP_UGT;
+}
+
+// A guard proves `V > 0` when every path into the header takes at least
+// one proving edge. That is checked exactly: collect the proving edges
+// (branches whose condition orders V against 0 or a small positive
+// constant, taking the side that continues), drop them from the graph, and
+// require the header to become unreachable from the entry. Any remaining
+// path would enter the header with V <= 0, which is where the signed exit
+// rewrite would disagree with the widened one.
+static bool guardProvesNonNegative(Value *V, BasicBlock *Header,
+                                   Function &F) {
+  if (!V)
+    return false;
+  BasicBlock *Entry = &F.getEntryBlock();
+  // Dominating check without a dominator tree: the header must be
+  // reachable in the first place, or the shape is not a loop we matched.
+  if (!reachable(Entry, Header))
+    return false;
+
+  // Collect proving edges as (source, proving successor) pairs.
+  SmallVector<std::pair<BasicBlock *, BasicBlock *>, 16> Proving;
+  for (BasicBlock &B : F) {
+    auto *Br = dyn_cast<BranchInst>(B.getTerminator());
+    if (!Br || !Br->isConditional())
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+    if (!Cmp || !comparesAgainstZero(Cmp, V))
+      continue;
+    BasicBlock *ProvingSucc = provingSideIsTrue(Cmp) ? Br->getSuccessor(0)
+                                                     : Br->getSuccessor(1);
+    Proving.emplace_back(&B, ProvingSucc);
+  }
+
+  // Reachability from Entry with every proving edge removed.
+  SmallPtrSet<BasicBlock *, 32> Seen;
+  SmallVector<BasicBlock *, 32> Stack{Entry};
+  auto IsProvingEdge = [&](BasicBlock *From, BasicBlock *To) {
+    for (auto &P : Proving)
+      if (P.first == From && P.second == To)
+        return true;
+    return false;
+  };
+  bool Reached = false;
+  while (!Stack.empty()) {
+    BasicBlock *B = Stack.pop_back_val();
+    if (B == Header) {
+      Reached = true;
+      break;
+    }
+    if (!Seen.insert(B).second)
+      continue;
+    auto *T = dyn_cast<BranchInst>(B->getTerminator());
+    if (!T)
+      continue;
+    for (BasicBlock *S : T->successors())
+      if (!IsProvingEdge(B, S))
+        Stack.push_back(S);
+  }
+  (void)Reached;
+  return !Reached;
+}
+
+static bool provablyNonNegative(Value *V, BasicBlock *Header,
+                                Function &F) {
+  if (selfNonNegative(V, 0))
+    return true;
+  return guardProvesNonNegative(V, Header, F);
+}
+
+namespace {
 
 static BasicBlock *findLatch(BasicBlock *Header) {
   BasicBlock *Latch = nullptr;
@@ -329,6 +493,11 @@ struct LoopShape {
   bool PtrCountdown = false;
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> PtrSteps;
+  // Element offset of each pointer entry (peeled loops enter at element 1)
+  // and the entries themselves (value, predecessor), one list per pointer
+  // PHI in the same predecessor order.
+  SmallVector<int64_t, 2> EntryOffsets;
+  SmallVector<SmallVector<std::pair<Value *, BasicBlock *>, 2>, 2> PtrEntries;
   // Self-feeding extra integer PHIs (kept mirrors/counters the exit compare
   // does not test); both they and their steps die with the rewrite. An extra
   // whose step feeds a PHI on the loop's exit edge (the LSR end value used
@@ -367,7 +536,8 @@ struct LoopShape {
 // through byte GEPs. An i32 IV may also feed in-loop value uses (the loop
 // body computes on the index, e.g. the `i % 3` of `break_continue`) and
 // may escape as `trunc` into the result.
-static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
+static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S,
+                         Function &F) {
   S = LoopShape();
   PHINode *IV = nullptr;
   Instruction *Step = nullptr;
@@ -450,6 +620,7 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   ICmpInst *Cmp = nullptr;
   Value *Wide = nullptr;
   bool CountdownTrip = false;
+  bool NarrowIsNneg = false;
   auto inLoop = [&](BasicBlock *BB) {
     return BB == Header || BB == Latch ||
            (reachable(Header, BB) && reachable(BB, Latch));
@@ -514,6 +685,15 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   if (!Narrow || !Narrow->getType()->isIntegerTy(32) ||
       !isLoopInvariant(Narrow, Header, Latch))
     return false;
+  // A bound reached through `zext nneg` is non-negative by construction:
+  // the flag is the lifter's assertion that the narrow value never has its
+  // sign bit set, which is exactly the fact the rewrite needs.
+  NarrowIsNneg = false;
+  if (!CountdownTrip) {
+    if (auto *W = dyn_cast<ZExtInst>(Wide))
+      if (W->hasNonNeg() && W->getOperand(0) == Narrow)
+        NarrowIsNneg = true;
+  }
 
   // The compare's exit edge must leave the loop: `ne` continues on true,
   // `eq` on false. Folded tails test in the loop block itself; split loops
@@ -662,6 +842,16 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   // `break_continue`) still restore: the exit compare itself is the
   // indvars artifact that gets inverted.
 
+  // The exit becomes `icmp slt i32 ..., %n`, so the bound has to be
+  // proven non-negative: with `%n < 0` the original widened equality exit
+  // runs a count near 2^32 while the signed form exits immediately. A
+  // countdown's start value is a trip count and non-negative by
+  // construction; any other bound needs the proof or the loop keeps its
+  // widened exit for the unroll pass to handle.
+  if (!CountdownTrip && !NarrowIsNneg &&
+      !provablyNonNegative(Narrow, Header, F))
+    return false;
+
   S.Header = Header;
   S.Latch = Latch;
   S.IV = IV;
@@ -689,7 +879,8 @@ static bool matchIntLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
 // stepping by the same stride (bound: `%start + %n * stride`, the LSR end
 // address). Loads/stores touch the ptr PHIs directly; unrolled remainders
 // with extra constant GEPs do not match.
-static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
+static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S,
+                         Function &F) {
   S = LoopShape();
   SmallVector<PHINode *, 2> Ptrs;
   SmallVector<GetElementPtrInst *, 2> Steps;
@@ -697,6 +888,10 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   Type *ElemTy = nullptr;
   int64_t Stride = 0;
   unsigned Entries = 0;
+  // Entry (value, predecessor) pairs of the pointer streams, per pointer
+  // PHI, in predecessor order: a peeled loop enters at element 1 on one path
+  // and element 0 on the other.
+  SmallVector<SmallVector<std::pair<Value *, BasicBlock *>, 2>, 2> PtrEntries;
   for (Instruction &I : *Header) {
     auto *PN = dyn_cast<PHINode>(&I);
     if (!PN)
@@ -706,6 +901,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     Value *Back = nullptr;
     Value *Start = nullptr;
     unsigned N = 0;
+    SmallVector<std::pair<Value *, BasicBlock *>, 2> Ent;
     for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
       if (PN->getIncomingBlock(i) == Latch) {
         if (Back)
@@ -713,6 +909,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
         Back = PN->getIncomingValue(i);
       } else {
         Start = PN->getIncomingValue(i);
+        Ent.emplace_back(Start, PN->getIncomingBlock(i));
         ++N;
       }
     }
@@ -731,6 +928,7 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       return false;
     Ptrs.push_back(PN);
     Steps.push_back(Step);
+    PtrEntries.push_back(std::move(Ent));
     if (!Start0)
       Start0 = Start;
     // Byte addressing with a 1-element GEP is the classic pointer loop;
@@ -831,6 +1029,72 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (!Cmp)
     return false;
+  // Element offset of every pointer entry. The first entry is the base
+  // (element 0); another entry is that base advanced by a whole number of
+  // elements (`gep i8, %base, %stride * k`), which is what the peeled
+  // iteration leaves behind. Pointer PHIs must agree on the offsets.
+  SmallVector<int64_t, 2> Offsets;
+  bool OffsetsValid = true;
+  {
+    SmallVector<int64_t, 2> Result;
+    if (PtrEntries.empty() || PtrEntries.front().empty()) {
+      OffsetsValid = false;
+    } else {
+      Result.assign(PtrEntries.front().size(), 0);
+      for (unsigned P = 0; P < PtrEntries.size() && OffsetsValid; ++P) {
+        auto &Ent = PtrEntries[P];
+        if (Ent.size() != PtrEntries.front().size()) {
+          OffsetsValid = false;
+          break;
+        }
+        Value *Base = nullptr;
+        for (auto &E : Ent)
+          if (E.first == PtrEntries.front()[0].first)
+            Base = E.first;
+        if (!Base) {
+          OffsetsValid = false;
+          break;
+        }
+        for (unsigned K = 0; K < Ent.size() && OffsetsValid; ++K) {
+          Value *V = Ent[K].first;
+          if (V == Base) {
+            if (Result[K] != 0) {
+              OffsetsValid = false;
+              break;
+            }
+            continue;
+          }
+          auto *G = dyn_cast<GetElementPtrInst>(V);
+          if (!G || G->getPointerOperand() != Base ||
+              G->getNumIndices() != 1) {
+            OffsetsValid = false;
+            break;
+          }
+          auto *C = dyn_cast<ConstantInt>(G->getOperand(1));
+          if (!C || C->getSExtValue() % Stride != 0 ||
+              C->getSExtValue() / Stride <= 0) {
+            OffsetsValid = false;
+            break;
+          }
+          int64_t Off = C->getSExtValue() / Stride;
+          if (Result[K] != 0 && Result[K] != Off) {
+            OffsetsValid = false;
+            break;
+          }
+          Result[K] = Off;
+        }
+      }
+      if (OffsetsValid) {
+        bool AnyZero = false;
+        for (int64_t O : Result)
+          if (O == 0)
+            AnyZero = true;
+        if (!AnyZero)
+          OffsetsValid = false;
+      }
+    }
+    Offsets = std::move(Result);
+  }
   SmallVector<std::tuple<PHINode *, Value *, int64_t>, 2> Escapes;
   // The other stepped PHIs feed only their step, and the step feeds the PHI
   // plus at most PHIs on the loop's exit edge (the LSR end value the caller
@@ -863,11 +1127,39 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (!Cmp || !Bound || !isLoopInvariant(Bound, Header, Latch))
     return false;
-  if (Mirror) {
-    // `%end = %start + %n * stride`; the new index runs 0..%n-1.
-    if (MirrorStarts.size() != 1 || !MirrorStarts.front().first)
+  // Per-entry element offsets of the pointer stream: the direct entry is
+  // element 0 and a peeled entry is element 1 (`gep i8, %base, stride`).
+  // A countdown carries several entries as long as every one of them is an
+  // element offset of the same base (the mirror form additionally requires
+  // offsets because its bound is the end address); the countdown's bound is
+  // its start value, which is a trip count on every entry.
+  SmallVector<int64_t, 2> EntryOffsets;
+  if (Mirror || (Countdown && Entries > 1)) {
+    if (!OffsetsValid)
       return false;
-    Value *MStart = MirrorStarts.front().first;
+    EntryOffsets = std::move(Offsets);
+  }
+  if (Mirror) {
+    // `%end = %start + %n * stride`; the new index runs 0..%n-1. With
+    // several entries the reference start is the one whose offset is 0.
+    if (MirrorStarts.size() != EntryOffsets.size())
+      return false;
+    // The reference start is the mirror entry on the same predecessor as
+    // the pointer entry whose element offset is 0.
+    BasicBlock *ZeroPred = nullptr;
+    if (PtrEntries.empty() || PtrEntries.front().size() != EntryOffsets.size())
+      return false;
+    for (unsigned K = 0; K < EntryOffsets.size(); ++K)
+      if (EntryOffsets[K] == 0)
+        ZeroPred = PtrEntries.front()[K].second;
+    if (!ZeroPred)
+      return false;
+    Value *MStart = nullptr;
+    for (auto &M : MirrorStarts)
+      if (M.second == ZeroPred && M.first)
+        MStart = M.first;
+    if (!MStart)
+      return false;
     auto *Add = dyn_cast<BinaryOperator>(Bound);
     if (!Add || Add->getOpcode() != Instruction::Add)
       return false;
@@ -881,20 +1173,44 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
       return false;
   }
   if (Countdown) {
-    // The countdown starts at the trip count (one entry only: the peeled
-    // remainder form would need the exit count too).
-    if (MirrorStarts.size() != 1 || !MirrorStarts.front().first)
+    // The countdown starts at the trip count. The peeled remainder form
+    // would need the exit count too, so the start must be a single
+    // loop-invariant value; with several entries the lifted remainder enters
+    // the header once per peeled path and each start is its own count.
+    if (MirrorStarts.empty())
       return false;
-    Value *N = MirrorStarts.front().first;
-    if (!N->getType()->isIntegerTy(32)) {
-      N = peelWidening(N);
-      if (!N)
+    for (auto &M : MirrorStarts) {
+      if (!M.first)
+        return false;
+      Value *N = M.first;
+      if (!N->getType()->isIntegerTy(32)) {
+        N = peelWidening(N);
+        if (!N)
+          return false;
+      }
+      // A trip count counts down to zero, so it is non-negative by
+      // construction; a negative start would already be an infinite loop in
+      // the source, which the lifter never produces.
+      if (!selfNonNegative(N, 0) &&
+          !provablyNonNegative(N, Header, *Header->getParent()))
         return false;
     }
-    Bound = N;
+    Bound = MirrorStarts.front().first;
+    if (!Bound->getType()->isIntegerTy(32)) {
+      Bound = peelWidening(Bound);
+      if (!Bound)
+        return false;
+    }
   }
   if (!Bound->getType()->isIntegerTy(32) ||
       !isLoopInvariant(Bound, Header, Latch))
+    return false;
+  // The exit becomes `icmp slt i32 ..., %n`, so the bound has to be proven
+  // non-negative. A countdown's start value is a trip count and is
+  // non-negative by construction; the mirror form's `%n` and the classic
+  // counter's trip bound both need the proof the integer half requires.
+  if (!Countdown &&
+      !provablyNonNegative(Bound, Header, *Header->getParent()))
     return false;
   auto *Br = dyn_cast<BranchInst>(Cmp->getParent()->getTerminator());
   if (!Br || !Br->isConditional() || Br->getCondition() != Cmp)
@@ -942,8 +1258,11 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
   }
   if (Touches.empty())
     return false;
-  if ((Mirror || Countdown) && Entries != 1)
-    return false; // derived bounds are only restored for one entry
+  // Mirrors restore with any number of entries: the new index carries the
+  // per-path element offsets. Countdowns keep one entry: the countdown's
+  // start value is the trip count of the path it starts on.
+  if (Countdown && Entries != 1)
+    return false;
 
   S.Header = Header;
   S.Latch = Latch;
@@ -964,6 +1283,8 @@ static bool matchPtrLoop(BasicBlock *Header, BasicBlock *Latch, LoopShape &S) {
     }
   S.Ptrs = std::move(Ptrs);
   S.PtrSteps = std::move(Steps);
+  S.PtrEntries = std::move(PtrEntries);
+  S.EntryOffsets = std::move(EntryOffsets);
   S.Touches = std::move(Touches);
   S.ElemTy = ElemTy;
   return true;
@@ -1113,21 +1434,36 @@ static bool rewritePtrLoop(LoopShape &S) {
     return false;
   LLVMContext &Ctx = S.Header->getContext();
   Type *I32 = Type::getInt32Ty(Ctx);
-  BasicBlock *Pre = nullptr;
+  // One entry per non-latch predecessor: constant 0 for the classic single
+  // entry, or the per-path element offset when a peeled iteration left the
+  // pointer stream at element 1.
+  SmallVector<std::pair<Value *, BasicBlock *>, 2> Preds;
   for (BasicBlock *P : predecessors(S.Header)) {
     if (P == S.Latch || P == S.Header)
       continue;
-    if (Pre)
-      return false;
-    Pre = P;
+    Preds.emplace_back(nullptr, P);
   }
-  if (!Pre)
+  if (Preds.empty())
     return false;
+  // The matcher records the offsets in the pointer PHI's incoming order;
+  // match them to predecessors by block, never by position.
+  DenseMap<BasicBlock *, int64_t> OffByPred;
+  if (!S.EntryOffsets.empty()) {
+    if (S.PtrEntries.empty() || S.PtrEntries.front().size() != S.EntryOffsets.size())
+      return false;
+    for (unsigned K = 0; K < S.EntryOffsets.size(); ++K)
+      OffByPred[S.PtrEntries.front()[K].second] = S.EntryOffsets[K];
+  }
+  for (auto &E : Preds) {
+    auto It = OffByPred.find(E.second);
+    E.first = ConstantInt::get(I32, It == OffByPred.end() ? 0 : It->second);
+  }
 
   IRBuilder<> HB(&S.Header->front());
-  PHINode *NewIV = HB.CreatePHI(I32, 2, S.IV->getName() + ".idx");
+  PHINode *NewIV = HB.CreatePHI(I32, Preds.size() + 1, S.IV->getName() + ".idx");
   moveVA(S.IV, NewIV);
-  NewIV->addIncoming(ConstantInt::get(I32, 0), Pre);
+  for (auto &E : Preds)
+    NewIV->addIncoming(E.first, E.second);
   // Same as the integer half: the new step goes before the old counter
   // step so it dominates every later use.
   IRBuilder<> LB(S.Step);
@@ -1182,11 +1518,25 @@ static bool rewritePtrLoop(LoopShape &S) {
   // GEP per touch in front of the memory op works for both.
   for (unsigned p = 0; p < S.Ptrs.size(); ++p) {
     PHINode *Phi = S.Ptrs[p];
-    // Start pointer: the non-latch incoming.
+    // Start pointer: the entry whose element offset is 0 (the direct path);
+    // with several entries every other entry is that base advanced by a
+    // whole number of elements, which the new index now expresses.
     Value *Start = nullptr;
     for (unsigned i = 0, e = Phi->getNumIncomingValues(); i != e; ++i)
       if (Phi->getIncomingBlock(i) != S.Latch)
         Start = Phi->getIncomingValue(i);
+    if (p < S.PtrEntries.size() && !S.PtrEntries[p].empty()) {
+      Value *First = S.PtrEntries[p].front().first;
+      for (auto &E : S.PtrEntries[p])
+        if (E.first == First)
+          Start = E.first;
+      // Prefer the offset-0 entry when the matcher computed offsets.
+      for (unsigned K = 0; K < S.PtrEntries[p].size() &&
+                           K < S.EntryOffsets.size();
+           ++K)
+        if (S.EntryOffsets[K] == 0)
+          Start = S.PtrEntries[p][K].first;
+    }
     for (auto &T : S.Touches) {
       if (T.PtrPhi != Phi)
         continue;
@@ -1237,12 +1587,12 @@ llvm::PreservedAnalyses UnivPass::run(llvm::Function &F,
     if (!Latch)
       continue;
     LoopShape S;
-    if (matchIntLoop(H, Latch, S)) {
+    if (matchIntLoop(H, Latch, S, F)) {
       Changed |= rewriteIntLoop(S);
       continue;
     }
     S = LoopShape();
-    if (matchPtrLoop(H, Latch, S))
+    if (matchPtrLoop(H, Latch, S, F))
       Changed |= rewritePtrLoop(S);
   }
   if (!Changed)

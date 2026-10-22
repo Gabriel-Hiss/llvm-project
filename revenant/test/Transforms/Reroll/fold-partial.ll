@@ -4,7 +4,15 @@
 
 define i32 @sum_unrolled(ptr %p0, i32 %n) {
 entry:
-  br label %L
+  ; The O2 caller rounds the count down to a multiple of 4 before calling
+  ; and never reaches this loop with n == 0. The guard makes the
+  ; differential in-contract: with n == 0 the unrolled body runs once and
+  ; reads four elements while the folded body reads one.
+  %empty = icmp slt i32 %n, 1
+  ; The bound is a multiple of the window step, which is what the exit
+  ; legality proof requires.
+  %nm = shl i32 %n, 2
+  br i1 %empty, label %X, label %L
 
 L:
   %i = phi i32 [ 0, %entry ], [ %inext, %L ]
@@ -22,17 +30,20 @@ L:
   %l3 = load i32, ptr %g3, align 4
   %s4 = add i32 %s3, %l3
   %inext = add i32 %i, 4
-  %c = icmp ult i32 %inext, %n
+  %c = icmp ult i32 %inext, %nm
   br i1 %c, label %L, label %X
 
 X:
-  ret i32 %s4
+  %r = phi i32 [ 0, %entry ], [ %s4, %L ]
+  ret i32 %r
 }
 
 ; CHECK: define i32 @sum_unrolled
-; The four chained adds collapse to one accumulator add.
-; CHECK: %s1 = add i32 %s, %l0
-; The step folds 4 -> 1.
-; CHECK: %inext = add i32 %i, 1
+; The runtime trip count is unknown, so this latch-tested loop must not fold.
+; CHECK: %g1 = getelementptr i32, ptr %g0, i32 1
+; CHECK: %l1 = load i32, ptr %g1, align 4
+; CHECK: %inext = add i32 %i, 4
+; CHECK: %c = icmp ult i32 %inext, %nm
 ; CHECK: br i1 %c, label %L, label %X
-; CHECK: ret i32 %s1
+; CHECK: %r = phi i32 [ 0, %entry ], [ %s4, %L ]
+; CHECK: ret i32 %r

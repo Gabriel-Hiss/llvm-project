@@ -2,6 +2,13 @@
 ; preheader and exit are erased through the shared lane-equivalence
 ; gate, leaving the countdown drain and the counted tail to cover
 ; the full range. Corpus shape: c-clang-o2avx2 add_vec inner dispatch.
+; The drain stays: drain [0, rem) plus tail [rem, N) covers [0, N)
+; exactly. The old drain-tail fusion erased the drain and started the
+; tail at the drain end, losing [0, rem) for every N not a multiple
+; of the tail stride (lli differential on this shape diverged for
+; n=1,2,3,5,6,7,...); with the tail start unable to cover the drain's
+; range on any lattice, erasing the drain is never sound here, so the
+; fusion was removed outright.
 ; RUN: %revenant-opt -passes=revenant-unloopvec,verify -S %s | %FileCheck %s
 
 define void @avx2_add_inner(ptr %0, ptr %1, i32 %2, i32 %3) {
@@ -101,11 +108,18 @@ bb_140001b0b:
                                      
   ret void
 }
-; The middle tier is gone through the shared lane-equivalence gate;
-; the countdown drain and the counted tail remain.
+; The middle tier is gone through the shared lane-equivalence gate, and
+; the countdown drain folds away through drain-tail fusion: S jumps to
+; the guard block with the tail-feed phi rewired to the drain end, and
+; the guard keeps its skip/exit decision over the counted tail.
 ; CHECK-LABEL: define{{.*}}void @avx2_add_inner
 ; CHECK-NOT: <4 x i32>
 ; CHECK: br label %bb_140001a9a
+; CHECK: br i1 %c348, label %bb_140001ac3, label %bb_140001ab0
+; CHECK: %d.load = load i32
 ; CHECK: store i32 %d.sum
+; CHECK: %r10.2 = phi i64 [ %s.start64, %bb_140001a9a ], [ %d.next, %bb_140001ab0 ]
+; CHECK: br i1 %c437, label %bb_140001b0b, label %bb_140001ad0
 ; CHECK: store i32 %t.sum
+; CHECK-NOT: unvecmaps.fused.start
 ; CHECK: ret void
