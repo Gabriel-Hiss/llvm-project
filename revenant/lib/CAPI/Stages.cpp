@@ -1586,6 +1586,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           };
           std::vector<FnKeyRec> FnKeys;
           size_t FnSeen = 0;
+          // The last function counted in `FnSeen`, while the shard only lifts.
+          WeakVH FnTail;
+          bool HaveFnTail = false;
+          bool AppendOnly = true;
           uint64_t FnSeq = 0;
           // Custom metadata kinds get IDs in first-use order, and IDs fix
           // the order attachments print in. Same timeline as functions.
@@ -1615,14 +1619,67 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           St.Ctx->getMDKindNames(Kinds);
           return Kinds.size();
         };
-        auto noteNewFunctions = [](ShardState &St, uint64_t Phase,
-                                   uint64_t Slot, StringRef By) {
-          size_t I = 0;
-          for (llvm::Function &F : *St.Mod)
-            if (I++ >= St.FnSeen)
+        // While a shard lifts, functions and globals are only appended, so what
+        // a step created is what follows the previous tail. Counting positions
+        // from the head (`size()`, `global_size()` and a walk to the position)
+        // is O(module) per function and quadratic in a shard: 300 s of lift
+        // workers on 219k functions. Cleanup erases and reorders, so the
+        // head scan stays for it (`AppendOnly` is cleared when the lift ends).
+        auto functionsAfterTail = [](ShardState &St) {
+          auto *Tail = cast_or_null<llvm::Function>(static_cast<Value *>(St.FnTail));
+          return Tail ? std::next(Module::iterator(Tail)) : St.Mod->begin();
+        };
+        auto markFunctionsSeen = [&](ShardState &St) {
+          if (!St.AppendOnly) {
+            St.FnSeen = St.Mod->size();
+            return;
+          }
+          if (St.HaveFnTail && !St.FnTail) {
+            St.Err = "a function was erased while lifting";
+            return;
+          }
+          for (auto It = functionsAfterTail(St); It != St.Mod->end(); ++It)
+            ++St.FnSeen;
+          if (!St.Mod->empty()) {
+            St.FnTail = &St.Mod->getFunctionList().back();
+            St.HaveFnTail = true;
+          }
+        };
+        auto globalTail = [](Module &M) -> llvm::GlobalVariable * {
+          return M.global_empty() ? nullptr : &*std::prev(M.global_end());
+        };
+        auto globalsAfter = [](Module &M, llvm::GlobalVariable *Tail) {
+          SmallVector<llvm::GlobalVariable *, 4> New;
+          auto It = Tail ? std::next(Module::global_iterator(Tail))
+                         : M.global_begin();
+          for (; It != M.global_end(); ++It)
+            New.push_back(&*It);
+          return New;
+        };
+        auto noteNewFunctions = [&](ShardState &St, uint64_t Phase,
+                                    uint64_t Slot, StringRef By) {
+          if (St.AppendOnly) {
+            if (St.HaveFnTail && !St.FnTail) {
+              St.Err = "a function was erased while lifting";
+              return;
+            }
+            for (auto It = functionsAfterTail(St); It != St.Mod->end(); ++It) {
               St.FnKeys.push_back(
-                  {WeakVH(&F), Phase, Slot, St.FnSeq++, By.str(), ""});
-          St.FnSeen = St.Mod->size();
+                  {WeakVH(&*It), Phase, Slot, St.FnSeq++, By.str(), ""});
+              ++St.FnSeen;
+            }
+            if (!St.Mod->empty()) {
+              St.FnTail = &St.Mod->getFunctionList().back();
+              St.HaveFnTail = true;
+            }
+          } else {
+            size_t I = 0;
+            for (llvm::Function &F : *St.Mod)
+              if (I++ >= St.FnSeen)
+                St.FnKeys.push_back(
+                    {WeakVH(&F), Phase, Slot, St.FnSeq++, By.str(), ""});
+            St.FnSeen = St.Mod->size();
+          }
           SmallVector<StringRef, 64> Kinds;
           St.Ctx->getMDKindNames(Kinds);
           for (size_t K = St.KindSeen; K < Kinds.size(); ++K)
@@ -1736,7 +1793,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                     Sigs->of(Rec.Start));
             }
             // Mirrors of definitions owned elsewhere: not creations here.
-            St.FnSeen = St.Mod->size();
+            markFunctionsSeen(St);
           };
           // Serial lifts every funclet first, in FuncletOrder. Lift the ones
           // this shard's parents inline and claim the rest. A funclet lift
@@ -1750,26 +1807,28 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                   *St.Mod,
                   lift::definitionName(Prog.Functions.at(Va(Address))),
                   &FuncletSig);
-              St.FnSeen = St.Mod->size();
+              markFunctionsSeen(St);
               continue;
             }
             if (!FuncletSigs)
               FuncletSigs.emplace(*Sigs);
-            size_t Before = St.Mod->global_size();
+            llvm::GlobalVariable *GTail = globalTail(*St.Mod);
+            WeakVH GTailHandle(GTail);
             auto F = liftFunclet(*St.Mod, *ThreadDis, *FuncletSigs, Address);
             if (!F) {
               St.Err = toString(F.takeError());
               return;
             }
+            if (GTail && !GTailHandle) {
+              St.Err = "a global was erased while lifting";
+              return;
+            }
             St.Funclets[Address] = *F;
-            SmallVector<llvm::GlobalVariable *, 4> New;
-            size_t I = 0;
-            for (llvm::GlobalVariable &G : St.Mod->globals())
-              if (I++ >= Before)
-                New.push_back(&G);
-            St.FuncletCreated.emplace_back(K, std::move(New));
+            St.FuncletCreated.emplace_back(K, globalsAfter(*St.Mod, GTail));
             St.FnSeq = uint64_t(K) << 32;
             noteNewFunctions(St, 0, 0, "");
+            if (!St.Err.empty())
+              return;
           }
           for (size_t Idx : Shards[S]) {
             Va T = Todo[Idx];
@@ -1785,7 +1844,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
               if (Owner != PersonalityOwner.end() && Owner->second < Idx)
                 EH = nullptr;
             }
-            size_t Before = St.Mod->global_size();
+            llvm::GlobalVariable *GTail = globalTail(*St.Mod);
+            WeakVH GTailHandle(GTail);
             auto LiftStart = StageClock::now();
             auto L = lift::liftFunction(*St.Mod, Prog, Prog.Functions.at(T),
                                         *ThreadDis, Sigs.get(),
@@ -1797,13 +1857,14 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                   std::chrono::duration_cast<std::chrono::microseconds>(
                       StageClock::now() - LiftStart)
                       .count();
-            SmallVector<llvm::GlobalVariable *, 4> New;
-            size_t K = 0;
-            for (llvm::GlobalVariable &G : St.Mod->globals())
-              if (K++ >= Before)
-                New.push_back(&G);
-            St.Created.emplace_back(Idx, std::move(New));
+            if (GTail && !GTailHandle) {
+              St.Err = "a global was erased while lifting";
+              return;
+            }
+            St.Created.emplace_back(Idx, globalsAfter(*St.Mod, GTail));
             noteNewFunctions(St, 0, Idx + 1, "");
+            if (!St.Err.empty())
+              return;
             if (!L) {
               std::string Message = toString(L.takeError());
               CleanSlots[Idx].Failed = true;
@@ -1823,6 +1884,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           // Finish the timeline: serial defines every later function too,
           // renaming any clashing callee declaration to `.decl`.
           claimForeignBefore(Todo.size());
+          // The tail markers assumed lifting only appends. The count is the
+          // proof: one walk here instead of one per function.
+          if (St.Err.empty() && St.FnSeen != St.Mod->size())
+            St.Err = "function bookkeeping drifted while lifting";
+          St.AppendOnly = false;
           if (!St.Funclets.empty()) {
             // Serial inlines parent by parent in module (= Todo) order.
             // Funclets are erased only once no shard uses them; decided
