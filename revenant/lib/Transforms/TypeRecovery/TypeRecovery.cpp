@@ -376,22 +376,10 @@ PreservedAnalyses TypeRecoveryPass::run(Function &F,
     }
   }
 
-  // Pointer bases that are not allocas (inttoptr results, GEP chains):
-  // describe their struct shape once via a retained type so the frontend
-  // can name field accesses. No variable to attach; the type is reachable
-  // through the alloca/argument that roots the base.
-  for (const auto &KV : TI.bases()) {
-    const Value *Base = KV.first;
-    if (isa<AllocaInst>(Base) || isa<Argument>(Base))
-      continue; // Already described above.
-    if (KV.second.Fields.size() < 2)
-      continue;
-    DIType *Pointee =
-        pointeeForBase(DIB, Scope, File, F, TI, Base, &KV.second);
-    DIType *Ptr = ir::createPointerType(DIB, Pointee);
-    DIB.retainType(Ptr);
-    Changed = true;
-  }
+  // Pointer bases that are not allocas (inttoptr results, GEP chains) get no
+  // retained type. Retaining one per function made every later DIBuilder copy
+  // and deduplicate the whole retained list in finalize(), which is quadratic
+  // in function count, and nothing reads the list.
 
   // The verifier wants a !dbg location on every call in a function that has a
   // DISubprogram; lifted calls only carry !revenant.va.
