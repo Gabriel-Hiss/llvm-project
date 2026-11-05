@@ -208,6 +208,70 @@ void releaseModule(Module &M) {
     GV.removeDeadConstantUsers();
 }
 
+/// Finds the function that owns an address inside its code ranges. A page
+/// table over the chunks answers in constant time what a scan of every
+/// function answered in linear time: a Rust binary has tens of thousands of
+/// landing pads that are not function starts, and the scan per pad took 34 s
+/// on a 46k-function program.
+class FunctionRangeIndex {
+public:
+  explicit FunctionRangeIndex(const std::map<Va, FuncRecord> &Functions) {
+    for (const auto &[Start, F] : Functions) {
+      if (F.Chunks.empty())
+        add(Start, Start, F.End);
+      else
+        for (const auto &[Lo, Hi] : F.Chunks)
+          add(Start, Lo, Hi);
+    }
+  }
+
+  /// The lowest function start, other than Owner, whose ranges contain
+  /// Address; the same function the scan in start order picks.
+  std::optional<Va> find(Va Address, Va Owner) const {
+    std::optional<Va> Best;
+    auto consider = [&](uint32_t Index) {
+      const Range &R = All[Index];
+      if (R.Start == Owner || Address < R.Lo || !(Address < R.Hi))
+        return;
+      if (!Best || R.Start < *Best)
+        Best = R.Start;
+    };
+    if (auto It = Pages.find(Address.Value >> PageShift); It != Pages.end())
+      for (uint32_t Index : It->second)
+        consider(Index);
+    for (uint32_t Index : Wide)
+      consider(Index);
+    return Best;
+  }
+
+private:
+  static constexpr unsigned PageShift = 12;
+  /// A range spanning more pages than this is checked on every lookup.
+  static constexpr uint64_t MaxPages = 1u << 10;
+  struct Range {
+    Va Start, Lo, Hi;
+  };
+
+  void add(Va Start, Va Lo, Va Hi) {
+    if (!(Lo < Hi))
+      return;
+    uint32_t Index = All.size();
+    All.push_back({Start, Lo, Hi});
+    uint64_t First = Lo.Value >> PageShift;
+    uint64_t Last = (Hi.Value - 1) >> PageShift;
+    if (Last - First >= MaxPages) {
+      Wide.push_back(Index);
+      return;
+    }
+    for (uint64_t Page = First; Page <= Last; ++Page)
+      Pages[Page].push_back(Index);
+  }
+
+  std::vector<Range> All;
+  DenseMap<uint64_t, SmallVector<uint32_t, 2>> Pages;
+  std::vector<uint32_t> Wide;
+};
+
 //==--------------------------------------------------------------------==//
 // Module skeleton and signatures
 //==--------------------------------------------------------------------==//
@@ -1032,6 +1096,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     DenseMap<uint64_t, SmallVector<uint64_t, 4>> OwnerFunclets;
     // EH map targets can point at the entry instruction inside a discovered
     // funclet, rather than at its containing Program function's start.
+    const FunctionRangeIndex FunctionRanges(Prog.Functions);
     auto collectFunclet = [&](Va Handler, Va Owner) {
       auto Exact = Prog.Functions.find(Handler);
       if (Exact != Prog.Functions.end() && Handler != Owner) {
@@ -1040,24 +1105,17 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         OwnerFunclets[Owner.Value].push_back(Handler.Value);
         return;
       }
-      for (const auto &[Start, F] : Prog.Functions) {
-        if (Start == Owner)
-          continue;
-        bool Contains = false;
-        for (const auto &[Lo, Hi] : F.Chunks)
-          Contains |= Lo <= Handler && Handler < Hi;
-        if (F.Chunks.empty())
-          Contains = Start <= Handler && Handler < F.End;
-        if (!Contains)
-          continue;
-        FuncletAddresses.insert(Start.Value);
-        FuncletAliases[Handler.Value] = Start.Value;
-        OwnerFunclets[Owner.Value].push_back(Start.Value);
-        return;
+      if (std::optional<Va> Start = FunctionRanges.find(Handler, Owner)) {
+        FuncletAddresses.insert(Start->Value);
+        FuncletAliases[Handler.Value] = Start->Value;
+        OwnerFunclets[Owner.Value].push_back(Start->Value);
       }
     };
+    DenseSet<uint64_t> TodoSet;
+    for (Va T : Todo)
+      TodoSet.insert(T.Value);
     for (const FunctionEH &EH : EHFunctions) {
-      if (!llvm::is_contained(Todo, EH.Function))
+      if (!TodoSet.contains(EH.Function.Value))
         continue;
       for (const EHHandler &H : EH.Handlers)
         collectFunclet(H.Address, EH.Function);
