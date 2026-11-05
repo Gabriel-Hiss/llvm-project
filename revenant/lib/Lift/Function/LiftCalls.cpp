@@ -138,8 +138,11 @@ static void emitIndirectTail(LiftState &LS, llvm::Value *TV, Va At) {
 llvm::Function *LiftState::calleeFn(Va Target, const Signature *S) {
   std::string Name =
       "sub_" + llvm::formatv("{0:x}", Target.Value).str();
+  // An empty recorded name must not reach sanitizeName: it returns "f", and
+  // every nameless callee would then share one declaration.
   if (P.Names)
-    if (auto It = P.Names->find(Target); It != P.Names->end())
+    if (auto It = P.Names->find(Target);
+        It != P.Names->end() && !It->second.empty())
       Name = sanitizeName(It->second);
   if (llvm::Function *Old = Mod.getFunction(Name))
     return Old;
@@ -268,10 +271,26 @@ void LiftState::emitCall(const Instr &I) {
     if (auto It = P.Externs->find(I.MemTarget); It != P.Externs->end()) {
       const Extern &E = It->second;
       std::string Sym = E.Name;
-      if (auto Bang = Sym.find('!'); Bang != std::string::npos)
+      std::string Dll;
+      if (auto Bang = Sym.find('!'); Bang != std::string::npos) {
+        Dll = Sym.substr(0, Bang);
         Sym = Sym.substr(Bang + 1);
-      if (auto Hash = Sym.find('#'); Hash != std::string::npos)
+      }
+      std::string Ordinal;
+      if (auto Hash = Sym.find('#'); Hash != std::string::npos) {
+        Ordinal = Sym.substr(Hash + 1);
         Sym = Sym.substr(0, Hash);
+      }
+      // An import by ordinal has no name; sanitizeName("") would answer "f"
+      // for all of them and merge unrelated imports into one declaration.
+      if (Sym.empty()) {
+        llvm::StringRef Stem = Dll;
+        Stem.consume_back_insensitive(".dll");
+        Sym = (Stem.empty() ? std::string("import") : Stem.str()) + "_ord" +
+              (Ordinal.empty()
+                   ? llvm::formatv("{0:x}", I.MemTarget.Value).str()
+                   : Ordinal);
+      }
       const Signature *Sig = nullptr;
       Signature Default;
       if (Sigs) {

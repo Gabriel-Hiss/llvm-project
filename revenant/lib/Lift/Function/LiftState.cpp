@@ -832,12 +832,14 @@ std::string lift::globalNameFor(const Program &P, Va Addr) {
   }
   if (P.Functions.count(Addr)) {
     if (P.Names)
-      if (auto It = P.Names->find(Addr); It != P.Names->end())
+      if (auto It = P.Names->find(Addr);
+          It != P.Names->end() && !It->second.empty())
         return "f_" + sanitizeName(It->second);
     return "f_" + utohexstr(Addr.Value, true);
   }
   if (P.Names)
-    if (auto It = P.Names->find(Addr); It != P.Names->end())
+    if (auto It = P.Names->find(Addr);
+        It != P.Names->end() && !It->second.empty())
       return sanitizeName(It->second);
   return "g_" + utohexstr(Addr.Value, true);
 }
