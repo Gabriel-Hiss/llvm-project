@@ -1370,7 +1370,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       bool Wanted = (!PC || StringRef(PC) != "0") && Threads > 1 &&
                     Todo.size() >= 256 && WantsClean && !structDIEnabled();
       if (Wanted) {
-        auto Elements = pipelineElements(cleanPipeline(false));
+        // The elements are views into this text: it has to outlive them.
+        const std::string CleanPipelineText = cleanPipeline(false);
+        auto Elements = pipelineElements(CleanPipelineText);
         CleanBlock1 = Elements.front().str();
         for (size_t I = 1; I < Elements.size(); ++I) {
           if (!CleanRemainder.empty())
