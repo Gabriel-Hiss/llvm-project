@@ -183,6 +183,17 @@ void record(std::vector<StageReport> &Stages, StringRef Name, StringRef Status,
   Stages.push_back(std::move(R));
 }
 
+/// Prepare a module that is about to be destroyed half-merged. Constant
+/// expressions such as `ptrtoint (ptr @g to i64)` outlive their users and
+/// keep a use on `@g`; an assertions build aborts in ~Value when the global
+/// is destroyed with one left. Dropping every reference first makes them dead
+/// so they can be deleted.
+void releaseModule(Module &M) {
+  M.dropAllReferences();
+  for (GlobalValue &GV : M.global_values())
+    GV.removeDeadConstantUsers();
+}
+
 //==--------------------------------------------------------------------==//
 // Module skeleton and signatures
 //==--------------------------------------------------------------------==//
@@ -2129,8 +2140,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                 return createStringError("parse: " +
                                          toString(ShardOrErr.takeError()));
               std::string Err = mergeShard(**ShardOrErr);
-              if (!Err.empty())
+              if (!Err.empty()) {
+                releaseModule(**ShardOrErr);
+                releaseModule(*M);
                 return createStringError("merge: " + Err);
+              }
             }
             for (ShardState &St : State)
               for (auto &[Name, Counter] : St.Counters)
