@@ -1135,6 +1135,15 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // Decode the image's EH metadata once, then associate each lifted function
     // with its table entry. The EH vector owns these entries through the loop.
     std::vector<FunctionEH> EHFunctions = decodeEHTables(pe());
+    // The first table entry of each function. Looking a function up by a scan
+    // of the table is quadratic: 219k functions cost 300 s of lift workers.
+    DenseMap<uint64_t, size_t> EHIndex;
+    for (size_t I = 0; I < EHFunctions.size(); ++I)
+      EHIndex.try_emplace(EHFunctions[I].Function.Value, I);
+    auto ehFor = [&](Va Function) -> FunctionEH * {
+      auto It = EHIndex.find(Function.Value);
+      return It == EHIndex.end() ? nullptr : &EHFunctions[It->second];
+    };
     DenseSet<uint64_t> FuncletAddresses;
     DenseMap<uint64_t, uint64_t> FuncletAliases;
     // Parents whose EH handlers resolved to a funclet, with the funclet each
@@ -1641,12 +1650,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             OwnerNameByVa[Todo[Entry.second].Value] = Entry.getKey().str();
           StringMap<size_t> FirstBinder;
           for (size_t Idx = 0; Idx < Todo.size(); ++Idx) {
-            const FunctionEH *EH = nullptr;
-            for (const FunctionEH &Entry : EHFunctions)
-              if (Entry.Function == Todo[Idx]) {
-                EH = &Entry;
-                break;
-              }
+            const FunctionEH *EH = ehFor(Todo[Idx]);
             if (!EH || EH->TryRegions.empty() ||
                 (EH->Handlers.empty() && EH->Cleanups.empty()))
               continue;
@@ -1770,13 +1774,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
           for (size_t Idx : Shards[S]) {
             Va T = Todo[Idx];
             claimForeignBefore(Idx);
-            const FunctionEH *EH = nullptr;
-            auto EHIt = llvm::find_if(EHFunctions,
-                                      [T](const FunctionEH &Entry) {
-                                        return Entry.Function == T;
-                                      });
-            if (EHIt != EHFunctions.end())
-              EH = &*EHIt;
+            const FunctionEH *EH = ehFor(T);
             // An earlier function owns the personality name: serial has its
             // definition under that name when this function is lifted, so
             // the EH conversion does not fire here. Drop the EH entry to
@@ -2467,15 +2465,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         continue;
       FunctionStageTrace Trace("lift", "liftFunction", Prog.Functions.at(T).Name,
                                T.Value);
-      const FunctionEH *EH = nullptr;
-      auto EHIt = llvm::find_if(EHFunctions, [T](const FunctionEH &Entry) {
-        return Entry.Function == T;
-      });
-      if (EHIt != EHFunctions.end()) {
-        if (Compiler.Producer == revenant::Compiler::Rustc)
-          EHIt->Model = EHModel::Rust;
-        EH = &*EHIt;
-      }
+      FunctionEH *EH = ehFor(T);
+      if (EH && Compiler.Producer == revenant::Compiler::Rustc)
+        EH->Model = EHModel::Rust;
       auto L = lift::liftFunction(*M, Prog, Prog.Functions.at(T), *Dis,
                                   Sigs.get(), /*TM=*/nullptr,
                                   /*RunPasses=*/false, EH);
