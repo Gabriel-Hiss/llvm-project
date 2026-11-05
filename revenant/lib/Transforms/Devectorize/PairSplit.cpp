@@ -280,15 +280,21 @@ bool tryStore(Function &F, StoreInst *SI, unsigned &Changed) {
   SI->eraseFromParent();
 
   // Erase dead web defs in reverse use order (phis before their loads).
-  // Every def was private to the web + store, so all uses are gone.
+  // Every def was private to the web + store, so all uses are gone. A def
+  // leaves the list when it is erased: the next sweep must not touch it.
+  SmallVector<Instruction *, 8> Defs;
+  for (Value *D : Web)
+    Defs.push_back(cast<Instruction>(D));
   bool Swept = true;
   while (Swept) {
     Swept = false;
-    for (Value *D : Web) {
-      auto *I = cast<Instruction>(D);
-      if (I->getParent() == nullptr || !I->use_empty())
+    for (auto It = Defs.begin(); It != Defs.end();) {
+      if (!(*It)->use_empty()) {
+        ++It;
         continue;
-      I->eraseFromParent();
+      }
+      (*It)->eraseFromParent();
+      It = Defs.erase(It);
       Swept = true;
     }
   }
