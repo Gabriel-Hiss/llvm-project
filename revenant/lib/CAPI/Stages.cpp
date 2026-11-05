@@ -168,6 +168,17 @@ void resetStageClock() {
   StageClockStarted = true;
 }
 
+/// Set REVENANT_TRACE_STAGES=1 to print each stage as it finishes. The driver
+/// otherwise prints the stage list only after the whole run, so a decompile
+/// that takes minutes shows nothing until the end.
+bool traceStagesEnabled() {
+  static const bool Enabled = [] {
+    const char *V = std::getenv("REVENANT_TRACE_STAGES");
+    return V && *V && StringRef(V) != "0";
+  }();
+  return Enabled;
+}
+
 /// Append a finished stage; its elapsed time runs from the previous record.
 void record(std::vector<StageReport> &Stages, StringRef Name, StringRef Status,
             StringRef Note) {
@@ -180,6 +191,9 @@ void record(std::vector<StageReport> &Stages, StringRef Name, StringRef Status,
             .count();
   LastStageTime = Now;
   StageClockStarted = true;
+  if (traceStagesEnabled())
+    errs() << "[trace] " << R.Status << " " << R.Name << " ("
+           << formatv("{0:F2}", R.ElapsedMicroseconds / 1000.0) << " ms)\n";
   Stages.push_back(std::move(R));
 }
 
