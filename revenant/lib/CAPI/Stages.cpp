@@ -33,6 +33,9 @@
 #include "revenant/Transforms/Uncxx/Uncxx.h"
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <numeric>
 #include <thread>
 
@@ -270,6 +273,49 @@ private:
   std::vector<Range> All;
   DenseMap<uint64_t, SmallVector<uint32_t, 2>> Pages;
   std::vector<uint32_t> Wide;
+};
+
+/// Destroys finished shard modules and their contexts on one background
+/// thread. Twenty workers freeing a context at once queue on the process heap
+/// lock, and the convoy that forms turned 20 s of freeing into 120 s of
+/// waiting on a 46k-function program. A single thread frees them in turn while
+/// the main thread merges, and the process exit ends it.
+class ShardReaper {
+public:
+  static ShardReaper &get() {
+    static ShardReaper *Instance = new ShardReaper;
+    return *Instance;
+  }
+
+  void submit(std::unique_ptr<Module> M, std::unique_ptr<LLVMContext> Ctx) {
+    {
+      std::lock_guard<std::mutex> Lock(Mutex);
+      Queue.emplace_back(std::move(M), std::move(Ctx));
+    }
+    Wake.notify_one();
+  }
+
+private:
+  ShardReaper() {
+    std::thread([this] {
+      for (;;) {
+        std::pair<std::unique_ptr<Module>, std::unique_ptr<LLVMContext>> Dead;
+        {
+          std::unique_lock<std::mutex> Lock(Mutex);
+          Wake.wait(Lock, [this] { return !Queue.empty(); });
+          Dead = std::move(Queue.front());
+          Queue.pop_front();
+        }
+        Dead.first.reset(); // The module dies before its context.
+        Dead.second.reset();
+      }
+    }).detach();
+  }
+
+  std::mutex Mutex;
+  std::condition_variable Wake;
+  std::deque<std::pair<std::unique_ptr<Module>, std::unique_ptr<LLVMContext>>>
+      Queue;
 };
 
 //==--------------------------------------------------------------------==//
@@ -2087,8 +2133,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             WriteBitcodeToFile(*St.Mod, BC,
                                /*ShouldPreserveUseListOrder=*/true);
             BC.flush();
-            St.Mod.reset();
-            St.Ctx.reset();
+            ShardReaper::get().submit(std::move(St.Mod), std::move(St.Ctx));
           });
           for (unsigned S = 0; S < State.size(); ++S)
             if (!State[S].Err.empty() && Why.empty())
