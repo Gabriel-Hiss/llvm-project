@@ -1279,8 +1279,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // as the serial path does on M; a funclet shared by parents in several
     // shards is lifted in each (inlining copies its body anyway), and the
     // merge keeps one copy of the funclet and of its globals.
-    // Any failure resets M and the serial path runs unchanged. Source emit
-    // only: the raw-IR artifact has no serial meaning here.
+    // Any failure resets M and the serial path runs unchanged. Every emit
+    // past ir-clean uses it; ir-raw does not: its text has no serial meaning
+    // here.
     struct CleanSlot {
       bool Failed = false;
       std::string Note;
@@ -1304,9 +1305,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       unsigned Threads = std::thread::hardware_concurrency();
       if (const char *V = std::getenv("REVENANT_THREADS"))
         Threads = std::max(1u, static_cast<unsigned>(std::atoi(V)));
+      bool WantsClean = Opts.Emit == EmitKind::Source ||
+                        Opts.Emit == EmitKind::IrClean ||
+                        Opts.Emit == EmitKind::IrPreLike ||
+                        Opts.Emit == EmitKind::IrFinal;
       bool Wanted = (!PC || StringRef(PC) != "0") && Threads > 1 &&
-                    Todo.size() >= 256 && Opts.Emit == EmitKind::Source &&
-                    !structDIEnabled();
+                    Todo.size() >= 256 && WantsClean && !structDIEnabled();
       if (Wanted) {
         auto Elements = pipelineElements(cleanPipeline(false));
         CleanBlock1 = Elements.front().str();
