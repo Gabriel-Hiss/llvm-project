@@ -1122,6 +1122,12 @@ static bool mustDefine(const Function &F, const McTables &T,
                        unsigned Reg) {
   size_t N = F.Blocks.size();
   std::vector<bool> Defs(N, false), MustIn(N, false);
+  // A scan of the blocks per edge made this cubic on a function with
+  // thousands of blocks: 47 s of the signature stage on a 219k-function
+  // program. The first block with a given start wins, as in the scan.
+  DenseMap<uint64_t, size_t> IndexOfStart;
+  for (size_t Bi = 0; Bi < N; ++Bi)
+    IndexOfStart.try_emplace(F.Blocks[Bi].Start.Value, Bi);
   for (size_t Bi = 0; Bi < N; ++Bi) {
     const BasicBlock &B = F.Blocks[Bi];
     for (size_t i = B.InstrsBegin;
@@ -1150,12 +1156,8 @@ static bool mustDefine(const Function &F, const McTables &T,
       default:
         Need = !B.Edges.empty();
         for (const Edge &E : B.Edges) {
-          size_t Si = N;
-          for (size_t J = 0; J < N; ++J)
-            if (F.Blocks[J].Start == E.To) {
-              Si = J;
-              break;
-            }
+          auto Succ = IndexOfStart.find(E.To.Value);
+          size_t Si = Succ == IndexOfStart.end() ? N : Succ->second;
           if (Si == N || !MustIn[Si]) {
             Need = false;
             break;
