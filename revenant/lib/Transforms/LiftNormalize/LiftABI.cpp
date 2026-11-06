@@ -264,8 +264,22 @@ struct Signature {
   SmallVector<bool, 8> Pointers;
   bool PointerReturn = false;
 };
+/// V is the integer bits of a pointer the function holds: a `ptrtoint`, a
+/// parameter the analysis already types as a pointer, or a read of a stack
+/// slot a pointer was stored to (`Held`).
+bool pointerBits(const Value *V, const DenseMap<Function *, Signature> &Sigs,
+                 const SmallPtrSetImpl<const Value *> &Held) {
+  if (isa<PtrToIntInst>(V) || Held.count(V))
+    return true;
+  if (const auto *A = dyn_cast<Argument>(V)) {
+    auto It = Sigs.find(A->getParent());
+    return It != Sigs.end() && It->second.Pointers[A->getArgNo()];
+  }
+  return false;
+}
 bool canRewrite(Function &F) {
-  if (F.isIntrinsic() || F.getName().starts_with("revenant.asm."))
+  if (F.isIntrinsic() || F.getName().starts_with("revenant.asm.") ||
+      F.getName().starts_with("revenant.o0."))
     return false;
   for (User *U : F.users())
     if (auto *C = dyn_cast<CallBase>(U))
@@ -371,6 +385,65 @@ void rewriteSignature(Function &F, Signature &S) {
   F.replaceAllUsesWith(N);
   F.eraseFromParent();
 }
+/// Retype one indirect call: an argument made by `ptrtoint` passes the
+/// pointer, and a result whose every use truncates to one width is read at
+/// that width. The callee is unknown, so only the call site's type changes.
+bool retypeIndirectCall(CallBase &CB) {
+  LLVMContext &Ctx = CB.getContext();
+  FunctionType *Old = CB.getFunctionType();
+  Type *PT = PointerType::getUnqual(Ctx);
+  SmallVector<Type *, 8> Params(Old->params());
+  SmallVector<Value *, 8> Args(CB.args());
+  SmallVector<unsigned, 4> ChangedArgs;
+  for (unsigned J = 0; J < Args.size() && J < Params.size(); ++J)
+    if (auto *P = dyn_cast<PtrToIntInst>(Args[J]))
+      if (Params[J]->isIntegerTy(64) && P->getPointerOperand()->getType() == PT) {
+        Args[J] = P->getPointerOperand();
+        Params[J] = PT;
+        ChangedArgs.push_back(J);
+      }
+  Type *Ret = Old->getReturnType();
+  SmallVector<TruncInst *, 4> Truncs;
+  if (Ret->isIntegerTy() && !CB.use_empty() && !isa<InvokeInst>(CB)) {
+    Type *Narrow = nullptr;
+    for (User *U : CB.users()) {
+      auto *T = dyn_cast<TruncInst>(U);
+      if (!T || (Narrow && T->getType() != Narrow)) {
+        Narrow = nullptr;
+        break;
+      }
+      Narrow = T->getType();
+      Truncs.push_back(T);
+    }
+    if (Narrow)
+      Ret = Narrow;
+    else
+      Truncs.clear();
+  }
+  if (ChangedArgs.empty() && Truncs.empty())
+    return false;
+  auto *FT = FunctionType::get(Ret, Params, Old->isVarArg());
+  auto *New = cast<CallBase>(CB.clone());
+  for (unsigned J : ChangedArgs)
+    New->setArgOperand(J, Args[J]);
+  New->mutateFunctionType(FT);
+  AttributeList AL = New->getAttributes();
+  for (unsigned J : ChangedArgs)
+    AL = AL.removeParamAttributes(Ctx, J);
+  if (!Truncs.empty())
+    AL = AL.removeAttributesAtIndex(Ctx, AttributeList::ReturnIndex);
+  New->setAttributes(AL);
+  New->insertBefore(CB.getIterator());
+  New->takeName(&CB);
+  for (TruncInst *T : Truncs) {
+    T->replaceAllUsesWith(New);
+    T->eraseFromParent();
+  }
+  if (!CB.use_empty())
+    CB.replaceAllUsesWith(New);
+  CB.eraseFromParent();
+  return true;
+}
 } // namespace
 PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
   const DataLayout &DL = M.getDataLayout();
@@ -452,34 +525,107 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
 
   DenseMap<Function *, Signature> Signatures;
   SmallPtrSet<Value *, 32> Addresses;
+  // Evidence is per value, and a constant is one value module-wide: an
+  // `i64 11` used as an address in one function would make every function
+  // returning 11 return a pointer. Image addresses were resolved to their
+  // symbols above, so constants carry no evidence.
+  auto Mark = [&](Value *V) {
+    return !isa<Constant>(V) && Addresses.insert(V).second;
+  };
   for (Function &F : M) {
     if (!canRewrite(F))
       continue;
     Signature &S = Signatures[&F];
     S.Pointers.resize(F.arg_size(), false);
+    // An address is a value used as a pointer (inttoptr operand) or made
+    // from one (ptrtoint result).
     for (Instruction &I : instructions(F))
-      if (auto *P = dyn_cast<IntToPtrInst>(&I))
+      if (auto *P = dyn_cast<IntToPtrInst>(&I)) {
         if (P->getOperand(0)->getType()->isIntegerTy(64))
-          Addresses.insert(P->getOperand(0));
+          Mark(P->getOperand(0));
+      } else if (auto *P = dyn_cast<PtrToIntInst>(&I)) {
+        if (P->getType()->isIntegerTy(64))
+          Addresses.insert(P);
+      }
   }
   // Propagate address evidence along real direct-call parameters and returns.
   // A monotone finite set reaches a fixed point even for recursive functions.
   // Walk the module's function order, not the map's: pointer-keyed iteration
   // order changes per process, and a rewrite cloning a caller's arguments
   // would land in a different instruction order run to run.
+  // A stack slot is one variable: what is stored to it and what is loaded
+  // from it are the same value. An unoptimized frame keeps its slots, so the
+  // evidence has to cross them. A slot a pointer is stored to (as a pointer,
+  // or as its `ptrtoint` bits), or that is read as a pointer, holds an
+  // address: its integer reads are the bits of a pointer the function holds.
+  struct SlotValues {
+    SmallVector<Value *, 4> Values;
+  };
+  std::vector<SlotValues> Slots;
+  SmallPtrSet<const Value *, 32> Held;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : F.getEntryBlock()) {
+      auto *A = dyn_cast<AllocaInst>(&I);
+      if (!A)
+        continue;
+      SlotValues SV;
+      bool Closed = true;
+      bool HoldsPointer = false;
+      for (Use &U : A->uses()) {
+        if (auto *L = dyn_cast<LoadInst>(U.getUser())) {
+          if (L->getType()->isIntegerTy(64))
+            SV.Values.push_back(L);
+          HoldsPointer |= L->getType()->isPointerTy();
+        } else if (auto *S = dyn_cast<StoreInst>(U.getUser());
+                   S && U.getOperandNo() == StoreInst::getPointerOperandIndex()) {
+          Type *T = S->getValueOperand()->getType();
+          if (T->isIntegerTy(64))
+            SV.Values.push_back(S->getValueOperand());
+          HoldsPointer |= T->isPointerTy() || isa<PtrToIntInst>(S->getValueOperand());
+        } else if (auto *C = dyn_cast<CallBase>(U.getUser());
+                   C && C->getCalledFunction() &&
+                   C->getCalledFunction()->getName() == "revenant.o0.keep") {
+          // The unoptimized-frame pin is not a use of the slot's contents.
+        } else {
+          Closed = false;
+        }
+      }
+      if (!Closed)
+        continue;
+      if (HoldsPointer) {
+        for (Value *V : SV.Values) {
+          Mark(V);
+          if (isa<LoadInst>(V))
+            Held.insert(V);
+        }
+      } else if (SV.Values.size() > 1) {
+        Slots.push_back(std::move(SV));
+      }
+    }
+  }
   bool Progress;
   do {
     Progress = false;
+    for (SlotValues &SV : Slots)
+      if (llvm::any_of(SV.Values, [&](Value *V) { return Addresses.count(V); }))
+        for (Value *V : SV.Values)
+          Progress |= Mark(V);
     for (Function &F : M) {
       auto It = Signatures.find(&F);
       if (It == Signatures.end())
         continue;
       Signature &S = It->second;
-      for (Argument &A : F.args())
+      for (Argument &A : F.args()) {
         if (A.getType()->isIntegerTy(64) && Addresses.count(&A) && !S.Pointers[A.getArgNo()]) {
           S.Pointers[A.getArgNo()] = true;
           Progress = true;
         }
+        // A pointer parameter is an address inside the callee as well.
+        if (S.Pointers[A.getArgNo()])
+          Progress |= Mark(&A);
+      }
       for (User *U : F.users())
         if (auto *C = dyn_cast<CallBase>(U)) {
           if (C->getCalledOperand() != &F)
@@ -488,15 +634,41 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
             S.PointerReturn = true;
             Progress = true;
           }
-          for (unsigned J = 0; J < S.Pointers.size() && J < C->arg_size(); ++J)
-            if (S.Pointers[J] && C->getArgOperand(J)->getType()->isIntegerTy(64))
-              Progress |= Addresses.insert(C->getArgOperand(J)).second;
+          // A pointer-returning callee yields addresses at its call sites.
+          if (S.PointerReturn && C->getType()->isIntegerTy(64))
+            Progress |= Mark(C);
+          for (unsigned J = 0; J < S.Pointers.size() && J < C->arg_size(); ++J) {
+            Value *Arg = C->getArgOperand(J);
+            if (!Arg->getType()->isIntegerTy(64))
+              continue;
+            if (S.Pointers[J])
+              Progress |= Mark(Arg);
+            else if (F.getArg(J)->getType()->isIntegerTy(64) &&
+                     pointerBits(Arg, Signatures, Held)) {
+              // The caller passes the bits of a pointer it holds: the
+              // parameter is a pointer. Only a direct cast, a pointer
+              // parameter or a pointer read back from its slot counts;
+              // integers derived from addresses (hashes, offsets) stay
+              // integers.
+              S.Pointers[J] = true;
+              Progress = true;
+            }
+          }
         }
+      if (!S.PointerReturn && F.getReturnType()->isIntegerTy(64))
+        for (BasicBlock &BB : F)
+          if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator()))
+            if (R->getReturnValue() && Addresses.count(R->getReturnValue())) {
+              // The function returns an address.
+              S.PointerReturn = true;
+              Progress = true;
+              break;
+            }
       if (S.PointerReturn)
         for (BasicBlock &BB : F)
           if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator()))
             if (R->getReturnValue())
-              Progress |= Addresses.insert(R->getReturnValue()).second;
+              Progress |= Mark(R->getReturnValue());
     }
   } while (Progress);
   // Rewriting a signature replaces the function object, so collect the
@@ -549,6 +721,33 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
     L->eraseFromParent();
     Changed = true;
   }
-  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  // The same holds for stores: an address stored as its integer bits stores
+  // the pointer itself.
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *St = dyn_cast<StoreInst>(&I))
+        if (auto *P = dyn_cast<PtrToIntInst>(St->getValueOperand()))
+          if (P->getType()->isIntegerTy(64) && P->getPointerOperand()->getType()->isPointerTy() &&
+              P->getPointerAddressSpace() == 0) {
+            St->setOperand(0, P->getPointerOperand());
+            Changed = true;
+          }
+  // Indirect calls carry the call site's own function type: pass addresses as
+  // pointers, and read a result that is only ever truncated at its width.
+  SmallVector<CallBase *, 32> Indirect;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (!CB->getCalledFunction() && !CB->isInlineAsm() && !isa<CallBrInst>(CB) &&
+            !CB->isMustTailCall() && !CB->getFunctionType()->isVarArg())
+          Indirect.push_back(CB);
+  for (CallBase *CB : Indirect) {
+    if (retypeIndirectCall(*CB)) {
+      Changed = true;
+    }
+  }
+  if (!Changed)
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
 } // namespace revenant
