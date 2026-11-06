@@ -1,5 +1,6 @@
 //===- LiftNormalize.cpp - machine state to compiler IR ------------------===//
 #include "revenant/Transforms/LiftNormalize/LiftNormalize.h"
+#include "revenant/IR/Contract.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/DenseSet.h"
@@ -9,6 +10,8 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
@@ -104,10 +107,12 @@ struct FrameObject {
 // The object bounds are inferred, not proven: a callee that reads past the
 // next accessed offset, or a field this function also reads, would land
 // in another object. Only the ir-final storage tail asks for this.
-// `ScalarSlots` receives the scalar allocas no escape reaches.
+// `ScalarSlots` receives the scalar allocas no escape reaches; `AllSlots`
+// every alloca the split creates.
 bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
                 bool AllowEscapes = false,
-                SmallVectorImpl<AllocaInst *> *ScalarSlots = nullptr) {
+                SmallVectorImpl<AllocaInst *> *ScalarSlots = nullptr,
+                SmallVectorImpl<AllocaInst *> *AllSlots = nullptr) {
   auto *AT = dyn_cast<ArrayType>(Frame.getAllocatedType());
   if (!AT || !AT->getElementType()->isIntegerTy(8) ||
       !Frame.getName().contains("frame") || !Frame.isStaticAlloca())
@@ -230,6 +235,8 @@ bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
     provenance(Slot, Frame);
     if (Scalar && ScalarSlots)
       ScalarSlots->push_back(Slot);
+    if (AllSlots)
+      AllSlots->push_back(Slot);
     for (const Access *X : O.Accesses) {
       IRBuilder<> B(X->I);
       Value *P = Slot;
@@ -754,6 +761,183 @@ bool mergeTwins(Function &F, const DataLayout &DL,
   }
   return true;
 }
+// The allocation a frame address is derived from (through constant GEPs).
+const AllocaInst *frameBase(const Value *P) {
+  while (const auto *G = dyn_cast<GetElementPtrInst>(P))
+    P = G->getPointerOperand();
+  return dyn_cast<AllocaInst>(P);
+}
+bool isFrame(const AllocaInst *A) {
+  return A && A->getName().contains("frame");
+}
+// An unoptimized build stores every register argument to the frame before
+// anything else reads it: the lifted entry block reads the argument
+// register once and stores that value to a frame slot (clang -O0 parameter
+// allocas, MSVC /Od home slots). Optimized code keeps arguments in
+// registers. Stack arguments already arrive in the frame. A function
+// without arguments has no such evidence and stays optimized. The stores
+// sit in the prologue: right after `sub rsp` (clang), before the
+// callee-saved pushes (MSVC /Od) or after the /GS cookie. Optimized code
+// that spills an argument (register pressure, a taken address) does it
+// later. rustc -O0 spills only what it describes in debug info; the driver
+// decides for a rustc binary as a whole (lib/CAPI/Unoptimized.h).
+bool spillsArguments(Function &F) {
+  if (F.arg_empty())
+    return false;
+  BasicBlock &Entry = F.getEntryBlock();
+  // Only the raw lift has the frame byte array and the register slots; a
+  // later run (after mem2reg, or with an unsplit escaping frame) would read
+  // an ordinary store of an argument as its spill.
+  bool HasFrame = false, HasRegisters = false;
+  for (Instruction &I : Entry)
+    if (auto *A = dyn_cast<AllocaInst>(&I)) {
+      HasFrame |= isFrame(A);
+      HasRegisters |= A->getName() == "rax";
+    }
+  if (!HasFrame || !HasRegisters)
+    return false;
+  // Position of each machine instruction of the entry block.
+  DenseMap<uint64_t, unsigned> Position;
+  for (Instruction &I : Entry)
+    if (auto VA = ir::getInstructionVA(I))
+      Position.try_emplace(*VA, Position.size());
+  const unsigned PrologueLimit = F.arg_size() + 6;
+  auto InPrologue = [&](Instruction &I) {
+    auto VA = ir::getInstructionVA(I);
+    if (!VA)
+      return false;
+    auto It = Position.find(*VA);
+    return It != Position.end() && It->second <= PrologueLimit;
+  };
+  // Whether argument A is spilled as an unoptimized prologue does it.
+  auto Spilled = [&](Argument &A) -> bool {
+    // The register the argument arrives in: `store %A, ptr %reg`, the
+    // argument possibly extended or bit-cast to the register's width.
+    AllocaInst *Reg = nullptr;
+    bool InFrame = false;
+    SmallVector<Value *, 4> Vals{&A};
+    for (unsigned K = 0; K < Vals.size() && K < 8; ++K)
+      for (User *U : Vals[K]->users()) {
+        if (auto *C = dyn_cast<CastInst>(U)) {
+          Vals.push_back(C);
+          continue;
+        }
+        auto *S = dyn_cast<StoreInst>(U);
+        if (!S || S->getValueOperand() != Vals[K] || S->getParent() != &Entry)
+          continue;
+        if (auto *R = dyn_cast<AllocaInst>(S->getPointerOperand()); R && !isFrame(R))
+          Reg = R;
+        else if (A.getArgNo() >= 4 && isFrame(frameBase(S->getPointerOperand())))
+          InFrame = true; // a stack parameter the lifter placed in the frame
+      }
+    if (InFrame)
+      return true;
+    if (!Reg)
+      return false;
+    // Its first read in the entry block must be stored to the frame.
+    LoadInst *First = nullptr;
+    for (Instruction &I : Entry) {
+      if (auto *L = dyn_cast<LoadInst>(&I))
+        if (L->getPointerOperand() == Reg) {
+          First = L;
+          break;
+        }
+      if (auto *S = dyn_cast<StoreInst>(&I))
+        if (S->getPointerOperand() == Reg && !llvm::is_contained(Vals, S->getValueOperand()))
+          return false;
+    }
+    if (!First)
+      return false;
+    // An unoptimized body never computes from the argument register again:
+    // every use reloads the slot. Optimized code keeps computing from it (a
+    // second load, or the lifter's cached value feeding something besides
+    // the spill). A load that only merges a partial write back into the
+    // register (`mov cl, [rax]`: `and old, mask | new`) is no such use.
+    auto MergesOnly = [&](LoadInst *L) {
+      if (!L->hasOneUse())
+        return false;
+      auto *And = dyn_cast<BinaryOperator>(L->user_back());
+      if (!And || And->getOpcode() != Instruction::And || !isa<ConstantInt>(And->getOperand(1)) ||
+          !And->hasOneUse())
+        return false;
+      auto *Or = dyn_cast<BinaryOperator>(And->user_back());
+      if (!Or || Or->getOpcode() != Instruction::Or || !Or->hasOneUse())
+        return false;
+      auto *S = dyn_cast<StoreInst>(Or->user_back());
+      return S && S->getPointerOperand() == Reg;
+    };
+    for (Instruction *I = First->getNextNode(); I; I = I->getNextNode()) {
+      if (auto *L = dyn_cast<LoadInst>(I); L && L->getPointerOperand() == Reg && !MergesOnly(L))
+        return false;
+      if (auto *S = dyn_cast<StoreInst>(I); S && S->getPointerOperand() == Reg)
+        break;
+    }
+    {
+      SmallVector<Value *, 4> Cast{First};
+      for (unsigned K = 0; K < Cast.size(); ++K)
+        for (User *U : Cast[K]->users()) {
+          if (isa<CastInst>(U))
+            Cast.push_back(cast<Instruction>(U));
+          else if (auto *S = dyn_cast<StoreInst>(U);
+                   !S || S->getValueOperand() != Cast[K] ||
+                   !isFrame(frameBase(S->getPointerOperand())))
+            return false;
+        }
+    }
+    SmallVector<Value *, 4> Work{First};
+    bool Stored = false;
+    for (unsigned Steps = 0; !Work.empty() && !Stored && Steps < 16; ++Steps) {
+      Value *V = Work.pop_back_val();
+      for (User *U : V->users()) {
+        if (auto *S = dyn_cast<StoreInst>(U)) {
+          Stored |= S->getValueOperand() == V &&
+                    isFrame(frameBase(S->getPointerOperand())) && InPrologue(*S);
+        } else if (auto *C = dyn_cast<CastInst>(U)) {
+          Work.push_back(C);
+        }
+      }
+    }
+    return Stored;
+  };
+  return llvm::all_of(F.args(), Spilled);
+}
+// The call that pins an unoptimized slot through cleanup.
+constexpr char KeepSlotName[] = "revenant.o0.keep";
+// Keep an unoptimized frame slot's memory traffic through cleanup: every
+// access becomes volatile (forwarding and folding leave it alone), and the
+// slot's address escapes into `revenant.o0.keep` so SROA and mem2reg keep
+// the alloca whole, with the metadata on its accesses. `revenant-o0-slots`
+// undoes both.
+void markUnoptimizedSlot(AllocaInst &Slot) {
+  MDNode *Tag = MDNode::get(Slot.getContext(), {});
+  SmallVector<Value *, 8> Work{&Slot};
+  while (!Work.empty()) {
+    Value *P = Work.pop_back_val();
+    for (Use &U : P->uses()) {
+      User *Usr = U.getUser();
+      if (auto *G = dyn_cast<GetElementPtrInst>(Usr)) {
+        Work.push_back(G);
+      } else if (auto *L = dyn_cast<LoadInst>(Usr)) {
+        L->setVolatile(true);
+        L->setMetadata("revenant.o0", Tag);
+      } else if (auto *S = dyn_cast<StoreInst>(Usr);
+                 S && U.getOperandNo() == StoreInst::getPointerOperandIndex()) {
+        S->setVolatile(true);
+        S->setMetadata("revenant.o0", Tag);
+      }
+    }
+  }
+  Module &M = *Slot.getModule();
+  FunctionCallee Keep = M.getOrInsertFunction(
+      KeepSlotName, FunctionType::get(Type::getVoidTy(M.getContext()),
+                                      {PointerType::getUnqual(M.getContext())}, false));
+  IRBuilder<> B(Slot.getNextNode());
+  B.CreateCall(Keep, {&Slot});
+}
+bool isRustModule(const Module &M) {
+  auto *S = dyn_cast_or_null<MDString>(M.getModuleFlag("revenant.lang"));
+  return S && S->getString() == "rust";
+}
 } // namespace
 PreservedAnalyses FrameSlotsPass::run(Function &F,
                                       FunctionAnalysisManager &FAM) {
@@ -789,8 +973,23 @@ PreservedAnalyses LiftNormalizePass::run(Function &F,
   for (Instruction &I : F.getEntryBlock())
     if (auto *A = dyn_cast<AllocaInst>(&I))
       Frames.push_back(A);
+  // An unoptimized function keeps its frame: every slot becomes its own
+  // alloca (escaped ones too) and its accesses survive cleanup, as the
+  // compiler's -O0 IR keeps one alloca per variable. The first run sees the
+  // raw lift and decides; later runs find the attribute. A rustc binary is
+  // decided as a whole by the driver, which sets the attribute before
+  // cleanup (lib/CAPI/Unoptimized.h).
+  bool Unoptimized = F.hasFnAttribute("revenant.o0");
+  if (!Unoptimized && !Frames.empty() && !isRustModule(*F.getParent()) && spillsArguments(F)) {
+    F.addFnAttr("revenant.o0");
+    Unoptimized = true;
+  }
+  SmallVector<AllocaInst *, 16> Slots;
   for (AllocaInst *A : Frames)
-    Changed |= splitFrame(*A, DL);
+    Changed |= Unoptimized ? splitFrame(*A, DL, /*AllowEscapes=*/true, nullptr, &Slots)
+                           : splitFrame(*A, DL);
+  for (AllocaInst *S : Slots)
+    markUnoptimizedSlot(*S);
   for (Instruction &I : make_early_inc_range(instructions(F)))
     if (auto *P = dyn_cast<PHINode>(&I))
       Changed |= narrowPhi(*P);
