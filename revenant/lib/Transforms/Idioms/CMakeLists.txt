@@ -2,6 +2,7 @@ add_llvm_library(RevenantTransformIdioms
   Idioms.cpp
 
   LINK_COMPONENTS
+  Analysis
   Core
   Support
   TransformUtils

@@ -33,6 +33,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -1077,6 +1078,85 @@ PreservedAnalyses revenant::IdiomsPass::run(Function &F,
   if (!Changed)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
+}
+
+namespace {
+/// The intrinsic a compare-and-select computes, in the shapes `revenant-idioms`
+/// expands them to and the orientations instcombine accepts; null when it is
+/// none of them.
+Value *refoldSelect(SelectInst &S, IRBuilder<> &B) {
+  Type *Ty = S.getType();
+  if (!Ty->isIntegerTy())
+    return nullptr;
+  Value *L = nullptr, *R = nullptr;
+  Instruction::CastOps Cast = Instruction::CastOps(0);
+  SelectPatternResult SPR = matchSelectPattern(&S, L, R, &Cast);
+  if (!Cast && SelectPatternResult::isMinOrMax(SPR.Flavor) &&
+      L->getType() == Ty && R->getType() == Ty) {
+    Intrinsic::ID ID = getMinMaxIntrinsic(SPR.Flavor);
+    return B.CreateBinaryIntrinsic(ID, L, R);
+  }
+  Value *A = nullptr, *Bv = nullptr;
+  CmpPredicate P;
+  // abs: a < 0 ? -a : a
+  if (match(&S, m_Select(m_ICmp(P, m_Value(A), m_Zero()), m_Neg(m_Deferred(A)),
+                         m_Deferred(A))) &&
+      P == ICmpInst::ICMP_SLT)
+    return B.CreateBinaryIntrinsic(Intrinsic::abs, A, B.getFalse());
+  // usub.sat: a < b ? 0 : a - b
+  if (match(&S, m_Select(m_ICmp(P, m_Value(A), m_Value(Bv)), m_Zero(),
+                         m_Sub(m_Deferred(A), m_Deferred(Bv)))) &&
+      P == ICmpInst::ICMP_ULT)
+    return B.CreateBinaryIntrinsic(Intrinsic::usub_sat, A, Bv);
+  // uadd.sat: a + b < a ? -1 : a + b
+  Value *Sum = nullptr;
+  if (match(&S, m_Select(m_ICmp(P, m_Value(Sum), m_Value(A)), m_AllOnes(),
+                         m_Deferred(Sum))) &&
+      P == ICmpInst::ICMP_ULT &&
+      match(Sum, m_c_Add(m_Specific(A), m_Value(Bv))))
+    return B.CreateBinaryIntrinsic(Intrinsic::uadd_sat, A, Bv);
+  // scmp/ucmp: a < b ? -1 : (a > b ? 1 : 0)
+  CmpPredicate Q;
+  Value *A2 = nullptr, *B2 = nullptr;
+  if (match(&S, m_Select(m_ICmp(P, m_Value(A), m_Value(Bv)), m_AllOnes(),
+                         m_Select(m_ICmp(Q, m_Value(A2), m_Value(B2)), m_One(),
+                                  m_Zero()))) &&
+      A == A2 && Bv == B2 && A->getType()->isIntegerTy()) {
+    if (P == ICmpInst::ICMP_SLT && Q == ICmpInst::ICMP_SGT)
+      return B.CreateIntrinsic(Ty, Intrinsic::scmp, {A, Bv});
+    if (P == ICmpInst::ICMP_ULT && Q == ICmpInst::ICMP_UGT)
+      return B.CreateIntrinsic(Ty, Intrinsic::ucmp, {A, Bv});
+  }
+  return nullptr;
+}
+} // namespace
+
+PreservedAnalyses revenant::RefoldPass::run(Function &F, FunctionAnalysisManager &) {
+  if (F.isDeclaration() || F.hasFnAttribute("revenant.o0"))
+    return PreservedAnalyses::all();
+  SmallVector<WeakTrackingVH, 16> Dead;
+  bool Changed = false;
+  IRBuilder<> B(F.getContext());
+  // Outer selects first (the three-way compare nests one), in program order.
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *S = dyn_cast<SelectInst>(&I);
+    if (!S || !S->getParent() || hasOpaque(S))
+      continue;
+    B.SetInsertPoint(S);
+    Value *R = refoldSelect(*S, B);
+    if (!R)
+      continue;
+    if (auto *RI = dyn_cast<Instruction>(R))
+      copyProvenance(RI, S);
+    R->takeName(S);
+    S->replaceAllUsesWith(R);
+    for (Value *Op : S->operands())
+      Dead.push_back(Op);
+    S->eraseFromParent();
+    Changed = true;
+  }
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
 llvm::PassPluginLibraryInfo getPassPluginInfo() {

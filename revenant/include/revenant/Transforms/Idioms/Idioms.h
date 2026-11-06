@@ -17,6 +17,19 @@ struct IdiomsPass : llvm::PassInfoMixin<IdiomsPass> {
   static bool isRequired() { return true; }
 };
 
+/// `revenant-refold`: the inverse of the intrinsic expansion above, for the
+/// ir-final storage of optimized functions. Optimized LLVM canonicalizes a
+/// min/max, abs, saturating add/sub or three-way compare written as
+/// compare and select into its intrinsic (`llvm.umin`, `llvm.abs`,
+/// `llvm.uadd.sat`, `llvm.scmp`, ...), so the IR before instruction
+/// selection has the intrinsic. Unoptimized functions (`revenant.o0`) keep
+/// the source's compare and select.
+struct RefoldPass : llvm::PassInfoMixin<RefoldPass> {
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
+
 } // namespace revenant
 
 #endif
