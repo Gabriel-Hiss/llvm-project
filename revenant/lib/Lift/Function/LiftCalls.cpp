@@ -120,7 +120,7 @@ static void emitIndirectTail(LiftState &LS, llvm::Value *TV, Va At) {
     Sig = &Empty;
   }
   llvm::FunctionType *FT = LS.fnType(Sig);
-  std::vector<llvm::Value *> Args = LS.callArgs(Sig, std::nullopt);
+  std::vector<llvm::Value *> Args = LS.callArgs(Sig, std::nullopt, /*Tail=*/true);
   Args.resize(std::min<size_t>(Args.size(), FT->getNumParams()));
   while (Args.size() < FT->getNumParams())
     Args.push_back(llvm::UndefValue::get(LS.i64()));
@@ -163,13 +163,18 @@ llvm::Function *LiftState::calleeByName(llvm::StringRef Name,
 }
 
 std::vector<llvm::Value *> LiftState::callArgs(const Signature *S,
-                                              std::optional<size_t> Prefix) {
+                                              std::optional<size_t> Prefix,
+                                              bool Tail) {
   std::vector<llvm::Value *> Args;
   if (S) {
     for (const Param &P : S->Params) {
       llvm::Value *V = nullptr;
       if (P.Loc.IsStack) {
-        V = readCallerArg(P.Loc.StackOff);
+        int64_t Off = Stack.rspOff(CurVa, Tail ? P.Loc.StackOff : P.Loc.StackOff - 8);
+        auto *Load = B.CreateAlignedLoad(i64(), framePtrOff(Off), llvm::Align(1), "sa");
+        // `revenant-o0-slots` forwards the store that wrote the argument.
+        Load->setMetadata("revenant.stackarg", llvm::MDNode::get(Mod.getContext(), {}));
+        V = Load;
         V = extTo(V, std::min(P.Bits, 64u));
       } else if (P.Float) {
         V = regRead(P.Loc.Reg);
@@ -421,7 +426,8 @@ void LiftState::emitTailCall(Va Target) {
   llvm::Function *Callee = calleeFn(Target, Sig);
   Signature Empty;
   Empty.Ret.reset();
-  std::vector<llvm::Value *> Args = callArgs(Sig ? Sig : &Empty, std::nullopt);
+  std::vector<llvm::Value *> Args =
+      callArgs(Sig ? Sig : &Empty, std::nullopt, /*Tail=*/true);
   coerceArgs(Callee, Args);
   llvm::CallInst *Call =
       B.CreateCall(Callee, Args,

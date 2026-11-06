@@ -287,8 +287,13 @@ public:
   llvm::FunctionType *fnType(const Signature *S);
   llvm::Function *calleeFn(Va Target, const Signature *S);
   llvm::Function *calleeByName(llvm::StringRef Name, const Signature *S);
+  /// Arguments of a call at the current instruction. A stack parameter sits
+  /// at `[rsp + StackOff - 8]` before a `call` pushes the return address; a
+  /// tail jump hands the callee the caller's own entry frame, where it sits
+  /// at `[entry rsp + StackOff]`.
   std::vector<llvm::Value *> callArgs(const Signature *S,
-                                    std::optional<size_t> Prefix);
+                                    std::optional<size_t> Prefix,
+                                    bool Tail = false);
   void coerceArgs(llvm::Function *F, std::vector<llvm::Value *> &Args);
   llvm::Value *readCallerArg(int64_t Off);
   void emitCall(const Instr &I);

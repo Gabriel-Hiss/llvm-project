@@ -751,4 +751,46 @@ TEST(LiftFunction, RecoveredSignatureIsPublishedForUnabi) {
   EXPECT_FALSE(Lifted2->Fn->hasFnAttribute("revenant.sig"));
 }
 
+TEST(LiftFunction, OutgoingStackArgumentIsReadAtTheCallSite) {
+  // c-clang-o0 vsprintf (0x1400022f0) calls _vsnprintf_l (0x1400024f0) with
+  // five arguments: the fifth is stored to [rsp+0x20] right before the call.
+  // The callee finds it at [its entry rsp+0x28], so the caller has to read
+  // [call-site rsp+0x20], not its own incoming area at [entry rsp+0x28],
+  // which nothing wrote (the argument came out undef).
+  auto Fx = open(REVENANT_TEST_PARITY "/c-clang-o0/c-clang-o0.exe");
+  ASSERT_TRUE(Fx.has_value());
+  Program P = analyze(*Fx->Pe, *createX86TargetHooks());
+  auto It = P.Functions.find(Va(0x1400022f0));
+  ASSERT_NE(It, P.Functions.end());
+  const Va Callee(0x1400024f0);
+  lift::Signatures Sigs;
+  lift::Signature S;
+  for (llvm::MCRegister R : {llvm::X86::RCX, llvm::X86::RDX, llvm::X86::R8, llvm::X86::R9})
+    S.Params.push_back({lift::ParamLoc::reg(R), 64, false, std::nullopt});
+  S.Params.push_back({lift::ParamLoc::stack(0x28), 64, false, std::nullopt});
+  S.Ret = lift::RetLoc{false, 32};
+  Sigs.Funcs.emplace(Callee, S);
+  // vsprintf's own three register parameters, so the value it stores for the
+  // fifth argument (its third parameter) is defined.
+  lift::Signature Caller;
+  for (llvm::MCRegister R : {llvm::X86::RCX, llvm::X86::RDX, llvm::X86::R8})
+    Caller.Params.push_back({lift::ParamLoc::reg(R), 64, false, std::nullopt});
+  Caller.Ret = lift::RetLoc{false, 32};
+  Sigs.Funcs.emplace(Va(0x1400022f0), Caller);
+  llvm::LLVMContext C;
+  llvm::Module M("stack_arg", C);
+  auto Lifted = lift::liftFunction(M, P, It->second, *Fx->Dis, &Sigs, nullptr,
+                                   /*RunPasses=*/true);
+  ASSERT_FALSE(!Lifted) << toString(Lifted.takeError());
+  ASSERT_FALSE(verifyModule(M, &llvm::errs()));
+  const llvm::CallBase *Call = nullptr;
+  for (llvm::BasicBlock &BB : *Lifted->Fn)
+    for (llvm::Instruction &I : BB)
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I))
+        if (CB->arg_size() == 5)
+          Call = CB;
+  ASSERT_NE(Call, nullptr);
+  EXPECT_FALSE(llvm::isa<llvm::UndefValue>(Call->getArgOperand(4)));
+}
+
 } // end anonymous namespace
