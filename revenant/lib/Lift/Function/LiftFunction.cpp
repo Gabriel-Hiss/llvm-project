@@ -21,6 +21,7 @@
 #include "revenant/Disasm/Disasm.h"
 #include "revenant/IR/Contract.h"
 
+#include "X86BaseInfo.h"
 #include "X86MCTargetDesc.h"
 
 #include "llvm/IR/BasicBlock.h"
@@ -182,6 +183,43 @@ static std::pair<CmpOperand, int64_t> switchLoc(const FuncRecord &F,
     Loc.Reg = (unsigned)llvm::X86::RAX;
   }
   return {Loc, Off};
+}
+
+/// The last instruction of a dispatch block (before its indirect jump) that
+/// loads through a scaled index, `mov[sxd] reg, [base + 4*idx]`, with the
+/// index register. That load reads the jump table.
+static std::optional<std::pair<size_t, unsigned>>
+tableLoadIndex(llvm::ArrayRef<Instr> Instrs, const BlockRec &BR,
+               const llvm::MCInstrInfo &MII) {
+  for (size_t N = BR.InstrsEnd - 1; N-- > BR.InstrsBegin;) {
+    const llvm::MCInst &Inst = Instrs[N].Inst;
+    const llvm::MCInstrDesc &Desc = MII.get(Inst.getOpcode());
+    if (!Desc.mayLoad())
+      continue;
+    int Mem = llvm::X86II::getMemoryOperandNo(Desc.TSFlags);
+    if (Mem < 0)
+      continue;
+    Mem += llvm::X86II::getOperandBias(Desc);
+    const llvm::MCOperand &Scale = Inst.getOperand(Mem + llvm::X86::AddrScaleAmt);
+    const llvm::MCOperand &Index = Inst.getOperand(Mem + llvm::X86::AddrIndexReg);
+    if (Scale.isImm() && (Scale.getImm() == 4 || Scale.getImm() == 8) &&
+        Index.isReg() && Index.getReg())
+      return std::make_pair(N, unsigned(Index.getReg()));
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+/// True when an instruction in [Begin, End) writes Reg or an alias of it.
+static bool clobbersBefore(llvm::ArrayRef<Instr> Instrs, size_t Begin,
+                           size_t End, unsigned Reg,
+                           const llvm::MCInstrInfo &MII,
+                           const llvm::MCRegisterInfo &MRI) {
+  for (size_t N = Begin; N < End; ++N)
+    if (MII.get(Instrs[N].Inst.getOpcode())
+            .hasDefOfPhysReg(Instrs[N].Inst, Reg, MRI))
+      return true;
+  return false;
 }
 
 /// True for the trap instructions (ud0/ud1/ud2, the `TRAP` opcode): they
@@ -735,12 +773,38 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
     // The block body can shuffle the index register afterwards (Win64 arg
     // moves), and a read at the end would dispatch on the wrong value.
     llvm::Value *SwitchEntry = nullptr;
+    // When the block computes the index itself (a niche-enum decode such as
+    // `xor r8, rax; cmovs rax, r8`), the traced register is written before
+    // the table load and its entry value is stale. The index register of
+    // the table load, read right before that load, is what the hardware
+    // dispatches on.
+    size_t TableLoad = SIZE_MAX;
+    unsigned TableIndex = 0;
     if (Instrs[BR.InstrsEnd - 1].Flow == FlowKind::IndirectBranch &&
         BR.SwitchIndex != UINT32_MAX) {
       auto [SLoc, SOff] = switchLoc(F, BR);
-      (void)SOff;
       SwitchEntry = LS.evalCmpOperand(SLoc, Start);
+      if (SOff == 0 && SLoc.Tag == CmpOperand::Kind::Reg)
+        if (auto Load = tableLoadIndex(Instrs, BR, *LS.MC.MII);
+            Load && clobbersBefore(Instrs, BR.InstrsBegin, Load->first,
+                                   SLoc.Reg, *LS.MC.MII, *LS.MC.MRI)) {
+          TableLoad = Load->first;
+          TableIndex = Load->second;
+        }
     }
+    // Windows targets lower IR `unreachable` to ud2 (TrapUnreachable), so a
+    // ud2 right after a call is the `unreachable` behind a noreturn callee;
+    // any other ud2 is the program's own trap (`llvm.trap`).
+    auto EmitTrap = [&](const Instr &I, const Instr *Prev) {
+      LS.setVA(I.Addr);
+      if (!Prev || Prev->Flow != FlowKind::Call) {
+        auto *T = LS.B.CreateIntrinsic(llvm::Intrinsic::trap, llvm::ArrayRef<llvm::Type *>{},
+                                       llvm::ArrayRef<llvm::Value *>{});
+        attachVa(T, I.Addr.Value);
+      }
+      auto *UI = LS.B.CreateUnreachable();
+      attachVa(UI, I.Addr.Value);
+    };
     // Set when a trap instruction ended the block before its last
     // instruction; the rest of the block is dead code.
     bool Trapped = false;
@@ -752,11 +816,14 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
       // the rest of the function. The trap ends the block instead, and the
       // dead code behind it is not lifted at all.
       if (isTrapInsn(I)) {
-        LS.setVA(I.Addr);
-        auto *UI = LS.B.CreateUnreachable();
-        attachVa(UI, I.Addr.Value);
+        EmitTrap(I, N > BR.InstrsBegin ? &Instrs[N - 1] : nullptr);
         Trapped = true;
         break;
+      }
+      if (N == TableLoad) {
+        CmpOperand Index;
+        Index.Reg = TableIndex;
+        SwitchEntry = LS.evalCmpOperand(Index, Start);
       }
       if (llvm::Error E = LS.liftInstr(I)) {
         Fn->deleteBody();
@@ -767,9 +834,7 @@ liftFunction(llvm::Module &M, const Program &P, const FuncRecord &F,
       continue;
     const Instr &Last = Instrs[BR.InstrsEnd - 1];
     if (isTrapInsn(Last)) {
-      LS.setVA(Last.Addr);
-      auto *UI = LS.B.CreateUnreachable();
-      attachVa(UI, Last.Addr.Value);
+      EmitTrap(Last, BR.InstrsEnd - 1 > BR.InstrsBegin ? &Instrs[BR.InstrsEnd - 2] : nullptr);
       continue;
     }
     LS.setVA(Last.Addr);

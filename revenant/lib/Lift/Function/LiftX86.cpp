@@ -120,6 +120,11 @@ bool GenContext::lift(const Instr &I) {
   PtrOf.clear();
 
   LiftInsnTrace Trace(I.Inst, *LS.MC.MII, I.Addr.Value);
+  // The disassembler folds an F0 prefix into the locked instruction (flag
+  // IP_HAS_LOCK) instead of decoding LOCK_PREFIX on its own, so the lock
+  // reaches the table here.
+  if (I.Inst.getFlags() & X86::IP_HAS_LOCK)
+    prefixOp("lock", MCRegister());
 
   bool Handled = llvm::revenant::liftX86Inst(*this, I.Inst, I.Addr.Value,
                                              I.Size);

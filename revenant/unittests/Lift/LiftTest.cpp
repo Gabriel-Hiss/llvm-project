@@ -376,6 +376,86 @@ TEST(LiftFunction, SoftwareInterruptsLift) {
   EXPECT_FALSE(DebugTrap->doesNotReturn());
 }
 
+TEST(LiftFunction, Ud2IsTrapUnlessItFollowsACall) {
+  // Windows targets lower IR `unreachable` to ud2, so ud2 after a call is
+  // the unreachable behind a noreturn callee; any other ud2 is llvm.trap.
+  auto Lift = [](llvm::ArrayRef<uint8_t> Code, size_t Count, llvm::LLVMContext &C) {
+    auto Img = std::make_shared<Image>();
+    Img->Base = Va(0x140000000);
+    Section Sec;
+    Sec.Name = ".text";
+    Sec.SecVa = Va(0x140001000);
+    Sec.Vsize = Code.size();
+    Sec.Data.assign(Code.begin(), Code.end());
+    Sec.Flags = SectionFlags::rx();
+    Img->Sections.push_back(Sec);
+    auto D = Disasm::create(*Img);
+    EXPECT_FALSE(!D);
+    std::vector<Instr> Block = D->decodeSlice(Sec.SecVa, Code);
+    EXPECT_EQ(Block.size(), Count);
+    Program P = emptyProgram(Img);
+    FuncRecord R = singleBlockFunc(P, Block);
+    auto M = std::make_unique<llvm::Module>("ud2", C);
+    auto Lifted = lift::liftFunction(*M, P, R, *D, nullptr, nullptr, /*RunPasses=*/false);
+    EXPECT_FALSE(!Lifted);
+    if (!Lifted)
+      consumeError(Lifted.takeError());
+    return M;
+  };
+  auto Traps = [](const llvm::Module &M) {
+    const llvm::Function *T = M.getFunction("llvm.trap");
+    return T ? T->getNumUses() : 0u;
+  };
+  llvm::LLVMContext C;
+  const uint8_t Own[] = {0x31, 0xC0, 0x0F, 0x0B}; // xor eax, eax; ud2
+  EXPECT_EQ(Traps(*Lift(Own, 2, C)), 1u);
+  const uint8_t AfterCall[] = {0xFF, 0xD0, 0x0F, 0x0B}; // call rax; ud2
+  EXPECT_EQ(Traps(*Lift(AfterCall, 2, C)), 0u);
+}
+
+/// A one-block function at 0x140001000 over `Code`, decoded to `Count`
+/// instructions and lifted with `Sigs`.
+static std::unique_ptr<llvm::Module>
+liftCode(llvm::ArrayRef<uint8_t> Code, size_t Count, llvm::LLVMContext &C,
+         const lift::Signatures *Sigs, bool RunPasses) {
+  auto Img = std::make_shared<Image>();
+  Img->Base = Va(0x140000000);
+  Section Sec;
+  Sec.Name = ".text";
+  Sec.SecVa = Va(0x140001000);
+  Sec.Vsize = Code.size();
+  Sec.Data.assign(Code.begin(), Code.end());
+  Sec.Flags = SectionFlags::rx();
+  Img->Sections.push_back(Sec);
+  auto D = Disasm::create(*Img);
+  EXPECT_FALSE(!D);
+  std::vector<Instr> Block = D->decodeSlice(Sec.SecVa, Code);
+  EXPECT_EQ(Block.size(), Count);
+  Program P = emptyProgram(Img);
+  FuncRecord R = singleBlockFunc(P, Block);
+  auto M = std::make_unique<llvm::Module>("code", C);
+  auto Lifted = lift::liftFunction(*M, P, R, *D, Sigs, nullptr, RunPasses);
+  EXPECT_FALSE(!Lifted);
+  if (!Lifted)
+    consumeError(Lifted.takeError());
+  return M;
+}
+
+TEST(LiftFunction, LockPrefixMakesTheUpdateAtomic) {
+  // The disassembler folds F0 into the instruction it locks, so the lock
+  // arrives as a flag on `add qword ptr [rcx], 1`, not as its own prefix.
+  llvm::LLVMContext C;
+  const uint8_t Code[] = {0xF0, 0x48, 0x83, 0x01, 0x01, 0xC3};
+  auto M = liftCode(Code, 2, C, nullptr, /*RunPasses=*/false);
+  unsigned Atomic = 0;
+  for (const llvm::Function &F : *M)
+    for (const llvm::BasicBlock &BB : F)
+      for (const llvm::Instruction &I : BB)
+        if (auto *RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I))
+          Atomic += RMW->getOperation() == llvm::AtomicRMWInst::Add;
+  EXPECT_EQ(Atomic, 1u);
+}
+
 TEST(LiftFunction, CalleeClobberPreservesLoopIv) {
   // c-gcc-o2 map_call_vec (0x140001ea0) keeps its loop induction variable in
   // r8/r9 across a call to the local leaf sub_140001cc0, which only writes
