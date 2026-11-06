@@ -5,15 +5,16 @@ add_llvm_library(RevenantCAPI
   Detect.cpp
   Session.cpp
   Stages.cpp
+  Unoptimized.cpp
 
   LINK_COMPONENTS
   Core
   IRReader
+  MC
   Passes
   Support
   TargetParser
   TransformUtils
-
   LINK_LIBS
   RevenantObject
   RevenantDisasm

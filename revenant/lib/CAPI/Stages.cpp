@@ -18,6 +18,8 @@
 
 #include "revenant/Engine/Session.h"
 
+#include "Unoptimized.h"
+
 #include "revenant/Analysis/LibMatch.h"
 #include "revenant/Analysis/EHTables.h"
 #include "revenant/Analysis/Signatures.h"
@@ -783,18 +785,32 @@ bool structDIEnabled() {
 
 /// ir-clean: normalize lifted stack/address/width shapes, run cleanup and
 /// the module-level ABI recovery, then idioms as the LAST function pass.
-/// Idioms runs twice on purpose. The early run rewrites verified
-/// multiply-high DAGs into udiv/sdiv and the quotient-times-divisor residual
-/// into urem/srem while the DAG still has its source shape. The second
-/// instcombine round then canonicalizes the surviving results, and
-/// instcombine refolds a source-level three-way compare, min/max, abs or
-/// saturating add/sub into llvm.scmp/llvm.smin/llvm.abs/llvm.uadd.sat, so the
-/// late run converts those optimizer forms back to the compiler's
-/// pre-optimization (source) compare/select shape for the emitter.
+/// Idioms runs before and after instcombine on purpose. The early run
+/// rewrites verified multiply-high DAGs into udiv/sdiv and the
+/// quotient-times-divisor residual into urem/srem while the DAG still has
+/// its source shape. The later instcombine rounds then canonicalize the
+/// surviving results, and instcombine refolds a source-level three-way
+/// compare, min/max, abs or saturating add/sub into
+/// llvm.scmp/llvm.smin/llvm.abs/llvm.uadd.sat, so each late run converts
+/// those optimizer forms back to the compiler's pre-optimization (source)
+/// compare/select shape for the emitter.
+/// ABI recovery runs twice: its first signature rewrite leaves pointer casts
+/// that instcombine folds, and the folded IR shows the next pointer and
+/// return evidence. The second round cleans up only the functions it
+/// changed (a few hundred of thousands; a whole-module instcombine is the
+/// most expensive pass of the stage). `dce` drops what lift-normalize and
+/// idioms leave dead (an address computed both as an integer and as a GEP).
+/// An unoptimized function's frame slots keep their memory traffic through
+/// all of it and `revenant-o0-slots` ends that (see LiftNormalize.h). The
+/// /GS cookie goes before ABI recovery: what is left of its check in the
+/// return register is not a result (the deopt run of the pass finds
+/// nothing more, but handles compiler IR the ceiling feeds it).
 std::string cleanPipeline(bool EnableStructDI) {
-  return formatv("function({0},{1}),revenant-lift-abi,"
+  return formatv("function({0},{1},revenant-gscookie),revenant-lift-abi,"
                  "function(instcombine<no-verify-fixpoint>,early-cse,"
-                 "revenant-lift-normalize,{1}){2}",
+                 "revenant-lift-normalize,{1},dce),"
+                 "revenant-lift-abi(instcombine<no-verify-fixpoint>,early-cse,{1},dce),"
+                 "function(revenant-o0-slots){2}",
                  CleanupPipeline, IdiomsPipeline,
                  EnableStructDI ? ",revenant-lift-structs" : "")
       .str();
@@ -815,13 +831,33 @@ std::string deoptPipeline(bool IncludeUncxx) {
 }
 
 /// The storage the ir-final artifact ends with for clang, MSVC and GCC
-/// binaries: one alloca per frame object even where frame addresses escape
-/// (the object bounds are inferred, so only ir-final takes this), then one
-/// stack slot per parameter, phi web and multi-return value, as clang lays
-/// out an unoptimized function, then the control-flow shape.
+/// binaries, shaped like the compiler's own IR: one alloca per frame object
+/// even where frame addresses escape (the object bounds are inferred, so
+/// only ir-final takes this). An unoptimized function then gets one stack
+/// slot per parameter, phi web and multi-return value, as clang lays out
+/// -O0 code; an optimized one keeps its SSA values, as the IR before
+/// instruction selection does. `revenant-o0-module` extends the
+/// unoptimized marking to the whole user code of an -O0 binary. An
+/// optimized function gets back what the pre-isel IR carries: the stack
+/// protector calls where it had a /GS cookie (`revenant-stackprotector`)
+/// and the min/max, abs, saturation and three-way compare intrinsics
+/// cleanup expanded for the source (`revenant-refold`). Then the
+/// control-flow shape.
 std::string finalStoragePipeline(bool Patterns) {
-  return formatv("function(revenant-frame-slots,revenant-locals-to-slots,"
+  return formatv("revenant-o0-module,function(revenant-stackprotector,revenant-refold,"
+                 "revenant-frame-slots,revenant-locals-to-slots<unoptimized>,"
                  "revenant-structure{0})",
+                 Patterns ? ",revenant-patterns" : "")
+      .str();
+}
+
+/// The ir-final storage of a rustc binary: no locals. rustc's IR keeps its
+/// scalar locals in SSA values at every optimization level, so the
+/// deoptimized module is closest as it is (rust-o0 0.760 against 0.753
+/// with SSA-out locals, rust-o3 0.893 against 0.780 on pre-isel IR).
+/// Optimized functions get their intrinsics back (`revenant-refold`).
+std::string rustcFinalStoragePipeline(bool Patterns) {
+  return formatv("function(revenant-refold,revenant-structure{0})",
                  Patterns ? ",revenant-patterns" : "")
       .str();
 }
@@ -1043,6 +1079,11 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   size_t InstrCount = 0;
   std::vector<Va> Ready;
   int64_t AsmDisasmMicros = 0;
+  // rustc binaries: whether each function writes a stack slot it never
+  // reads, the -O0 debug spills (see Unoptimized.h).
+  const bool RustcBinary = Compiler.Producer == revenant::Compiler::Rustc;
+  StackSlotScanner SlotScanner;
+  DenseMap<uint64_t, StackSlots> SlotEvidence;
   for (Va T : Todo) {
     auto FOrErr = materialize(T);
     if (!FOrErr) {
@@ -1058,6 +1099,9 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       AsmDisasmMicros += std::chrono::duration_cast<std::chrono::microseconds>(
                              StageClock::now() - DisasmStart)
                              .count();
+    }
+    if (RustcBinary) {
+      SlotEvidence[T.Value] = SlotScanner.scan(FOrErr->Instrs);
     }
     Ready.push_back(T);
     InstrCount += FOrErr->Instrs.size();
@@ -1100,6 +1144,22 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       return ClassificationOrErr.takeError();
     FunctionClassification Classification =
         std::move(*ClassificationOrErr);
+    // A rustc binary built without optimization: every function it
+    // compiled is lifted as unoptimized.
+    bool UnoptimizedBinary = false;
+    if (RustcBinary) {
+      unsigned Known = 0, WriteOnly = 0;
+      for (auto [VA, E] : SlotEvidence)
+        if (E != StackSlots::Unknown && Classification.UserReachable.count(Va(VA))) {
+          ++Known;
+          WriteOnly += E == StackSlots::WriteOnly;
+        }
+      UnoptimizedBinary = mostlyWriteOnly(WriteOnly, Known);
+    }
+    auto MarkUnoptimized = [&](llvm::Function &F, Va T) {
+      if (UnoptimizedBinary && !Classification.LibraryNames.count(T))
+        F.addFnAttr("revenant.o0");
+    };
     // Name the startup-traced entry so the C emitter's main normalization
     // fires. A discovered real name always wins over the traced spelling.
     if (Classification.UserEntry && Classification.UserEntryName) {
@@ -1892,6 +1952,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
             auto Library = Classification.LibraryNames.find(T);
             if (Library != Classification.LibraryNames.end())
               L->Fn->addFnAttr("revenant.lib", Library->second);
+            MarkUnoptimized(*L->Fn, T);
           }
           // Finish the timeline: serial defines every later function too,
           // renaming any clashing callee declaration to `.decl`.
@@ -2562,6 +2623,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       auto Library = Classification.LibraryNames.find(T);
       if (Library != Classification.LibraryNames.end())
         F->addFnAttr("revenant.lib", Library->second);
+      MarkUnoptimized(*F, T);
       if (Classification.UserReachable.count(T))
         UserFunctionNames.insert(F->getName());
       OpaqueSites += L->AsmFallbacks.size();
@@ -2644,17 +2706,13 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
 
     // ---- ir-final ----------------------------------------------------------
     // Deoptimization and type recovery run once. The ir-final artifact then
-    // keeps one stack slot per variable (locals-to-slots), the way clang
-    // lays out unoptimized IR, and the source stage reads SSA-out locals.
-    // When both are wanted, the ir-final storage runs on a worker thread
-    // over a bitcode copy in its own context while the source stage runs
-    // here. rustc's unoptimized IR keeps scalar locals in SSA values, and
-    // SSA-out is the closer ir-final for it (rust-o0 0.656 against 0.614
-    // with slots), so a rustc binary uses one storage for both.
-    const bool SlotStorage = Compiler.Producer != revenant::Compiler::Rustc;
-    const std::string FinalStorage = SlotStorage
-                                         ? finalStoragePipeline(Opts.Patterns)
-                                         : sourceStoragePipeline(Opts.Patterns);
+    // takes the compiler's storage (finalStoragePipeline, or none for rustc)
+    // and the source stage reads SSA-out locals. When both are wanted, the
+    // ir-final storage runs on a worker thread over a bitcode copy in its
+    // own context while the source stage runs here.
+    const std::string FinalStorage = RustcBinary
+                                         ? rustcFinalStoragePipeline(Opts.Patterns)
+                                         : finalStoragePipeline(Opts.Patterns);
     const std::string Deopt = deoptPipeline(Out == Lang::Cpp);
     if (auto E = runPipelineText(
             "ir-final", M, Deopt, R.Stages, uncxxFlavor(Compiler.Producer),
@@ -2698,8 +2756,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         return std::move(E);
       MergeShards = nullptr;
       record(R.Stages, "ir-final", "ok",
-             SlotStorage ? "locals-to-slots + structure"
-                         : "ssaout + structure");
+             RustcBinary ? "structure" : "frame-slots + locals-to-slots + structure");
       auto PrintStart = StageClock::now();
       FinalText = moduleText(*M);
       reportArtifactTiming(
@@ -2710,7 +2767,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
       R.Text = FinalText;
       break;
     }
-    if (SlotStorage && !Opts.ArtifactBase.empty()) {
+    if (!Opts.ArtifactBase.empty()) {
       auto SnapshotStart = StageClock::now();
       FinalInput = snapshotModule(*M);
       reportArtifactTiming(
@@ -2728,23 +2785,12 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
                                  ModuleBuilder(RebuildDeopt)))
       return std::move(E);
     MergeShards = nullptr;
-    // One storage for both: the ir-final artifact is this module. The
-    // Clang source emitter can mutate the module, so print it first.
-    if (!SlotStorage && !Opts.ArtifactBase.empty()) {
-      auto PrintStart = StageClock::now();
-      FinalText = moduleText(*M);
-      reportArtifactTiming(
-          "print-ir-final",
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              StageClock::now() - PrintStart)
-              .count());
-    }
     {
       FunctionStageTrace Trace("source", Out == Lang::Rust ? "rustc" : "clang",
                                "module");
       Expected<EmitResult> Em =
           Out == Lang::Rust
-              ? emitRustcSource(FinalText.empty() ? moduleText(*M) : FinalText)
+              ? emitRustcSource(moduleText(*M))
               : emitClangSource(*M, Out == Lang::Cpp, Opts.UserBodiesOnly);
       if (!Em)
         return Em.takeError();
