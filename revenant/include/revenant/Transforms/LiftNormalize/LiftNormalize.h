@@ -2,6 +2,7 @@
 #ifndef REVENANT_TRANSFORMS_LIFTNORMALIZE_H
 #define REVENANT_TRANSFORMS_LIFTNORMALIZE_H
 #include "llvm/IR/PassManager.h"
+#include <vector>
 namespace revenant {
 class LiftNormalizePass : public llvm::PassInfoMixin<LiftNormalizePass> {
 public:
@@ -17,9 +18,20 @@ class FrameSlotsPass : public llvm::PassInfoMixin<FrameSlotsPass> {
 public:
   llvm::PreservedAnalyses run(llvm::Function &, llvm::FunctionAnalysisManager &);
 };
+/// `revenant-lift-abi`: recovers pointer parameters and returns, void and
+/// narrow returns, and absolute addresses as module symbols.
+/// `revenant-lift-abi(<function passes>)` then runs those passes, pass by
+/// pass, over the functions it changed only: a later ABI round rewrites a
+/// few hundred functions of thousands, and the rest need no new cleanup.
 class LiftABIPass : public llvm::PassInfoMixin<LiftABIPass> {
 public:
+  LiftABIPass() = default;
+  explicit LiftABIPass(std::vector<llvm::FunctionPassManager> Refine)
+      : Refine(std::move(Refine)) {}
   llvm::PreservedAnalyses run(llvm::Module &, llvm::ModuleAnalysisManager &);
+
+private:
+  std::vector<llvm::FunctionPassManager> Refine;
 };
 class LiftStructsPass : public llvm::PassInfoMixin<LiftStructsPass> {
 public:

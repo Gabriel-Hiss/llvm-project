@@ -455,7 +455,7 @@ bool canRewrite(Function &F) {
         return false;
   return true;
 }
-void rewriteSignature(Function &F, Signature &S) {
+void rewriteSignature(Function &F, Signature &S, SmallPtrSetImpl<Function *> &Touched) {
   Module &M = *F.getParent();
   SmallVector<Type *, 8> Params;
   Type *PT = PointerType::getUnqual(M.getContext());
@@ -480,6 +480,8 @@ void rewriteSignature(Function &F, Signature &S) {
   M.getFunctionList().insert(F.getIterator(), N);
   N->takeName(&F);
   N->splice(N->end(), &F);
+  Touched.erase(&F);
+  Touched.insert(N);
   updateSubprogramType(*N, ArrayRef<bool>(S.Pointers), S.PointerReturn);
   for (Argument &Old : F.args()) {
     Argument *New = N->getArg(Old.getArgNo());
@@ -526,6 +528,7 @@ void rewriteSignature(Function &F, Signature &S) {
       if (CB->getCalledOperand() == &F)
         Calls.push_back(CB);
   for (CallBase *C : Calls) {
+    Touched.insert(C->getFunction());
     BasicBlock *ResultBlock = nullptr;
     if (S.PointerReturn || S.NarrowReturn)
       if (auto *II = dyn_cast<InvokeInst>(C))
@@ -634,7 +637,7 @@ bool retypeIndirectCall(CallBase &CB) {
   return true;
 }
 } // namespace
-PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
+PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &MAM) {
   const DataLayout &DL = M.getDataLayout();
   if (DL.getPointerSizeInBits() != 64 || DL.isNonIntegralAddressSpace(0))
     return PreservedAnalyses::all();
@@ -645,6 +648,8 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
   // real pointer uses.
   Absolute Abs;
   bool Changed = false;
+  // Functions whose body changed, for the refine passes.
+  SmallPtrSet<Function *, 32> Touched;
   for (GlobalVariable &G : M.globals())
     if (auto VA = ir::getGlobalVA(G))
       Abs.Globals.push_back({*VA, &G});
@@ -681,6 +686,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
               else
                 CB->setCalledOperand(R);
               Changed = true;
+              Touched.insert(&F);
             }
   }
   // Any other constant inttoptr operand: phi inedges, non-callee call
@@ -698,6 +704,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
         if (R != C) {
           U.set(R);
           Changed = true;
+          Touched.insert(&F);
         }
       }
   // IntToPtr instructions over image constants never reach the operand
@@ -710,6 +717,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
             P->replaceAllUsesWith(R);
             P->eraseFromParent();
             Changed = true;
+            Touched.insert(&F);
           }
 
   DenseMap<Function *, Signature> Signatures;
@@ -901,7 +909,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
   }
   for (Function *F : ToRewrite) {
     Signature &S = Signatures[F];
-    rewriteSignature(*F, S);
+    rewriteSignature(*F, S, Touched);
     Changed = true;
   }
   // Memory is untyped on this target. A pointer-sized integer load consumed
@@ -937,6 +945,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
     }
     L->eraseFromParent();
     Changed = true;
+    Touched.insert(P->getFunction());
   }
   // The same holds for stores: an address stored as its integer bits stores
   // the pointer itself.
@@ -948,6 +957,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
               P->getPointerAddressSpace() == 0) {
             St->setOperand(0, P->getPointerOperand());
             Changed = true;
+            Touched.insert(&F);
           }
   // Indirect calls carry the call site's own function type: pass addresses as
   // pointers, and read a result that is only ever truncated at its width.
@@ -959,12 +969,28 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
             !CB->isMustTailCall() && !CB->getFunctionType()->isVarArg())
           Indirect.push_back(CB);
   for (CallBase *CB : Indirect) {
+    Function *F = CB->getFunction();
     if (retypeIndirectCall(*CB)) {
       Changed = true;
+      Touched.insert(F);
     }
   }
   if (!Changed)
     return PreservedAnalyses::all();
+  if (!Refine.empty()) {
+    // Module order, not the set's: the passes may read other functions.
+    SmallVector<Function *, 64> Functions;
+    for (Function &F : M)
+      if (!F.isDeclaration() && Touched.count(&F))
+        Functions.push_back(&F);
+    FunctionAnalysisManager &FAM =
+        MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    for (Function *F : Functions)
+      FAM.invalidate(*F, PreservedAnalyses::none());
+    for (FunctionPassManager &FPM : Refine)
+      for (Function *F : Functions)
+        FAM.invalidate(*F, FPM.run(*F, FAM));
+  }
   return PreservedAnalyses::none();
 }
 } // namespace revenant

@@ -25,6 +25,9 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 
+#include <string>
+#include <vector>
+
 // Per-pass headers. One include per pass, guarded so this file builds before
 // the pass agent lands.
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
@@ -109,6 +112,18 @@
 #include "revenant/Transforms/Unoutline/Unoutline.h"
 #endif
 using namespace llvm;
+
+/// The text of one parsed pipeline element, nested passes included.
+static std::string elementText(const PassBuilder::PipelineElement &E) {
+  std::string Text = E.Name.str();
+  if (!E.InnerPipeline.empty()) {
+    Text += '(';
+    for (size_t I = 0; I < E.InnerPipeline.size(); ++I)
+      Text += (I ? "," : "") + elementText(E.InnerPipeline[I]);
+    Text += ')';
+  }
+  return Text;
+}
 
 namespace revenant {
 
@@ -275,10 +290,19 @@ void registerRevenantPasses(PassBuilder &PB) {
   // regions). Registered on the Module pipeline so top-level
   // `-passes=revenant-<name>` resolves without the function adaptor.
   PB.registerPipelineParsingCallback(
-      [](StringRef Name, ModulePassManager &MPM,
-         ArrayRef<PassBuilder::PipelineElement>) {
+      [&PB](StringRef Name, ModulePassManager &MPM,
+            ArrayRef<PassBuilder::PipelineElement> Inner) {
         if (Name == "revenant-lift-abi") {
-          MPM.addPass(LiftABIPass());
+          std::vector<FunctionPassManager> Refine;
+          for (const PassBuilder::PipelineElement &E : Inner) {
+            FunctionPassManager FPM;
+            if (Error Err = PB.parsePassPipeline(FPM, elementText(E))) {
+              consumeError(std::move(Err));
+              return false;
+            }
+            Refine.push_back(std::move(FPM));
+          }
+          MPM.addPass(LiftABIPass(std::move(Refine)));
           return true;
         }
         if (Name == "revenant-lift-structs") {
