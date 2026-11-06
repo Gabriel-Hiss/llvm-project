@@ -139,6 +139,10 @@ void registerRevenantPasses(PassBuilder &PB) {
           FPM.addPass(FrameSlotsPass());
           return true;
         }
+        if (Name == "revenant-o0-slots") {
+          FPM.addPass(UnoptimizedSlotsPass());
+          return true;
+        }
 #if __has_include("revenant/Transforms/Devectorize/Devectorize.h")
         if (Name == "revenant-devectorize") {
           FPM.addPass(DevectorizePass());
@@ -307,6 +311,10 @@ void registerRevenantPasses(PassBuilder &PB) {
         }
         if (Name == "revenant-lift-structs") {
           MPM.addPass(LiftStructsPass());
+          return true;
+        }
+        if (Name == "revenant-o0-module") {
+          MPM.addPass(UnoptimizedModulePass());
           return true;
         }
 #if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")

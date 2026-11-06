@@ -962,6 +962,387 @@ PreservedAnalyses FrameSlotsPass::run(Function &F,
     PromoteMemToReg(Scalars, FAM.getResult<DominatorTreeAnalysis>(F));
   return PreservedAnalyses::none();
 }
+// Every use of the slot's address, through constant GEPs, is a load or a
+// store to it: nothing else can read or write the slot.
+static bool closedSlot(AllocaInst &Slot) {
+  SmallVector<Value *, 8> Work{&Slot};
+  while (!Work.empty()) {
+    Value *P = Work.pop_back_val();
+    for (Use &U : P->uses()) {
+      User *Usr = U.getUser();
+      if (isa<GetElementPtrInst>(Usr))
+        Work.push_back(Usr);
+      else if (isa<LoadInst>(Usr))
+        continue;
+      else if (auto *S = dyn_cast<StoreInst>(Usr);
+               !S || U.getOperandNo() != StoreInst::getPointerOperandIndex())
+        return false;
+    }
+  }
+  return true;
+}
+// Erase the slot and the GEPs over it once no access remains.
+static void eraseDeadAddresses(AllocaInst &Slot) {
+  SmallVector<Instruction *, 8> Order;
+  SmallVector<Instruction *, 8> Work{&Slot};
+  while (!Work.empty()) {
+    Instruction *P = Work.pop_back_val();
+    Order.push_back(P);
+    for (User *U : P->users())
+      if (auto *G = dyn_cast<GetElementPtrInst>(U))
+        Work.push_back(G);
+  }
+  for (Instruction *I : llvm::reverse(Order))
+    if (I->use_empty())
+      I->eraseFromParent();
+}
+namespace {
+// (slot, byte offset) of an address made of constant GEPs over an alloca.
+std::pair<AllocaInst *, int64_t> slotOffset(Value *P, const DataLayout &DL) {
+  int64_t Off = 0;
+  while (auto *G = dyn_cast<GetElementPtrInst>(P)) {
+    APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
+    if (!G->accumulateConstantOffset(DL, O))
+      return {nullptr, 0};
+    Off += O.getSExtValue();
+    P = G->getPointerOperand();
+  }
+  return {dyn_cast<AllocaInst>(P), Off};
+}
+struct SlotUses {
+  SmallVector<LoadInst *, 4> Loads;
+  SmallVector<StoreInst *, 4> Stores;
+  // Any use that is not a direct load or store (GEP, escape).
+  bool Indirect = false;
+};
+SlotUses usesOf(AllocaInst &A) {
+  SlotUses U;
+  for (Use &Us : A.uses()) {
+    if (auto *L = dyn_cast<LoadInst>(Us.getUser()))
+      U.Loads.push_back(L);
+    else if (auto *S = dyn_cast<StoreInst>(Us.getUser());
+             S && Us.getOperandNo() == StoreInst::getPointerOperandIndex())
+      U.Stores.push_back(S);
+    else
+      U.Indirect = true;
+  }
+  return U;
+}
+// V re-read as a value of type Ty: the same bits through a no-op cast.
+Value *asType(Value *V, Type *Ty, Instruction *Before, const DataLayout &DL) {
+  if (V->getType() == Ty)
+    return V;
+  if (DL.getTypeStoreSize(V->getType()) != DL.getTypeStoreSize(Ty))
+    return nullptr;
+  IRBuilder<> B(Before);
+  if (V->getType()->isPointerTy() && Ty->isIntegerTy())
+    return B.CreatePtrToInt(V, Ty);
+  if (V->getType()->isIntegerTy() && Ty->isPointerTy())
+    return B.CreateIntToPtr(V, Ty);
+  if (CastInst::isBitCastable(V->getType(), Ty))
+    return B.CreateBitCast(V, Ty);
+  return nullptr;
+}
+// One unoptimized slot whose direct accesses sit at distinct, non-overlapping
+// offsets becomes one alloca per offset.
+bool splitSlot(AllocaInst &Slot, const DataLayout &DL) {
+  if (!Slot.isStaticAlloca())
+    return false;
+  struct Acc {
+    Instruction *I;
+    unsigned PtrOp;
+    int64_t Off;
+    uint64_t Size;
+    Type *Ty;
+  };
+  SmallVector<Acc, 8> Accs;
+  SmallVector<Value *, 8> Work{&Slot};
+  while (!Work.empty()) {
+    Value *P = Work.pop_back_val();
+    for (Use &U : P->uses()) {
+      User *Usr = U.getUser();
+      if (isa<GetElementPtrInst>(Usr)) {
+        Work.push_back(Usr);
+        continue;
+      }
+      Type *Ty = nullptr;
+      unsigned PtrOp = 0;
+      if (auto *L = dyn_cast<LoadInst>(Usr)) {
+        Ty = L->getType();
+      } else if (auto *S = dyn_cast<StoreInst>(Usr);
+                 S && U.getOperandNo() == StoreInst::getPointerOperandIndex()) {
+        Ty = S->getValueOperand()->getType();
+        PtrOp = 1;
+      } else {
+        return false;
+      }
+      auto *I = cast<Instruction>(Usr);
+      auto [Base, Off] = slotOffset(I->getOperand(PtrOp), DL);
+      TypeSize Size = DL.getTypeStoreSize(Ty);
+      if (Base != &Slot || Off < 0 || Size.isScalable())
+        return false;
+      Accs.push_back({I, PtrOp, Off, Size.getFixedValue(), Ty});
+    }
+  }
+  llvm::stable_sort(Accs, [](const Acc &A, const Acc &B) { return A.Off < B.Off; });
+  struct Group {
+    int64_t Begin;
+    int64_t End;
+    SmallVector<const Acc *, 4> Members;
+  };
+  SmallVector<Group, 4> Groups;
+  for (const Acc &A : Accs) {
+    int64_t End = A.Off + int64_t(A.Size);
+    if (!Groups.empty() && A.Off < Groups.back().End)
+      Groups.back().End = std::max(Groups.back().End, End);
+    else
+      Groups.push_back({A.Off, End, {}});
+    Groups.back().Members.push_back(&A);
+  }
+  if (Groups.size() < 2)
+    return false;
+  IRBuilder<> Entry(&Slot);
+  for (const Group &G : Groups) {
+    Type *Ty = G.Members.front()->Ty;
+    for (const Acc *A : G.Members)
+      if (A->Off != G.Begin || A->Ty != Ty)
+        Ty = nullptr;
+    if (!Ty)
+      Ty = ArrayType::get(Entry.getInt8Ty(), G.End - G.Begin);
+    AllocaInst *Part = Entry.CreateAlloca(Ty, nullptr, Slot.getName());
+    Part->setAlignment(Slot.getAlign());
+    provenance(Part, Slot);
+    for (const Acc *A : G.Members) {
+      IRBuilder<> B(A->I);
+      Value *P = Part;
+      if (A->Off != G.Begin)
+        P = B.CreateGEP(B.getInt8Ty(), Part, B.getInt64(A->Off - G.Begin));
+      A->I->setOperand(A->PtrOp, P);
+    }
+  }
+  eraseDeadAddresses(Slot);
+  return true;
+}
+} // namespace
+PreservedAnalyses UnoptimizedModulePass::run(Module &M, ModuleAnalysisManager &) {
+  unsigned WithArgs = 0, Unoptimized = 0;
+  for (const Function &F : M)
+    if (!F.isDeclaration() && !F.arg_empty() &&
+        F.getFnAttribute("revenant.user").getValueAsString() == "true") {
+      ++WithArgs;
+      Unoptimized += F.hasFnAttribute("revenant.o0");
+    }
+  if (!Unoptimized || 2 * Unoptimized < WithArgs)
+    return PreservedAnalyses::all();
+  // Everything but the code a library signature identified: the user code
+  // the reachability walk missed was built with the same flags.
+  bool Changed = false;
+  for (Function &F : M)
+    if (!F.isDeclaration() && !F.hasFnAttribute("revenant.lib") &&
+        !F.hasFnAttribute("revenant.o0")) {
+      F.addFnAttr("revenant.o0");
+      Changed = true;
+    }
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+PreservedAnalyses UnoptimizedSlotsPass::run(Function &F,
+                                            FunctionAnalysisManager &FAM) {
+  if (F.isDeclaration() || !F.hasFnAttribute("revenant.o0"))
+    return PreservedAnalyses::all();
+  const DataLayout &DL = F.getDataLayout();
+  // The frame slots' accesses are ordinary memory again. Cleanup may split
+  // a slot (SROA keeps the volatile flag, not the tag), so every stack
+  // access counts: the lifter never makes one volatile itself.
+  for (Instruction &I : instructions(F)) {
+    if (auto *L = dyn_cast<LoadInst>(&I)) {
+      if (L->isVolatile() && slotOffset(L->getPointerOperand(), DL).first)
+        L->setVolatile(false);
+    } else if (auto *S = dyn_cast<StoreInst>(&I)) {
+      if (S->isVolatile() && slotOffset(S->getPointerOperand(), DL).first)
+        S->setVolatile(false);
+    }
+    I.setMetadata("revenant.o0", nullptr);
+  }
+  // Unpin the slots. A store of an undefined register (`push` of a register
+  // the function never set, which reserves stack) and a load nothing reads
+  // (the matching `pop`) are not part of any variable.
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    if (auto *C = dyn_cast<CallInst>(&I)) {
+      if (C->getCalledFunction() && C->getCalledFunction()->getName() == KeepSlotName)
+        C->eraseFromParent();
+    } else if (auto *S = dyn_cast<StoreInst>(&I)) {
+      if (isa<UndefValue>(S->getValueOperand()) && slotOffset(S->getPointerOperand(), DL).first)
+        S->eraseFromParent();
+    } else if (auto *L = dyn_cast<LoadInst>(&I)) {
+      if (L->use_empty() && !L->isVolatile() && slotOffset(L->getPointerOperand(), DL).first)
+        L->eraseFromParent();
+    }
+  }
+  // With the reservation gone, one frame object may hold several variables
+  // at distinct offsets (two parameters inside an 8-byte `push`): one alloca
+  // per variable.
+  {
+    SmallVector<AllocaInst *, 16> Allocas;
+    for (Instruction &I : F.getEntryBlock())
+      if (auto *A = dyn_cast<AllocaInst>(&I))
+        Allocas.push_back(A);
+    for (AllocaInst *A : Allocas)
+      if (!splitSlot(*A, DL))
+        eraseDeadAddresses(*A); // a reservation nothing uses (frame padding)
+  }
+  // Outgoing stack arguments: the caller stores them right below the call;
+  // the compiler's IR passes the value as an operand instead.
+  SmallPtrSet<AllocaInst *, 8> ArgSlots;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *L = dyn_cast<LoadInst>(&I);
+    if (!L || !L->getMetadata("revenant.stackarg"))
+      continue;
+    auto [Slot, Off] = slotOffset(L->getPointerOperand(), DL);
+    if (!Slot || !closedSlot(*Slot))
+      continue;
+    for (Instruction *P = L->getPrevNode(); P; P = P->getPrevNode()) {
+      if (auto *S = dyn_cast<StoreInst>(P)) {
+        auto [SSlot, SOff] = slotOffset(S->getPointerOperand(), DL);
+        if (SSlot != Slot)
+          continue;
+        if (SOff == Off)
+          if (Value *V = asType(S->getValueOperand(), L->getType(), L, DL)) {
+            L->replaceAllUsesWith(V);
+            L->eraseFromParent();
+            ArgSlots.insert(Slot);
+          }
+        break;
+      }
+      if (isa<CallBase>(P) && !isa<DbgInfoIntrinsic>(P))
+        break;
+    }
+  }
+  // An argument slot nothing reads any more is the outgoing-argument area.
+  for (AllocaInst *Slot : ArgSlots) {
+    bool Read = false;
+    SmallVector<Instruction *, 8> Dead;
+    SmallVector<Value *, 8> Work{Slot};
+    while (!Work.empty() && !Read) {
+      Value *P = Work.pop_back_val();
+      for (User *U : P->users()) {
+        if (auto *G = dyn_cast<GetElementPtrInst>(U))
+          Work.push_back(G);
+        else if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == P)
+          Dead.push_back(S);
+        else
+          Read = true;
+      }
+    }
+    if (Read)
+      continue;
+    for (Instruction *S : Dead)
+      S->eraseFromParent();
+    eraseDeadAddresses(*Slot);
+  }
+  DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+  SmallVector<AllocaInst *, 16> Slots;
+  for (Instruction &I : F.getEntryBlock())
+    if (auto *A = dyn_cast<AllocaInst>(&I))
+      Slots.push_back(A);
+  for (AllocaInst *A : Slots) {
+    SlotUses U = usesOf(*A);
+    if (U.Indirect || U.Stores.empty())
+      continue;
+    // Only an undefined register is ever stored: a callee-saved register
+    // pushed and popped around the body.
+    if (llvm::all_of(U.Stores, [](StoreInst *S) { return isa<UndefValue>(S->getValueOperand()); })) {
+      for (LoadInst *L : U.Loads) {
+        L->replaceAllUsesWith(UndefValue::get(L->getType()));
+        L->eraseFromParent();
+      }
+      for (StoreInst *S : U.Stores)
+        S->eraseFromParent();
+      A->eraseFromParent();
+      continue;
+    }
+    // rustc -O0 writes the values it describes in debug info to slots it
+    // never reads (`<name>.dbg.spill`); those are debug info, not program
+    // state, so a slot nothing reads back goes whatever it holds.
+    if (U.Loads.empty() && isRustModule(*F.getParent())) {
+      for (StoreInst *S : U.Stores)
+        S->eraseFromParent();
+      A->eraseFromParent();
+      continue;
+    }
+    // A register-allocator spill: one store of a value that is also used
+    // directly, read back only where that store dominates. A value used
+    // only by the store is a spill too when it is read back once in the
+    // same block (RegAllocFast keeps a temporary across a call or a
+    // division that needs its register); arguments and loaded values stay,
+    // those are parameter homes and copies between variables.
+    if (U.Stores.size() != 1)
+      continue;
+    StoreInst *S = U.Stores.front();
+    Value *V = S->getValueOperand();
+    if (!isa<Instruction>(V) && !isa<Argument>(V))
+      continue;
+    if (V->hasOneUse()) {
+      bool Temporary = isa<Instruction>(V) && !isa<LoadInst>(V) &&
+                       U.Loads.size() == 1 &&
+                       U.Loads.front()->getParent() == S->getParent();
+      // The return value kept across the epilogue (the /GS check call):
+      // the compiler's IR returns the loaded value itself.
+      bool Returned = isa<Instruction>(V) && U.Loads.size() == 1 &&
+                      U.Loads.front()->hasOneUse() &&
+                      isa<ReturnInst>(U.Loads.front()->user_back());
+      if (!Temporary && !Returned)
+        continue;
+    }
+    if (!llvm::all_of(U.Loads, [&](LoadInst *L) {
+          return L->getType() == V->getType() && DT.dominates(S, L);
+        }))
+      continue;
+    for (LoadInst *L : U.Loads) {
+      L->replaceAllUsesWith(V);
+      L->eraseFromParent();
+    }
+    S->eraseFromParent();
+    A->eraseFromParent();
+  }
+  // Cleanup's instcombine rewrote source subtractions: `x - c` became
+  // `x + -c`, and `y - x / c` became `y + x / -c`. The compiler's -O0 IR
+  // has the subtraction.
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *Add = dyn_cast<BinaryOperator>(&I);
+    if (!Add || Add->getOpcode() != Instruction::Add)
+      continue;
+    auto Negated = [](Value *V) -> Constant * {
+      auto *C = dyn_cast<ConstantInt>(V);
+      if (!C || !C->isNegative() || C->isMinValue(/*IsSigned=*/true))
+        return nullptr;
+      return ConstantInt::get(C->getType(), -C->getValue());
+    };
+    IRBuilder<> B(Add);
+    Value *Sub = nullptr;
+    if (Constant *C = Negated(Add->getOperand(1))) {
+      Sub = B.CreateSub(Add->getOperand(0), C, "", /*HasNUW=*/false,
+                        Add->hasNoSignedWrap());
+    } else {
+      for (unsigned K = 0; K < 2 && !Sub; ++K) {
+        auto *Div = dyn_cast<BinaryOperator>(Add->getOperand(K));
+        if (!Div || Div->getOpcode() != Instruction::SDiv || !Div->hasOneUse())
+          continue;
+        if (Constant *C = Negated(Div->getOperand(1))) {
+          Value *Pos = B.CreateSDiv(Div->getOperand(0), C, "", Div->isExact());
+          Sub = B.CreateSub(Add->getOperand(1 - K), Pos);
+        }
+      }
+    }
+    if (!Sub)
+      continue;
+    if (auto *SI = dyn_cast<Instruction>(Sub))
+      provenance(SI, *Add);
+    Sub->takeName(Add);
+    Add->replaceAllUsesWith(Sub);
+    RecursivelyDeleteTriviallyDeadInstructions(Add);
+  }
+  return PreservedAnalyses::none();
+}
 PreservedAnalyses LiftNormalizePass::run(Function &F,
                                          FunctionAnalysisManager &) {
   if (F.isDeclaration())

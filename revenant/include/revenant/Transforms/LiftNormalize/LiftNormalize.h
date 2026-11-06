@@ -18,6 +18,27 @@ class FrameSlotsPass : public llvm::PassInfoMixin<FrameSlotsPass> {
 public:
   llvm::PreservedAnalyses run(llvm::Function &, llvm::FunctionAnalysisManager &);
 };
+/// `revenant-o0-slots`: ends cleanup of an unoptimized function (attribute
+/// `revenant.o0`). Its frame slots kept their memory traffic through
+/// cleanup as volatile accesses; this restores them, then removes what the
+/// compiler's IR never had: outgoing stack arguments (passed directly),
+/// slots that only ever hold an undefined register (callee-saved pushes)
+/// and register-allocator spills (a slot written once with a value that is
+/// also used directly, as RegAllocFast spills an SSA value across a call).
+class UnoptimizedSlotsPass : public llvm::PassInfoMixin<UnoptimizedSlotsPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Function &, llvm::FunctionAnalysisManager &);
+};
+/// `revenant-o0-module`: in a binary built without optimization, marks every
+/// function no library signature identified `revenant.o0`. Cleanup detects
+/// an unoptimized function by its argument spills, which a function without
+/// register arguments does not have; when most user functions with
+/// arguments are unoptimized, the binary is, and so is the rest of its own
+/// code. Identified library code linked in (the CRT) keeps its own shape.
+class UnoptimizedModulePass : public llvm::PassInfoMixin<UnoptimizedModulePass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &, llvm::ModuleAnalysisManager &);
+};
 /// `revenant-lift-abi`: recovers pointer parameters and returns, void and
 /// narrow returns, and absolute addresses as module symbols.
 /// `revenant-lift-abi(<function passes>)` then runs those passes, pass by
