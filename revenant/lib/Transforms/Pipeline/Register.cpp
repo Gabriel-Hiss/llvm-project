@@ -220,6 +220,10 @@ void registerRevenantPasses(PassBuilder &PB) {
           FPM.addPass(LocalSlotsPass());
           return true;
         }
+        if (Name == "revenant-locals-to-slots<unoptimized>") {
+          FPM.addPass(LocalSlotsPass(/*OnlyUnoptimized=*/true));
+          return true;
+        }
 #endif
 #if __has_include("revenant/Transforms/Unhoist/Unhoist.h")
         if (Name == "revenant-unhoist") {

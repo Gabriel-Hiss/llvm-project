@@ -7,6 +7,7 @@
 #include "revenant/Transforms/LocalSlots/LocalSlots.h"
 #include "revenant/Transforms/SsaOut/PhiCopies.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -79,16 +80,37 @@ std::string localName(const PHINode &PN) {
 
 PreservedAnalyses LocalSlotsPass::run(Function &F,
                                       FunctionAnalysisManager &) {
-  if (F.isDeclaration() || F.empty())
+  if (F.isDeclaration() || F.empty() ||
+      (OnlyUnoptimized && !F.hasFnAttribute("revenant.o0")))
     return PreservedAnalyses::all();
 
   BasicBlock &Entry = F.getEntryBlock();
   LLVMContext &Ctx = F.getContext();
   bool Changed = false;
 
+  // An argument whose only uses already store it to stack slots has its
+  // home: the unoptimized frame of the binary kept it (see
+  // `revenant-o0-slots`). Every other argument gets one.
+  auto Homed = [](Argument &Arg) {
+    bool Any = false;
+    for (User *U : Arg.users()) {
+      if (isa<DbgInfoIntrinsic>(U))
+        continue;
+      auto *S = dyn_cast<StoreInst>(U);
+      if (!S || S->getValueOperand() != &Arg ||
+          !isa<AllocaInst>(getUnderlyingObject(S->getPointerOperand())))
+        return false;
+      Any = true;
+    }
+    return Any;
+  };
   SmallVector<AllocaInst *, 8> ParamSlots;
   Instruction *Before = Entry.empty() ? nullptr : &Entry.front();
   for (Argument &Arg : F.args()) {
+    if (Homed(Arg)) {
+      ParamSlots.push_back(nullptr);
+      continue;
+    }
     std::string Name =
         Arg.hasName() ? Arg.getName().str() : "a" + std::to_string(Arg.getArgNo());
     IRBuilder<> B(Before ? Before : Entry.getTerminator());
@@ -99,7 +121,8 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
   if (!ParamSlots.empty()) {
     IRBuilder<> B(firstNonAlloca(Entry));
     for (unsigned I = 0; I != F.arg_size(); ++I)
-      B.CreateStore(F.getArg(I), ParamSlots[I]);
+      if (ParamSlots[I])
+        B.CreateStore(F.getArg(I), ParamSlots[I]);
   }
 
   SmallVector<PHINode *, 32> Phis;
@@ -215,16 +238,17 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
   // An incoming value defined in its predecessor is stored right after
   // its definition, as clang -O0 stores an assignment, when nothing reads
   // the local between that point and the edge and no other successor of
-  // the predecessor still needs the old value.
-  auto EarlyStoreSafe = [&](unsigned R, Instruction *Def, BasicBlock *Succ) {
-    BasicBlock *Pred = Def->getParent();
+  // the predecessor still needs the old value. A null Def is an argument:
+  // it is defined at the start of the entry block.
+  auto EarlyStoreSafe = [&](unsigned R, BasicBlock *Pred, Instruction *Def,
+                            BasicBlock *Succ) {
     for (PHINode *M : Members[R])
       for (Use &U : M->uses()) {
         auto *UserI = cast<Instruction>(U.getUser());
         if (auto *UserPhi = dyn_cast<PHINode>(UserI)) {
           if (UserPhi->getIncomingBlock(U) == Pred)
             return false;
-        } else if (UserI->getParent() == Pred && Def->comesBefore(UserI)) {
+        } else if (UserI->getParent() == Pred && (!Def || Def->comesBefore(UserI))) {
           return false;
         }
       }
@@ -246,7 +270,7 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
           continue;
       auto *Def = dyn_cast<Instruction>(V);
       if (Def && Def->getParent() == Pred && !Def->isTerminator() &&
-          !isa<PHINode>(Def) && EarlyStoreSafe(Root(I), Def, PN->getParent())) {
+          !isa<PHINode>(Def) && EarlyStoreSafe(Root(I), Pred, Def, PN->getParent())) {
         // An alloca incoming sits among the entry allocas, before the
         // slots: its store goes after them.
         IRBuilder<> B(isa<AllocaInst>(Def) && Def->getParent() == &Entry
@@ -254,6 +278,13 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
                           : Def->getNextNode());
         StoreInst *Store = B.CreateStore(V, Slot);
         copyProvenance(*Def, *Store);
+        continue;
+      }
+      if (isa<Argument>(V) && Pred == &Entry &&
+          EarlyStoreSafe(Root(I), Pred, nullptr, PN->getParent())) {
+        IRBuilder<> B(firstNonAlloca(Entry));
+        StoreInst *Store = B.CreateStore(V, Slot);
+        copyProvenance(*Entry.getTerminator(), *Store);
         continue;
       }
       EdgeCopies.push_back({PN, Pred, PN->getParent(), V, Slot});
@@ -359,6 +390,8 @@ PreservedAnalyses LocalSlotsPass::run(Function &F,
   unsigned ArgIndex = 0;
   for (Argument &Arg : F.args()) {
     AllocaInst *Slot = ParamSlots[ArgIndex++];
+    if (!Slot)
+      continue;
     SmallVector<Use *, 16> Uses;
     for (Use &U : Arg.uses()) {
       if (isa<DbgInfoIntrinsic>(U.getUser()))
