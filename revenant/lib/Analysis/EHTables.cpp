@@ -201,12 +201,32 @@ void resolveTryRanges(FunctionEH &F) {
   F.TryRegions = std::move(Resolved);
 }
 
-void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
-  auto Magic = u32(I, Data);
-  if (!Magic || (*Magic != EH_MAGIC && *Magic != EH_MAGIC_1 &&
-                 *Magic != EH_MAGIC_2 && *Magic != EH_MAGIC_3 &&
-                 *Magic != EH_MAGIC_4))
+bool isFuncInfoMagic(uint32_t M) {
+  return M == EH_MAGIC || M == EH_MAGIC_1 || M == EH_MAGIC_2 ||
+         M == EH_MAGIC_3 || M == EH_MAGIC_4;
+}
+
+/// The FuncInfo a __CxxFrameHandler3 handler-data block names. On x64 the
+/// block holds the FuncInfo's RVA; an inline FuncInfo is the x86 layout.
+std::optional<Va> funcInfo3At(const Image &I, Va Data) {
+  auto First = u32(I, Data);
+  if (!First)
+    return std::nullopt;
+  if (isFuncInfoMagic(*First))
+    return Data;
+  if (!*First)
+    return std::nullopt;
+  Va Info = I.vaOfRva(*First);
+  if (auto Magic = u32(I, Info); Magic && isFuncInfoMagic(*Magic))
+    return Info;
+  return std::nullopt;
+}
+
+void readFuncInfo3(const Image &I, FunctionEH &F, Va HandlerData) {
+  std::optional<Va> Info = funcInfo3At(I, HandlerData);
+  if (!Info)
     return;
+  Va Data = *Info;
   auto MaxState = i32(I, Data.wrappingAdd(4));
   auto UnwindRva = u32(I, Data.wrappingAdd(8));
   auto TryCount = u32(I, Data.wrappingAdd(12));
@@ -220,7 +240,8 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
   F.Model = EHModel::MSVC;
   if (*UnwindRva) {
     Va U = I.vaOfRva(*UnwindRva);
-    for (int32_t S = 0; S <= *MaxState; ++S) {
+    // The unwind map has one entry per state, MaxState entries in all.
+    for (int32_t S = 0; S < *MaxState; ++S) {
       Va E = U.wrappingAdd(static_cast<uint64_t>(S) * 8);
       auto To = i32(I, E);
       auto Action = u32(I, E.wrappingAdd(4));
@@ -276,7 +297,12 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va Data) {
       auto State = i32(I, IP.wrappingAdd(4));
       if (!Offset || !State)
         break;
-      F.CallSites.push_back({I.vaOfRva(*Offset), *State});
+      // A parent and its funclets share one FuncInfo, and the IP map covers
+      // all of them; each function keeps the entries inside its own code.
+      Va Site = I.vaOfRva(*Offset);
+      if (Site < F.Function || !(Site < F.End))
+        continue;
+      F.CallSites.push_back({Site, *State});
     }
   }
   resolveTryRanges(F);
@@ -689,10 +715,7 @@ std::vector<FunctionEH> revenant::decodeEHTables(const PeFile &PE) {
       F.CallSites.clear();
     }
     if (F.Model == EHModel::None) {
-      auto Magic = u32(I, U->Data);
-      if (Magic && (*Magic == EH_MAGIC || *Magic == EH_MAGIC_1 ||
-                    *Magic == EH_MAGIC_2 || *Magic == EH_MAGIC_3 ||
-                    *Magic == EH_MAGIC_4)) {
+      if (funcInfo3At(I, U->Data)) {
         readFuncInfo3(I, F, U->Data);
       } else {
         auto First = I.dataAt(U->Data, 1);

@@ -1152,14 +1152,26 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     // EH map targets can point at the entry instruction inside a discovered
     // funclet, rather than at its containing Program function's start.
     const FunctionRangeIndex FunctionRanges(Prog.Functions);
+    // Every x64 funclet has its own pdata entry. A handler address that
+    // starts none is a misdecoded table, not a funclet: resolving it by
+    // range would lift an ordinary function with the funclet signature.
+    DenseSet<uint64_t> UnwindStarts;
+    for (const RuntimeFunction &R : pe().Pdata)
+      UnwindStarts.insert(R.Begin.Value);
     auto collectFunclet = [&](Va Handler, Va Owner) {
+      // A funclet's own pdata entry shares its parent's FuncInfo and lists
+      // the funclet itself; that is no handler of another function.
+      if (Handler == Owner)
+        return;
       auto Exact = Prog.Functions.find(Handler);
-      if (Exact != Prog.Functions.end() && Handler != Owner) {
+      if (Exact != Prog.Functions.end()) {
         FuncletAddresses.insert(Handler.Value);
         FuncletAliases[Handler.Value] = Handler.Value;
         OwnerFunclets[Owner.Value].push_back(Handler.Value);
         return;
       }
+      if (!UnwindStarts.contains(Handler.Value))
+        return;
       if (std::optional<Va> Start = FunctionRanges.find(Handler, Owner)) {
         FuncletAddresses.insert(Start->Value);
         FuncletAliases[Handler.Value] = Start->Value;

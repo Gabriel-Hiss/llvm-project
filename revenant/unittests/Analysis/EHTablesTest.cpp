@@ -118,10 +118,26 @@ TEST(EHTablesTest, DecodesFuncInfo3CatchHandlerAndTypeName) {
   EXPECT_EQ(EH[0].TryRegions[0].Begin, Va(0x1110));
   EXPECT_EQ(EH[0].TryRegions[0].End, Va(0x1120));
 }
+TEST(EHTablesTest, FollowsTheFuncInfoRvaInX64HandlerData) {
+  // x64 handler data holds the FuncInfo's RVA (rustc and clang-cl
+  // __CxxFrameHandler3 tables), not the FuncInfo itself.
+  PeFile PE = makePE(true);
+  auto &D = PE.Img->Sections[1].Data;
+  std::copy(D.begin() + 8, D.begin() + 36, D.begin() + 0x400);
+  std::fill(D.begin() + 8, D.begin() + 36, 0);
+  put32(D, 8, 0x1400); // RVA of VA 0x2400 = D[0x400]
+  auto EH = decodeEHTables(PE);
+  ASSERT_EQ(EH.size(), 1u);
+  EXPECT_EQ(EH[0].Model, EHModel::MSVC);
+  ASSERT_EQ(EH[0].Handlers.size(), 1u);
+  EXPECT_EQ(EH[0].Handlers[0].Address, Va(0x2300));
+  EXPECT_EQ(EH[0].Handlers[0].TypeName, ".H");
+}
 TEST(EHTablesTest, DecodesCleanupOnlyFuncInfo3RangesFromIPStates) {
   PeFile PE = makePE(true);
   auto &D = PE.Img->Sections[1].Data;
-  put32(D, 12, 0);
+  // MaxState counts the unwind-map entries: one cleanup state.
+  put32(D, 12, 1);
   put32(D, 16, 0x1280);
   put32(D, 20, 0);
   put32(D, 24, 0);
