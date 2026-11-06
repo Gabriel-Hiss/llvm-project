@@ -24,6 +24,16 @@
 
 namespace revenant::lift {
 
+llvm::Type *returnType(llvm::LLVMContext &C, const RetLoc &R) {
+  if (R.Float)
+    return R.Bits == 32 ? llvm::Type::getFloatTy(C) : llvm::Type::getDoubleTy(C);
+  if (R.Pair) {
+    llvm::Type *I64 = llvm::Type::getInt64Ty(C);
+    return llvm::StructType::get(C, {I64, I64});
+  }
+  return llvm::Type::getIntNTy(C, std::max(1u, R.Bits));
+}
+
 llvm::FunctionType *LiftState::fnType(const Signature *S) {
   llvm::SmallVector<llvm::Type *, 8> Params;
   if (S)
@@ -36,13 +46,30 @@ llvm::FunctionType *LiftState::fnType(const Signature *S) {
                                                    std::max(1u, P.Bits)));
   llvm::Type *Ret = llvm::Type::getVoidTy(Mod.getContext());
   if (S && S->Ret)
-    Ret = S->Ret->Float
-              ? (S->Ret->Bits == 32
-                     ? llvm::Type::getFloatTy(Mod.getContext())
-                     : llvm::Type::getDoubleTy(Mod.getContext()))
-              : llvm::Type::getIntNTy(Mod.getContext(),
-                                      std::max(1u, S->Ret->Bits));
+    Ret = returnType(Mod.getContext(), *S->Ret);
   return llvm::FunctionType::get(Ret, Params, false);
+}
+
+llvm::Value *LiftState::pairFromRegs() {
+  llvm::Type *I64 = i64();
+  llvm::Value *P = llvm::PoisonValue::get(
+      llvm::StructType::get(Mod.getContext(), {I64, I64}));
+  P = B.CreateInsertValue(P, extTo(regRead(llvm::X86::RAX), 64), 0);
+  return B.CreateInsertValue(P, extTo(regRead(llvm::X86::RDX), 64), 1);
+}
+
+void LiftState::writeCallResult(llvm::Value *Result) {
+  llvm::Type *Ty = Result->getType();
+  if (Ty->isIntegerTy()) {
+    regWrite(llvm::X86::RAX, extTo(Result, 64));
+  } else if (Ty->isFloatingPointTy()) {
+    llvm::Value *BC =
+        B.CreateBitCast(Result, iN(Ty->getPrimitiveSizeInBits()), "cr");
+    regWrite(llvm::X86::XMM0, extTo(BC, 128));
+  } else if (Ty->isStructTy()) {
+    regWrite(llvm::X86::RAX, B.CreateExtractValue(Result, 0));
+    regWrite(llvm::X86::RDX, B.CreateExtractValue(Result, 1));
+  }
 }
 
 static const llvm::MCRegister Win64Regs[4] = {llvm::X86::RCX, llvm::X86::RDX,
@@ -100,6 +127,8 @@ static void emitGuardReturn(LiftState &LS, Va At) {
                          ? llvm::Type::getFloatTy(LS.Mod.getContext())
                          : llvm::Type::getDoubleTy(LS.Mod.getContext());
     Ret = LS.B.CreateBitCast(LS.extTo(Ret, Bits), Ty);
+  } else if (Sig->Ret->Pair) {
+    Ret = LS.pairFromRegs();
   } else {
     Ret = LS.extTo(LS.regRead(llvm::X86::RAX), Bits);
   }
@@ -323,15 +352,7 @@ void LiftState::emitCall(const Instr &I) {
         clobberFlags();
       else
         clobberVolatile();
-      if (Call->getType()->isIntegerTy())
-        regWrite(llvm::X86::RAX, extTo(Call, 64));
-      else if (Call->getType()->isFloatingPointTy()) {
-        llvm::Value *BC =
-            B.CreateBitCast(Call, iN(Call->getType()
-                                         ->getPrimitiveSizeInBits()),
-                            "cr");
-        regWrite(llvm::X86::XMM0, extTo(BC, 128));
-      }
+      writeCallResult(Call);
       Prod.reset();
       (void)IP;
       return;
@@ -372,14 +393,7 @@ void LiftState::emitCall(const Instr &I) {
                      Callee->getReturnType()->isVoidTy() ? "" : "c");
     ir::setInstructionVA(*Call, I.Addr.Value);
     clobberCallee(Callee, I.Target);
-    if (Call->getType()->isIntegerTy())
-      regWrite(llvm::X86::RAX, extTo(Call, 64));
-    else if (Call->getType()->isFloatingPointTy()) {
-      llvm::Value *BC =
-          B.CreateBitCast(Call, iN(Call->getType()->getPrimitiveSizeInBits()),
-                          "cr");
-      regWrite(llvm::X86::XMM0, extTo(BC, 128));
-    }
+    writeCallResult(Call);
     Prod.reset();
     return;
   }
@@ -439,6 +453,16 @@ void LiftState::emitTailCall(Va Target) {
     llvm::Value *RV = Call;
     if (Call->getType()->isVoidTy()) {
       RV = llvm::Constant::getNullValue(ReturnTy);
+    } else if (Call->getType() != ReturnTy && (ReturnTy->isStructTy() ||
+                                               Call->getType()->isStructTy())) {
+      // A pair on either side: go through the registers both shapes name.
+      writeCallResult(Call);
+      if (ReturnTy->isStructTy())
+        RV = pairFromRegs();
+      else if (ReturnTy->isIntegerTy())
+        RV = B.CreateZExtOrTrunc(regRead(llvm::X86::RAX), ReturnTy, "tr");
+      else
+        RV = llvm::Constant::getNullValue(ReturnTy);
     } else if (Call->getType() != ReturnTy) {
       if (Call->getType()->isFloatingPointTy() &&
           ReturnTy->isFloatingPointTy()) {

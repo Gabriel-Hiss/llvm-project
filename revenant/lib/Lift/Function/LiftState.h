@@ -144,6 +144,10 @@ struct FlagProd {
 
 class GenContext;
 
+/// IR type of a recovered return: float/double for xmm0, `{i64, i64}` for a
+/// rax:rdx pair, else an integer of the recovered width.
+llvm::Type *returnType(llvm::LLVMContext &C, const RetLoc &R);
+
 /// The per-function lifter state (Rust `struct Lift`).
 class LiftState {
 public:
@@ -285,6 +289,11 @@ public:
 
   // ---- calls ---------------------------------------------------------------------
   llvm::FunctionType *fnType(const Signature *S);
+  /// `{rax, rdx}` as the `{i64, i64}` pair a rax:rdx return carries.
+  llvm::Value *pairFromRegs();
+  /// Writes a call's result back to the registers it returns in: rax (and
+  /// rdx for a pair) or xmm0.
+  void writeCallResult(llvm::Value *Result);
   llvm::Function *calleeFn(Va Target, const Signature *S);
   llvm::Function *calleeByName(llvm::StringRef Name, const Signature *S);
   /// Arguments of a call at the current instruction. A stack parameter sits

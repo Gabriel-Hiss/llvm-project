@@ -4,6 +4,7 @@ add_llvm_library(RevenantCAPI
   CAPI.cpp
   Detect.cpp
   Session.cpp
+  PairReturns.cpp
   Stages.cpp
   Unoptimized.cpp
 

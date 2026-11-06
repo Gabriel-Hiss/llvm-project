@@ -77,6 +77,9 @@ struct Param {
 struct RetLoc {
   bool Float = false;
   uint32_t Bits = 64;
+  /// Two-register result in rax:rdx, lifted as `{i64, i64}` (rustc returns
+  /// scalar pairs such as slices and `Option<usize>` this way).
+  bool Pair = false;
 };
 
 enum class SigSource { Pdb, Inferred, Library, Default };

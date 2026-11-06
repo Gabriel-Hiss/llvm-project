@@ -18,6 +18,7 @@
 
 #include "revenant/Engine/Session.h"
 
+#include "PairReturns.h"
 #include "Unoptimized.h"
 
 #include "revenant/Analysis/LibMatch.h"
@@ -1084,6 +1085,10 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
   const bool RustcBinary = Compiler.Producer == revenant::Compiler::Rustc;
   StackSlotScanner SlotScanner;
   DenseMap<uint64_t, StackSlots> SlotEvidence;
+  // rustc binaries: callees whose callers read rdx after the call, the
+  // second word of a scalar-pair return (see PairReturns.h).
+  PairReturnScanner PairScanner;
+  DenseSet<uint64_t> PairReturns;
   for (Va T : Todo) {
     auto FOrErr = materialize(T);
     if (!FOrErr) {
@@ -1102,6 +1107,7 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
     }
     if (RustcBinary) {
       SlotEvidence[T.Value] = SlotScanner.scan(FOrErr->Instrs);
+      PairScanner.scan(*FOrErr, PairReturns);
     }
     Ready.push_back(T);
     InstrCount += FOrErr->Instrs.size();
@@ -1138,6 +1144,20 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         return Recovered.takeError();
       Sigs = std::move(*Recovered);
     }
+    // Callers read rdx after these calls: the callee returns a pair. The
+    // recovered signatures are shared, so a changed set is a new copy.
+    std::shared_ptr<lift::Signatures> Paired;
+    for (uint64_t VA : PairReturns) {
+      auto It = Sigs->Funcs.find(Va(VA));
+      if (It == Sigs->Funcs.end() || It->second.NoReturn ||
+          (It->second.Ret && (It->second.Ret->Float || It->second.Ret->Pair)))
+        continue;
+      if (!Paired)
+        Paired = std::make_shared<lift::Signatures>(*Sigs);
+      Paired->Funcs[Va(VA)].Ret = lift::RetLoc{false, 64, true};
+    }
+    if (Paired)
+      Sigs = std::move(Paired);
     auto ClassificationOrErr =
         classifyFunctions(Out, Opts.LibraryDBPath);
     if (!ClassificationOrErr)

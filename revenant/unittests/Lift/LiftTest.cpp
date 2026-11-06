@@ -456,6 +456,34 @@ TEST(LiftFunction, LockPrefixMakesTheUpdateAtomic) {
   EXPECT_EQ(Atomic, 1u);
 }
 
+TEST(LiftFunction, PairReturnHandsTheSecondWordToRdx) {
+  // rustc returns scalar pairs in rax:rdx. `call f; mov rax, rdx; ret`
+  // returns the second word of f's result.
+  llvm::LLVMContext C;
+  const uint8_t Code[] = {0xE8, 0x00, 0x00, 0x00, 0x00, // call 0x140001005
+                          0x48, 0x89, 0xD0,             // mov rax, rdx
+                          0xC3};                        // ret
+  lift::Signatures Sigs;
+  lift::Signature Callee;
+  Callee.Ret = lift::RetLoc{false, 64, true};
+  Sigs.Funcs.emplace(Va(0x140001005), Callee);
+  lift::Signature Caller;
+  Caller.Ret = lift::RetLoc{false, 64};
+  Sigs.Funcs.emplace(Va(0x140001000), Caller);
+  auto M = liftCode(Code, 3, C, &Sigs, /*RunPasses=*/true);
+  ASSERT_FALSE(verifyModule(*M, &llvm::errs()));
+  const llvm::ReturnInst *Ret = nullptr;
+  for (const llvm::Function &F : *M)
+    for (const llvm::BasicBlock &BB : F)
+      if (auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator()))
+        Ret = R;
+  ASSERT_NE(Ret, nullptr);
+  auto *Second = llvm::dyn_cast<llvm::ExtractValueInst>(Ret->getReturnValue());
+  ASSERT_NE(Second, nullptr);
+  EXPECT_EQ(Second->getIndices()[0], 1u);
+  EXPECT_TRUE(llvm::isa<llvm::CallInst>(Second->getAggregateOperand()));
+}
+
 TEST(LiftFunction, CalleeClobberPreservesLoopIv) {
   // c-gcc-o2 map_call_vec (0x140001ea0) keeps its loop induction variable in
   // r8/r9 across a call to the local leaf sub_140001cc0, which only writes

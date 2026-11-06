@@ -75,9 +75,7 @@ static llvm::FunctionType *functionType(llvm::LLVMContext &C,
                                                        std::max(1u, P.Bits)));
   llvm::Type *Ret = llvm::Type::getVoidTy(C);
   if (S && S->Ret)
-    Ret = S->Ret->Float ? (S->Ret->Bits == 32 ? llvm::Type::getFloatTy(C)
-                                              : llvm::Type::getDoubleTy(C))
-                        : llvm::Type::getIntNTy(C, std::max(1u, S->Ret->Bits));
+    Ret = returnType(C, *S->Ret);
   return llvm::FunctionType::get(Ret, Params, false);
 }
 
@@ -310,6 +308,8 @@ static llvm::Error liftTerminator(LiftState &LS, const FuncRecord &F,
                              : llvm::Type::getDoubleTy(LS.Mod.getContext());
         Ret = LS.B.CreateBitCast(LS.B.CreateTrunc(Ret, LS.iN(ValBits)),
                                  Ty, "retf");
+      } else if (Sig->Ret->Pair) {
+        Ret = LS.pairFromRegs();
       } else {
         Ret = LS.regRead(llvm::X86::RAX);
         Ret = LS.extTo(Ret, Bits);
