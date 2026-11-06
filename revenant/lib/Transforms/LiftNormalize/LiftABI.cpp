@@ -8,12 +8,14 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/DIBuilder.h"
 #include <algorithm>
 #include <vector>
 using namespace llvm;
+using namespace llvm::PatternMatch;
 namespace revenant {
 namespace {
 DIType *irDebugType(Type *Ty, DIBuilder &DIB) {
@@ -260,9 +262,175 @@ Value *toPointer(Value *V, IRBuilder<> &B) {
     return nullptr;
   return B.CreateIntToPtr(V, B.getPtrTy(), "abi.ptr");
 }
+/// The narrow-typed value a return of `V` carries when every return of the
+/// function is a zero extension from `Narrow` (see `narrowReturnType`). A
+/// bool held in a byte is truncated to its bit.
+Value *narrowReturnValue(Value *V, Type *Narrow, IRBuilder<> &B) {
+  if (auto *Z = dyn_cast<ZExtInst>(V))
+    if (Z->getSrcTy() == Narrow)
+      return Z->getOperand(0);
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return ConstantInt::get(Narrow, C->getValue().trunc(Narrow->getIntegerBitWidth()));
+  if (isa<UndefValue>(V))
+    return UndefValue::get(Narrow);
+  if (Narrow->isIntegerTy(1))
+    return B.CreateTrunc(V, Narrow, "abi.bool");
+  return nullptr;
+}
+/// V is a byte that only ever holds 0 or 1: a bool as the x64 ABI passes
+/// it. Unoptimized code masks a bool it returns (`and al, 1`), optimized
+/// code returns a `setcc` result.
+bool boolByte(Value *V, SmallPtrSetImpl<Value *> &Seen) {
+  if (!Seen.insert(V).second || isa<UndefValue>(V))
+    return true;
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->getValue().ule(1);
+  if (auto *Z = dyn_cast<ZExtInst>(V))
+    return Z->getSrcTy()->isIntegerTy(1);
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::And)
+      return match(BO->getOperand(1), m_One()) || boolByte(BO->getOperand(0), Seen) ||
+             boolByte(BO->getOperand(1), Seen);
+    if (BO->getOpcode() == Instruction::Xor || BO->getOpcode() == Instruction::Or)
+      return boolByte(BO->getOperand(0), Seen) && boolByte(BO->getOperand(1), Seen);
+    return false;
+  }
+  if (auto *P = dyn_cast<PHINode>(V))
+    return llvm::all_of(P->incoming_values(), [&](Value *In) { return boolByte(In, Seen); });
+  return false;
+}
+/// The type every return value of F zero-extends from, when all returns are
+/// such extensions (at least one) or constants that fit. MSVC x64 returns
+/// `int` in eax, and a 32-bit write zero-extends rax, so the lift sees
+/// `zext i32 %x to i64` where the source returned the i32 itself. A byte
+/// result that only holds 0 or 1 is a bool (`i1`); a wider result built
+/// from a compare stays, `int f() { return a < b; }` returns an int.
+Type *narrowReturnType(Function &F) {
+  auto *RT = dyn_cast<IntegerType>(F.getReturnType());
+  if (!RT)
+    return nullptr;
+  if (RT->getBitWidth() == 8) {
+    SmallPtrSet<Value *, 16> Seen;
+    bool Any = false, Bool = true;
+    for (BasicBlock &BB : F)
+      if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator()))
+        if (Value *V = R->getReturnValue()) {
+          Any |= !isa<Constant>(V);
+          Bool &= boolByte(V, Seen);
+        }
+    return Any && Bool ? Type::getInt1Ty(F.getContext()) : nullptr;
+  }
+  Type *Narrow = nullptr;
+  SmallVector<ConstantInt *, 4> Constants;
+  for (BasicBlock &BB : F) {
+    auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!R || !R->getReturnValue())
+      continue;
+    Value *V = R->getReturnValue();
+    if (auto *Z = dyn_cast<ZExtInst>(V)) {
+      if (Narrow && Z->getSrcTy() != Narrow)
+        return nullptr;
+      Narrow = Z->getSrcTy();
+    } else if (auto *C = dyn_cast<ConstantInt>(V)) {
+      Constants.push_back(C);
+    } else if (!isa<UndefValue>(V)) {
+      return nullptr;
+    }
+  }
+  if (!Narrow || Narrow->getIntegerBitWidth() < 8)
+    return nullptr;
+  for (ConstantInt *C : Constants)
+    if (C->getValue().getActiveBits() > Narrow->getIntegerBitWidth())
+      return nullptr;
+  return Narrow;
+}
+/// True when no direct call reads F's result and F has no other use, so the
+/// value in the return register is not part of the interface. A result that
+/// only feeds the return of a function already in `Dead` is unread too.
+bool deadReturn(Function &F, const SmallPtrSetImpl<Function *> &Dead) {
+  if (F.getReturnType()->isVoidTy() || F.use_empty())
+    return false;
+  for (const Use &U : F.uses()) {
+    auto *C = dyn_cast<CallBase>(U.getUser());
+    if (!C || !C->isCallee(&U))
+      return false;
+    for (const User *R : C->users())
+      if (!isa<ReturnInst>(R) || !Dead.count(cast<ReturnInst>(R)->getFunction()))
+        return false;
+  }
+  return true;
+}
+/// True when nothing F computes reaches its returns: each returned value is
+/// undef or another call's result (through casts and phis), i.e. the return
+/// register only still holds what a callee left there. Callers that drop a
+/// result are not proof of a void function on their own: a lift that loses a
+/// register across a call drops the use too. A function that computes its
+/// return value keeps it. In an unoptimized function a register merged
+/// across blocks is never a result: RegAllocFast spills every value live
+/// across a block boundary, so a real result is reloaded where it returns,
+/// and the merge is whatever the paths last left in rax.
+bool incidentalReturn(Function &F) {
+  const bool Unoptimized = F.hasFnAttribute("revenant.o0");
+  SmallVector<Value *, 8> Work;
+  SmallPtrSet<Value *, 16> Seen;
+  for (BasicBlock &BB : F)
+    if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator()))
+      if (R->getReturnValue())
+        Work.push_back(R->getReturnValue());
+  if (Work.empty())
+    return false;
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    if (isa<UndefValue>(V) || isa<CallBase>(V))
+      continue;
+    // MSVC hands back an sret pointer in rax; the compiler's IR is void.
+    if (auto *A = dyn_cast<Argument>(V); A && A->getArgNo() > 0)
+      continue;
+    if (auto *C = dyn_cast<CastInst>(V)) {
+      Work.push_back(C->getOperand(0));
+      continue;
+    }
+    if (auto *P = dyn_cast<PHINode>(V)) {
+      if (Unoptimized)
+        continue;
+      for (Value *In : P->incoming_values())
+        Work.push_back(In);
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+/// True when every return of F hands back its first argument unchanged
+/// (possibly through a pointer/integer cast).
+bool returnsFirstArgument(Function &F) {
+  if (F.arg_empty())
+    return false;
+  Argument *A0 = F.getArg(0);
+  bool Any = false;
+  for (BasicBlock &BB : F) {
+    auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!R || !R->getReturnValue())
+      continue;
+    Value *V = R->getReturnValue();
+    if (auto *C = dyn_cast<CastInst>(V))
+      if (C->getOpcode() == Instruction::PtrToInt || C->getOpcode() == Instruction::IntToPtr)
+        V = C->getOperand(0);
+    if (V != A0)
+      return false;
+    Any = true;
+  }
+  return Any;
+}
 struct Signature {
   SmallVector<bool, 8> Pointers;
   bool PointerReturn = false;
+  /// No direct caller reads the result and the function has no other use.
+  bool VoidReturn = false;
+  /// Every returned value is a zero extension from this narrower type.
+  Type *NarrowReturn = nullptr;
 };
 /// V is the integer bits of a pointer the function holds: a `ptrtoint`, a
 /// parameter the analysis already types as a pointer, or a read of a stack
@@ -293,7 +461,11 @@ void rewriteSignature(Function &F, Signature &S) {
   Type *PT = PointerType::getUnqual(M.getContext());
   for (Argument &A : F.args())
     Params.push_back(S.Pointers[A.getArgNo()] ? PT : A.getType());
-  Type *Ret = S.PointerReturn ? PT : F.getReturnType();
+  Type *Ret = S.VoidReturn      ? Type::getVoidTy(M.getContext())
+              : S.PointerReturn ? PT
+              : S.NarrowReturn  ? S.NarrowReturn
+                                : F.getReturnType();
+  const bool RetChanged = Ret != F.getReturnType();
   auto *FT = FunctionType::get(Ret, Params, F.isVarArg());
   if (FT == F.getFunctionType())
     return;
@@ -304,7 +476,7 @@ void rewriteSignature(Function &F, Signature &S) {
   for (unsigned J = 0; J < Params.size(); ++J)
     Attrs.push_back(S.Pointers[J] ? AttributeSet() : F.getAttributes().getParamAttrs(J));
   N->setAttributes(AttributeList::get(M.getContext(), F.getAttributes().getFnAttrs(),
-      S.PointerReturn ? AttributeSet() : F.getAttributes().getRetAttrs(), Attrs));
+      RetChanged ? AttributeSet() : F.getAttributes().getRetAttrs(), Attrs));
   M.getFunctionList().insert(F.getIterator(), N);
   N->takeName(&F);
   N->splice(N->end(), &F);
@@ -323,20 +495,31 @@ void rewriteSignature(Function &F, Signature &S) {
       Old.replaceAllUsesWith(Bits);
     }
   }
-  if (S.PointerReturn)
-    for (BasicBlock &BB : *N)
-      if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator())) {
-        if (!R->getReturnValue())
-          continue;
-        IRBuilder<> B(R);
-        Value *V = toPointer(R->getReturnValue(), B);
-        if (!V)
-          continue;
-        if (auto *I = dyn_cast<Instruction>(V))
-          if (I != R->getReturnValue())
-            copyOrigin(I, *R);
-        R->setOperand(0, V);
-      }
+  for (BasicBlock &BB : *N) {
+    auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!R || !R->getReturnValue())
+      continue;
+    IRBuilder<> B(R);
+    if (S.VoidReturn) {
+      auto *RV = B.CreateRetVoid();
+      copyOrigin(RV, *R);
+      R->eraseFromParent();
+      continue;
+    }
+    Instruction *Prev = R->getPrevNode();
+    Value *V = nullptr;
+    if (S.PointerReturn)
+      V = toPointer(R->getReturnValue(), B);
+    else if (S.NarrowReturn)
+      V = narrowReturnValue(R->getReturnValue(), S.NarrowReturn, B);
+    if (!V)
+      continue;
+    // Casts the conversion inserted sit between Prev and the return.
+    for (Instruction *I = Prev ? Prev->getNextNode() : &BB.front(); I != R;
+         I = I->getNextNode())
+      copyOrigin(I, *R);
+    R->setOperand(0, V);
+  }
   SmallVector<CallBase *, 16> Calls;
   for (User *U : F.users())
     if (auto *CB = dyn_cast<CallBase>(U))
@@ -344,9 +527,10 @@ void rewriteSignature(Function &F, Signature &S) {
         Calls.push_back(CB);
   for (CallBase *C : Calls) {
     BasicBlock *ResultBlock = nullptr;
-    if (S.PointerReturn)
+    if (S.PointerReturn || S.NarrowReturn)
       if (auto *II = dyn_cast<InvokeInst>(C))
-        ResultBlock = SplitEdge(II->getParent(), II->getNormalDest());
+        if (!C->use_empty())
+          ResultBlock = SplitEdge(II->getParent(), II->getNormalDest());
     IRBuilder<> B(C);
     auto *New = cast<CallBase>(C->clone());
     // A call site recovered with fewer operands than the new signature keeps
@@ -366,18 +550,23 @@ void rewriteSignature(Function &F, Signature &S) {
     New->mutateFunctionType(FT);
     New->setCalledFunction(N);
     New->setAttributes(AttributeList::get(M.getContext(), C->getAttributes().getFnAttrs(),
-        S.PointerReturn ? AttributeSet() : C->getAttributes().getRetAttrs(), Attrs));
+        RetChanged ? AttributeSet() : C->getAttributes().getRetAttrs(), Attrs));
+    if (New->getType()->isVoidTy())
+      New->setName("");
     Value *Result = New;
-    if (S.PointerReturn && !C->use_empty()) {
+    if ((S.PointerReturn || S.NarrowReturn) && !C->use_empty()) {
       if (ResultBlock)
         B.SetInsertPoint(ResultBlock->getTerminator());
       else
         B.SetInsertPoint(C);
-      Result = B.CreatePtrToInt(New, C->getType(), "abi.result");
+      Result = S.PointerReturn ? B.CreatePtrToInt(New, C->getType(), "abi.result")
+                               : B.CreateZExt(New, C->getType(), "abi.result");
       copyOrigin(cast<Instruction>(Result), *C);
     }
+    // A void callee's result only fed returns of functions that become void
+    // too; undef holds the place until their returns are rewritten.
     if (!C->use_empty())
-      C->replaceAllUsesWith(Result);
+      C->replaceAllUsesWith(S.VoidReturn ? UndefValue::get(C->getType()) : Result);
     C->eraseFromParent();
   }
   // Opaque pointers retain the exact code address for address-taken uses.
@@ -671,6 +860,34 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
               Progress |= Mark(R->getReturnValue());
     }
   } while (Progress);
+  // Return width. A result no direct caller reads is not part of the
+  // interface (void), except for a function that hands back its first
+  // argument: MSVC constructors and assignment operators return `this`
+  // whether or not the caller uses it. Otherwise a return that is always a
+  // zero extension narrows to the extended type.
+  SmallPtrSet<Function *, 32> Dead;
+  bool Grew;
+  do {
+    Grew = false;
+    for (Function &F : M)
+      if (Signatures.count(&F) && !Dead.count(&F) && deadReturn(F, Dead) &&
+          incidentalReturn(F) && !returnsFirstArgument(F)) {
+        Dead.insert(&F);
+        Grew = true;
+      }
+  } while (Grew);
+  for (Function &F : M) {
+    auto It = Signatures.find(&F);
+    if (It == Signatures.end())
+      continue;
+    Signature &S = It->second;
+    if (Dead.count(&F)) {
+      S.VoidReturn = true;
+      S.PointerReturn = false;
+    } else if (!S.PointerReturn) {
+      S.NarrowReturn = narrowReturnType(F);
+    }
+  }
   // Rewriting a signature replaces the function object, so collect the
   // targets in module order first.
   SmallVector<Function *, 32> ToRewrite;
@@ -679,7 +896,7 @@ PreservedAnalyses LiftABIPass::run(Module &M, ModuleAnalysisManager &) {
     if (It == Signatures.end())
       continue;
     Signature &S = It->second;
-    if (S.PointerReturn || llvm::is_contained(S.Pointers, true))
+    if (S.PointerReturn || S.VoidReturn || S.NarrowReturn || llvm::is_contained(S.Pointers, true))
       ToRewrite.push_back(&F);
   }
   for (Function *F : ToRewrite) {
