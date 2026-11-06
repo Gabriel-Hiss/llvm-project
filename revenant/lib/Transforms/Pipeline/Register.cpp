@@ -157,6 +157,10 @@ void registerRevenantPasses(PassBuilder &PB) {
           FPM.addPass(GsCookiePass());
           return true;
         }
+        if (Name == "revenant-stackprotector") {
+          FPM.addPass(StackProtectorPass());
+          return true;
+        }
 #endif
 #if __has_include("revenant/Transforms/RustBlocks/RustBlocks.h")
         if (Name == "revenant-rustblocks") {

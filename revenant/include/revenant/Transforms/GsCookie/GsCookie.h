@@ -53,6 +53,20 @@ struct GsCookiePass : public llvm::PassInfoMixin<GsCookiePass> {
   static bool isRequired() { return true; }
 };
 
+/// `revenant-stackprotector`: the cookie as the optimizing compiler's IR
+/// right before instruction selection has it. The StackProtector pass leaves
+/// `llvm.stackprotector(llvm.stackguard(), %StackGuardSlot)` at the entry of
+/// a protected function and the selector expands the rest, so a function
+/// whose cookie `revenant-gscookie` removed (`"rv.gscookie"`) gets those two
+/// calls and the slot back. Unoptimized functions (`revenant.o0`) stay as
+/// they are: the compiler's -O0 IR is compared before that pass ran. Only
+/// the ir-final storage runs it; the source is built without the cookie.
+struct StackProtectorPass : public llvm::PassInfoMixin<StackProtectorPass> {
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
+
 } // namespace revenant
 
 #endif
