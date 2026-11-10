@@ -262,10 +262,53 @@ Value *toPointer(Value *V, IRBuilder<> &B) {
     return nullptr;
   return B.CreateIntToPtr(V, B.getPtrTy(), "abi.ptr");
 }
+/// The byte a partial-register return carries. `mov al, x` or `setcc al`
+/// before `ret` lifts as the previous rax with its low byte replaced,
+/// `or (and Old, ~0xff), zext Byte`: the function produced the byte, and the
+/// upper bits are whatever rax last held. Returns `Byte` (i8 or i1).
+Value *returnedByte(Value *V) {
+  Value *Low;
+  ConstantInt *Mask;
+  if (!match(V, m_c_Or(m_And(m_Value(), m_ConstantInt(Mask)), m_ZExt(m_Value(Low)))))
+    return nullptr;
+  unsigned Bits = V->getType()->getIntegerBitWidth();
+  if (Bits <= 8 || Low->getType()->getIntegerBitWidth() > 8 ||
+      Mask->getValue() != APInt::getHighBitsSet(Bits, Bits - 8))
+    return nullptr;
+  return Low;
+}
+/// True when no direct caller of F reads more of its result than the low
+/// byte: each use of a call's result truncates or masks to a byte, or hands
+/// it on as the caller's own result.
+bool callersReadByte(Function &F) {
+  for (const Use &U : F.uses()) {
+    auto *C = dyn_cast<CallBase>(U.getUser());
+    if (!C || !C->isCallee(&U))
+      continue;
+    for (const User *R : C->users()) {
+      if (isa<ReturnInst>(R))
+        continue;
+      if (auto *T = dyn_cast<TruncInst>(R); T && T->getType()->getIntegerBitWidth() <= 8)
+        continue;
+      const APInt *M;
+      if (match(R, m_And(m_Value(), m_APInt(M))) && M->ule(0xff))
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
 /// The narrow-typed value a return of `V` carries when every return of the
-/// function is a zero extension from `Narrow` (see `narrowReturnType`). A
-/// bool held in a byte is truncated to its bit.
+/// function is a zero extension from `Narrow` or a byte written over the
+/// previous rax (see `narrowReturnType`). A bool held in a byte is truncated
+/// to its bit.
 Value *narrowReturnValue(Value *V, Type *Narrow, IRBuilder<> &B) {
+  if (Value *Byte = returnedByte(V)) {
+    if (Byte->getType() == Narrow)
+      return Byte;
+    return Narrow->isIntegerTy(1) ? B.CreateTrunc(Byte, Narrow, "abi.bool")
+                                  : B.CreateZExt(Byte, Narrow, "abi.byte");
+  }
   if (auto *Z = dyn_cast<ZExtInst>(V))
     if (Z->getSrcTy() == Narrow)
       return Z->getOperand(0);
@@ -322,6 +365,7 @@ Type *narrowReturnType(Function &F) {
   }
   Type *Narrow = nullptr;
   SmallVector<ConstantInt *, 4> Constants;
+  SmallVector<Value *, 4> Bytes;
   for (BasicBlock &BB : F) {
     auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
     if (!R || !R->getReturnValue())
@@ -333,9 +377,26 @@ Type *narrowReturnType(Function &F) {
       Narrow = Z->getSrcTy();
     } else if (auto *C = dyn_cast<ConstantInt>(V)) {
       Constants.push_back(C);
+    } else if (Value *Byte = returnedByte(V)) {
+      Bytes.push_back(Byte);
     } else if (!isa<UndefValue>(V)) {
       return nullptr;
     }
+  }
+  if (!Bytes.empty()) {
+    // Every computed result is a byte written into al.
+    if (Narrow || !callersReadByte(F))
+      return nullptr;
+    SmallPtrSet<Value *, 16> Seen;
+    bool Bool = true;
+    for (Value *Byte : Bytes)
+      Bool &= Byte->getType()->isIntegerTy(1) || boolByte(Byte, Seen);
+    for (ConstantInt *C : Constants) {
+      if (C->getValue().getActiveBits() > 8)
+        return nullptr;
+      Bool &= C->getValue().ule(1);
+    }
+    return Bool ? Type::getInt1Ty(F.getContext()) : Type::getInt8Ty(F.getContext());
   }
   if (!Narrow || Narrow->getIntegerBitWidth() < 8)
     return nullptr;

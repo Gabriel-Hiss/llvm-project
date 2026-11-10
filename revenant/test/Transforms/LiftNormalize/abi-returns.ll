@@ -216,3 +216,53 @@ define void @use_bytes(ptr %p, ptr %q) {
   store i8 %c, ptr %q
   ret void
 }
+
+; `setcc al` before `ret` leaves the previous rax above the byte: the lift
+; shows the old value with its low byte replaced. The function returns the
+; byte, a bool when it comes from a compare.
+; CHECK-LABEL: define i1 @byte_bool(
+; CHECK: %c = icmp ne i64 %{{.*}}, 0
+; CHECK: ret i1 %c
+define i64 @byte_bool(i64 %x) {
+  %r = call i64 @sink(i64 %x)
+  %c = icmp ne i64 %r, 0
+  %clr = and i64 %r, -256
+  %z = zext i1 %c to i64
+  %m = or disjoint i64 %clr, %z
+  ret i64 %m
+}
+; A byte that is not a bool stays a byte.
+; CHECK-LABEL: define i8 @byte_char(
+; CHECK: ret i8 %v
+define i64 @byte_char(ptr %p, i64 %x) {
+  %v = load i8, ptr %p
+  %clr = and i64 %x, -256
+  %z = zext i8 %v to i64
+  %m = or i64 %clr, %z
+  ret i64 %m
+}
+; A caller that reads more than the low byte keeps the full register.
+; CHECK-LABEL: define i64 @byte_wide(
+; CHECK: ret i64 %m
+define i64 @byte_wide(ptr %p, i64 %x) {
+  %v = load i8, ptr %p
+  %clr = and i64 %x, -256
+  %z = zext i8 %v to i64
+  %m = or i64 %clr, %z
+  ret i64 %m
+}
+; CHECK-LABEL: define void @byte_callers(
+; CHECK: call i1 @byte_bool(
+; CHECK: call i8 @byte_char(
+; CHECK: call i64 @byte_wide(
+define void @byte_callers(ptr %p, ptr %q, i64 %x) {
+  %a = call i64 @byte_bool(i64 %x)
+  %a8 = trunc i64 %a to i8
+  store i8 %a8, ptr %q
+  %b = call i64 @byte_char(ptr %p, i64 %x)
+  %b8 = and i64 %b, 255
+  store i64 %b8, ptr %q
+  %c = call i64 @byte_wide(ptr %p, i64 %x)
+  store i64 %c, ptr %q
+  ret void
+}
