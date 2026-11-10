@@ -12,8 +12,10 @@
 //   and `llvm.eh.exceptioncode` reads in the handler. Personality
 //   `__C_specific_handler`.
 // - Unwind-only (dtor/unwind-map, Rust drop glue): `invoke ... unwind
-//   label %cleanup` with `%cleanup: cleanuppad within none []` and
-//   `cleanupret from %pad unwind to caller`.
+//   label %cleanup` with `%cleanup: cleanuppad within none []`. MSVC
+//   cleanups are per state: every call in a state unwinds to one pad, and
+//   `cleanupret from %pad unwind label %next` continues to the cleanup of
+//   the unwind map's next state (`unwind to caller` past the last).
 // - MinGW LSDA: `invoke ... unwind label %lpad` with `%lpad: landingpad
 //   {ptr, i32} cleanup` (plus catch clauses when the action is nonzero)
 //   and `resume`.
@@ -39,6 +41,10 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+
+#include <functional>
 
 using namespace llvm;
 
@@ -120,6 +126,38 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
 
   unsigned Converted = 0;
   LLVMContext &C = M->getContext();
+  // One cleanup pad per MSVC unwind state, made on first use.
+  DenseMap<int32_t, BasicBlock *> CleanupPads;
+  SmallPtrSet<const EHCleanup *, 8> Building;
+  auto CleanupOf = [&](int32_t State) -> const EHCleanup * {
+    for (const EHCleanup &Cl : EH.Cleanups)
+      if (Cl.State == State)
+        return &Cl;
+    return nullptr;
+  };
+  std::function<BasicBlock *(const EHCleanup &, const Instruction &)> CleanupPad =
+      [&](const EHCleanup &Cl, const Instruction &At) -> BasicBlock * {
+    if (BasicBlock *Done = CleanupPads.lookup(Cl.State))
+      return Done;
+    // A cyclic unwind map ends at the caller.
+    if (!Building.insert(&Cl).second)
+      return nullptr;
+    BasicBlock *Next = nullptr;
+    if (Cl.ToState >= 0)
+      if (const EHCleanup *To = CleanupOf(Cl.ToState))
+        Next = CleanupPad(*To, At);
+    BasicBlock *PadBB = BasicBlock::Create(C, "", &Fn);
+    ir::nameBlock(*PadBB);
+    auto *PadI = CleanupPadInst::Create(ConstantTokenNone::get(C), {}, "eh.cleanup", PadBB);
+    auto *Ret = CleanupReturnInst::Create(PadI, Next, PadBB);
+    ir::copyInstructionVA(At, *PadI);
+    ir::copyInstructionVA(At, *Ret);
+    PadI->setMetadata("revenant.handler",
+                      MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(
+                                         Type::getInt64Ty(C), Cl.Address.Value))}));
+    CleanupPads[Cl.State] = PadBB;
+    return PadBB;
+  };
   for (CallInst *CI : Candidates) {
     auto VA = vaOf(*CI);
     if (!VA)
@@ -150,6 +188,9 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     const EHHandler *Handler = Handlers.empty() ? nullptr : Handlers.front();
     if (!Handler && !Cleanup)
       continue;
+    BasicBlock *Shared = nullptr;
+    if (!Handler && (EH.Model == EHModel::MSVC || EH.Model == EHModel::Rust))
+      Shared = CleanupPad(*Cleanup, *CI);
 
     BasicBlock *BB = CI->getParent();
     // Split the block after the call: normal edge keeps fallthrough.
@@ -157,13 +198,16 @@ unsigned liftEH(Function &Fn, const FunctionEH &EH) {
     ++SplitAt;
     BasicBlock *Normal = BB->splitBasicBlock(SplitAt);
     ir::nameBlock(*Normal);
-    BasicBlock *Dispatch =
-        BasicBlock::Create(C, "", &Fn, Normal);
-    ir::nameBlock(*Dispatch);
-
+    BasicBlock *Dispatch = Shared;
+    if (!Dispatch) {
+      Dispatch = BasicBlock::Create(C, "", &Fn, Normal);
+      ir::nameBlock(*Dispatch);
+    }
     // Build the pad in the dispatch block per model.
     Value *Pad = nullptr;
-    if (EH.Model == EHModel::Itanium) {
+    if (Shared) {
+      Pad = &*Shared->getFirstNonPHIIt();
+    } else if (EH.Model == EHModel::Itanium) {
       auto *LP = LandingPadInst::Create(
           StructType::get(C, {PointerType::getUnqual(C), Type::getInt32Ty(C)}),
           0, "eh.lpad", Dispatch);

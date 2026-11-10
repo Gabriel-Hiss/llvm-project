@@ -248,7 +248,7 @@ void readFuncInfo3(const Image &I, FunctionEH &F, Va HandlerData) {
       if (!To || !Action)
         break;
       if (*Action)
-        F.Cleanups.push_back({I.vaOfRva(*Action), S});
+        F.Cleanups.push_back({I.vaOfRva(*Action), S, *To});
     }
   }
   if (*TryRva) {

@@ -63,6 +63,9 @@ struct EHHandler {
 struct EHCleanup {
   Va Address;
   int32_t State = -1;
+  /// The state unwinding continues in once this cleanup ran (MSVC unwind
+  /// map `toState`); -1 is the caller.
+  int32_t ToState = -1;
 };
 
 struct EHCallSite {
