@@ -174,6 +174,10 @@ void registerRevenantPasses(PassBuilder &PB) {
           FPM.addPass(RefoldPass());
           return true;
         }
+        if (Name == "revenant-copyruns") {
+          FPM.addPass(CopyRunsPass());
+          return true;
+        }
 #endif
 #if __has_include("revenant/Transforms/GsCookie/GsCookie.h")
         if (Name == "revenant-gscookie") {

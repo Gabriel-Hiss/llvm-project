@@ -1276,6 +1276,232 @@ PreservedAnalyses revenant::RefoldPass::run(Function &F, FunctionAnalysisManager
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
+namespace {
+/// One moved value: `L` reads `SrcOff` bytes past the source base and its
+/// only user `S` writes it `DstOff` bytes past the destination base.
+struct CopyPair {
+  LoadInst *L;
+  StoreInst *S;
+  Value *Src, *Dst;
+  int64_t SrcOff, DstOff;
+  uint64_t Size;
+};
+
+/// Folds one group of pairs that share both bases into a memcpy when the
+/// pairs move one contiguous range to the same relative offsets.
+bool foldCopyGroup(ArrayRef<CopyPair> Group) {
+  constexpr uint64_t MinBytes = 16;
+  if (Group.size() < 2)
+    return false;
+  SmallVector<CopyPair, 8> Sorted(Group.begin(), Group.end());
+  llvm::sort(Sorted, [](const CopyPair &A, const CopyPair &B) {
+    return A.SrcOff < B.SrcOff;
+  });
+  const int64_t Src0 = Sorted.front().SrcOff, Dst0 = Sorted.front().DstOff;
+  uint64_t Next = 0;
+  for (const CopyPair &P : Sorted) {
+    if (uint64_t(P.SrcOff - Src0) != Next || P.DstOff - Dst0 != P.SrcOff - Src0)
+      return false;
+    Next += P.Size;
+  }
+  const uint64_t Len = Next;
+  if (Len < MinBytes)
+    return false;
+  // memcpy ranges may not overlap; distinct bases are distinct objects as
+  // far as the copy the compiler expanded is concerned.
+  if (Group.front().Src == Group.front().Dst &&
+      Src0 < Dst0 + int64_t(Len) && Dst0 < Src0 + int64_t(Len))
+    return false;
+  StoreInst *Last = Group.back().S;
+  IRBuilder<> B(Last);
+  auto At = [&](Value *Base, int64_t Off) -> Value * {
+    return Off ? B.CreateGEP(B.getInt8Ty(), Base, B.getInt64(Off)) : Base;
+  };
+  Value *Dst = At(Group.front().Dst, Dst0);
+  Value *Src = At(Group.front().Src, Src0);
+  CallInst *Copy = B.CreateMemCpy(Dst, MaybeAlign(1), Src, MaybeAlign(1), Len);
+  copyProvenance(Copy, Last);
+  SmallVector<WeakTrackingVH, 16> Dead;
+  for (const CopyPair &P : Group) {
+    Dead.push_back(P.S->getPointerOperand());
+    Dead.push_back(P.L->getPointerOperand());
+    P.S->eraseFromParent();
+    P.L->eraseFromParent();
+  }
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+  return true;
+}
+
+/// Folds the first foldable group of `BB`. A fold moves and erases
+/// instructions, so the caller scans the block again until nothing folds.
+bool foldCopyRun(BasicBlock &BB, const DataLayout &DL) {
+  SmallVector<Instruction *, 64> Order;
+  DenseMap<const Instruction *, unsigned> Index;
+  for (Instruction &I : BB) {
+    Index[&I] = Order.size();
+    Order.push_back(&I);
+  }
+  SmallVector<CopyPair, 16> Pairs;
+  for (Instruction *I : Order) {
+    auto *S = dyn_cast<StoreInst>(I);
+    auto *L = S ? dyn_cast<LoadInst>(S->getValueOperand()) : nullptr;
+    if (!L || !S->isSimple() || !L->isSimple() || !L->hasOneUse() ||
+        L->getParent() != &BB || hasOpaque(L) || hasOpaque(S))
+      continue;
+    TypeSize Size = DL.getTypeStoreSize(L->getType());
+    if (Size.isScalable() || DL.getTypeSizeInBits(L->getType()) != Size * 8)
+      continue;
+    APInt SO(64, 0), DO(64, 0);
+    Value *Src = L->getPointerOperand()->stripAndAccumulateConstantOffsets(DL, SO, true);
+    Value *Dst = S->getPointerOperand()->stripAndAccumulateConstantOffsets(DL, DO, true);
+    Pairs.push_back({L, S, Src, Dst, SO.getSExtValue(), DO.getSExtValue(),
+                     Size.getFixedValue()});
+  }
+  // Groups: consecutive pairs on one source and one destination base whose
+  // span touches memory only through the group itself.
+  size_t Begin = 0;
+  while (Begin < Pairs.size()) {
+    SmallPtrSet<const Instruction *, 16> Members{Pairs[Begin].L, Pairs[Begin].S};
+    unsigned Lo = Index[Pairs[Begin].L];
+    auto Clean = [&](size_t Last) {
+      unsigned From = std::min(Lo, Index[Pairs[Last].L]);
+      for (unsigned At = From, Hi = Index[Pairs[Last].S]; At <= Hi; ++At)
+        if (!Members.count(Order[At]) && Order[At]->mayReadOrWriteMemory())
+          return false;
+      return true;
+    };
+    size_t End = Begin + 1;
+    while (End < Pairs.size() && Pairs[End].Src == Pairs[Begin].Src &&
+           Pairs[End].Dst == Pairs[Begin].Dst) {
+      Members.insert(Pairs[End].L);
+      Members.insert(Pairs[End].S);
+      if (!Clean(End)) {
+        Members.erase(Pairs[End].L);
+        Members.erase(Pairs[End].S);
+        break;
+      }
+      Lo = std::min(Lo, Index[Pairs[End].L]);
+      ++End;
+    }
+    if (End - Begin >= 2 && Clean(End - 1) &&
+        foldCopyGroup(ArrayRef(Pairs).slice(Begin, End - Begin)))
+      return true;
+    Begin = End;
+  }
+  return false;
+}
+
+/// The byte a stored constant repeats in every byte (`0`, `-1`, `0x4141...`),
+/// or none.
+std::optional<uint8_t> splatByte(const Value *V, const DataLayout &DL) {
+  auto *C = dyn_cast<Constant>(V);
+  if (!C)
+    return std::nullopt;
+  if (C->isNullValue())
+    return uint8_t(0);
+  auto *CI = dyn_cast<ConstantInt>(C);
+  if (!CI || CI->getBitWidth() % 8)
+    return std::nullopt;
+  const APInt &A = CI->getValue();
+  uint8_t B = uint8_t(A.getLoBits(8).getZExtValue());
+  if (A != APInt::getSplat(A.getBitWidth(), APInt(8, B)))
+    return std::nullopt;
+  (void)DL;
+  return B;
+}
+
+/// Folds the first run of `BB` that stores one splat byte over a contiguous
+/// range of at least 16 bytes on one base, with no other memory access in
+/// between, into a memset (the backend expands a small fixed-size memset
+/// into such stores).
+bool foldFillRun(BasicBlock &BB, const DataLayout &DL) {
+  constexpr uint64_t MinBytes = 16;
+  struct Fill {
+    StoreInst *S;
+    Value *Base;
+    int64_t Off;
+    uint64_t Size;
+    uint8_t Byte;
+  };
+  SmallVector<Fill, 8> Run;
+  auto Flush = [&]() -> bool {
+    if (Run.size() < 2)
+      return false;
+    SmallVector<Fill, 8> Sorted(Run.begin(), Run.end());
+    llvm::sort(Sorted, [](const Fill &A, const Fill &B) { return A.Off < B.Off; });
+    uint64_t Next = 0;
+    for (const Fill &F : Sorted) {
+      if (uint64_t(F.Off - Sorted.front().Off) != Next)
+        return false;
+      Next += F.Size;
+    }
+    if (Next < MinBytes)
+      return false;
+    StoreInst *Last = Run.back().S;
+    IRBuilder<> B(Last);
+    Value *Dst = Sorted.front().Base;
+    if (Sorted.front().Off)
+      Dst = B.CreateGEP(B.getInt8Ty(), Dst, B.getInt64(Sorted.front().Off));
+    CallInst *Set = B.CreateMemSet(Dst, B.getInt8(Run.front().Byte), Next, MaybeAlign(1));
+    copyProvenance(Set, Last);
+    SmallVector<WeakTrackingVH, 8> Dead;
+    for (const Fill &F : Run) {
+      Dead.push_back(F.S->getPointerOperand());
+      F.S->eraseFromParent();
+    }
+    RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+    return true;
+  };
+  for (Instruction &I : BB) {
+    auto *S = dyn_cast<StoreInst>(&I);
+    std::optional<uint8_t> Byte;
+    TypeSize Size = TypeSize::getFixed(0);
+    if (S && S->isSimple() && !hasOpaque(S)) {
+      Byte = splatByte(S->getValueOperand(), DL);
+      Size = DL.getTypeStoreSize(S->getValueOperand()->getType());
+      if (Size.isScalable() ||
+          DL.getTypeSizeInBits(S->getValueOperand()->getType()) != Size * 8)
+        Byte.reset();
+    }
+    if (Byte) {
+      APInt O(64, 0);
+      Value *Base = S->getPointerOperand()->stripAndAccumulateConstantOffsets(DL, O, true);
+      if (!Run.empty() && (Run.front().Base != Base || Run.front().Byte != *Byte)) {
+        if (Flush())
+          return true;
+        Run.clear();
+      }
+      Run.push_back({S, Base, O.getSExtValue(), Size.getFixedValue(), *Byte});
+      continue;
+    }
+    // Address arithmetic between the stores is fine; memory traffic ends the run.
+    if (I.mayReadOrWriteMemory() || I.isTerminator()) {
+      if (Flush())
+        return true;
+      Run.clear();
+    }
+  }
+  return false;
+}
+} // namespace
+
+PreservedAnalyses revenant::CopyRunsPass::run(Function &F, FunctionAnalysisManager &) {
+  if (F.isDeclaration())
+    return PreservedAnalyses::all();
+  const DataLayout &DL = F.getDataLayout();
+  bool Changed = false;
+  // Unoptimized code stores each field on its own; only an optimized
+  // function's adjacent constant stores are a merged memset.
+  const bool Fill = !F.hasFnAttribute("revenant.o0");
+  for (BasicBlock &BB : F) {
+    while (foldCopyRun(BB, DL))
+      Changed = true;
+    while (Fill && foldFillRun(BB, DL))
+      Changed = true;
+  }
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
 llvm::PassPluginLibraryInfo getPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "RevenantIdioms", "0.1",
           [](llvm::PassBuilder &PB) {

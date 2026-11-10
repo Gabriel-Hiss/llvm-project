@@ -32,6 +32,20 @@ struct RefoldPass : llvm::PassInfoMixin<RefoldPass> {
   static bool isRequired() { return true; }
 };
 
+/// `revenant-copyruns`: the backend expands a small fixed-size `llvm.memcpy`
+/// into loads and stores that move one contiguous byte range between two
+/// bases; compiler IR at every optimization level carries the intrinsic.
+/// A run of at least 16 bytes whose loads each feed exactly one store at
+/// the same relative offset, with non-overlapping ranges, folds back. A
+/// fixed-size `llvm.memset` expands the same way: in optimized functions,
+/// stores of one repeated byte that cover at least 16 contiguous bytes of
+/// one base fold back too (unoptimized code stores each field itself).
+struct CopyRunsPass : llvm::PassInfoMixin<CopyRunsPass> {
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
+
 } // namespace revenant
 
 #endif
