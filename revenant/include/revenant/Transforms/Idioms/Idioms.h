@@ -46,6 +46,22 @@ struct CopyRunsPass : llvm::PassInfoMixin<CopyRunsPass> {
   static bool isRequired() { return true; }
 };
 
+/// `revenant-prune-eh`: an optimized compiler's IR calls a function it knows
+/// cannot unwind with `call`, not `invoke`, and keeps no cleanup for it. The
+/// lift sees every call inside a protected range as possibly unwinding. The
+/// pass infers which lifted functions cannot unwind (no `resume`, no pad
+/// exit to the caller, no call outside an invoke to a callee that may), then
+/// turns each invoke of such a callee into a call and drops the pads only
+/// those invokes reached. It infers nothing else: memory effects would let
+/// later folding delete calls the lift cannot prove dead. Unoptimized
+/// functions (`revenant.o0`) keep their invokes: an unoptimized front end
+/// does not infer `nounwind`.
+struct PruneEHPass : llvm::PassInfoMixin<PruneEHPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
+
 } // namespace revenant
 
 #endif

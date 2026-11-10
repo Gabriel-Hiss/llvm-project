@@ -325,6 +325,12 @@ void registerRevenantPasses(PassBuilder &PB) {
           MPM.addPass(UnoptimizedModulePass());
           return true;
         }
+#if __has_include("revenant/Transforms/Idioms/Idioms.h")
+        if (Name == "revenant-prune-eh") {
+          MPM.addPass(PruneEHPass());
+          return true;
+        }
+#endif
 #if __has_include("revenant/Transforms/UnhotCold/UnhotCold.h")
         if (Name == "revenant-unhotcold") {
           MPM.addPass(UnhotColdPass());

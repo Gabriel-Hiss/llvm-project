@@ -1502,6 +1502,90 @@ PreservedAnalyses revenant::CopyRunsPass::run(Function &F, FunctionAnalysisManag
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
+namespace {
+/// An external the lift calls that cannot unwind into its caller: a C
+/// symbol such as the import `CloseHandle`. Neither rustc nor MSVC-mode
+/// clang (`/EHsc`) lets an exception cross an `extern "C"` function, and
+/// both declare those `nounwind`. C++ and Rust symbols (`?`, `_R`, `_Z`),
+/// code the lift did not reach (`sub_<VA>`), the lifter's own helpers
+/// (`revenant.*`: an opaque `jmp` can reach anything) and the routines that
+/// raise or continue an exception stay possibly unwinding.
+bool externalCannotUnwind(const Function &F) {
+  StringRef N = F.getName();
+  if (N.empty() || N.starts_with("?") || N.starts_with("_R") || N.starts_with("_Z") ||
+      N.starts_with("sub_") || N.starts_with("revenant."))
+    return false;
+  static constexpr StringLiteral Raise[] = {
+      "_CxxThrowException", "RaiseException", "RtlRaiseException", "RtlUnwind",
+      "RtlUnwindEx", "longjmp", "_longjmp", "__cxa_throw", "_Unwind_RaiseException",
+      "_Unwind_Resume", "__CxxFrameHandler3", "__CxxFrameHandler4", "__C_specific_handler"};
+  return !llvm::is_contained(Raise, N);
+}
+/// True when a call to `Callee` cannot unwind into its caller.
+bool calleeCannotUnwind(Function *Callee, const SmallPtrSetImpl<Function *> &Nounwind) {
+  if (!Callee)
+    return false;
+  if (Callee->isDeclaration())
+    return Callee->doesNotThrow() || Callee->isIntrinsic() || externalCannotUnwind(*Callee);
+  return Nounwind.count(Callee);
+}
+/// The function an instruction of `F` can unwind into F's caller through: a
+/// `resume`, a pad exit that unwinds to the caller, or a call outside any
+/// invoke whose callee may unwind. `Nounwind` holds the defined functions
+/// still assumed not to unwind.
+bool mayUnwind(Function &F, const SmallPtrSetImpl<Function *> &Nounwind) {
+  for (Instruction &I : instructions(F)) {
+    if (isa<ResumeInst>(I))
+      return true;
+    if (auto *R = dyn_cast<CleanupReturnInst>(&I); R && R->unwindsToCaller())
+      return true;
+    if (auto *S = dyn_cast<CatchSwitchInst>(&I); S && S->unwindsToCaller())
+      return true;
+    auto *C = dyn_cast<CallInst>(&I);
+    if (C && !C->doesNotThrow() && !calleeCannotUnwind(C->getCalledFunction(), Nounwind))
+      return true;
+  }
+  return false;
+}
+} // namespace
+
+PreservedAnalyses revenant::PruneEHPass::run(Module &M, ModuleAnalysisManager &) {
+  // Optimistic fixed point, so mutually recursive functions can both stay
+  // `nounwind`: start with every definition, drop each that may unwind.
+  SmallPtrSet<Function *, 32> Nounwind;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Nounwind.insert(&F);
+  bool Dropped;
+  do {
+    Dropped = false;
+    for (Function &F : M)
+      if (Nounwind.count(&F) && mayUnwind(F, Nounwind)) {
+        Nounwind.erase(&F);
+        Dropped = true;
+      }
+  } while (Dropped);
+  bool Changed = false;
+  for (Function &F : M) {
+    if (F.isDeclaration() || F.hasFnAttribute("revenant.o0"))
+      continue;
+    SmallVector<InvokeInst *, 8> Calls;
+    for (BasicBlock &BB : F)
+      if (auto *II = dyn_cast<InvokeInst>(BB.getTerminator())) {
+        if (II->doesNotThrow() || calleeCannotUnwind(II->getCalledFunction(), Nounwind))
+          Calls.push_back(II);
+      }
+    if (Calls.empty())
+      continue;
+    for (InvokeInst *II : Calls)
+      changeToCall(II);
+    // Cleanup and catch pads only those invokes reached.
+    removeUnreachableBlocks(F);
+    Changed = true;
+  }
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
 llvm::PassPluginLibraryInfo getPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "RevenantIdioms", "0.1",
           [](llvm::PassBuilder &PB) {
