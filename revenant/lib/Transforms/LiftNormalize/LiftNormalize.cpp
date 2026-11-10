@@ -167,6 +167,10 @@ bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
       Accesses.push_back({MI, Offset, Len, nullptr, &Use});
       continue;
     } else if (Escapes && !isa<PHINode>(U) && !isa<SelectInst>(U)) {
+      // An address computation nothing reads (the lifter forms `rsp + k`
+      // for every access) hands the address to no one.
+      if (auto *I = dyn_cast<Instruction>(U); I && I->use_empty() && !I->mayHaveSideEffects())
+        continue;
       Escapes->push_back({&Use, Offset});
       continue;
     } else {
