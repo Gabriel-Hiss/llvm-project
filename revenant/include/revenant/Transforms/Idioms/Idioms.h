@@ -23,7 +23,9 @@ struct IdiomsPass : llvm::PassInfoMixin<IdiomsPass> {
 /// compare and select into its intrinsic (`llvm.umin`, `llvm.abs`,
 /// `llvm.uadd.sat`, `llvm.scmp`, ...), so the IR before instruction
 /// selection has the intrinsic. Unoptimized functions (`revenant.o0`) keep
-/// the source's compare and select.
+/// the source's compare and select. An atomic update whose only use tests
+/// its result becomes the `llvm.x86.atomic.<op>.cc` intrinsic X86's atomic
+/// expansion leaves in the pre-isel IR.
 struct RefoldPass : llvm::PassInfoMixin<RefoldPass> {
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &AM);

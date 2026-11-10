@@ -2,6 +2,28 @@
 ; Optimized IR carries min/max, abs, saturation and three-way compares as
 ; intrinsics; cleanup expanded them to compare and select for the source.
 ; The ir-final storage folds them back, except in unoptimized functions.
+; An atomic update whose only use tests its result is the flag-producing
+; x86 intrinsic AtomicExpand leaves in the pre-isel IR.
+
+; CHECK-LABEL: define i1 @release(
+; CHECK-NEXT: %[[CC:.*]] = call i8 @llvm.x86.atomic.sub.cc.i64(ptr %p, i64 1, i32 4)
+; CHECK-NEXT: %last = trunc i8 %[[CC]] to i1
+; CHECK-NEXT: ret i1 %last
+define i1 @release(ptr %p) {
+  %old = atomicrmw sub ptr %p, i64 1 seq_cst, align 8
+  %last = icmp eq i64 %old, 1
+  ret i1 %last
+}
+
+; The old value is read beyond the compare: it stays an atomicrmw.
+; CHECK-LABEL: define i64 @kept(
+; CHECK: atomicrmw sub
+define i64 @kept(ptr %p) {
+  %old = atomicrmw sub ptr %p, i64 1 seq_cst, align 8
+  %last = icmp eq i64 %old, 1
+  %r = select i1 %last, i64 0, i64 %old
+  ret i64 %r
+}
 
 ; CHECK-LABEL: define i32 @umin(
 ; CHECK: %r = call i32 @llvm.umin.i32(i32 %a, i32 %b)

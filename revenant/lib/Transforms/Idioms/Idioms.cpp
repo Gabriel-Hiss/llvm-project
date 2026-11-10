@@ -42,6 +42,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsX86.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -1129,6 +1130,115 @@ Value *refoldSelect(SelectInst &S, IRBuilder<> &B) {
   }
   return nullptr;
 }
+
+/// The compare of an atomic read-modify-write's result that X86's atomic
+/// expansion folds into the instruction's flags: AtomicExpand rewrites
+/// `atomicrmw` plus that one compare to `llvm.x86.atomic.<op>.cc` before
+/// instruction selection, so the pre-isel IR carries the intrinsic. Mirrors
+/// `shouldExpandCmpArithRMWInIR` in X86ISelLowering.cpp; returns the
+/// compare, and in `Temp` the arithmetic between the two when there is one.
+ICmpInst *cmpArithCompare(AtomicRMWInst &AI, Instruction *&Temp) {
+  Temp = nullptr;
+  if (!AI.hasOneUse() || AI.getType()->getPrimitiveSizeInBits() > 64)
+    return nullptr;
+  Value *Op = AI.getValOperand();
+  CmpPredicate Pred;
+  Instruction *I = AI.user_back();
+  auto SignTest = [&](Instruction *Arith) -> ICmpInst * {
+    auto *C = dyn_cast<ICmpInst>(Arith->user_back());
+    if (C && (match(C, m_SpecificICmp(ICmpInst::ICMP_SLT, m_Value(), m_ZeroInt())) ||
+              match(C, m_SpecificICmp(ICmpInst::ICMP_SGT, m_Value(), m_AllOnes())))) {
+      Temp = Arith;
+      return C;
+    }
+    return nullptr;
+  };
+  auto EqNe = [&]() -> ICmpInst * {
+    return Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE ? cast<ICmpInst>(I)
+                                                                 : nullptr;
+  };
+  switch (AI.getOperation()) {
+  case AtomicRMWInst::Add:
+    if (match(I, m_c_ICmp(Pred, m_Sub(m_ZeroInt(), m_Specific(Op)), m_Value())))
+      return EqNe();
+    if (match(I, m_OneUse(m_c_Add(m_Specific(Op), m_Value()))))
+      return SignTest(I);
+    return nullptr;
+  case AtomicRMWInst::Sub:
+    if (match(I, m_c_ICmp(Pred, m_Specific(Op), m_Value())))
+      return EqNe();
+    if (match(I, m_OneUse(m_Sub(m_Value(), m_Specific(Op)))))
+      return SignTest(I);
+    return nullptr;
+  case AtomicRMWInst::Or:
+  case AtomicRMWInst::And: {
+    bool Or = AI.getOperation() == AtomicRMWInst::Or;
+    if (!(Or ? match(I, m_OneUse(m_c_Or(m_Specific(Op), m_Value())))
+             : match(I, m_OneUse(m_c_And(m_Specific(Op), m_Value())))))
+      return nullptr;
+    auto *C = dyn_cast<ICmpInst>(I->user_back());
+    if (C && match(C, m_ICmp(Pred, m_Value(), m_ZeroInt())) &&
+        (Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE ||
+         Pred == ICmpInst::ICMP_SLT)) {
+      Temp = I;
+      return C;
+    }
+    if (C && match(C, m_SpecificICmp(ICmpInst::ICMP_SGT, m_Value(), m_AllOnes()))) {
+      Temp = I;
+      return C;
+    }
+    return nullptr;
+  }
+  case AtomicRMWInst::Xor:
+    if (match(I, m_c_ICmp(Pred, m_Specific(Op), m_Value())))
+      return EqNe();
+    if (match(I, m_OneUse(m_c_Xor(m_Specific(Op), m_Value()))))
+      return SignTest(I);
+    return nullptr;
+  default:
+    return nullptr;
+  }
+}
+
+/// Rewrites `AI` and its compare to the flag-producing intrinsic, as
+/// `emitCmpArithAtomicRMWIntrinsic` does.
+bool refoldCmpArith(AtomicRMWInst &AI) {
+  Instruction *Temp = nullptr;
+  ICmpInst *C = cmpArithCompare(AI, Temp);
+  if (!C)
+    return false;
+  // X86::CondCode values: COND_E 4, COND_NE 5, COND_S 8, COND_NS 9.
+  unsigned CC;
+  switch (C->getPredicate()) {
+  case ICmpInst::ICMP_EQ: CC = 4; break;
+  case ICmpInst::ICMP_NE: CC = 5; break;
+  case ICmpInst::ICMP_SLT: CC = 8; break;
+  case ICmpInst::ICMP_SGT: CC = 9; break;
+  default: return false;
+  }
+  Intrinsic::ID IID;
+  switch (AI.getOperation()) {
+  case AtomicRMWInst::Add: IID = Intrinsic::x86_atomic_add_cc; break;
+  case AtomicRMWInst::Sub: IID = Intrinsic::x86_atomic_sub_cc; break;
+  case AtomicRMWInst::Or: IID = Intrinsic::x86_atomic_or_cc; break;
+  case AtomicRMWInst::And: IID = Intrinsic::x86_atomic_and_cc; break;
+  case AtomicRMWInst::Xor: IID = Intrinsic::x86_atomic_xor_cc; break;
+  default: return false;
+  }
+  IRBuilder<> B(&AI);
+  Value *Call = B.CreateIntrinsic(
+      IID, AI.getType(), {AI.getPointerOperand(), AI.getValOperand(), B.getInt32(CC)});
+  Value *Result = B.CreateTrunc(Call, B.getInt1Ty());
+  if (auto *CI = dyn_cast<Instruction>(Call))
+    copyProvenance(CI, &AI);
+  Result->takeName(C);
+  C->replaceAllUsesWith(Result);
+  C->eraseFromParent();
+  if (Temp)
+    Temp->eraseFromParent();
+  AI.eraseFromParent();
+  return true;
+}
 } // namespace
 
 PreservedAnalyses revenant::RefoldPass::run(Function &F, FunctionAnalysisManager &) {
@@ -1155,6 +1265,13 @@ PreservedAnalyses revenant::RefoldPass::run(Function &F, FunctionAnalysisManager
     S->eraseFromParent();
     Changed = true;
   }
+  // The rewrite erases the compare after each atomic: collect them first.
+  SmallVector<AtomicRMWInst *, 8> Atomics;
+  for (Instruction &I : instructions(F))
+    if (auto *AI = dyn_cast<AtomicRMWInst>(&I))
+      Atomics.push_back(AI);
+  for (AtomicRMWInst *AI : Atomics)
+    Changed |= refoldCmpArith(*AI);
   RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
