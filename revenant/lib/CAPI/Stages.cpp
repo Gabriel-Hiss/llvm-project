@@ -842,11 +842,12 @@ std::string deoptPipeline(bool IncludeUncxx) {
 /// optimized function gets back what the pre-isel IR carries: the stack
 /// protector calls where it had a /GS cookie (`revenant-stackprotector`)
 /// and the min/max, abs, saturation and three-way compare intrinsics
-/// cleanup expanded for the source (`revenant-refold`). Then the
-/// control-flow shape.
+/// cleanup expanded for the source (`revenant-refold`). Invokes of callees
+/// that cannot unwind become calls, as in an optimized compiler's IR
+/// (`revenant-prune-eh`). Then the control-flow shape.
 std::string finalStoragePipeline(bool Patterns) {
-  return formatv("revenant-o0-module,function(revenant-stackprotector,revenant-refold,"
-                 "revenant-frame-slots,revenant-locals-to-slots<unoptimized>,"
+  return formatv("revenant-o0-module,revenant-prune-eh,function(revenant-stackprotector,revenant-refold,"
+                 "revenant-copyruns,revenant-frame-slots,revenant-locals-to-slots<unoptimized>,"
                  "revenant-structure{0})",
                  Patterns ? ",revenant-patterns" : "")
       .str();
@@ -856,9 +857,13 @@ std::string finalStoragePipeline(bool Patterns) {
 /// scalar locals in SSA values at every optimization level, so the
 /// deoptimized module is closest as it is (rust-o0 0.760 against 0.753
 /// with SSA-out locals, rust-o3 0.893 against 0.780 on pre-isel IR).
-/// Optimized functions get their intrinsics back (`revenant-refold`).
+/// Optimized functions get their intrinsics back (`revenant-refold`). The
+/// frame is split into one alloca per object (`revenant-frame-slots`) as
+/// rustc's IR keeps its aggregates: opendevin-o3 0.785 against 0.801 on
+/// pre-isel IR.
 std::string rustcFinalStoragePipeline(bool Patterns) {
-  return formatv("function(revenant-refold,revenant-structure{0})",
+  return formatv("revenant-prune-eh,function(revenant-refold,revenant-copyruns,revenant-frame-slots,"
+                 "revenant-structure{0})",
                  Patterns ? ",revenant-patterns" : "")
       .str();
 }
@@ -2776,7 +2781,8 @@ Expected<Decompiled> Session::decompileAll(ArrayRef<Va> Targets, Lang Out,
         return std::move(E);
       MergeShards = nullptr;
       record(R.Stages, "ir-final", "ok",
-             RustcBinary ? "structure" : "frame-slots + locals-to-slots + structure");
+             RustcBinary ? "frame-slots + structure"
+                         : "frame-slots + locals-to-slots + structure");
       auto PrintStart = StageClock::now();
       FinalText = moduleText(*M);
       reportArtifactTiming(
