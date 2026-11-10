@@ -11,6 +11,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Dominators.h"
@@ -33,8 +34,90 @@ struct Access {
   Instruction *I;
   int64_t Offset;
   uint64_t Size;
+  /// Null for a memory intrinsic, which moves untyped bytes.
   Type *Ty;
+  /// The intrinsic's pointer operand that addresses the frame.
+  Use *U = nullptr;
 };
+// Frame offset of a slot `splitFrame` made for an unoptimized function.
+constexpr StringLiteral FrameOffsetMD = "revenant.frame.off";
+// One memory access to a frame or slot: the instruction, its byte offset
+// and its width.
+struct Placed {
+  Instruction *I;
+  uint64_t Off;
+  uint64_t Size;
+};
+// The base a pointer addresses and its constant byte offset from it, through
+// constant GEPs and, in raw lifted IR, `inttoptr (add X, C)`.
+std::pair<const Value *, int64_t> movedBase(const Value *P, const DataLayout &DL) {
+  using namespace PatternMatch;
+  APInt O(64, 0);
+  const Value *B = P->stripAndAccumulateConstantOffsets(DL, O, true);
+  int64_t Off = O.getSExtValue();
+  if (auto *I2P = dyn_cast<IntToPtrInst>(B)) {
+    Value *X = I2P->getOperand(0), *Y = nullptr;
+    ConstantInt *C = nullptr;
+    B = X;
+    if (match(X, m_Add(m_Value(Y), m_ConstantInt(C)))) {
+      B = Y;
+      Off += C->getSExtValue();
+    }
+  }
+  return {B, Off};
+}
+// Byte ranges [Begin, End) a function moves as a unit. The backend expands
+// a fixed-size memcpy into load/store pairs at consecutive offsets with one
+// other base on the far side, at the same relative offsets; such a range is
+// one object (`revenant-copyruns` folds the pairs back once they address
+// one). `Sorted` is ordered by offset; a run spans at least 16 bytes and
+// two pairs in one block.
+SmallVector<std::pair<uint64_t, uint64_t>, 4> copyRuns(ArrayRef<Placed> Sorted,
+                                                       const DataLayout &DL) {
+  struct Moved {
+    uint64_t Off, Size;
+    const Value *Other;
+    int64_t OtherOff;
+    bool Load;
+    const BasicBlock *BB;
+  };
+  SmallVector<Moved, 16> M;
+  for (const Placed &X : Sorted) {
+    if (auto *L = dyn_cast<LoadInst>(X.I)) {
+      auto *S = L->hasOneUse() ? dyn_cast<StoreInst>(L->user_back()) : nullptr;
+      if (!S || S->getValueOperand() != L || !S->isSimple() ||
+          S->getParent() != L->getParent())
+        continue;
+      auto [B, O] = movedBase(S->getPointerOperand(), DL);
+      M.push_back({X.Off, X.Size, B, O, true, L->getParent()});
+    } else if (auto *S = dyn_cast<StoreInst>(X.I)) {
+      auto *L = dyn_cast<LoadInst>(S->getValueOperand());
+      if (!L || !L->hasOneUse() || !L->isSimple() || L->getParent() != S->getParent())
+        continue;
+      auto [B, O] = movedBase(L->getPointerOperand(), DL);
+      M.push_back({X.Off, X.Size, B, O, false, S->getParent()});
+    }
+  }
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> Runs;
+  for (size_t I = 0; I < M.size();) {
+    size_t J = I + 1;
+    uint64_t End = M[I].Off + M[I].Size;
+    for (size_t K = I + 1; K < M.size(); ++K) {
+      if (M[K].Off < End)
+        continue; // another access to the same bytes
+      if (M[K].Off != End || M[K].Other != M[I].Other || M[K].Load != M[I].Load ||
+          M[K].BB != M[I].BB ||
+          M[K].OtherOff - M[I].OtherOff != int64_t(M[K].Off - M[I].Off))
+        break;
+      End = M[K].Off + M[K].Size;
+      J = K + 1;
+    }
+    if (End - M[I].Off >= 16 && J - I >= 2)
+      Runs.push_back({M[I].Off, End});
+    I = J;
+  }
+  return Runs;
+}
 // A use of a frame address that leaves the frame (a call argument, a
 // ptrtoint, a stored pointer) at a constant byte offset.
 struct Escape {
@@ -73,6 +156,16 @@ bool collectFrame(Value *P, int64_t Offset, const DataLayout &DL,
       if (S->getValueOperand() == P || S->isVolatile() || S->isAtomic())
         return false;
       Ty = S->getValueOperand()->getType();
+    } else if (auto *MI = dyn_cast<MemIntrinsic>(U);
+               MI && !MI->isVolatile() && isa<ConstantInt>(MI->getLength()) &&
+               (Use.getOperandNo() == 0 ||
+                (Use.getOperandNo() == 1 && isa<MemTransferInst>(MI)))) {
+      // A fixed-size copy or fill reads or writes [Offset, Offset + len).
+      uint64_t Len = cast<ConstantInt>(MI->getLength())->getZExtValue();
+      if (!Len)
+        return false;
+      Accesses.push_back({MI, Offset, Len, nullptr, &Use});
+      continue;
     } else if (Escapes && !isa<PHINode>(U) && !isa<SelectInst>(U)) {
       Escapes->push_back({&Use, Offset});
       continue;
@@ -147,6 +240,28 @@ bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
       Objects.push_back({uint64_t(X.Offset), End, {}, {}});
     }
     Objects.back().Accesses.push_back(&X);
+  }
+  // Bytes the function moves as a unit stay one object (see copyRuns).
+  {
+    SmallVector<Placed, 32> P;
+    for (const Access &X : A)
+      if (!X.U)
+        P.push_back({X.I, uint64_t(X.Offset), X.Size});
+    for (const auto &Run : copyRuns(P, DL)) {
+      const uint64_t Begin = Run.first, End = Run.second;
+      auto First = llvm::partition_point(Objects, [Begin](const FrameObject &O) {
+        return O.Limit <= Begin;
+      });
+      if (First == Objects.end() || First->Begin < Begin)
+        continue;
+      auto Last = First + 1;
+      while (Last != Objects.end() && Last->Limit <= End) {
+        First->Limit = std::max(First->Limit, Last->Limit);
+        First->Accesses.append(Last->Accesses.begin(), Last->Accesses.end());
+        ++Last;
+      }
+      Objects.erase(First + 1, Last);
+    }
   }
   if (!E.empty()) {
     // Each escape joins the object it points into, or starts one.
@@ -235,8 +350,14 @@ bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
     provenance(Slot, Frame);
     if (Scalar && ScalarSlots)
       ScalarSlots->push_back(Slot);
-    if (AllSlots)
+    if (AllSlots) {
       AllSlots->push_back(Slot);
+      // Where the slot sat in the frame, for `revenant-o0-slots` (see
+      // mergeCopiedSlots), which drops the mark.
+      Slot->setMetadata(FrameOffsetMD,
+                        MDNode::get(Slot->getContext(),
+                                    ConstantAsMetadata::get(Entry.getInt64(O.Begin))));
+    }
     for (const Access *X : O.Accesses) {
       IRBuilder<> B(X->I);
       Value *P = Slot;
@@ -244,7 +365,9 @@ bool splitFrame(AllocaInst &Frame, const DataLayout &DL,
         P = B.CreateGEP(B.getInt8Ty(), Slot,
                        B.getInt64(uint64_t(X->Offset) - O.Begin));
       provenance(P, *X->I);
-      if (auto *L = dyn_cast<LoadInst>(X->I))
+      if (X->U)
+        X->U->set(P);
+      else if (auto *L = dyn_cast<LoadInst>(X->I))
         L->setOperand(0, P);
       else
         cast<StoreInst>(X->I)->setOperand(1, P);
@@ -1099,6 +1222,27 @@ bool splitSlot(AllocaInst &Slot, const DataLayout &DL) {
       Groups.push_back({A.Off, End, {}});
     Groups.back().Members.push_back(&A);
   }
+  // A range the function moves as a unit stays one variable (see copyRuns).
+  {
+    SmallVector<Placed, 16> P;
+    for (const Acc &A : Accs)
+      P.push_back({A.I, uint64_t(A.Off), A.Size});
+    for (const auto &Run : copyRuns(P, DL)) {
+      const int64_t Begin = Run.first, End = Run.second;
+      auto First = llvm::partition_point(Groups, [Begin](const Group &G) {
+        return G.End <= Begin;
+      });
+      if (First == Groups.end() || First->Begin < Begin)
+        continue;
+      auto Last = First + 1;
+      while (Last != Groups.end() && Last->End <= End) {
+        First->End = std::max(First->End, Last->End);
+        First->Members.append(Last->Members.begin(), Last->Members.end());
+        ++Last;
+      }
+      Groups.erase(First + 1, Last);
+    }
+  }
   if (Groups.size() < 2)
     return false;
   IRBuilder<> Entry(&Slot);
@@ -1122,6 +1266,89 @@ bool splitSlot(AllocaInst &Slot, const DataLayout &DL) {
   }
   eraseDeadAddresses(Slot);
   return true;
+}
+// Frame slots one copy run spans become one slot again. Cleanup splits the
+// frame while the copy still goes through register variables, so the pairs
+// a fixed-size memcpy expanded into land in separate slots; at the end of
+// cleanup they address the frame directly and show the run (see copyRuns).
+// Drops the frame-offset marks.
+void mergeCopiedSlots(Function &F, const DataLayout &DL) {
+  struct Marked {
+    AllocaInst *A;
+    uint64_t Off, Size;
+  };
+  SmallVector<Marked, 16> Slots;
+  for (Instruction &I : F.getEntryBlock())
+    if (auto *A = dyn_cast<AllocaInst>(&I))
+      if (MDNode *MD = A->getMetadata(FrameOffsetMD)) {
+        A->setMetadata(FrameOffsetMD, nullptr);
+        auto *C = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
+        std::optional<TypeSize> Size = A->getAllocationSize(DL);
+        if (C && Size && !Size->isScalable())
+          Slots.push_back({A, C->getZExtValue(), Size->getFixedValue()});
+      }
+  if (Slots.size() < 2)
+    return;
+  llvm::sort(Slots, [](const Marked &X, const Marked &Y) { return X.Off < Y.Off; });
+  SmallVector<Placed, 32> P;
+  for (const Marked &S : Slots) {
+    SmallVector<Value *, 8> Work{S.A};
+    while (!Work.empty()) {
+      Value *V = Work.pop_back_val();
+      for (User *U : V->users()) {
+        if (isa<GetElementPtrInst>(U)) {
+          Work.push_back(U);
+          continue;
+        }
+        auto *I = dyn_cast<Instruction>(U);
+        Type *Ty = nullptr;
+        if (auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == V)
+          Ty = L->getType();
+        else if (auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == V)
+          Ty = St->getValueOperand()->getType();
+        if (!Ty)
+          continue;
+        auto [Base, Off] = slotOffset(V, DL);
+        if (Base != S.A || Off < 0)
+          continue;
+        P.push_back({I, S.Off + uint64_t(Off), DL.getTypeStoreSize(Ty).getFixedValue()});
+      }
+    }
+  }
+  llvm::stable_sort(P, [](const Placed &X, const Placed &Y) { return X.Off < Y.Off; });
+  for (const auto &Run : copyRuns(P, DL)) {
+    uint64_t Begin = Run.first, End = Run.second;
+    SmallVector<Marked *, 4> In;
+    bool Usable = true;
+    for (Marked &S : Slots)
+      if (S.Off < End && Begin < S.Off + S.Size) {
+        // A slot an earlier merge already took, or one that overlaps the
+        // previous piece: not disjoint pieces of one range.
+        if (!S.A || (!In.empty() && S.Off < In.back()->Off + In.back()->Size))
+          Usable = false;
+        In.push_back(&S);
+        Begin = std::min(Begin, S.Off);
+        End = std::max(End, S.Off + S.Size);
+      }
+    if (!Usable || In.size() < 2)
+      continue;
+    IRBuilder<> B(In.front()->A);
+    auto *Whole = B.CreateAlloca(ArrayType::get(B.getInt8Ty(), End - Begin));
+    Whole->setAlignment(In.front()->A->getAlign());
+    provenance(Whole, *In.front()->A);
+    for (Marked *S : In) {
+      Value *At = Whole;
+      if (S->Off != Begin) {
+        B.SetInsertPoint(Whole->getNextNode());
+        At = B.CreateGEP(B.getInt8Ty(), Whole, B.getInt64(S->Off - Begin));
+      }
+      S->A->replaceAllUsesWith(At);
+      S->A->eraseFromParent();
+      S->A = nullptr;
+    }
+    // The pieces held the name; the merged slot takes it once they are gone.
+    Whole->setName("stack_" + Twine(Begin));
+  }
 }
 } // namespace
 PreservedAnalyses UnoptimizedModulePass::run(Module &M, ModuleAnalysisManager &) {
@@ -1178,6 +1405,7 @@ PreservedAnalyses UnoptimizedSlotsPass::run(Function &F,
         L->eraseFromParent();
     }
   }
+  mergeCopiedSlots(F, DL);
   // With the reservation gone, one frame object may hold several variables
   // at distinct offsets (two parameters inside an 8-byte `push`): one alloca
   // per variable.
